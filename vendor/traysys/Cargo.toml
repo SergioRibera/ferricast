@@ -1,0 +1,43 @@
+[package]
+name = "traysys"
+version = "0.1.0"
+edition = "2021"
+description = "Super simple API to make tray menus on Windows, Mac & Linux"
+keywords = ["gui", "tray", "desktop", "tray-item"]
+
+[features]
+default = ["png", "svg"]
+png = ["dep:image"]
+svg = ["dep:resvg", "dep:usvg", "dep:tiny-skia"]
+
+[dependencies]
+image = { version = "0.25", optional = true, default-features = false, features = [
+    "png",
+] }
+resvg = { version = "0.44", optional = true }
+usvg = { version = "0.44", optional = true }
+tiny-skia = { version = "0.11", optional = true }
+thiserror.workspace = true
+
+[target.'cfg(target_os="linux")'.dependencies]
+ksni = { version = "0.2" }
+
+[target."cfg(target_os = \"windows\")".dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_System_SystemServices",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
+]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+objc-foundation = "0.1"
+objc_id = "0.1"
+libc = "0.2"
+objc-sys = "0.3"
+cocoa = "0.26"
+core-foundation = "0.10"

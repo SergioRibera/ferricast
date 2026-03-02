@@ -1,0 +1,12 @@
+[package]
+name = "ferricast-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core traits and types for ferricast streaming protocols"
+
+[dependencies]
+tokio = { workspace = true, features = ["sync", "macros"] }
+tracing.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+uuid.workspace = true

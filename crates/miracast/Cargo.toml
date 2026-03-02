@@ -1,0 +1,18 @@
+[package]
+name = "ferricast-miracast"
+version = "0.1.0"
+edition = "2024"
+description = "Miracast (Wi-Fi Display) protocol for ferricast"
+
+[dependencies]
+ferricast-core.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "sync", "process"] }
+tracing.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+
+zbus = "5"
+httparse = "1"
+rand = "0.8"
+futures-lite = "2"

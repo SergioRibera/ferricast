@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "crates/core",
+    "crates/capture",
+    "crates/chromecast",
+    "crates/dial",
+    "crates/airplay",
+    "crates/miracast",
+]
+
+[workspace.dependencies]
+ferricast-core = { path = "crates/core" }
+ferricast-capture = { path = "crates/capture" }
+ferricast-chromecast = { path = "crates/chromecast" }
+ferricast-dial = { path = "crates/dial" }
+ferricast-airplay = { path = "crates/airplay" }
+ferricast-miracast = { path = "crates/miracast" }
+
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+thiserror = "2"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[package]
+name = "ferricast"
+version = "0.1.0"
+edition = "2024"
+description = "Unified screen and video streaming for Linux"
+
+[dependencies]
+ferricast-core.workspace = true
+ferricast-capture.workspace = true
+ferricast-chromecast.workspace = true
+ferricast-dial.workspace = true
+ferricast-airplay.workspace = true
+ferricast-miracast.workspace = true
+
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+traysys = { version = "0.1", path = "vendor/traysys" }
+rustls = { version = "0.23", features = ["ring"] }
+uuid.workspace = true

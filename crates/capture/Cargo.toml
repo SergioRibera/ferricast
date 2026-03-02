@@ -1,0 +1,15 @@
+[package]
+name = "ferricast-capture"
+version = "0.1.0"
+edition = "2024"
+description = "PipeWire screen capture for ferricast"
+
+[dependencies]
+ferricast-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+
+pipewire = "0.8"
+ashpd = { version = "0.10", features = ["tokio"] }

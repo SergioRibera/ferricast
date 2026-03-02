@@ -1,0 +1,23 @@
+[package]
+name = "ferricast-airplay"
+version = "0.1.0"
+edition = "2024"
+description = "AirPlay 2 protocol for ferricast"
+
+[dependencies]
+ferricast-core.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "sync"] }
+tracing.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+
+mdns-sd = "0.11"
+rustls = { version = "0.23", features = ["ring"] }
+plist = "1"
+httparse = "1"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
