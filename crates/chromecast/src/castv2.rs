@@ -10,6 +10,7 @@
 use bytes::{Buf, BufMut, BytesMut};
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use thiserror::Error;
 use tracing::{debug, trace};
 
@@ -62,6 +63,7 @@ pub enum PayloadType {
 ///   5 = payload_type
 ///   6 = payload_utf8
 ///   7 = payload_binary
+///
 #[derive(Clone, PartialEq, Message)]
 pub struct CastMessage {
     #[prost(enumeration = "ProtocolVersion", tag = "1")]
@@ -84,6 +86,11 @@ pub struct CastMessage {
 
     #[prost(bytes = "vec", optional, tag = "7")]
     pub payload_binary: Option<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct CastMessageManager<S: AsyncReadExt + AsyncWriteExt> {
+    
 }
 
 /// Protocol version enum (only CASTV2_1_0 is used in practice).

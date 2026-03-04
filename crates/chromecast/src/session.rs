@@ -13,7 +13,9 @@ type TlsStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
 type SharedWriter = Arc<Mutex<tokio::io::WriteHalf<TlsStream>>>;
 
 #[derive(Default)]
-pub struct ChromecastSession;
+pub struct ChromecastSession {
+    msg_manager: Arc<Message>,  
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]

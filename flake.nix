@@ -45,6 +45,8 @@
           ] ++ libraries;
           LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath libraries}";
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+	
+  	  BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include -I${pkgs.libclang.lib}/lib/clang/${pkgs.clang.version}/include";
         };
       });
 }
