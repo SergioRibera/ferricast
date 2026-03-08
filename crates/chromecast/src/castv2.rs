@@ -88,10 +88,6 @@ pub struct CastMessage {
     pub payload_binary: Option<Vec<u8>>,
 }
 
-#[derive(Clone, PartialEq)]
-pub struct CastMessageManager<S: AsyncReadExt + AsyncWriteExt> {
-    
-}
 
 /// Protocol version enum (only CASTV2_1_0 is used in practice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]

@@ -14,7 +14,7 @@ type SharedWriter = Arc<Mutex<tokio::io::WriteHalf<TlsStream>>>;
 
 #[derive(Default)]
 pub struct ChromecastSession {
-    msg_manager: Arc<Message>,  
+
 }
 
 #[derive(Debug, Clone)]
