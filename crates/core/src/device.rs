@@ -3,7 +3,7 @@ use std::net::IpAddr;
 
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Device {
     pub id: Uuid,
     pub name: String,
@@ -15,7 +15,7 @@ pub struct Device {
     pub metadata: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeviceCapabilities {
     pub supports_audio: bool,
     pub supports_video: bool,

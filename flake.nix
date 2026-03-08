@@ -27,6 +27,17 @@
           # gdk-pixbuf
           # libsoup_3
           # xdotool
+          xorg.libX11
+          xorg.libxcb
+          libxkbcommon
+
+          wayland
+
+          vulkan-loader
+          libGL
+          fontconfig
+          freetype
+          pkgs.stdenv.cc.cc.lib
 
           dbus
           pipewire

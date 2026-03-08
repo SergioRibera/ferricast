@@ -2,21 +2,25 @@ mod manager;
 mod tray;
 
 use std::sync::Arc;
-use std::time::Duration;
 
+use freya::{prelude::*, radio::*};
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
 use ferricast_capture::{PassthroughEncoder, PipeWireCapture};
 use ferricast_core::{CaptureSource, Codec, StreamConfig};
 
-use crate::manager::StreamManager;
+use crate::manager::*;
 use crate::tray::{FerricastTray, TrayAction};
+
+use crate::app::*;
+
+mod app;
 
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error")),
         )
         .init();
 
@@ -30,6 +34,7 @@ fn main() {
         .enable_all()
         .build()
         .expect("Failed to create tokio runtime");
+    let _rt = rt.enter();
 
     let mut stream_manager = StreamManager::default();
     stream_manager.register::<ferricast_chromecast::ChromecastHandler>();
@@ -53,56 +58,116 @@ fn main() {
 
     let stream_manager = Arc::new(Mutex::new(stream_manager));
 
-    rt.block_on(async {
-        if let Err(e) = stream_manager.lock().await.start_discovery().await {
-            tracing::error!(%e, "Failed to start discovery");
-        } else {
-            tracing::info!("Discovery started for all protocols");
-        }
-    });
+    let radio_station = RadioStation::create_global(AppState::default());
 
-    rt.block_on(async {
-        loop {
-            if let Some(action) = tray.try_recv_action() {
-                match action {
-                    TrayAction::About => {
-                        let _ = std::process::Command::new("xdg-open")
-                            .arg("https://github.com/SergioRibera/ferricast")
-                            .spawn();
-                    }
-                    TrayAction::Quit => {
-                        tracing::info!("Shutting down");
-                        let _ = stream_manager.lock().await.shutdown().await;
-                        tray.close();
-                        break;
-                    }
-                    TrayAction::Device(device_id) => {
-                        tracing::info!(?device_id, "Device selected, opening screen picker");
-                        let sm = Arc::clone(&stream_manager);
-                        tokio::spawn(async move {
-                            let capture = PipeWireCapture::new();
-                            let encoder = PassthroughEncoder::new(Codec::H264);
-                            let source = CaptureSource::FullScreen { monitor: None };
-                            let config = StreamConfig::default();
+    // Clon para el future de eventos
+    let mut radio_events = radio_station.clone();
+    let sm_discovery = Arc::clone(&stream_manager);
+    let sm_tray = Arc::clone(&stream_manager);
+    let radio_tray = radio_station.clone();
 
-                            let sm = sm.lock().await;
-                            if let Err(e) = sm
-                                .start_stream(device_id, source, capture, encoder, config)
-                                .await
-                            {
-                                tracing::error!(%e, ?device_id, "Failed to start stream");
-                            }
-                        });
-                    }
-                    _ => {}
+    launch(
+        LaunchConfig::new()
+            // Discovery
+            .with_future(move |_| async move {
+                if let Err(e) = sm_discovery.lock().await.start_discovery().await {
+                    tracing::error!(%e, "Failed to start discovery");
+                } else {
+                    tracing::info!("Discovery started for all protocols");
                 }
-            }
+            })
+            // Loop de eventos del manager -> actualiza RadioStation
+            .with_future(move |_| async move {
+                loop {
+                    match event_rx.recv().await {
+                        Some(ManagerEvent::DeviceFound(device)) => {
+                            radio_events
+                                .write_channel(AppChannel::Devices)
+                                .devices
+                                .push(device);
+                        }
+                        Some(ManagerEvent::DeviceLost(id)) => {
+                            radio_events
+                                .write_channel(AppChannel::Devices)
+                                .devices
+                                .retain(|d| d.id != id);
+                            radio_events
+                                .write_channel(AppChannel::Streaming)
+                                .streaming
+                                .retain(|&s| s != id);
+                        }
+                        Some(ManagerEvent::StreamStarted { device_id, .. }) => {
+                            let mut state = radio_events.write_channel(AppChannel::Streaming);
+                            if !state.streaming.contains(&device_id) {
+                                state.streaming.push(device_id);
+                            }
+                        }
+                        Some(ManagerEvent::StreamStopped { device_id }) => {
+                            radio_events
+                                .write_channel(AppChannel::Streaming)
+                                .streaming
+                                .retain(|&s| s != device_id);
+                        }
+                        None => break,
+                        _ => {}
+                    }
+                }
+            })
+            // Loop del tray
+            .with_future(move |_| async move {
+                loop {
+                    // try_recv_action es síncrono, usamos sleep para no bloquear
+                    if let Some(action) = tray.try_recv_action() {
+                        match action {
+                            TrayAction::About => {
+                                let _ = std::process::Command::new("xdg-open")
+                                    .arg("https://github.com/SergioRibera/ferricast")
+                                    .spawn();
+                            }
+                            TrayAction::Quit => {
+                                tracing::info!("Shutting down");
+                                let _ = sm_tray.lock().await.shutdown().await;
+                                tray.close();
+                                break;
+                            }
+                            TrayAction::Device(device_id) => {
+                                let sm = Arc::clone(&sm_tray);
+                                tokio::spawn(async move {
+                                    let capture = PipeWireCapture::new();
+                                    let encoder = PassthroughEncoder::new(Codec::H264);
+                                    let source = CaptureSource::FullScreen { monitor: None };
+                                    let config = StreamConfig::default();
+                                    let sm = sm.lock().await;
+                                    if let Err(e) = sm
+                                        .start_stream(device_id, source, capture, encoder, config)
+                                        .await
+                                    {
+                                        tracing::error!(%e, ?device_id, "Failed to start stream");
+                                    }
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
 
-            while let Ok(event) = event_rx.try_recv() {
-                tray.handle_manager_event(&event);
-            }
+                    // Sincronizar devices del radio al tray
+                    {
+                        let state = radio_tray.read();
+                        for device in &state.devices {
+                            tray.handle_manager_event(&ManagerEvent::DeviceFound(device.clone()));
+                        }
+                    }
 
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    });
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                }
+            })
+            .with_window(
+                WindowConfig::new_app(FerricastApp {
+                    stream_manager,
+                    radio_station,
+                })
+                .with_title("Ferricast")
+                .with_size(800., 600.),
+            ),
+    );
 }
