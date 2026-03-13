@@ -28,8 +28,11 @@
           # libsoup_3
           # xdotool
           xorg.libX11
+	  xorg.libXi
           xorg.libxcb
           libxkbcommon
+
+	  xorg.libXcursor
 
           wayland
 
