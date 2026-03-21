@@ -27,6 +27,7 @@ struct DeviceInfo {
 
 impl CastSession for ChromecastSession {
     async fn connect(&mut self, device: &Device) -> Result<()> {
+        println!("connecting");
         Ok(())
     }
 

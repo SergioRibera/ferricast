@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use ferricast_capture::{PassthroughEncoder, PipeWireCapture};
+use ferricast_capture::{PassthroughEncoder, PipeWireCapture, X11Capture};
 use ferricast_core::{CaptureSource, Codec, Device, StreamConfig};
 
 use crate::manager::{ManagerEvent, StreamManager};
@@ -64,7 +64,8 @@ impl App for FerricastApp {
                             move || {
                                 let sm = sm.clone();
                                 spawn(async move {
-                                    let capture = PipeWireCapture::new();
+                                    
+                                    let capture = X11Capture::new();
                                     let encoder = PassthroughEncoder::new(Codec::H264);
                                     let source = CaptureSource::FullScreen { monitor: None };
                                     let config = StreamConfig::default();
@@ -167,7 +168,7 @@ impl Component for DeviceCard {
                     )
                     .child(
                         label()
-                            .text(format!("{} · {}", device.protocol, device.addr))
+                            .text(format!("{} - {}", device.protocol, device.addr))
                             .font_size(12.)
                             .color((100, 100, 120)),
                     )

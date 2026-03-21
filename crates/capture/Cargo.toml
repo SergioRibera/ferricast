@@ -13,3 +13,5 @@ bytes.workspace = true
 
 pipewire = "0.8"
 ashpd = { version = "0.10", features = ["tokio"] }
+xcb = { version = "1.7.0", features = ["shm"] }
+libc = "0.2.183"

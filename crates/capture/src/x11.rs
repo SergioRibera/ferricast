@@ -1,0 +1,150 @@
+use bytes::Bytes;
+use ferricast_core::{FerricastError, ScreenCapture};
+use xcb::{shm::Seg, x::{Format, Pixmap, Screen, ScreenBuf}};
+use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::Instant};
+
+
+pub struct X11Capture {
+    seg_id: i32,
+    segment: Option<Seg>,
+    conn: Option<Arc<xcb::Connection>>,
+    screen: Option<ScreenBuf>,
+    pixmap: Option<Format>,
+    is_running: AtomicBool,
+    size: (usize, usize)
+}
+
+impl X11Capture {
+    pub fn new() -> Self {
+        Self {
+            seg_id: 0,
+            screen: None,
+            segment: None,
+            conn: None,
+            pixmap: None,
+            is_running: AtomicBool::new(false),
+            size: (0,0),
+        }
+    }
+}
+
+impl ScreenCapture for X11Capture {
+    async fn start(
+            &mut self,
+            source: ferricast_core::CaptureSource,
+            config: ferricast_core::CaptureConfig,
+        ) -> ferricast_core::Result<()> {
+             let (conn, screen_num) = xcb::Connection::connect(None).map_err(|_| FerricastError::Capture("Cannot connect to server".to_string()))?;
+             
+                
+             let screen = conn.get_setup().roots().nth(screen_num as usize).unwrap();
+            
+             let pixmap = conn.get_setup().pixmap_formats().iter().find(|f| f.depth() == f.bits_per_pixel()).unwrap();
+
+             let pixmap = pixmap.to_owned();
+             
+             let screen = screen.to_owned();
+             
+
+             
+             let w = config.width.unwrap_or(screen.width_in_pixels() as u32) as usize;
+             let h = config.height.unwrap_or(screen.width_in_pixels() as u32) as usize;
+
+
+             let root = screen.root();
+
+             let segment = conn.generate_id();
+
+             let seg_id = unsafe { libc::shmget(libc::IPC_PRIVATE, w * h * 4, libc::IPC_CREAT | 0o600) };
+
+             if seg_id == -1 {
+                 // TODO: should try without it in case that is imposible to create one(?
+                return Err(FerricastError::Capture("Cannot create shared memory".to_string()));
+             }
+             
+             conn.send_request(&xcb::shm::Attach {
+                shmseg: segment,
+                shmid: seg_id as u32,
+                read_only: false,
+             });
+
+             conn.flush().map_err(|_| FerricastError::Capture("Cannot flush x11 server".to_string()))?;
+
+
+            self.seg_id = seg_id;
+            self.segment = Some(segment);
+            self.conn = Some(Arc::new(conn));
+            self.screen = Some(screen);
+            self.is_running = AtomicBool::new(true);
+            self.size = (w, h);
+            self.pixmap = Some(pixmap); 
+        Ok(())
+    }
+    async fn stop(&mut self) -> ferricast_core::Result<()> {
+        if !self.is_running.load(Ordering::Acquire) {
+            return Err(FerricastError::Capture("Trying to close recorder without starting it".to_string()));
+        }
+        
+        let conn = self.conn.as_ref().unwrap();
+        
+
+        unsafe {
+            if libc::shmctl(self.seg_id, libc::IPC_RMID, core::ptr::null_mut()) == -1 {
+                return Err(FerricastError::Capture("Cannot clean segment".to_string()));
+            }
+        }
+
+        conn.send_request(&xcb::shm::Detach {
+            shmseg: self.segment.unwrap(),
+        });
+
+        conn.flush().map_err(|_| FerricastError::Capture("Cannot flush x11 server".to_string()))?;
+       
+        self.is_running.store(false, Ordering::SeqCst);
+
+        Ok(())
+    }
+    fn is_running(&self) -> bool {
+        self.is_running.load(Ordering::SeqCst)
+    }
+    async fn next_frame(&mut self) -> ferricast_core::Result<ferricast_core::RawFrame> {
+        if !self.is_running.load(Ordering::Acquire) {
+            return Err(FerricastError::Capture("Trying to close recorder without starting it".to_string()));
+        }
+
+        let buffer = unsafe { libc::shmat(self.seg_id, core::ptr::null(), 0) } as *mut u8;
+        let buffer = unsafe { std::slice::from_raw_parts(buffer, 1920 * 1080 * 4) };
+
+
+
+        let conn = self.conn.as_ref().unwrap();
+        let screen = self.screen.as_ref().unwrap();
+        let format = self.pixmap.as_ref().unwrap();
+
+        let cookie = conn.send_request(&xcb::shm::GetImage {
+            drawable: xcb::x::Drawable::Window(screen.root()),
+            x: 0,
+            y: 0,
+            width: self.size.0 as u16,
+            height: self.size.1 as u16,
+            plane_mask: !0,
+            format: 2,
+            shmseg: self.segment.unwrap(),
+            offset: 0,
+        });
+
+        let _reply = conn.wait_for_reply(cookie).map_err(|_| FerricastError::Capture("Cannot get frame from xserver".to_string()));
+
+        
+
+
+        Ok(ferricast_core::RawFrame {
+            width: self.size.0 as u32,
+            height: self.size.0 as u32,
+            stride: format.bits_per_pixel() as u32,
+            format: ferricast_core::PixelFormat::Bgra,
+            data: Bytes::from(buffer.to_vec()),
+            timestamp_us: Instant::now().elapsed().as_micros() as u64,
+        })
+    }
+}

@@ -32,6 +32,8 @@
           xorg.libxcb
           libxkbcommon
 
+pipewire.dev
+pipewire
 	  xorg.libXcursor
 
           wayland
