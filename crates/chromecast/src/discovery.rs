@@ -128,8 +128,9 @@ impl Discovery for ChromecastDiscovery {
                             supported_codecs: vec![Codec::H264, Codec::Vp8],
                         };
 
-                        let addr: std::net::IpAddr = match info.get_addresses().iter().next() {
-                            Some(addr) => (*addr).into(),
+                    
+                        let addr: std::net::IpAddr = match info.get_addresses_v4().iter().next() {
+                            Some(addr) => (*(*addr)).into(),
                             None => {
                                 warn!(
                                     name = info.get_fullname(),

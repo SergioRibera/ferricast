@@ -2,7 +2,7 @@ use bytes::Bytes;
 use ferricast_core::{FerricastError, ScreenCapture};
 use xcb::{shm::Seg, x::{Format, Pixmap, Screen, ScreenBuf}};
 use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::Instant};
-
+use tracing::info;
 
 pub struct X11Capture {
     seg_id: i32,
@@ -34,6 +34,7 @@ impl ScreenCapture for X11Capture {
             source: ferricast_core::CaptureSource,
             config: ferricast_core::CaptureConfig,
         ) -> ferricast_core::Result<()> {
+             info!("Connecting to Xserver");
              let (conn, screen_num) = xcb::Connection::connect(None).map_err(|_| FerricastError::Capture("Cannot connect to server".to_string()))?;
              
                 
@@ -55,6 +56,7 @@ impl ScreenCapture for X11Capture {
 
              let segment = conn.generate_id();
 
+             info!("Creating shared memory");
              let seg_id = unsafe { libc::shmget(libc::IPC_PRIVATE, w * h * 4, libc::IPC_CREAT | 0o600) };
 
              if seg_id == -1 {
@@ -70,6 +72,7 @@ impl ScreenCapture for X11Capture {
 
              conn.flush().map_err(|_| FerricastError::Capture("Cannot flush x11 server".to_string()))?;
 
+             info!("Connected");
 
             self.seg_id = seg_id;
             self.segment = Some(segment);
@@ -81,6 +84,7 @@ impl ScreenCapture for X11Capture {
         Ok(())
     }
     async fn stop(&mut self) -> ferricast_core::Result<()> {
+        info!("Closing connection");
         if !self.is_running.load(Ordering::Acquire) {
             return Err(FerricastError::Capture("Trying to close recorder without starting it".to_string()));
         }

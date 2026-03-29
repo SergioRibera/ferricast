@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use rust_cast::{channels::{media::Media, receiver::CastDeviceApp}, CastDevice};
 use rustls::pki_types::ServerName;
+use serde::de;
 use tokio::sync::Mutex;
 use tracing::debug;
 
@@ -8,13 +10,18 @@ use ferricast_core::{CastSession, Device, EncodedFrame, Result, StreamConfig};
 
 type TlsStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
 
+const DEFAULT_DESTINATION_ID: &str = "receiver-0";
+
+
 /// A shared, split TLS writer half protected by a mutex so multiple tasks
 /// (heartbeat, frame sender) can write concurrently.
 type SharedWriter = Arc<Mutex<tokio::io::WriteHalf<TlsStream>>>;
 
+const URL: &'static str = "http://<your_ip_addr>:8000";
+
 #[derive(Default)]
 pub struct ChromecastSession {
-
+    device: Option<CastDevice<'static>>,
 }
 
 #[derive(Debug, Clone)]
@@ -27,11 +34,40 @@ struct DeviceInfo {
 
 impl CastSession for ChromecastSession {
     async fn connect(&mut self, device: &Device) -> Result<()> {
+        let device = CastDevice::connect_without_host_verification(device.addr.to_string(), device.port).unwrap();
+
         println!("connecting");
+        device.connection.connect(DEFAULT_DESTINATION_ID.to_string()).unwrap();
+        device.heartbeat.ping().unwrap();
+    
+        println!("connected");
+
+        let device_app = CastDeviceApp::DefaultMediaReceiver;
+        println!("{:?}", device_app);
+
+        let app = device.receiver.launch_app(&device_app).unwrap();
+        println!("launched");
+
+        device.heartbeat.ping().unwrap();
+
+        device.media.load(app.transport_id.as_str(), app.session_id.as_str(), &Media {
+            content_id: URL.to_string(),
+            content_type: "video/mp4".to_string(),
+            metadata: None,
+            stream_type: rust_cast::channels::media::StreamType::Live,
+            duration: None,
+        }).unwrap();
+        println!("sending media");
+
+        
+
+        self.device = Some(device);
+        
         Ok(())
     }
 
     async fn setup_stream(&mut self, config: &StreamConfig) -> Result<()> {
+         
         Ok(())
     }
 
