@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rust_cast::{channels::{media::Media, receiver::CastDeviceApp}, CastDevice};
+use rust_cast::{channels::{heartbeat::HeartbeatResponse, media::Media, receiver::CastDeviceApp}, CastDevice, ChannelMessage};
 use rustls::pki_types::ServerName;
 use serde::de;
 use tokio::sync::Mutex;
@@ -17,7 +17,7 @@ const DEFAULT_DESTINATION_ID: &str = "receiver-0";
 /// (heartbeat, frame sender) can write concurrently.
 type SharedWriter = Arc<Mutex<tokio::io::WriteHalf<TlsStream>>>;
 
-const URL: &'static str = "http://<your_ip_addr>:8000";
+const URL: &'static str = "<video url in https>";
 
 #[derive(Default)]
 pub struct ChromecastSession {
@@ -40,6 +40,8 @@ impl CastSession for ChromecastSession {
         device.connection.connect(DEFAULT_DESTINATION_ID.to_string()).unwrap();
         device.heartbeat.ping().unwrap();
     
+
+    
         println!("connected");
 
         let device_app = CastDeviceApp::DefaultMediaReceiver;
@@ -48,7 +50,7 @@ impl CastSession for ChromecastSession {
         let app = device.receiver.launch_app(&device_app).unwrap();
         println!("launched");
 
-        device.heartbeat.ping().unwrap();
+        device.connection.connect(app.transport_id.as_str()).unwrap();
 
         device.media.load(app.transport_id.as_str(), app.session_id.as_str(), &Media {
             content_id: URL.to_string(),
@@ -58,6 +60,31 @@ impl CastSession for ChromecastSession {
             duration: None,
         }).unwrap();
         println!("sending media");
+
+        loop {
+            match device.receive() {
+                Ok(ChannelMessage::Heartbeat(response)) => {
+                    println!("[Heartbeat] {:?}", response);
+
+                    if let HeartbeatResponse::Ping = response {
+                        device.heartbeat.pong().unwrap();
+                    }
+                }
+
+                Ok(ChannelMessage::Connection(response)) => println!("[Connection] {:?}", response),
+                Ok(ChannelMessage::Media(response)) => println!("[Media] {:?}", response),
+                Ok(ChannelMessage::Receiver(response)) => println!("[Receiver] {:?}", response),
+                Ok(ChannelMessage::Raw(response)) => println!(
+                    "Support for the following message type is not yet supported: {:?}",
+                    response
+                ),
+
+                Err(error) => panic!("Error occurred while receiving message {}", error),
+            }
+        }
+    
+    
+
 
         
 
