@@ -146,14 +146,17 @@ impl ScreenCapture for X11Capture {
 
         Ok(ferricast_core::RawFrame {
             width: self.size.0 as u32,
-            height: self.size.0 as u32,
+            height: self.size.1 as u32,
             stride: format.bits_per_pixel() as u32,
             format: ferricast_core::PixelFormat::Bgra,
             data: Bytes::from(buffer.to_vec()),
             timestamp_us: Instant::now().elapsed().as_micros() as u64,
         })
     }
-    fn get_pixelformat(&self) -> ferricast_core::PixelFormat {
+    fn get_pixel_format(&self) -> ferricast_core::PixelFormat {
         ferricast_core::PixelFormat::Bgra
+    }
+    fn get_screen_size(&self) -> (usize, usize) {
+        self.size
     }
 }

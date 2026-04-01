@@ -447,9 +447,14 @@ impl ScreenCapture for PipeWireCapture {
         Ok(())
     }
 
-    fn get_pixelformat(&self) -> PixelFormat {
+    fn get_pixel_format(&self) -> PixelFormat {
         PixelFormat::Bgra
     }
+    
+    fn get_screen_size(&self) -> (usize, usize) {
+        todo!("get_screen_size is not implemented for pipewire capture")
+    }
+
     fn is_running(&self) -> bool {
         self.shared
             .as_ref()

@@ -29,6 +29,7 @@ impl VideoEncoder for H264Encoder {
             },
             PixelFormat::I420 => Colorspace::I420,
         };
+
         let encoder = Encoder::builder().fps(config.fps, 1).bitrate(config.bitrate_kbps as i32).build(colorspace, config.width as i32, config.height as i32).map_err(|_| FerricastError::Encoder("Cannot create encoder".to_string()))?;
 
         self.encoder = Some(encoder);

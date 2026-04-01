@@ -43,5 +43,6 @@ pub trait ScreenCapture: Send {
     fn next_frame(&mut self) -> impl Future<Output = Result<RawFrame>> + Send;
     fn stop(&mut self) -> impl Future<Output = Result<()>> + Send;
     fn is_running(&self) -> bool;
-    fn get_pixelformat(&self) -> PixelFormat;
+    fn get_pixel_format(&self) -> PixelFormat;
+    fn get_screen_size(&self) -> (usize, usize);
 }

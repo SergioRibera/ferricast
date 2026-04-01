@@ -247,8 +247,12 @@ impl StreamManager {
         capture.start(source, capture_config).await?;
         tracing::info!(device_id = %device_id, "Capture started, connecting to device");
 
+        let size = capture.get_screen_size();
+
         encoder.configure(&EncoderConfig {
-            pixel_format: capture.get_pixelformat(),   
+            pixel_format: capture.get_pixel_format(),
+            width: size.0 as u32,
+            height: size.1 as u32,
             ..Default::default()
         })?;
         

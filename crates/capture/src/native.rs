@@ -41,10 +41,16 @@ impl ScreenCapture for NativeCapture {
             Self::Pipewire(pipe) => pipe.start(source, config).await,
         }
     }
-    fn get_pixelformat(&self) -> ferricast_core::PixelFormat {
+    fn get_pixel_format(&self) -> ferricast_core::PixelFormat {
         match self {
-            Self::X11(x) => x.get_pixelformat(),
-            Self::Pipewire(pw) => pw.get_pixelformat(), 
+            Self::X11(x) => x.get_pixel_format(),
+            Self::Pipewire(pw) => pw.get_pixel_format(), 
+        }
+    }
+    fn get_screen_size(&self) -> (usize, usize) {
+        match self {
+            Self::X11(x) => x.get_screen_size(),
+            Self::Pipewire(pw) => pw.get_screen_size(),
         }
     }
 

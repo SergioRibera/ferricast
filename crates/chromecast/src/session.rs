@@ -17,7 +17,7 @@ const DEFAULT_DESTINATION_ID: &str = "receiver-0";
 /// (heartbeat, frame sender) can write concurrently.
 type SharedWriter = Arc<Mutex<tokio::io::WriteHalf<TlsStream>>>;
 
-const URL: &'static str = "https://trainers-conf-candles-phoenix.trycloudflare.com";
+const URL: &'static str = "https://machines-ministry-that-methodology.trycloudflare.com";
 
 #[derive(Default)]
 pub struct ChromecastSession {
