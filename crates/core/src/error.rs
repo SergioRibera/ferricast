@@ -20,9 +20,12 @@ pub enum FerricastError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    #[error("Encoder error: {0}")]
+    Encoder(String),
+
     #[error("Device not found: {0}")]
     DeviceNotFound(String),
-
+    
     #[error("Unsupported codec: {codec:?} for protocol {protocol}")]
     UnsupportedCodec {
         codec: crate::Codec,

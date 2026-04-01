@@ -1,5 +1,6 @@
 use crate::error::Result;
 use crate::frame::RawFrame;
+use crate::PixelFormat;
 
 #[derive(Debug, Clone)]
 pub enum CaptureSource {
@@ -42,4 +43,5 @@ pub trait ScreenCapture: Send {
     fn next_frame(&mut self) -> impl Future<Output = Result<RawFrame>> + Send;
     fn stop(&mut self) -> impl Future<Output = Result<()>> + Send;
     fn is_running(&self) -> bool;
+    fn get_pixelformat(&self) -> PixelFormat;
 }

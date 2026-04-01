@@ -137,6 +137,8 @@ impl ScreenCapture for X11Capture {
             offset: 0,
         });
 
+        
+
         let _reply = conn.wait_for_reply(cookie).map_err(|_| FerricastError::Capture("Cannot get frame from xserver".to_string()));
 
         
@@ -150,5 +152,8 @@ impl ScreenCapture for X11Capture {
             data: Bytes::from(buffer.to_vec()),
             timestamp_us: Instant::now().elapsed().as_micros() as u64,
         })
+    }
+    fn get_pixelformat(&self) -> ferricast_core::PixelFormat {
+        ferricast_core::PixelFormat::Bgra
     }
 }

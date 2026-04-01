@@ -17,7 +17,7 @@ const DEFAULT_DESTINATION_ID: &str = "receiver-0";
 /// (heartbeat, frame sender) can write concurrently.
 type SharedWriter = Arc<Mutex<tokio::io::WriteHalf<TlsStream>>>;
 
-const URL: &'static str = "<video url in https>";
+const URL: &'static str = "<your url in https>";
 
 #[derive(Default)]
 pub struct ChromecastSession {

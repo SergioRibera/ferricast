@@ -447,6 +447,9 @@ impl ScreenCapture for PipeWireCapture {
         Ok(())
     }
 
+    fn get_pixelformat(&self) -> PixelFormat {
+        PixelFormat::Bgra
+    }
     fn is_running(&self) -> bool {
         self.shared
             .as_ref()

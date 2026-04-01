@@ -31,6 +31,7 @@
 	  xorg.libXi
           xorg.libxcb
           libxkbcommon
+	  x264.dev
 
 pipewire.dev
 pipewire

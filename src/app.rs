@@ -1,9 +1,10 @@
+use ferricast_encoder::h264::H264Encoder;
 use freya::{prelude::*, radio::*};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use ferricast_capture::{NativeCapture, PassthroughEncoder, PipeWireCapture, X11Capture};
+use ferricast_capture::{NativeCapture, PipeWireCapture, X11Capture};
 use ferricast_core::{CaptureSource, Codec, Device, StreamConfig};
 
 use crate::manager::{ManagerEvent, StreamManager};
@@ -66,7 +67,7 @@ impl App for FerricastApp {
                                 spawn(async move {
                                     
                                     let capture = NativeCapture::new();
-                                    let encoder = PassthroughEncoder::new(Codec::H264);
+                                    let encoder = H264Encoder::default();
                                     let source = CaptureSource::FullScreen { monitor: None };
                                     let config = StreamConfig::default();
                                     let sm = sm.lock().await;

@@ -3,11 +3,12 @@ mod tray;
 
 use std::sync::Arc;
 
+use ferricast_encoder::h264::H264Encoder;
 use freya::{prelude::*, radio::*};
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-use ferricast_capture::{PassthroughEncoder, PipeWireCapture};
+use ferricast_capture::PipeWireCapture;
 use ferricast_core::{CaptureSource, Codec, StreamConfig};
 
 use crate::manager::*;
@@ -134,7 +135,7 @@ fn main() {
                                 let sm = Arc::clone(&sm_tray);
                                 tokio::spawn(async move {
                                     let capture = PipeWireCapture::new();
-                                    let encoder = PassthroughEncoder::new(Codec::H264);
+                                    let encoder = H264Encoder::default();
                                     let source = CaptureSource::FullScreen { monitor: None };
                                     let config = StreamConfig::default();
                                     let sm = sm.lock().await;

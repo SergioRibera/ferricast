@@ -1,0 +1,9 @@
+[package]
+name = "ferricast-encoder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+x264 = "0.5.0"
+ferricast-core.workspace = true
+bytes.workspace = true

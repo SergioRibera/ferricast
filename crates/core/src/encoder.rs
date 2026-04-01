@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::frame::{EncodedFrame, RawFrame};
-use crate::Codec;
+use crate::{Codec, PixelFormat};
 
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
@@ -10,6 +10,7 @@ pub struct EncoderConfig {
     pub bitrate_kbps: u32,
     pub fps: u32,
     pub keyframe_interval: u32,
+    pub pixel_format: PixelFormat
 }
 
 impl Default for EncoderConfig {
@@ -21,13 +22,15 @@ impl Default for EncoderConfig {
             bitrate_kbps: 5000,
             fps: 30,
             keyframe_interval: 60,
+            pixel_format: PixelFormat::Bgra,
         }
     }
 }
 
 pub trait VideoEncoder: Send {
-    fn codec(&self) -> Codec;
+    const CODEC: Codec;
+
     fn configure(&mut self, config: &EncoderConfig) -> Result<()>;
     fn encode(&mut self, frame: &RawFrame) -> Result<EncodedFrame>;
-    fn flush(&mut self) -> Result<Vec<EncodedFrame>>;
+    fn flush(self) -> Result<Vec<EncodedFrame>>;
 }

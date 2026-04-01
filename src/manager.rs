@@ -7,8 +7,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 
 use ferricast_core::{
-    CaptureConfig, CaptureSource, CastSession, Device, Discovery, DiscoveryEvent, EncodedFrame,
-    FerricastError, ProtocolHandler, Result, ScreenCapture, StreamConfig, VideoEncoder,
+    CaptureConfig, CaptureSource, CastSession, Device, Discovery, DiscoveryEvent, EncodedFrame, EncoderConfig, FerricastError, ProtocolHandler, Result, ScreenCapture, StreamConfig, VideoEncoder
 };
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -247,6 +246,12 @@ impl StreamManager {
 
         capture.start(source, capture_config).await?;
         tracing::info!(device_id = %device_id, "Capture started, connecting to device");
+
+        encoder.configure(&EncoderConfig {
+            pixel_format: capture.get_pixelformat(),   
+            ..Default::default()
+        })?;
+        
 
         let mut session = (proto.create_session)()?;
         session.connect(&device).await?;

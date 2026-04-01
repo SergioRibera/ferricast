@@ -41,6 +41,12 @@ impl ScreenCapture for NativeCapture {
             Self::Pipewire(pipe) => pipe.start(source, config).await,
         }
     }
+    fn get_pixelformat(&self) -> ferricast_core::PixelFormat {
+        match self {
+            Self::X11(x) => x.get_pixelformat(),
+            Self::Pipewire(pw) => pw.get_pixelformat(), 
+        }
+    }
 
     async fn next_frame(&mut self) -> ferricast_core::Result<ferricast_core::RawFrame> {
         match self {
