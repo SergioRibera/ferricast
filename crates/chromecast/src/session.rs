@@ -17,11 +17,12 @@ const DEFAULT_DESTINATION_ID: &str = "receiver-0";
 /// (heartbeat, frame sender) can write concurrently.
 type SharedWriter = Arc<Mutex<tokio::io::WriteHalf<TlsStream>>>;
 
-const URL: &'static str = "<your url in https>";
+const URL: &'static str = "https://trainers-conf-candles-phoenix.trycloudflare.com";
 
 #[derive(Default)]
 pub struct ChromecastSession {
     device: Option<CastDevice<'static>>,
+    handle: Option<tokio::task::JoinHandle<()>>
 }
 
 #[derive(Debug, Clone)]
@@ -61,34 +62,29 @@ impl CastSession for ChromecastSession {
         }).unwrap();
         println!("sending media");
 
-        loop {
-            match device.receive() {
-                Ok(ChannelMessage::Heartbeat(response)) => {
-                    println!("[Heartbeat] {:?}", response);
+        let handle = tokio::spawn(async move {
+            loop {
+                match device.receive() { 
+                        Ok(ChannelMessage::Heartbeat(res)) => {
+                            tracing::info!("Heartbeat: {:?}", res);
 
-                    if let HeartbeatResponse::Ping = response {
-                        device.heartbeat.pong().unwrap();
-                    }
+                            if let HeartbeatResponse::Ping = res {
+                                device.heartbeat.pong().unwrap();
+                            }
+                        }
+                        Ok(ChannelMessage::Connection(res)) => tracing::debug!("Connection {:?}", res),
+                        Ok(ChannelMessage::Media(res)) => tracing::debug!("Media {:?}", res),
+                        Ok(ChannelMessage::Receiver(res)) => tracing::debug!("Receiver {:?}", res),
+                        Ok(ChannelMessage::Raw(res)) => tracing::error!("Support for the following message type is not yet "),
+                        Err(_) => {},
                 }
-
-                Ok(ChannelMessage::Connection(response)) => println!("[Connection] {:?}", response),
-                Ok(ChannelMessage::Media(response)) => println!("[Media] {:?}", response),
-                Ok(ChannelMessage::Receiver(response)) => println!("[Receiver] {:?}", response),
-                Ok(ChannelMessage::Raw(response)) => println!(
-                    "Support for the following message type is not yet supported: {:?}",
-                    response
-                ),
-
-                Err(error) => panic!("Error occurred while receiving message {}", error),
             }
-        }
-    
-    
-
-
+        });
+     
         
 
-        self.device = Some(device);
+        self.handle = Some(handle);
+        //self.device = Some(device);
         
         Ok(())
     }

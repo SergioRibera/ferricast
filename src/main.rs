@@ -8,7 +8,7 @@ use freya::{prelude::*, radio::*};
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-use ferricast_capture::PipeWireCapture;
+use ferricast_capture::{NativeCapture, PipeWireCapture};
 use ferricast_core::{CaptureSource, Codec, StreamConfig};
 
 use crate::manager::*;
@@ -134,7 +134,7 @@ fn main() {
                             TrayAction::Device(device_id) => {
                                 let sm = Arc::clone(&sm_tray);
                                 tokio::spawn(async move {
-                                    let capture = PipeWireCapture::new();
+                                    let capture = NativeCapture::new();
                                     let encoder = H264Encoder::default();
                                     let source = CaptureSource::FullScreen { monitor: None };
                                     let config = StreamConfig::default();
