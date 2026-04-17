@@ -17,7 +17,7 @@ const DEFAULT_DESTINATION_ID: &str = "receiver-0";
 /// (heartbeat, frame sender) can write concurrently.
 type SharedWriter = Arc<Mutex<tokio::io::WriteHalf<TlsStream>>>;
 
-const URL: &'static str = "https://machines-ministry-that-methodology.trycloudflare.com";
+const URL: &'static str = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
 
 #[derive(Default)]
 pub struct ChromecastSession {
@@ -41,6 +41,7 @@ impl CastSession for ChromecastSession {
         device.connection.connect(DEFAULT_DESTINATION_ID.to_string()).unwrap();
         device.heartbeat.ping().unwrap();
     
+        device.receiver.set_volume(0.25).unwrap();
 
     
         println!("connected");
@@ -55,7 +56,7 @@ impl CastSession for ChromecastSession {
 
         device.media.load(app.transport_id.as_str(), app.session_id.as_str(), &Media {
             content_id: URL.to_string(),
-            content_type: "video/mp4".to_string(),
+            content_type: "application/x-mpegurl".to_string(),
             metadata: None,
             stream_type: rust_cast::channels::media::StreamType::Live,
             duration: None,
@@ -72,9 +73,9 @@ impl CastSession for ChromecastSession {
                                 device.heartbeat.pong().unwrap();
                             }
                         }
-                        Ok(ChannelMessage::Connection(res)) => tracing::debug!("Connection {:?}", res),
-                        Ok(ChannelMessage::Media(res)) => tracing::debug!("Media {:?}", res),
-                        Ok(ChannelMessage::Receiver(res)) => tracing::debug!("Receiver {:?}", res),
+                        Ok(ChannelMessage::Connection(res)) => println!("Connection {:?}", res),
+                        Ok(ChannelMessage::Media(res)) => println!("Media {:?}", res),
+                        Ok(ChannelMessage::Receiver(res)) => println!("Receiver {:?}", res),
                         Ok(ChannelMessage::Raw(res)) => tracing::error!("Support for the following message type is not yet "),
                         Err(_) => {},
                 }
