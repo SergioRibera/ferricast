@@ -1,0 +1,7 @@
+[package]
+name = "ferricast-muxer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ferricast-core.workspace = true
