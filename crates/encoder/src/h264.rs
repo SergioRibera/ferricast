@@ -58,7 +58,8 @@ impl VideoEncoder for H264Encoder {
             data: Bytes::from(data.entirety().to_vec()),
             timestamp_us: frame.timestamp_us,
             duration_us: None,
-            is_keyframe: p.keyframe()
+            is_keyframe: p.keyframe(),
+            pts_dts: (p.pts() as u64, p.dts() as u64),
         })
     }
     fn flush(self) -> ferricast_core::Result<Vec<ferricast_core::EncodedFrame>> {
@@ -73,6 +74,7 @@ impl VideoEncoder for H264Encoder {
                 timestamp_us: 0,
                 is_keyframe: p.keyframe(),
                 duration_us: None,
+                pts_dts: (p.pts() as u64, p.dts() as u64),
             });
         }
         

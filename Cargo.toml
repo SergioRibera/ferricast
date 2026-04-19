@@ -7,7 +7,7 @@ members = [
     "crates/chromecast",
     "crates/dial",
     "crates/airplay",
-    "crates/miracast", "crates/encoder", "crates/m3u8",
+    "crates/miracast", "crates/encoder", "crates/m3u8", "crates/muxer", "crates/hls",
 ]
 
 [workspace.dependencies]
@@ -19,6 +19,7 @@ ferricast-airplay = { path = "crates/airplay" }
 ferricast-miracast = { path = "crates/miracast" }
 ferricast-encoder = { path = "crates/encoder" }
 ferricast-m3u8 = { path = "crates/m3u8" }
+ferricast-muxer = { path = "crates/muxer" }
 
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

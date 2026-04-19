@@ -25,6 +25,7 @@ pub struct EncodedFrame {
     pub timestamp_us: u64,
     pub is_keyframe: bool,
     pub duration_us: Option<u64>,
+    pub pts_dts: (u64, u64),
 }
 
 #[derive(Debug, Clone)]
