@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 ferricast-core.workspace = true
+libmpegts = "0.3.2"
