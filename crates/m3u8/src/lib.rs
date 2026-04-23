@@ -12,7 +12,8 @@ pub enum M3u8Version {
 pub struct M3u8Writer {
     target_duration: u8,
     version: u8,
-    segments: Vec<(u8, String)>
+    segments: Vec<(u8, String)>,
+    media_seq: Option<u64>,
 }
 
 impl Default for M3u8Writer {
@@ -21,6 +22,7 @@ impl Default for M3u8Writer {
             target_duration: 10,
             version: M3u8Version::V3 as u8,
             segments: Vec::new(),
+            media_seq: None,
         }
     }
 }
@@ -48,11 +50,19 @@ impl M3u8Writer {
         Ok(self)
     } 
 
+    pub fn media_seq(mut self, media_seq: u64) -> Self {
+        self.media_seq = Some(media_seq);
+        self
+    }
 
     pub fn write<W: Write>(&self, writer: &mut W) -> Result<(), M3u8Error> {
         writer.write_all(HEADER)?;
         writer.write_all(format!("#EXT-X-TARGETDURATION:{}\n", self.target_duration).as_bytes())?;
         writer.write_all(format!("#EXT-X-VERSION:{}\n", self.version).as_bytes())?;
+
+        if let Some(seq) = self.media_seq  {
+            writer.write_all(format!("#EXT-X-MEDIA-SEQUENCE:{}\n", seq).as_bytes())?;
+        }
 
         for segment in &self.segments {
             writer.write_all(format!("#EXTINF:{},\n{}\n", segment.0, segment.1).as_bytes())?;
