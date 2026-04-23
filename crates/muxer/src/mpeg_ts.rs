@@ -10,6 +10,15 @@ pub struct MpegTs {
     video_index: usize,
 }
 
+impl Default for MpegTs {
+    fn default() -> Self {
+        Self {
+            mux: None,
+            video_index: 0,
+        }
+    }
+}
+
 impl Muxer for MpegTs {
     fn config(&mut self, sps_pps: Vec<u8>) -> Result<(), ferricast_core::FerricastError> {
         let mut mux = Multiplexer::new(1);

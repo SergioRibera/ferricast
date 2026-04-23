@@ -1,7 +1,5 @@
-use std::sync::{Arc, Mutex};
-
 use bytes::Bytes;
-use ferricast_core::{Codec, EncodedFrame, FerricastError, PixelFormat, VideoEncoder};
+use ferricast_core::{Result, Codec, EncodedFrame, FerricastError, PixelFormat, VideoEncoder};
 use x264::{Colorspace, Encoder, Image};
 
 #[derive(Default)]
@@ -37,6 +35,9 @@ impl VideoEncoder for H264Encoder {
         self.fps = config.fps as i64;
 
         Ok(())
+    }
+    fn get_headers(&mut self) -> Result<Vec<u8>> {
+        Ok(self.encoder.as_mut().unwrap().headers().map_err(|_| FerricastError::Encoder("Cannot get headers".to_string()))?.entirety().to_vec())
     }
     fn encode(&mut self, frame: &ferricast_core::RawFrame) -> ferricast_core::Result<ferricast_core::EncodedFrame> {
         let image = match self.colorspace.unwrap() {

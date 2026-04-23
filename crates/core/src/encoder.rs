@@ -33,4 +33,5 @@ pub trait VideoEncoder: Send {
     fn configure(&mut self, config: &EncoderConfig) -> Result<()>;
     fn encode(&mut self, frame: &RawFrame) -> Result<EncodedFrame>;
     fn flush(self) -> Result<Vec<EncodedFrame>>;
+    fn get_headers(&mut self) -> Result<Vec<u8>>;
 }

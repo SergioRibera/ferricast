@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
 use ferricast_capture::{NativeCapture, PipeWireCapture};
-use ferricast_core::{CaptureSource, Codec, StreamConfig};
+use ferricast_core::{CaptureSource, Codec, EncoderConfig, ScreenCapture, StreamConfig, VideoEncoder};
 
 use crate::manager::*;
 use crate::tray::{FerricastTray, TrayAction};
@@ -18,7 +18,29 @@ use crate::app::*;
 
 mod app;
 
-fn main() {
+
+// tmp change
+#[tokio::main]
+async fn main() {
+    let mut encoder = H264Encoder::default();
+    let mut capture = NativeCapture::new();
+    
+    
+    capture.start(CaptureSource::Window { identifier: ferricast_core::WindowIdentifier::Title("hla".to_string()) }, ferricast_core::CaptureConfig { fps: 60, width: None, height: None, show_cursor: false }).await.unwrap();
+        let size = capture.get_screen_size();
+
+        encoder.configure(&EncoderConfig {
+            pixel_format: capture.get_pixel_format(),
+            width: size.0 as u32,
+            height: size.1 as u32,
+            ..Default::default()
+        }).unwrap();
+
+    let mut server = ferricast_hls::HlsServer::listen("0.0.0.0:8000", encoder, capture).await.unwrap();
+
+    server.serve().await.unwrap();
+    
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error")),
