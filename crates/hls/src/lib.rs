@@ -65,9 +65,11 @@ impl<S: ScreenCapture, E: VideoEncoder> HlsServer<S, E> {
 
         match req.path.unwrap() {
             "/" => {
-                let m3u8 = M3u8Writer::default();
-                
-                 
+                let m3u8 = M3u8Writer::default()
+                    .set_media_seq(self.seq_num)
+                    .set_version(ferricast_m3u8::M3u8Version::V3)
+                    .set_target_duration(6)
+                    .add_segment(3, format!("video{}.ts", self.seq_num));
             },
             other => {
                 // GET_SEGMENT

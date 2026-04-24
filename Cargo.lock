@@ -1636,6 +1636,7 @@ dependencies = [
 name = "ferricast-m3u8"
 version = "0.1.0"
 dependencies = [
+ "ferricast-core",
  "thiserror 2.0.18",
 ]
 

@@ -1,3 +1,4 @@
+use ferricast_core::FerricastError;
 use thiserror::Error;
 
 const HEADER: &[u8] = b"#EXTM3U\n";
@@ -38,9 +39,9 @@ impl M3u8Writer {
         self
     }
 
-    pub fn add_segment(mut self, duration: u8, url: String) -> Result<Self, M3u8Error> { 
+    pub fn add_segment(mut self, duration: u8, url: String) -> Result<Self, FerricastError> { 
         if duration == self.target_duration {
-            return Err(M3u8Error::InvalidSegment);
+            return Err(FerricastError::M3u8("Invalid segment duration".to_string()));
         }
 
         self.segments.push((duration, url));        
@@ -53,15 +54,15 @@ impl M3u8Writer {
         self
     }
 
-    pub fn to_string(&self) -> Result<String, M3u8Error> {
+    pub fn to_string(&self) -> Result<String, FerricastError> {
         let mut v = Vec::new();
         self.write(&mut v)?;
         
 
-        Ok(String::from_utf8(v)?)
+        Ok(String::from_utf8(v).map_err(|_| FerricastError::M3u8("Invalid m3u8".to_string()))?)
     }
 
-    pub fn write<W: std::io::Write>(&self, writer: &mut W) -> Result<(), M3u8Error> {
+    pub fn write<W: std::io::Write>(&self, writer: &mut W) -> Result<(), FerricastError> {
         writer.write_all(HEADER)?;
         writer.write_all(format!("#EXT-X-TARGETDURATION:{}\n", self.target_duration).as_bytes())?;
         writer.write_all(format!("#EXT-X-VERSION:{}\n", self.version).as_bytes())?;
@@ -78,14 +79,3 @@ impl M3u8Writer {
     }
 }
 
-#[derive(Error, Debug)]
-pub enum M3u8Error {
-    #[error("IO Error {0}")]
-    IoError(#[from] std::io::Error), 
-
-    #[error("Invalid Segment")]
-    InvalidSegment,
-
-    #[error("Utf8 Error: {0}")]
-    Utf8Error(#[from] std::string::FromUtf8Error),
-}

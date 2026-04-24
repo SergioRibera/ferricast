@@ -28,6 +28,9 @@ pub enum FerricastError {
 
     #[error("Hls error: {0}")]
     Hls(String),
+
+    #[error("M3u8 Error: {0}")]
+    M3u8(String),
     
     #[error("Unsupported codec: {codec:?} for protocol {protocol}")]
     UnsupportedCodec {
