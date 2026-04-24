@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use ferricast_core::{FerricastError, ScreenCapture};
 use xcb::{shm::Seg, x::{Format, Pixmap, Screen, ScreenBuf}};
-use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::Instant};
+use std::{sync::{Arc, atomic::{AtomicBool, AtomicPtr, Ordering}}, time::Instant};
 use tracing::info;
 
 pub struct X11Capture {
@@ -11,7 +11,8 @@ pub struct X11Capture {
     screen: Option<ScreenBuf>,
     pixmap: Option<Format>,
     is_running: AtomicBool,
-    size: (usize, usize)
+    size: (usize, usize),
+    buffer_ptr: AtomicPtr<u8>,
 }
 
 impl X11Capture {
@@ -24,6 +25,7 @@ impl X11Capture {
             pixmap: None,
             is_running: AtomicBool::new(false),
             size: (0,0),
+            buffer_ptr: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 }
@@ -49,7 +51,7 @@ impl ScreenCapture for X11Capture {
 
              
              let w = config.width.unwrap_or(screen.width_in_pixels() as u32) as usize;
-             let h = config.height.unwrap_or(screen.width_in_pixels() as u32) as usize;
+             let h = config.height.unwrap_or(screen.height_in_pixels() as u32) as usize;
 
 
              let root = screen.root();
@@ -59,11 +61,22 @@ impl ScreenCapture for X11Capture {
              info!("Creating shared memory");
              let seg_id = unsafe { libc::shmget(libc::IPC_PRIVATE, w * h * 4, libc::IPC_CREAT | 0o600) };
 
+
+
              if seg_id == -1 {
                  // TODO: should try without it in case that is imposible to create one(?
                 return Err(FerricastError::Capture("Cannot create shared memory".to_string()));
              }
-             
+
+            let buffer = unsafe { libc::shmat(seg_id, core::ptr::null(), 0) } as *mut u8;
+
+            if buffer as i32 == -1 {
+                 return Err(FerricastError::Capture("Cannot map shared memory".to_string()));
+
+            }
+
+       
+
              conn.send_request(&xcb::shm::Attach {
                 shmseg: segment,
                 shmid: seg_id as u32,
@@ -74,6 +87,7 @@ impl ScreenCapture for X11Capture {
 
              info!("Connected");
 
+                  self.buffer_ptr = AtomicPtr::new(buffer);
             self.seg_id = seg_id;
             self.segment = Some(segment);
             self.conn = Some(Arc::new(conn));
@@ -116,8 +130,8 @@ impl ScreenCapture for X11Capture {
             return Err(FerricastError::Capture("Trying to close recorder without starting it".to_string()));
         }
 
-        let buffer = unsafe { libc::shmat(self.seg_id, core::ptr::null(), 0) } as *mut u8;
-        let buffer = unsafe { std::slice::from_raw_parts(buffer, self.size.0 * self.size.1 * 4) };
+
+        let buffer = unsafe { std::slice::from_raw_parts(self.buffer_ptr.load(Ordering::Relaxed), self.size.0 * self.size.1 * 4) };
 
 
 
