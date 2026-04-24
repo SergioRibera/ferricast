@@ -20,7 +20,7 @@ impl Default for EncoderConfig {
             width: 1920,
             height: 1080,
             bitrate_kbps: 5000,
-            fps: 30,
+            fps: 60,
             keyframe_interval: 60,
             pixel_format: PixelFormat::Bgra,
         }

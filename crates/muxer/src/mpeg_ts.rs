@@ -1,4 +1,4 @@
-use libmpegts::mux::{Multiplexer, MuxFrame, MuxService, MuxStream};
+use libmpegts::{mux::{Multiplexer, MuxFrame, MuxService, MuxStream}, ts::PACKET_SIZE};
 
 use crate::Muxer;
 
@@ -35,18 +35,18 @@ impl Muxer for MpegTs {
                     elementary_pid: 101,
                     stream_descriptors: Vec::new(),
                 }, 
-                MuxStream {
-                    stream_type: AAC,
-                    elementary_pid: 102,
-                    stream_descriptors: Vec::new(),
-                }
+                //MuxStream {
+                //    stream_type: AAC,
+                //    elementary_pid: 102,
+                //    stream_descriptors: Vec::new(),
+                //}
             ],
         });
 
 
 
         let index =  mux.stream_index(101).unwrap();
-        mux.push_frame(index, MuxFrame {
+            mux.push_frame(index, MuxFrame {
             data: sps_pps,
             is_key_frame: true,
             pts_dts: None,
@@ -74,7 +74,17 @@ impl Muxer for MpegTs {
         let mut v = Vec::new();
         let mux = self.mux.as_mut().unwrap();
 
-        while mux.drain(&mut v) != 0 {}
+        let mut n = 1;
+        
+        while n != 0 {
+            let mut buf = [0u8; PACKET_SIZE * 10];
+            n = mux.drain(&mut buf);
+
+            if n > 0 {
+                v.extend_from_slice(&buf[..n]);
+            }
+
+        }
 
         v
     }

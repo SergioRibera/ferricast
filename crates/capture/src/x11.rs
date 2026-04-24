@@ -117,7 +117,7 @@ impl ScreenCapture for X11Capture {
         }
 
         let buffer = unsafe { libc::shmat(self.seg_id, core::ptr::null(), 0) } as *mut u8;
-        let buffer = unsafe { std::slice::from_raw_parts(buffer, 1920 * 1080 * 4) };
+        let buffer = unsafe { std::slice::from_raw_parts(buffer, self.size.0 * self.size.1 * 4) };
 
 
 

@@ -1,13 +1,11 @@
-
 use ferricast_m3u8::M3u8Writer;
 use ferricast_muxer::Muxer;
 use ferricast_muxer::mpeg_ts::MpegTs;
-
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use tokio::net::ToSocketAddrs;
 
-use ferricast_core::{FerricastError, PixelFormat, RawFrame, ScreenCapture, VideoEncoder};
+use ferricast_core::{FerricastError, ScreenCapture, VideoEncoder};
 use tokio::net::TcpListener;
 
 pub struct HlsServer<S: ScreenCapture, E: VideoEncoder> {
@@ -60,7 +58,7 @@ impl<S: ScreenCapture, E: VideoEncoder> HlsServer<S, E> {
 
         if let Ok(r) = req.parse(req_text.as_bytes()) {
             if r.is_partial() {
-                socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 7\r\nContent-Type: text/plain\r\n\r\nBad Req");
+                socket.write_all(b"HTTP1/1 400 Bad Request\r\nContent-Length: 7\r\nContent-Type: text/plain\r\n\r\nBad Req");
                 return Err(FerricastError::Hls("Http Bad Request".to_string()));    
             }
         }
@@ -71,34 +69,13 @@ impl<S: ScreenCapture, E: VideoEncoder> HlsServer<S, E> {
                     .set_media_seq(self.seq_num)
                     .set_version(ferricast_m3u8::M3u8Version::V3)
                     .set_target_duration(6)
-                    .add_segment(3, format!("video{}.ts", self.seq_num))?
-                    .add_segment(3, format!("video{}.ts", self.seq_num.saturating_sub(1)))?
-                    .add_segment(3, format!("video{}.ts", self.seq_num.saturating_sub(2)))?.to_string()?;
+                    .add_segment(3, format!("video{}.ts", self.seq_num))?.to_string()?;
 
-                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-mpegurl\r\n").await?;
+                socket.write_all(b"HTTP1/1 200 OK\r\nContent-Type: application/x-mpegurl\r\n").await?;
                 socket.write_all(format!("Content-Length: {}\r\n\r\n{}", m3u8.len(), m3u8).as_bytes()).await?;
             },
-            _ => { 
-                for _ in 0..=180 {
-                    let frame = self.capture.next_frame().await?;
-                                   
-                    let encoded_frame = self.encoder.encode(&frame)?;
-                    self.muxer.add_frame(encoded_frame)?;
-                }
-
-        
-                let info = self.muxer.drain();
-                println!("{:?}", info);
-
-                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n").await?;
-                socket.write_all(format!("Content-Length: {}\r\n\r\n", info.len()).as_bytes()).await?;
-                socket.write_all(&info).await?;
-
-
+            other => {
                 self.seq_num += 1;
-                
-
-                
             },
         }
 
