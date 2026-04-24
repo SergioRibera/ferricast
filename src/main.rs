@@ -31,7 +31,7 @@ async fn main() {
 
         
         encoder.configure(&EncoderConfig {
-            pixel_format: PixelFormat::Rgba,
+            pixel_format: PixelFormat::Bgra,
             width: size.0 as u32,
             height: size.1 as u32,
             ..Default::default()
