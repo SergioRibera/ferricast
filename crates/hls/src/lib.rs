@@ -1,3 +1,4 @@
+use ferricast_m3u8::M3u8Writer;
 use ferricast_muxer::Muxer;
 use ferricast_muxer::mpeg_ts::MpegTs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -11,7 +12,8 @@ pub struct HlsServer<S: ScreenCapture, E: VideoEncoder> {
     listener: TcpListener,
     encoder: E,
     capture: S,
-    muxer: MpegTs
+    muxer: MpegTs,
+    seq_num: u64,
 }
 
 impl<S: ScreenCapture, E: VideoEncoder> HlsServer<S, E> {
@@ -25,6 +27,7 @@ impl<S: ScreenCapture, E: VideoEncoder> HlsServer<S, E> {
             encoder,
             capture,
             muxer,
+            seq_num: 0,
         })
     }
     pub async fn serve(&mut self) -> Result<(), FerricastError> {
@@ -51,6 +54,24 @@ impl<S: ScreenCapture, E: VideoEncoder> HlsServer<S, E> {
 
              }
                     
+        }
+
+        if let Ok(r) = req.parse(req_text.as_bytes()) {
+            if r.is_partial() {
+                socket.write_all(b"HTTP1/1 400 Bad Request\r\nContent-Length: 7\r\nContent-Type: text/plain\r\n\r\nBad Req");
+                return Err(FerricastError::Hls("Http Bad Request".to_string()));    
+            }
+        }
+
+        match req.path.unwrap() {
+            "/" => {
+                let m3u8 = M3u8Writer::default();
+                
+                 
+            },
+            other => {
+                // GET_SEGMENT
+            },
         }
 
        // socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/x-mpegurl\r\nContent-Length: {}\r\n\r\n{}", em.len(), em).as_bytes()).await?;

@@ -25,6 +25,9 @@ pub enum FerricastError {
 
     #[error("Device not found: {0}")]
     DeviceNotFound(String),
+
+    #[error("Hls error: {0}")]
+    Hls(String),
     
     #[error("Unsupported codec: {codec:?} for protocol {protocol}")]
     UnsupportedCodec {

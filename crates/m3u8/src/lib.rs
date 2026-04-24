@@ -1,5 +1,3 @@
-use std::io::Write;
-
 use thiserror::Error;
 
 const HEADER: &[u8] = b"#EXTM3U\n";
@@ -50,12 +48,20 @@ impl M3u8Writer {
         Ok(self)
     } 
 
-    pub fn media_seq(mut self, media_seq: u64) -> Self {
+    pub fn set_media_seq(mut self, media_seq: u64) -> Self {
         self.media_seq = Some(media_seq);
         self
     }
 
-    pub fn write<W: Write>(&self, writer: &mut W) -> Result<(), M3u8Error> {
+    pub fn to_string(&self) -> Result<String, M3u8Error> {
+        let mut v = Vec::new();
+        self.write(&mut v)?;
+        
+
+        Ok(String::from_utf8(v)?)
+    }
+
+    pub fn write<W: std::io::Write>(&self, writer: &mut W) -> Result<(), M3u8Error> {
         writer.write_all(HEADER)?;
         writer.write_all(format!("#EXT-X-TARGETDURATION:{}\n", self.target_duration).as_bytes())?;
         writer.write_all(format!("#EXT-X-VERSION:{}\n", self.version).as_bytes())?;
@@ -79,4 +85,7 @@ pub enum M3u8Error {
 
     #[error("Invalid Segment")]
     InvalidSegment,
+
+    #[error("Utf8 Error: {0}")]
+    Utf8Error(#[from] std::string::FromUtf8Error),
 }
