@@ -33,8 +33,9 @@
           libxkbcommon
 	  x264.dev
 
-pipewire.dev
-pipewire
+          pipewire.dev
+          pipewire
+          libva
 	  xorg.libXcursor
 
           wayland

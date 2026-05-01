@@ -26,7 +26,10 @@ async fn main() {
     let mut capture = NativeCapture::new();
     
     
-    capture.start(CaptureSource::Window { identifier: ferricast_core::WindowIdentifier::Title("hla".to_string()) }, ferricast_core::CaptureConfig { fps: 60, width: None, height: None, show_cursor: false }).await.unwrap();
+    capture.start(CaptureSource::FullScreen { monitor: None }, ferricast_core::CaptureConfig { fps: 60, width: None, height: None, show_cursor: false }).await.unwrap();
+
+       //capture.next_frame().await.unwrap();
+
         let size = capture.get_screen_size();
 
         

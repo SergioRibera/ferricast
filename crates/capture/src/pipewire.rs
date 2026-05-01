@@ -1,7 +1,7 @@
 //! PipeWire capture implementation using xdg-desktop-portal ScreenCast.
 
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -56,9 +56,11 @@ struct PortalSession {
     node_id: u32,
 }
 
+
 async fn open_portal_session(
     source: &CaptureSource,
     config: &CaptureConfig,
+    shared: Arc<SharedState>,
 ) -> Result<PortalSession> {
     use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 
@@ -92,6 +94,7 @@ async fn open_portal_session(
 
     info!("portal source selected, starting cast");
 
+
     let response = proxy.start(&session, None).await.map_err(portal_err)?;
     let response = response.response().map_err(portal_err)?;
 
@@ -99,6 +102,11 @@ async fn open_portal_session(
     let stream = streams.first().ok_or_else(|| {
         FerricastError::Capture("no streams returned from portal".into())
     })?;
+    let size = stream.size().unwrap_or((0, 0));
+    
+    
+    shared.width.store(size.0 as usize, Ordering::SeqCst);
+    shared.height.store(size.1 as usize, Ordering::SeqCst);
 
     let node_id = stream.pipe_wire_node_id();
     info!(node_id, "portal returned PipeWire node");
@@ -121,6 +129,8 @@ fn portal_err(e: impl std::fmt::Display) -> FerricastError {
 
 struct SharedState {
     running: AtomicBool,
+    width: AtomicUsize,
+    height: AtomicUsize,
 }
 
 enum PwEvent {
@@ -229,7 +239,7 @@ fn run_pw_thread(
 
             // The actual format will be determined from buffer metadata
             // when we receive the first frame. For now store zeros.
-            user_data.width = 0;
+             user_data.width = 0;
             user_data.height = 0;
         })
         .process({
@@ -279,6 +289,7 @@ fn run_pw_thread(
                     user_data.width = w;
                     w
                 } else {
+                    tracing::trace!("Cannot get width defaulting to 1920");
                     1920 // fallback
                 };
 
@@ -289,6 +300,7 @@ fn run_pw_thread(
                     user_data.height = h;
                     h
                 } else {
+                    tracing::trace!("Cannot get height defaulting to 1080");
                     1080 // fallback
                 };
 
@@ -386,12 +398,15 @@ impl ScreenCapture for PipeWireCapture {
 
         info!(?source, ?config, "starting PipeWire capture");
 
-        let portal = open_portal_session(&source, &config).await?;
+        
 
         let (tx, rx) = mpsc::channel::<PwEvent>(8);
         let shared = Arc::new(SharedState {
             running: AtomicBool::new(true),
+            width: AtomicUsize::new(0),
+            height: AtomicUsize::new(0)
         });
+        let portal = open_portal_session(&source, &config, Arc::clone(&shared)).await?;
         let shared_clone = Arc::clone(&shared);
 
         let handle = thread::Builder::new()
@@ -416,12 +431,13 @@ impl ScreenCapture for PipeWireCapture {
             .ok_or_else(|| FerricastError::Capture("capture not started".into()))?;
 
         loop {
-            match rx.recv().await {
-                Some(PwEvent::Frame(frame)) => return Ok(frame),
-                Some(PwEvent::Error(msg)) => {
+            match rx.try_recv() {
+                Ok(PwEvent::Frame(frame)) => return Ok(frame),
+                Ok(PwEvent::Error(msg)) => {
                     return Err(FerricastError::Capture(format!("PipeWire error: {msg}")));
                 }
-                None => {
+                Err(e) => {
+                    println!("{:?}", e);
                     return Err(FerricastError::Capture(
                         "PipeWire stream ended unexpectedly".into(),
                     ));
@@ -452,7 +468,10 @@ impl ScreenCapture for PipeWireCapture {
     }
     
     fn get_screen_size(&self) -> (usize, usize) {
-        todo!("get_screen_size is not implemented for pipewire capture")
+        let (w, h) = self.shared.as_ref().map(|s| (s.width.load(Ordering::SeqCst), s.height.load(Ordering::SeqCst))).unwrap_or((0, 0));
+        
+
+        (w, h)    
     }
 
     fn is_running(&self) -> bool {
