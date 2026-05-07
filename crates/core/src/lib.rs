@@ -12,6 +12,9 @@ pub use device::{Device, DeviceCapabilities, DiscoveryEvent};
 pub use discovery::{Discovery, MdnsDiscovery};
 pub use encoder::{EncoderConfig, VideoEncoder};
 pub use error::{FerricastError, Result};
-pub use frame::{AudioCodec, AudioFrame, EncodedFrame, PixelFormat, RawFrame};
+pub use frame::{
+    AudioCodec, AudioFrame, CapturedFrame, DmaBufImporter, DmaBufPlane, EncodedFrame, GpuFrame,
+    PixelFormat, RawFrame,
+};
 pub use protocol::{Codec, ProtocolHandler};
 pub use session::{CastSession, StreamConfig};

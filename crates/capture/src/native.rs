@@ -54,7 +54,7 @@ impl ScreenCapture for NativeCapture {
         }
     }
 
-    async fn next_frame(&mut self) -> ferricast_core::Result<ferricast_core::RawFrame> {
+    async fn next_frame(&mut self) -> ferricast_core::Result<ferricast_core::CapturedFrame> {
         match self {
             Self::X11(x) => x.next_frame().await,
             Self::Pipewire(pipe) => pipe.next_frame().await,

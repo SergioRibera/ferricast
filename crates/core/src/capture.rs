@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::frame::RawFrame;
+use crate::frame::CapturedFrame;
 use crate::PixelFormat;
 
 #[derive(Debug, Clone)]
@@ -40,7 +40,13 @@ pub trait ScreenCapture: Send {
         config: CaptureConfig,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    fn next_frame(&mut self) -> impl Future<Output = Result<RawFrame>> + Send;
+    /// Pull the next captured frame.
+    ///
+    /// Implementations may return either a CPU-resident frame
+    /// (`CapturedFrame::Cpu`) or a GPU-resident DMA-BUF
+    /// (`CapturedFrame::Gpu`). Encoders that need CPU bytes call
+    /// `CapturedFrame::into_cpu()` to trigger a readback on demand.
+    fn next_frame(&mut self) -> impl Future<Output = Result<CapturedFrame>> + Send;
     fn stop(&mut self) -> impl Future<Output = Result<()>> + Send;
     fn is_running(&self) -> bool;
     fn get_pixel_format(&self) -> PixelFormat;

@@ -22,13 +22,20 @@ mod app;
 // tmp change
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,ferricast_capture=debug")),
+        )
+        .init();
+
     let mut encoder = H264Encoder::default();
     let mut capture = NativeCapture::new();
-    
-    
+
+
     capture.start(CaptureSource::FullScreen { monitor: None }, ferricast_core::CaptureConfig { fps: 60, width: None, height: None, show_cursor: false }).await.unwrap();
 
-       //capture.next_frame().await.unwrap();
+       capture.next_frame().await.unwrap();
 
         let size = capture.get_screen_size();
 

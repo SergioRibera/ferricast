@@ -7,3 +7,9 @@ edition = "2024"
 x264 = "0.5.0"
 ferricast-core.workspace = true
 bytes.workspace = true
+tracing.workspace = true
+
+# VA-API binding without ffmpeg. Used to encode H.264 directly on
+# the GPU when the system has a VA-API driver. Loaded at runtime;
+# missing `libva.so` makes the encoder gracefully fall back to x264.
+cros-libva = "0.0.13"

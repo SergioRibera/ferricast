@@ -1,9 +1,11 @@
 use bytes::Bytes;
-use ferricast_core::{Result, Codec, EncodedFrame, FerricastError, PixelFormat, VideoEncoder};
+use ferricast_core::{
+    Codec, EncodedFrame, FerricastError, PixelFormat, Result, VideoEncoder,
+};
 use x264::{Colorspace, Encoder, Image};
 
 #[derive(Default)]
-pub struct H264Encoder {
+pub struct X264H264Encoder {
     encoder: Option<Encoder>,
     colorspace: Option<Colorspace>,
     frame_index: i64,
@@ -11,10 +13,10 @@ pub struct H264Encoder {
 }
 
 
-unsafe impl Send for H264Encoder {}
-unsafe impl Sync for H264Encoder {}
+unsafe impl Send for X264H264Encoder {}
+unsafe impl Sync for X264H264Encoder {}
 
-impl VideoEncoder for H264Encoder {
+impl VideoEncoder for X264H264Encoder {
     const CODEC: Codec = Codec::H264;
 
     fn configure(&mut self, config: &ferricast_core::EncoderConfig) -> ferricast_core::Result<()> {
@@ -39,7 +41,12 @@ impl VideoEncoder for H264Encoder {
     fn get_headers(&mut self) -> Result<Vec<u8>> {
         Ok(self.encoder.as_mut().unwrap().headers().map_err(|_| FerricastError::Encoder("Cannot get headers".to_string()))?.entirety().to_vec())
     }
-    fn encode(&mut self, frame: &ferricast_core::RawFrame) -> ferricast_core::Result<ferricast_core::EncodedFrame> { 
+    fn encode(&mut self, frame: ferricast_core::CapturedFrame) -> ferricast_core::Result<ferricast_core::EncodedFrame> {
+        // x264 only consumes CPU bytes — if the source produced a
+        // GpuFrame, force a readback through its attached importer.
+        // For VA-API or any future GPU-direct encoder we'd match on
+        // the variant instead of always materialising a `RawFrame`.
+        let frame = frame.into_cpu()?;
         let image = match self.colorspace.unwrap() {
             Colorspace::BGRA => Image::bgra(frame.width as i32, frame.height as i32, &frame.data),
             Colorspace::NV12 => return Err(FerricastError::Encoder("Unimplemented colorspace: nv12".to_string())),

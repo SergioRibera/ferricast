@@ -286,7 +286,7 @@ impl StreamManager {
                     frame_result = capture.next_frame() => {
                         match frame_result {
                             Ok(raw_frame) => {
-                                match encoder.encode(&raw_frame) {
+                                match encoder.encode(raw_frame) {
                                     Ok(encoded) => {
                                         if let Err(e) = session.send_frame(&encoded).await {
                                             tracing::error!(%e, "Failed to send frame");

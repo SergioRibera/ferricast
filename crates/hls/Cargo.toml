@@ -9,4 +9,6 @@ ferricast-muxer.workspace = true
 tokio.workspace = true
 ferricast-core.workspace = true
 httparse = "1.10.1"
+bytes.workspace = true
+tracing.workspace = true
 

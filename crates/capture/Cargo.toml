@@ -11,7 +11,17 @@ tracing.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 
-pipewire = "0.8"
 ashpd = { version = "0.10", features = ["tokio"] }
 xcb = { version = "1.7.0", features = ["shm"] }
 libc = "0.2.183"
+
+pipewire = { version = "0.8", features = ["v0_3_77"] }
+# `MODIFIER_FIXATION_REQUIRED` is gated behind libspa's own `v0_3_75`
+# feature, which the `pipewire` crate doesn't pass through directly.
+libspa = { version = "0.8", features = ["v0_3_75"] }
+
+# Vulkan loader — used to import dmabuf frames from PipeWire and read
+# them back to CPU memory. Optional at runtime: if `ash::Entry::load()`
+# fails (no Vulkan loader / driver) the capture path falls back to
+# SHM-only EnumFormat advertising.
+ash = "0.38"

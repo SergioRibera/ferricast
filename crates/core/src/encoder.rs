@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::frame::{EncodedFrame, RawFrame};
+use crate::frame::{CapturedFrame, EncodedFrame};
 use crate::{Codec, PixelFormat};
 
 #[derive(Debug, Clone)]
@@ -31,7 +31,17 @@ pub trait VideoEncoder: Send {
     const CODEC: Codec;
 
     fn configure(&mut self, config: &EncoderConfig) -> Result<()>;
-    fn encode(&mut self, frame: &RawFrame) -> Result<EncodedFrame>;
+
+    /// Encode the given captured frame.
+    ///
+    /// Implementations decide what to do with each variant:
+    /// * x264 — always reads CPU bytes, calling
+    ///   [`CapturedFrame::into_cpu`] to trigger a Vulkan readback if
+    ///   the source produced a `Gpu` frame.
+    /// * VA-API — consumes the `Gpu` variant directly (zero-copy)
+    ///   and uploads to a `VASurface` for the `Cpu` variant.
+    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame>;
+
     fn flush(self) -> Result<Vec<EncodedFrame>>;
     fn get_headers(&mut self) -> Result<Vec<u8>>;
 }

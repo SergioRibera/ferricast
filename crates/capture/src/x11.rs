@@ -125,7 +125,7 @@ impl ScreenCapture for X11Capture {
     fn is_running(&self) -> bool {
         self.is_running.load(Ordering::SeqCst)
     }
-    async fn next_frame(&mut self) -> ferricast_core::Result<ferricast_core::RawFrame> {
+    async fn next_frame(&mut self) -> ferricast_core::Result<ferricast_core::CapturedFrame> {
         if !self.is_running.load(Ordering::Acquire) {
             return Err(FerricastError::Capture("Trying to close recorder without starting it".to_string()));
         }
@@ -158,14 +158,14 @@ impl ScreenCapture for X11Capture {
         
 
 
-        Ok(ferricast_core::RawFrame {
+        Ok(ferricast_core::CapturedFrame::Cpu(ferricast_core::RawFrame {
             width: self.size.0 as u32,
             height: self.size.1 as u32,
             stride: format.bits_per_pixel() as u32,
             format: ferricast_core::PixelFormat::Bgra,
             data: Bytes::from(buffer.to_vec()),
             timestamp_us: Instant::now().elapsed().as_micros() as u64,
-        })
+        }))
     }
     fn get_pixel_format(&self) -> ferricast_core::PixelFormat {
         ferricast_core::PixelFormat::Bgra
