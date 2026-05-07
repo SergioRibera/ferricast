@@ -47,11 +47,15 @@ async fn main() {
             ..Default::default()
         }).unwrap();
 
-    let mut server = ferricast_hls::HlsServer::listen("0.0.0.0:8001", encoder, capture).await.unwrap();
-
-    loop { 
-     server.serve().await.unwrap();
-    }
+    let server = ferricast_hls::HlsServer::start(
+        "0.0.0.0:8001",
+        capture,
+        encoder,
+        ferricast_hls::HlsConfig::default(),
+    )
+    .await
+    .unwrap();
+    server.run().await.unwrap();
 
     tracing_subscriber::fmt()
         .with_env_filter(
