@@ -12,4 +12,16 @@ tracing.workspace = true
 # VA-API binding without ffmpeg. Used to encode H.264 directly on
 # the GPU when the system has a VA-API driver. Loaded at runtime;
 # missing `libva.so` makes the encoder gracefully fall back to x264.
-cros-libva = "0.0.13"
+#
+# Vendored copy of cros-libva 0.0.13 with two private methods
+# exposed (`Display::handle`, `Context::id`) so we can drop into
+# raw FFI for the packed-header buffer types the upstream crate
+# doesn't yet wrap. See `vendor/cros-libva/README-fork.md` (TODO).
+cros-libva = { path = "../../vendor/cros-libva" }
+
+# NVENC (NVIDIA hardware H.264 encode). Higher-level Rust binding
+# that wraps the Video Codec SDK headers — no SDK install needed at
+# build time, the libraries (libcuda.so, libnvidia-encode.so) are
+# dlopen'd at runtime. Missing libs cause `Encoder::new` to error
+# and the factory falls back through VA-API / x264.
+shiguredo_nvcodec = "2026.1.0"

@@ -1150,11 +1150,10 @@ dependencies = [
 [[package]]
 name = "cros-libva"
 version = "0.0.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0d5dfcdd9b868cc52eb2b5f5b8dea053314b205073ab9f13fa118c479d3a161"
 dependencies = [
  "bindgen 0.70.1",
  "bitflags 2.11.0",
+ "crc32fast",
  "log",
  "pkg-config",
  "regex",
@@ -1665,6 +1664,7 @@ dependencies = [
  "bytes",
  "cros-libva",
  "ferricast-core",
+ "shiguredo_nvcodec",
  "tracing",
  "x264",
 ]
@@ -4871,6 +4871,22 @@ checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
 ]
+
+[[package]]
+name = "shiguredo_nvcodec"
+version = "2026.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc8f44c9c10940619cb3a940127e623b995740b655a9122e6ba93e73e004f20"
+dependencies = [
+ "bindgen 0.72.1",
+ "shiguredo_toml",
+]
+
+[[package]]
+name = "shiguredo_toml"
+version = "2026.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f501556feebae970519ffa4afc5edb078c8eb16da4a0a2fbe803d75c0e34a79b"
 
 [[package]]
 name = "shlex"
