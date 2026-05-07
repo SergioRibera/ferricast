@@ -2,7 +2,7 @@ use bytes::Bytes;
 use ferricast_core::{
     Codec, EncodedFrame, FerricastError, PixelFormat, Result, VideoEncoder,
 };
-use x264::{Colorspace, Encoder, Image, Preset, Setup, Tune};
+use x264::{Colorspace, Encoder, Image};
 
 #[derive(Default)]
 pub struct X264H264Encoder {
@@ -24,32 +24,13 @@ impl VideoEncoder for X264H264Encoder {
             PixelFormat::Bgra => Colorspace::BGRA,
             PixelFormat::Nv12 => Colorspace::NV12,
             PixelFormat::Rgba => {
-                // This will probably fail
+                // This will probably fail 
                 Colorspace::RGB
             },
             PixelFormat::I420 => Colorspace::I420,
         };
 
-        // `ultrafast` + `zerolatency` is what every live encoder under
-        // the sun uses: drops B-frames, disables lookahead, sizes the
-        // VBV for one-frame buffering. Without it x264 defaults to
-        // `medium` with a multi-frame lookahead — far too slow for
-        // real-time screen casting.
-        //
-        // `scenecut_threshold(0)` pins keyframes to exactly every
-        // `max_keyframe_interval` frames so HLS segment cadence is
-        // predictable. With scenecuts on, an idle desktop yields ≥4 s
-        // segments and a busy one yields fragmentary < 1 s ones.
-        let keyint = config.keyframe_interval.max(1) as i32;
-        let encoder = Setup::preset(Preset::Ultrafast, Tune::None, false, true)
-            .fps(config.fps, 1)
-            .baseline()
-            .bitrate(config.bitrate_kbps as i32)
-            .max_keyframe_interval(keyint)
-            .min_keyframe_interval(keyint)
-            .scenecut_threshold(0)
-            .build(colorspace, config.width as i32, config.height as i32)
-            .map_err(|_| FerricastError::Encoder("Cannot create encoder".to_string()))?;
+        let encoder = Encoder::builder().fps(config.fps, 1).baseline().bitrate(config.bitrate_kbps as i32).build(colorspace, config.width as i32, config.height as i32).map_err(|_| FerricastError::Encoder("Cannot create encoder".to_string()))?;
 
         self.encoder = Some(encoder);
         self.colorspace = Some(colorspace);

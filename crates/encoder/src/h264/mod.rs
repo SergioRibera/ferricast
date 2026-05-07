@@ -1,43 +1,58 @@
 //! H.264 encoder facade.
 //!
-//! Picks a backend at runtime:
-//! 1. **VA-API** via `cros-libva` — preferred when the system has a
-//!    working DRM render node + an H.264 encode entrypoint
-//!    (Constrained Baseline or Main). Output is a standard H.264
-//!    bitstream compatible with Chromecast, Miracast and AirPlay.
-//! 2. **x264** — software fallback. Always available because
+//! Picks a backend at runtime, in order of preference:
+//! 1. **VA-API** via `cros-libva` — Intel iGPU + AMD Mesa. Encode
+//!    on the GPU, no CPU readback needed once the dmabuf import
+//!    path is wired.
+//! 2. **NVENC** via `shiguredo_nvcodec` — NVIDIA proprietary
+//!    driver. NVIDIA's VA-API implementation is decode-only, so
+//!    this is the path that actually engages the GPU on NVIDIA
+//!    hardware.
+//! 3. **x264** — software fallback. Always available because
 //!    `libx264` is a build-time dep.
 //!
-//! Both backends implement the same [`VideoEncoder`] trait so
+//! All three backends implement the same [`VideoEncoder`] trait so
 //! consumers (HLS server, Chromecast handler, etc.) don't need to
-//! care which one is active.
+//! care which one is active. Output is plain H.264 — every
+//! receiver protocol we ship (Chromecast / Miracast / AirPlay)
+//! decodes any of the three backends' bitstreams identically.
 //!
-//! [`H264Encoder::default`] (and [`H264Encoder::new`]) preserves the
-//! previous "just create the encoder, configure later" call shape
-//! from when only x264 existed; runtime detection happens inside
-//! `configure` so callers don't need to deal with the constructor
-//! returning a fallible result.
+//! Construction has two phases:
+//! * `H264Encoder::new()` returns an enum stuck in `Pending` —
+//!   detection is deferred so we can size surfaces / SPS / NVENC
+//!   session correctly from the user's actual resolution.
+//! * `configure(&EncoderConfig)` walks the preference list with
+//!   that config; on any failure at any backend (no driver, profile
+//!   not supported, session creation refused, ...) it transparently
+//!   tries the next one.
 
+mod bitstream;
+mod headers;
+mod nvenc_impl;
 mod vaapi_impl;
 mod x264_impl;
+mod yuv;
 
 use ferricast_core::{
     CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, Result, VideoEncoder,
 };
 use tracing::{info, warn};
 
+pub use nvenc_impl::NvencH264Encoder;
 pub use vaapi_impl::VaapiH264Encoder;
 pub use x264_impl::X264H264Encoder;
 
-/// Backend-agnostic H.264 encoder. Internally an enum of the
-/// available implementations; runtime detection happens at
-/// [`Self::configure`] time so the constructor stays simple.
+/// Backend-agnostic H.264 encoder. Internal enum picks a backend in
+/// `configure()`.
 pub enum H264Encoder {
-    /// Hardware VA-API path. Currently unreachable from the factory
-    /// because the encode body is still a TODO; the variant exists
-    /// so adding it later is a one-line change in the constructor.
+    /// Pre-configure placeholder. Replaced with one of the concrete
+    /// variants on first `configure()` call.
+    Pending,
+    /// Hardware VA-API path — Intel / AMD.
     Vaapi(VaapiH264Encoder),
-    /// Software x264 path. Always works.
+    /// Hardware NVENC path — NVIDIA.
+    Nvenc(NvencH264Encoder),
+    /// Software x264 path — always works.
     X264(X264H264Encoder),
 }
 
@@ -49,23 +64,7 @@ impl H264Encoder {
 
 impl Default for H264Encoder {
     fn default() -> Self {
-        // Cheap pre-detection — actual `configure()` will retry. We
-        // can't fail the constructor signature, so this returns the
-        // x264 fallback whenever VA-API can't come up.
-        match VaapiH264Encoder::probe() {
-            Ok(enc) => {
-                info!("H.264 encoder backend: VA-API");
-                H264Encoder::Vaapi(enc)
-            }
-            Err(e) => {
-                // info! once at startup so the user sees why x264 is
-                // active; debug! the actual error so it doesn't
-                // clutter the steady state.
-                info!("H.264 encoder backend: x264 (software)");
-                tracing::debug!(error = %e, "VA-API probe failed");
-                H264Encoder::X264(X264H264Encoder::default())
-            }
-        }
+        H264Encoder::Pending
     }
 }
 
@@ -74,13 +73,65 @@ impl VideoEncoder for H264Encoder {
 
     fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
         match self {
+            H264Encoder::Pending => {
+                // Try VA-API first; if that fails (NVIDIA, no
+                // libva, profile mismatch, ...) try NVENC; if that
+                // also fails, fall back to x264. We always end up
+                // with a working encoder — x264 is the floor.
+                match VaapiH264Encoder::probe_with(config.clone()) {
+                    Ok(enc) => {
+                        info!(
+                            width = config.width,
+                            height = config.height,
+                            fps = config.fps,
+                            "H.264 encoder backend: VA-API"
+                        );
+                        *self = H264Encoder::Vaapi(enc);
+                        return Ok(());
+                    }
+                    Err(e) => info!(error = %e, "VA-API unavailable, trying NVENC"),
+                }
+
+                match NvencH264Encoder::probe_with(config.clone()) {
+                    Ok(enc) => {
+                        info!(
+                            width = config.width,
+                            height = config.height,
+                            fps = config.fps,
+                            "H.264 encoder backend: NVENC"
+                        );
+                        *self = H264Encoder::Nvenc(enc);
+                        return Ok(());
+                    }
+                    Err(e) => info!(
+                        error = %e,
+                        "NVENC unavailable, falling back to x264. \
+                         If you expected NVENC, ensure libcuda.so.1 + \
+                         libnvidia-encode.so.1 are on LD_LIBRARY_PATH \
+                         (NixOS: /run/opengl-driver/lib)."
+                    ),
+                }
+
+                info!("H.264 encoder backend: x264 (software)");
+                let mut x = X264H264Encoder::default();
+                x.configure(config)?;
+                *self = H264Encoder::X264(x);
+                Ok(())
+            }
             H264Encoder::Vaapi(e) => match e.configure(config) {
                 Ok(()) => Ok(()),
                 Err(err) => {
-                    // VA-API rejected the config (resolution / format
-                    // not supported by the GPU). Swap to x264 in
-                    // place rather than failing the call.
-                    warn!(error = %err, "VA-API configure failed; falling back to x264");
+                    warn!(error = %err, "VA-API reconfigure failed, switching to x264");
+                    let mut x = X264H264Encoder::default();
+                    x.configure(config)?;
+                    *self = H264Encoder::X264(x);
+                    Ok(())
+                }
+            },
+            H264Encoder::Nvenc(e) => match e.configure(config) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    warn!(error = %err, "NVENC reconfigure failed, switching to x264");
                     let mut x = X264H264Encoder::default();
                     x.configure(config)?;
                     *self = H264Encoder::X264(x);
@@ -93,35 +144,40 @@ impl VideoEncoder for H264Encoder {
 
     fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
         match self {
+            H264Encoder::Pending => Err(FerricastError::Encoder(
+                "H264Encoder::encode called before configure()".into(),
+            )),
             H264Encoder::Vaapi(e) => e.encode(frame),
+            H264Encoder::Nvenc(e) => e.encode(frame),
             H264Encoder::X264(e) => e.encode(frame),
         }
     }
 
     fn flush(self) -> Result<Vec<EncodedFrame>> {
         match self {
+            H264Encoder::Pending => Ok(Vec::new()),
             H264Encoder::Vaapi(e) => e.flush(),
+            H264Encoder::Nvenc(e) => e.flush(),
             H264Encoder::X264(e) => e.flush(),
         }
     }
 
     fn get_headers(&mut self) -> Result<Vec<u8>> {
         match self {
+            H264Encoder::Pending => Err(FerricastError::Encoder(
+                "H264Encoder::get_headers called before configure()".into(),
+            )),
             H264Encoder::Vaapi(e) => e.get_headers(),
+            H264Encoder::Nvenc(e) => e.get_headers(),
             H264Encoder::X264(e) => e.get_headers(),
         }
     }
 }
 
-/// Convenience: explicit error for callers that want to know whether
-/// hardware encoding is active.
+/// Returns true when a VA-API H.264 encoder can be brought up on
+/// this system at the given resolution / fps. Useful for telemetry
+/// and config UIs.
 #[allow(dead_code)]
-pub fn vaapi_available() -> bool {
-    VaapiH264Encoder::probe().is_ok()
+pub fn vaapi_available(config: &EncoderConfig) -> bool {
+    VaapiH264Encoder::probe_with(config.clone()).is_ok()
 }
-
-// Suppress unused-import lints when the vaapi module's public types
-// aren't yet referenced from outside the crate.
-const _: fn() = || {
-    let _ = std::mem::size_of::<FerricastError>();
-};

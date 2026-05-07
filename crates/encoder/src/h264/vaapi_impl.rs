@@ -1,152 +1,320 @@
 //! VA-API H.264 encoder.
 //!
-//! ## Status
+//! Profile / feature decisions:
 //!
-//! **Detection + plumbing landed; the encode loop body is a TODO.**
+//! * **Profile**: Constrained Baseline (`66`) when the GPU exposes
+//!   it, else Main (`77`). Both are lowest-common-denominator across
+//!   Chromecast / Miracast / AirPlay. We don't target High because
+//!   only the screen-cast path benefits from it and not every
+//!   driver supports CABAC encode.
+//! * **GOP**: closed, IPPP… with an IDR every `keyframe_interval`
+//!   frames. No B-frames (Constrained Baseline forbids them; even
+//!   on Main we skip them — the segmenter cuts segments on
+//!   keyframes and B-frames complicate that).
+//! * **Surface format**: NV12 with `VA_RT_FORMAT_YUV420`. Universal.
+//!   BGRA capture frames are colour-converted to NV12 on the CPU
+//!   (see [`super::yuv`]) before upload — VA-API drivers don't
+//!   accept BGRA into the H.264 encoder entrypoint directly.
+//! * **Rate control**: CBR by default, configured via
+//!   `VAEncMiscParameterRateControl` + `FrameRate` + `HRD` chained
+//!   buffers.
+//! * **Packed headers**: we synthesise our own SPS / PPS NAL units
+//!   ([`super::headers`]) and submit them via `VAEncPackedHeader*`
+//!   buffers built by raw FFI — cros-libva 0.0.13 doesn't have safe
+//!   wrappers for those buffer types yet.
 //!
-//! Implementing a complete H.264 encoder through `cros-libva` is on
-//! the order of 800+ lines of careful code:
-//!
-//! * `VAEncSequenceParameterBufferH264` — 25+ fields, mostly
-//!   per-stream invariants (level_idc, picture dimensions in MBs,
-//!   bitrate, GOP structure, VUI flags).
-//! * `VAEncPictureParameterBufferH264` — per-frame state including
-//!   reference picture list management, IDR / P frame fields, and a
-//!   reference to the `VABufferID` of the coded buffer Vulkan will
-//!   write the bitstream into.
-//! * `VAEncSliceParameterBufferH264` — 30+ fields including weight
-//!   tables and ref-picture lists.
-//! * Packed SPS / PPS NAL units — H.264 syntax with Exp-Golomb
-//!   coding for the integer fields, RBSP trailing bits, and the
-//!   AnnexB start-code prefix. ~200 lines on its own.
-//! * Surface management — either allocate `VASurface`s natively or
-//!   import the dmabuf carried by `GpuFrame` via
-//!   `VASurfaceAttribExternalBuffers`.
-//! * Coded buffer extraction with `VACodedBufferSegment`.
-//!
-//! Doing all of that correctly without a way to test on the actual
-//! target hardware would invite subtle bugs. The factory in
-//! [`super`] is wired up so adding the encode body is now an
-//! isolated change — `configure` already opens the display, picks
-//! the profile and creates the config; what's missing is the
-//! per-frame buffer construction and submit/sync flow inside
-//! [`X264H264Encoder::encode`]'s VA-API counterpart here.
-//!
-//! Until then, [`VaapiH264Encoder::probe`] returns `Err` so the
-//! factory falls back to x264 transparently.
+//! Anything in this module that uses unsafe is in service of a
+//! `cros_libva::bindings::*` call documented in the libva headers.
 
+use std::cell::RefCell;
+use std::os::raw::c_void;
 use std::path::Path;
 use std::rc::Rc;
 
 use bytes::Bytes;
-use cros_libva::{Display, VAProfile};
+use cros_libva::bindings::{
+    self, VABufferID, VAStatus, VA_INVALID_ID,
+};
+use cros_libva::{
+    Buffer, Config, Context, Display, EncMiscParameter, EncMiscParameterFrameRate,
+    EncMiscParameterHRD, EncMiscParameterRateControl, EncPictureParameter, EncSequenceParameter,
+    EncSliceParameter, Image, MappedCodedBuffer, RcFlags, Surface, UsageHint,
+};
+use cros_libva::buffer::h264::{
+    EncPictureParameterBufferH264, EncSequenceParameterBufferH264, EncSliceParameterBufferH264,
+    H264EncFrameCropOffsets, H264EncPicFields, H264EncSeqFields, H264VuiFields, PictureH264,
+};
 use ferricast_core::{
     CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, PixelFormat, Result,
     VideoEncoder,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
-/// Render-node candidates we'll try, in order. The portal-screencast
-/// dmabuf usually lives on the primary GPU; falling through to the
-/// next node lets us cope with multi-GPU systems where the iGPU is
-/// the dmabuf producer.
+use super::headers::{self, profile, FrameCrop, PpsParams, SpsParams, VuiParams};
+use super::yuv;
+
 const RENDER_NODES: &[&str] = &[
     "/dev/dri/renderD128",
     "/dev/dri/renderD129",
     "/dev/dri/renderD130",
 ];
 
-/// H.264 profiles we can target, in preference order.
-///
-/// Constrained Baseline is the lowest-common-denominator across
-/// Chromecast / Miracast / AirPlay receivers; we prefer Main when
-/// the GPU exposes it (better compression, still widely accepted)
-/// and fall back to CB when nothing else matches.
-const H264_PROFILES: &[VAProfile::Type] = &[
-    VAProfile::VAProfileH264Main,
-    VAProfile::VAProfileH264ConstrainedBaseline,
-];
+/// Standard NV12 V4L2 / DRM fourcc reused across libva.
+const VA_FOURCC_NV12: u32 = 0x3231564E; // 'N','V','1','2'
+
+/// `VA_RT_FORMAT_YUV420` per `va.h`.
+const VA_RT_FORMAT_YUV420: u32 = 0x01;
+
+/// Number of reconstruction surfaces. One for the current frame +
+/// one for the previous reference (used by P frames). Two is the
+/// minimum for IPPP without B-frames.
+const RECON_POOL: usize = 2;
+
+/// Output coded-buffer size hint. Worst-case picture for 1080p ≈
+/// 1.5 × width × height bytes; we round up to a comfortable 8 MB
+/// because the driver pads its allocation anyway.
+const CODED_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 
 pub struct VaapiH264Encoder {
-    /// `Rc` because cros-libva's `Display` is not Sync and the
-    /// `Picture` / `Context` types it spawns hold an `Rc<Display>`.
-    /// We keep one per encoder; the encoder itself is `Send` via
-    /// the unsafe impl below (see comment).
     display: Rc<Display>,
-    /// Profile cros-libva agreed on. Stored so the encode body can
-    /// consult it when building parameter buffers.
+    /// Held so the FFI handle stays valid; cros-libva drops it
+    /// before the context.
     #[allow(dead_code)]
-    profile: VAProfile::Type,
-    /// Encoder configuration, latched in `configure()` and consulted
-    /// by `encode()`.
-    config: Option<EncoderConfig>,
+    config: Config,
+    context: Rc<Context>,
+
+    /// One NV12 surface that we re-upload every frame as the
+    /// encoder's input.
+    input: Surface<()>,
+    /// Reconstruction surfaces, alternated round-robin so the
+    /// previous one can serve as the reference picture for the
+    /// next P frame.
+    recon: Vec<Surface<()>>,
+
+    /// Latched configuration.
+    cfg: EncoderCfg,
+
+    /// Per-stream packed headers (Annex-B `00 00 00 01` prefixed,
+    /// emulation-byte-escaped). Re-emitted on every IDR.
+    sps_nal: Vec<u8>,
+    pps_nal: Vec<u8>,
+
+    /// Mutable per-frame state. Wrapped in `RefCell` so `encode`
+    /// can take `&mut self` without bleeding the cell into every
+    /// helper signature.
+    state: RefCell<FrameState>,
 }
 
-// SAFETY: cros-libva uses `Rc<Display>` internally because its
-// `Picture` types borrow the display non-thread-safely. We never
-// share the `Rc` across threads — the encoder is consumed by
-// `&mut self` from a single thread (the segmenter task), and the
-// `tokio::spawn` that owns it ensures it stays on that one thread.
-// Marking Send manually lets us put the encoder behind the
-// `VideoEncoder: Send` trait bound.
+#[derive(Clone)]
+struct EncoderCfg {
+    profile: bindings::VAProfile::Type,
+    profile_idc: u8,
+    /// `constraint_set0..5` packed in the high byte (see SPS
+    /// emission).
+    constraint_flags: u8,
+    /// CABAC iff Main / High; CAVLC for Constrained Baseline.
+    cabac: bool,
+    width: u32,
+    height: u32,
+    /// Width in 16-pixel macroblocks.
+    width_mbs: u16,
+    /// Height in 16-pixel macroblocks (rounded up).
+    height_mbs: u16,
+    /// Crop offset (in 2-luma units) needed when `height` isn't a
+    /// multiple of 16.
+    height_crop: u32,
+    fps: u32,
+    bitrate_bps: u32,
+    keyframe_interval: u32,
+    initial_qp: u32,
+    /// Same level as in the SPS / `level_idc`. 41 = 4.1, the
+    /// minimum for 1080p60.
+    level_idc: u8,
+}
+
+#[derive(Default)]
+struct FrameState {
+    frame_idx: u32,
+    /// Picture-order-count (×2 per frame, mod `MaxPicOrderCntLsb`).
+    poc: u32,
+    /// Toggles 0..1 every IDR. Sent in the slice header.
+    idr_pic_id: u16,
+    /// Round-robin index into `recon`.
+    next_recon: usize,
+    /// Previous reconstruction surface index, or `None` on the very
+    /// first frame.
+    prev_recon: Option<usize>,
+    /// Frame number of the previous reference (for P frame ref
+    /// list).
+    prev_frame_num: u32,
+    /// POC of the previous reference.
+    prev_poc: u32,
+}
+
 unsafe impl Send for VaapiH264Encoder {}
 
 impl VaapiH264Encoder {
-    /// Try to bring up VA-API. Returns `Ok(Self)` only when:
-    /// * `libva.so` loads,
-    /// * a render node opens,
-    /// * one of [`H264_PROFILES`] is supported with the
-    ///   `VAEntrypointEncSlice` entrypoint.
-    ///
-    /// Otherwise returns `Err(FerricastError::Encoder(_))` and the
-    /// caller falls back to x264.
+    /// Try to bring up VA-API + create everything that's
+    /// stream-invariant. Returns `Err` and the factory falls back
+    /// to x264 on any problem (no driver, no compatible profile,
+    /// surface alloc failed, ...).
     pub fn probe() -> Result<Self> {
-        let display = open_render_node().ok_or_else(|| {
-            FerricastError::Encoder("VA-API: no usable DRM render node".into())
-        })?;
+        Self::probe_with(EncoderConfig::default())
+    }
 
-        let vendor = display.query_vendor_string().unwrap_or_default();
-        debug!(%vendor, "VA-API display opened");
-
-        let supported_profiles = display.query_config_profiles().map_err(|e| {
-            FerricastError::Encoder(format!("VA-API: query_config_profiles failed: {e}"))
-        })?;
-
-        let profile = H264_PROFILES
-            .iter()
-            .copied()
-            .find(|p| supported_profiles.contains(p))
-            .ok_or_else(|| {
-                FerricastError::Encoder(
-                    "VA-API: no compatible H.264 profile (Main / Constrained Baseline)".into(),
-                )
-            })?;
-
-        // Make sure the encode entrypoint actually exists for this
-        // profile — some drivers expose the profile for decode only.
-        let entrypoints = display
-            .query_config_entrypoints(profile)
-            .map_err(|e| FerricastError::Encoder(format!("VA-API: query_entrypoints: {e}")))?;
-        if !entrypoints
-            .iter()
-            .any(|e| *e == cros_libva::VAEntrypoint::VAEntrypointEncSlice)
-        {
+    /// Real entry point used by the factory's `configure()` retry
+    /// path. The `EncoderConfig::default` from `probe` is replaced
+    /// here with the caller's actual config so we size surfaces
+    /// correctly.
+    pub fn probe_with(cfg: EncoderConfig) -> Result<Self> {
+        if !matches!(cfg.pixel_format, PixelFormat::Bgra | PixelFormat::Rgba) {
             return Err(FerricastError::Encoder(format!(
-                "VA-API: profile {profile:?} has no VAEntrypointEncSlice"
+                "VA-API: input pixel format {:?} not supported (need Bgra/Rgba)",
+                cfg.pixel_format
             )));
         }
 
-        info!(?profile, %vendor, "VA-API H.264 encoder available");
+        let display = open_render_node().ok_or_else(|| {
+            FerricastError::Encoder("VA-API: no usable DRM render node".into())
+        })?;
+        let vendor = display.query_vendor_string().unwrap_or_default();
+        debug!(%vendor, "VA-API display opened");
 
-        // Phase 2 ends here: the actual encode loop is the next
-        // chunk of work. Surface this as a clear error so the
-        // factory falls back to x264 instead of silently dropping
-        // frames.
-        Err(FerricastError::Encoder(
-            "VA-API encoder body not implemented yet; falling back to x264".into(),
-        ))
-        // When the encode loop lands, replace the line above with:
-        //   Ok(Self { display, profile, config: None })
+        let supported = display
+            .query_config_profiles()
+            .map_err(|e| FerricastError::Encoder(format!("query_config_profiles: {e}")))?;
+
+        let (profile, profile_idc, constraint_flags, cabac) = if supported
+            .contains(&bindings::VAProfile::VAProfileH264ConstrainedBaseline)
+            && profile_has_enc_slice(&display, bindings::VAProfile::VAProfileH264ConstrainedBaseline)
+        {
+            (
+                bindings::VAProfile::VAProfileH264ConstrainedBaseline,
+                profile::BASELINE,
+                0b0100_0000_u8, // constraint_set1_flag = 1 (Constrained Baseline)
+                false,
+            )
+        } else if supported.contains(&bindings::VAProfile::VAProfileH264Main)
+            && profile_has_enc_slice(&display, bindings::VAProfile::VAProfileH264Main)
+        {
+            (bindings::VAProfile::VAProfileH264Main, profile::MAIN, 0_u8, true)
+        } else {
+            return Err(FerricastError::Encoder(
+                "VA-API: no supported H.264 encode profile (need ConstrainedBaseline or Main)"
+                    .into(),
+            ));
+        };
+        info!(?profile, %vendor, "VA-API H.264 encoder selected");
+
+        let cfg = build_encoder_cfg(profile, profile_idc, constraint_flags, cabac, &cfg)?;
+
+        // VAConfig with rate control + RT format.
+        let cfg_handle = display
+            .create_config(
+                vec![
+                    bindings::VAConfigAttrib {
+                        type_: bindings::VAConfigAttribType::VAConfigAttribRTFormat,
+                        value: VA_RT_FORMAT_YUV420,
+                    },
+                    bindings::VAConfigAttrib {
+                        type_: bindings::VAConfigAttribType::VAConfigAttribRateControl,
+                        value: bindings::VA_RC_CBR,
+                    },
+                ],
+                profile,
+                bindings::VAEntrypoint::VAEntrypointEncSlice,
+            )
+            .map_err(|e| FerricastError::Encoder(format!("vaCreateConfig: {e}")))?;
+
+        // Allocate surfaces: one input + N reconstruction. All NV12.
+        let input_descs: Vec<()> = vec![()];
+        let mut input_surfaces = display
+            .create_surfaces(
+                VA_RT_FORMAT_YUV420,
+                Some(VA_FOURCC_NV12),
+                cfg.width,
+                cfg.padded_height(),
+                Some(UsageHint::USAGE_HINT_ENCODER),
+                input_descs,
+            )
+            .map_err(|e| FerricastError::Encoder(format!("create input surface: {e}")))?;
+        let input = input_surfaces.pop().expect("we asked for 1 surface");
+
+        let recon_descs: Vec<()> = (0..RECON_POOL).map(|_| ()).collect();
+        let recon = display
+            .create_surfaces(
+                VA_RT_FORMAT_YUV420,
+                Some(VA_FOURCC_NV12),
+                cfg.width,
+                cfg.padded_height(),
+                Some(UsageHint::USAGE_HINT_ENCODER),
+                recon_descs,
+            )
+            .map_err(|e| FerricastError::Encoder(format!("create recon surfaces: {e}")))?;
+
+        // Hand the recon surfaces (the encoder's render targets) to
+        // `vaCreateContext`. The input surface is uploaded every
+        // frame and isn't a render target, so it doesn't go in the
+        // context's surface list.
+        let context = display
+            .create_context(
+                &cfg_handle,
+                cfg.width,
+                cfg.padded_height(),
+                Some(&recon),
+                /* progressive = */ true,
+            )
+            .map_err(|e| FerricastError::Encoder(format!("vaCreateContext: {e}")))?;
+
+        // Synthesise SPS / PPS once per encoder. They get re-emitted
+        // unchanged on every IDR.
+        let sps_nal = headers::build_sps(&SpsParams {
+            profile_idc: cfg.profile_idc,
+            constraint_flags: cfg.constraint_flags,
+            level_idc: cfg.level_idc,
+            seq_parameter_set_id: 0,
+            pic_width_in_mbs_minus1: (cfg.width_mbs as u32) - 1,
+            pic_height_in_map_units_minus1: (cfg.height_mbs as u32) - 1,
+            log2_max_frame_num_minus4: 4,
+            log2_max_pic_order_cnt_lsb_minus4: 4,
+            max_num_ref_frames: 1,
+            frame_cropping: if cfg.height_crop > 0 {
+                Some(FrameCrop {
+                    left: 0,
+                    right: 0,
+                    top: 0,
+                    bottom: cfg.height_crop,
+                })
+            } else {
+                None
+            },
+            vui: Some(VuiParams {
+                num_units_in_tick: 1,
+                time_scale: 2 * cfg.fps,
+                fixed_frame_rate_flag: true,
+            }),
+        });
+        let pps_nal = headers::build_pps(&PpsParams {
+            pic_parameter_set_id: 0,
+            seq_parameter_set_id: 0,
+            entropy_coding_mode_flag: cfg.cabac,
+            num_ref_idx_l0_default_active_minus1: 0,
+            pic_init_qp_minus26: cfg.initial_qp as i32 - 26,
+            deblocking_filter_control_present_flag: true,
+            transform_8x8_mode_flag: false,
+        });
+
+        Ok(Self {
+            display,
+            config: cfg_handle,
+            context,
+            input,
+            recon,
+            cfg,
+            sps_nal,
+            pps_nal,
+            state: RefCell::new(FrameState::default()),
+        })
     }
 }
 
@@ -158,61 +326,733 @@ fn open_render_node() -> Option<Rc<Display>> {
         }
         match Display::open_drm_display(path) {
             Ok(d) => {
-                debug!(%node, "opened VA-API DRM display");
+                debug!(node = node, "opened VA-API DRM display");
                 return Some(d);
             }
-            Err(e) => {
-                debug!(%node, error = %e, "render node open failed");
-            }
+            Err(e) => debug!(node = node, error = %e, "render node open failed"),
         }
     }
-    // Last resort: let cros-libva pick.
     Display::open()
+}
+
+fn profile_has_enc_slice(display: &Display, profile: bindings::VAProfile::Type) -> bool {
+    match display.query_config_entrypoints(profile) {
+        Ok(eps) => eps
+            .iter()
+            .any(|e| *e == bindings::VAEntrypoint::VAEntrypointEncSlice),
+        Err(_) => false,
+    }
+}
+
+impl EncoderCfg {
+    /// MB-aligned encoded height. The user-visible height may be
+    /// smaller and is communicated via the SPS frame crop.
+    fn padded_height(&self) -> u32 {
+        (self.height_mbs as u32) * 16
+    }
+}
+
+fn build_encoder_cfg(
+    profile: bindings::VAProfile::Type,
+    profile_idc: u8,
+    constraint_flags: u8,
+    cabac: bool,
+    cfg: &EncoderConfig,
+) -> Result<EncoderCfg> {
+    let width = cfg.width.max(16);
+    let height = cfg.height.max(16);
+    let width_mbs = ((width + 15) / 16) as u16;
+    let height_mbs = ((height + 15) / 16) as u16;
+    let padded_h = (height_mbs as u32) * 16;
+    let height_crop = (padded_h - height) / 2;
+    let level_idc = pick_level(width, height, cfg.fps);
+
+    Ok(EncoderCfg {
+        profile,
+        profile_idc,
+        constraint_flags,
+        cabac,
+        width,
+        height,
+        width_mbs,
+        height_mbs,
+        height_crop,
+        fps: cfg.fps.max(1),
+        bitrate_bps: (cfg.bitrate_kbps.max(1) as u32).saturating_mul(1000),
+        keyframe_interval: cfg.keyframe_interval.max(1),
+        initial_qp: 26,
+        level_idc,
+    })
+}
+
+/// Pick the smallest H.264 level that contains the requested
+/// resolution+framerate (Annex A, Table A-1). 41 covers 1080p60;
+/// 50 covers 4K30. Anything larger we just clamp to 51.
+fn pick_level(width: u32, height: u32, fps: u32) -> u8 {
+    let mb_per_sec = ((width + 15) / 16) * ((height + 15) / 16) * fps.max(1);
+    if mb_per_sec <= 245_760 {
+        31
+    } else if mb_per_sec <= 522_240 {
+        40
+    } else if mb_per_sec <= 522_240 && (width * height) <= 2_073_600 {
+        41
+    } else if mb_per_sec <= 589_824 {
+        41
+    } else if mb_per_sec <= 983_040 {
+        42
+    } else if mb_per_sec <= 2_073_600 {
+        50
+    } else {
+        51
+    }
 }
 
 impl VideoEncoder for VaapiH264Encoder {
     const CODEC: Codec = Codec::H264;
 
-    fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
-        // Store the config; once the encode body is implemented this
-        // is where we'd build the `VAConfig` and `VAContext`.
-        self.config = Some(config.clone());
-        if !matches!(config.pixel_format, PixelFormat::Bgra | PixelFormat::Nv12) {
-            return Err(FerricastError::Encoder(format!(
-                "VA-API: unsupported pixel format {:?}",
-                config.pixel_format
-            )));
-        }
+    fn configure(&mut self, _config: &EncoderConfig) -> Result<()> {
+        // `probe_with` already configured everything stream-invariant
+        // when the factory built us. A reconfigure-after-the-fact
+        // would need to tear down surfaces / context / config; we
+        // don't support that today.
         Ok(())
     }
 
-    fn encode(&mut self, _frame: CapturedFrame) -> Result<EncodedFrame> {
-        // TODO(vaapi): build VAEncSequenceParameterBufferH264 +
-        // VAEncPictureParameterBufferH264 + VAEncSliceParameterBufferH264,
-        // pack SPS / PPS NAL units, submit Picture, sync, extract
-        // CodedBuffer.
-        let _ = &self.display; // silence dead-field once probe Errs out
-        warn!("VA-API encode body not implemented yet");
-        Err(FerricastError::Encoder(
-            "VA-API encoder body not implemented".into(),
-        ))
+    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
+        // VA-API consumes NV12. The shortest path that always works
+        // is "frame -> CPU bytes -> BGRA→NV12 -> upload". A future
+        // optimisation imports the dmabuf as a BGRA surface and runs
+        // a VPP step in-driver; that's a follow-up.
+        let raw = frame.into_cpu()?;
+        if raw.format != PixelFormat::Bgra {
+            return Err(FerricastError::Encoder(format!(
+                "VA-API: unexpected runtime pixel format {:?}",
+                raw.format
+            )));
+        }
+
+        upload_bgra_to_nv12(&self.input, &self.cfg, &raw.data, raw.stride as usize)?;
+
+        let (encoded_bytes, is_keyframe, frame_idx, poc) = {
+            let mut state = self.state.borrow_mut();
+            run_encode(self, &mut state)?
+        };
+
+        Ok(EncodedFrame {
+            codec: Codec::H264,
+            data: Bytes::from(encoded_bytes),
+            timestamp_us: raw.timestamp_us,
+            duration_us: Some(1_000_000 / self.cfg.fps as u64),
+            is_keyframe,
+            pts_dts: (poc as u64, frame_idx as u64),
+        })
     }
 
     fn flush(self) -> Result<Vec<EncodedFrame>> {
+        // No B-frame queue, no buffered frames — every `encode()`
+        // already produced its output.
         Ok(Vec::new())
     }
 
     fn get_headers(&mut self) -> Result<Vec<u8>> {
-        // SPS + PPS NAL units would be packed here. Returning an
-        // empty Vec is fine for the unimplemented path (the factory
-        // never reaches this code today).
-        Ok(Vec::new())
+        // SPS + PPS, AnnexB-prefixed, ready to live at the start of
+        // every HLS segment. The bitstream we hand out from
+        // `encode()` does NOT include these (we emit them via
+        // packed headers and the driver writes them into the coded
+        // buffer for IDR frames; non-IDR frames don't carry them).
+        let mut out = Vec::with_capacity(self.sps_nal.len() + self.pps_nal.len());
+        out.extend_from_slice(&self.sps_nal);
+        out.extend_from_slice(&self.pps_nal);
+        Ok(out)
     }
 }
 
-/// Unused for now; kept so the future encode body has a place to
-/// drop the bitstream-packing helper.
-#[allow(dead_code)]
-fn _bytes_placeholder() -> Bytes {
-    Bytes::new()
+/// Upload a BGRA frame into the encoder's NV12 input surface. Uses
+/// `vaDeriveImage` for a zero-copy view when the driver supports
+/// it; falls back to `vaCreateImage` + `vaPutImage` otherwise.
+fn upload_bgra_to_nv12(
+    surface: &Surface<()>,
+    cfg: &EncoderCfg,
+    bgra: &[u8],
+    bgra_stride: usize,
+) -> Result<()> {
+    let w = cfg.width;
+    let h = cfg.height;
+    // Pad height up to MB boundary; the extra rows will be black.
+    let padded_h = cfg.padded_height();
+
+    // Try derive first.
+    let mut image = match Image::derive_from(surface, (w, padded_h)) {
+        Ok(img) => img,
+        Err(_e) => {
+            // Driver doesn't allow derive on this format. Allocate
+            // an NV12 image and pay the put-image cost on drop.
+            let format = bindings::VAImageFormat {
+                fourcc: VA_FOURCC_NV12,
+                byte_order: bindings::VA_LSB_FIRST,
+                bits_per_pixel: 12,
+                ..Default::default()
+            };
+            Image::create_from(surface, format, (w, padded_h), (w, padded_h))
+                .map_err(|e| FerricastError::Encoder(format!("vaCreateImage(NV12): {e}")))?
+        }
+    };
+
+    // Lay out the NV12 planes inside the mapped buffer using the
+    // image's plane offsets and strides.
+    let im = image.image();
+    let y_off = im.offsets[0] as usize;
+    let uv_off = im.offsets[1] as usize;
+    let y_stride = im.pitches[0] as usize;
+    let uv_stride = im.pitches[1] as usize;
+
+    let buf = image.as_mut(); // marks dirty so vaPutImage runs on drop
+    let len = buf.len();
+    if y_off + y_stride * (padded_h as usize) > len
+        || uv_off + uv_stride * ((padded_h / 2) as usize) > len
+    {
+        return Err(FerricastError::Encoder(
+            "VA-API NV12 image buffer smaller than expected planes".into(),
+        ));
+    }
+    // Split-borrow to write Y and UV planes.
+    let (y_plane, uv_plane) = if y_off < uv_off {
+        let (lo, hi) = buf.split_at_mut(uv_off);
+        (&mut lo[y_off..], hi)
+    } else {
+        let (lo, hi) = buf.split_at_mut(y_off);
+        (hi, &mut lo[uv_off..])
+    };
+
+    yuv::bgra_to_nv12(
+        bgra,
+        bgra_stride.max((w * 4) as usize),
+        w,
+        h,
+        y_plane,
+        y_stride,
+        uv_plane,
+        uv_stride,
+    );
+
+    // Zero out any padding rows so they don't leak previous frame's
+    // data into reference frames at the bottom edge.
+    if padded_h > h {
+        for row in h..padded_h {
+            let off = (row as usize) * y_stride;
+            for b in &mut y_plane[off..off + w as usize] {
+                *b = 16;
+            }
+        }
+        for row in (h / 2)..(padded_h / 2) {
+            let off = (row as usize) * uv_stride;
+            for b in &mut uv_plane[off..off + w as usize] {
+                *b = 128;
+            }
+        }
+    }
+
+    Ok(())
+    // Image drops here: if !derived && dirty, vaPutImage writes
+    // back to the surface; vaUnmapBuffer + vaDestroyImage either
+    // way.
+}
+
+/// The actual encode call. Bumps frame state, builds parameter
+/// buffers, submits, syncs, extracts the coded bitstream.
+fn run_encode(
+    enc: &VaapiH264Encoder,
+    state: &mut FrameState,
+) -> Result<(Vec<u8>, bool, u32, u32)> {
+    let cfg = &enc.cfg;
+    let is_idr = state.frame_idx % cfg.keyframe_interval == 0;
+    let frame_num = if is_idr {
+        0
+    } else {
+        // frame_num counts reference frames since last IDR (mod
+        // 2^(log2_max_frame_num_minus4+4) = 2^8 = 256).
+        ((state.frame_idx - state.frame_idx_at_last_idr(cfg.keyframe_interval)) & 0xff) as u16
+    };
+    let poc = if is_idr { 0 } else { state.poc };
+
+    // Pick this frame's recon surface and remember the previous
+    // one as the P-frame reference.
+    let cur_recon_idx = state.next_recon;
+    let prev_recon_idx = state.prev_recon;
+    state.next_recon = (cur_recon_idx + 1) % enc.recon.len();
+
+    let curr_pic = picture_h264(enc.recon[cur_recon_idx].id(), frame_num as u32, 0, poc as i32);
+    // The "previous reference" slot used by P frames. `None` for
+    // IDR — built once and cloned into both the picture-param
+    // ReferenceFrames[16] and the slice-param ref_pic_list_0[32].
+    let prev_ref: Option<PictureH264> = if !is_idr {
+        prev_recon_idx.map(|prev_idx| {
+            picture_h264(
+                enc.recon[prev_idx].id(),
+                state.prev_frame_num,
+                bindings::VA_PICTURE_H264_SHORT_TERM_REFERENCE,
+                state.prev_poc as i32,
+            )
+        })
+    } else {
+        None
+    };
+    let reference_frames: [PictureH264; 16] = std::array::from_fn(|i| {
+        if i == 0 {
+            prev_ref
+                .as_ref()
+                .map(clone_pic)
+                .unwrap_or_else(invalid_picture_h264)
+        } else {
+            invalid_picture_h264()
+        }
+    });
+
+    // Allocate the coded output buffer. cros-libva exposes a
+    // dedicated `EncCodedBuffer` for this — `MappedCodedBuffer`
+    // takes that specific type rather than the generic `Buffer`.
+    let coded = enc
+        .context
+        .create_enc_coded(CODED_BUFFER_SIZE)
+        .map_err(|e| FerricastError::Encoder(format!("vaCreateBuffer(coded): {e}")))?;
+
+    // Build parameter buffers. Order matters per the VA-API loop
+    // (libva-utils encode/h264encode.c, FFmpeg vaapi_encode.c):
+    // sequence (IDR), misc (IDR), picture, packed SPS+data (IDR),
+    // packed PPS+data (IDR), slice.
+    let mut buffers: Vec<Buffer> = Vec::with_capacity(8);
+    let mut packed_buffer_ids: Vec<VABufferID> = Vec::new();
+
+    if is_idr {
+        let seq = build_seq_param(cfg);
+        buffers.push(
+            enc.context
+                .create_buffer(cros_libva::BufferType::EncSequenceParameter(
+                    EncSequenceParameter::H264(seq),
+                ))
+                .map_err(|e| FerricastError::Encoder(format!("seq buffer: {e}")))?,
+        );
+
+        let rc = build_rate_control(cfg);
+        let fr = EncMiscParameterFrameRate::new(cfg.fps, 0);
+        let hrd = EncMiscParameterHRD::new(cfg.bitrate_bps / 2, cfg.bitrate_bps);
+        for misc in [
+            cros_libva::BufferType::EncMiscParameter(EncMiscParameter::RateControl(rc)),
+            cros_libva::BufferType::EncMiscParameter(EncMiscParameter::FrameRate(fr)),
+            cros_libva::BufferType::EncMiscParameter(EncMiscParameter::HRD(hrd)),
+        ] {
+            buffers.push(
+                enc.context
+                    .create_buffer(misc)
+                    .map_err(|e| FerricastError::Encoder(format!("misc buffer: {e}")))?,
+            );
+        }
+    }
+
+    let pic = build_pic_param(cfg, &curr_pic, reference_frames, coded.id(), is_idr, frame_num);
+    // Rebuild the per-slice ref list from `prev_ref` rather than
+    // cloning the picture-param array (those `PictureH264` values
+    // were moved into `pic`).
+    buffers.push(
+        enc.context
+            .create_buffer(cros_libva::BufferType::EncPictureParameter(
+                EncPictureParameter::H264(pic),
+            ))
+            .map_err(|e| FerricastError::Encoder(format!("pic buffer: {e}")))?,
+    );
+
+    // Packed SPS / PPS. cros-libva 0.0.13 doesn't wrap these; we
+    // call vaCreateBuffer ourselves and remember the IDs so they
+    // get destroyed at the end of the frame.
+    if is_idr {
+        let (sp, sd) = unsafe {
+            create_packed_header(
+                &enc.context,
+                bindings::VAEncPackedHeaderType::VAEncPackedHeaderSequence,
+                &enc.sps_nal,
+            )?
+        };
+        packed_buffer_ids.push(sp);
+        packed_buffer_ids.push(sd);
+        let (pp, pd) = unsafe {
+            create_packed_header(
+                &enc.context,
+                bindings::VAEncPackedHeaderType::VAEncPackedHeaderPicture,
+                &enc.pps_nal,
+            )?
+        };
+        packed_buffer_ids.push(pp);
+        packed_buffer_ids.push(pd);
+    }
+
+    let slice = build_slice_param(cfg, is_idr, state.idr_pic_id, poc as u16, prev_ref.as_ref());
+    buffers.push(
+        enc.context
+            .create_buffer(cros_libva::BufferType::EncSliceParameter(
+                EncSliceParameter::H264(slice),
+            ))
+            .map_err(|e| FerricastError::Encoder(format!("slice buffer: {e}")))?,
+    );
+
+    // Submit. We bypass cros-libva's typestate Picture API because
+    // we need to mix our raw-FFI packed-header buffers with the
+    // safe ones in a single vaRenderPicture call.
+    // cros-libva's `Buffer.id` is a private field; the helper
+    // `Buffer::as_id_vec` is the public way to flatten a slice
+    // into a `Vec<VABufferID>`.
+    let mut all_ids: Vec<VABufferID> = Buffer::as_id_vec(&buffers);
+    all_ids.extend_from_slice(&packed_buffer_ids);
+
+    unsafe {
+        let dpy = enc.display.handle();
+        let ctx = enc.context.id();
+        let target = enc.recon[cur_recon_idx].id();
+
+        check_status(bindings::vaBeginPicture(dpy, ctx, target))
+            .map_err(|s| FerricastError::Encoder(format!("vaBeginPicture: {s:#x}")))?;
+
+        let render_status = bindings::vaRenderPicture(
+            dpy,
+            ctx,
+            all_ids.as_ptr() as *mut _,
+            all_ids.len() as i32,
+        );
+        if let Err(s) = check_status(render_status) {
+            // Best-effort cleanup on render failure.
+            let _ = bindings::vaEndPicture(dpy, ctx);
+            destroy_packed(&enc.display, &packed_buffer_ids);
+            return Err(FerricastError::Encoder(format!(
+                "vaRenderPicture: {s:#x}"
+            )));
+        }
+
+        check_status(bindings::vaEndPicture(dpy, ctx))
+            .map_err(|s| FerricastError::Encoder(format!("vaEndPicture: {s:#x}")))?;
+
+        check_status(bindings::vaSyncSurface(dpy, target))
+            .map_err(|s| FerricastError::Encoder(format!("vaSyncSurface: {s:#x}")))?;
+    }
+
+    // Pull the bitstream out of the coded buffer. Walks the
+    // VACodedBufferSegment linked list under the hood.
+    let mut bitstream = Vec::with_capacity(64 * 1024);
+    {
+        let mapped = MappedCodedBuffer::new(&coded)
+            .map_err(|e| FerricastError::Encoder(format!("map coded: {e}")))?;
+        for seg in mapped.segments() {
+            bitstream.extend_from_slice(seg.buf);
+        }
+    }
+    trace!(
+        is_idr,
+        frame_num,
+        bytes = bitstream.len(),
+        "VA-API encoded frame"
+    );
+
+    // Destroy the packed-header buffers we allocated by hand.
+    destroy_packed(&enc.display, &packed_buffer_ids);
+
+    // Update state for the next frame.
+    let frame_idx_now = state.frame_idx;
+    state.frame_idx += 1;
+    state.poc = if is_idr { 2 } else { state.poc + 2 };
+    state.prev_recon = Some(cur_recon_idx);
+    state.prev_frame_num = frame_num as u32;
+    state.prev_poc = poc;
+    if is_idr {
+        state.idr_pic_id ^= 1;
+    }
+
+    Ok((bitstream, is_idr, frame_idx_now, poc))
+}
+
+/// Helper kept inline so `state` updates and `frame_num` math live
+/// next to each other.
+impl FrameState {
+    fn frame_idx_at_last_idr(&self, gop: u32) -> u32 {
+        (self.frame_idx / gop) * gop
+    }
+}
+
+fn build_seq_param(cfg: &EncoderCfg) -> EncSequenceParameterBufferH264 {
+    let seq_fields = H264EncSeqFields::new(
+        /* chroma_format_idc */ 1,
+        /* frame_mbs_only_flag */ 1,
+        /* mb_adaptive_frame_field_flag */ 0,
+        /* seq_scaling_matrix_present_flag */ 0,
+        /* direct_8x8_inference_flag */ 1,
+        /* log2_max_frame_num_minus4 */ 4,
+        /* pic_order_cnt_type */ 0,
+        /* log2_max_pic_order_cnt_lsb_minus4 */ 4,
+        /* delta_pic_order_always_zero_flag */ 0,
+    );
+
+    let frame_crop = if cfg.height_crop > 0 {
+        Some(H264EncFrameCropOffsets {
+            left: 0,
+            right: 0,
+            top: 0,
+            bottom: cfg.height_crop,
+        })
+    } else {
+        None
+    };
+
+    let vui = Some(H264VuiFields::new(
+        /* aspect_ratio_info_present_flag */ 0,
+        /* timing_info_present_flag */ 1,
+        /* bitstream_restriction_flag */ 0,
+        /* log2_max_mv_length_horizontal */ 16,
+        /* log2_max_mv_length_vertical */ 16,
+        /* fixed_frame_rate_flag */ 1,
+        /* low_delay_hrd_flag */ 0,
+        /* motion_vectors_over_pic_boundaries_flag */ 1,
+    ));
+
+    EncSequenceParameterBufferH264::new(
+        /* seq_parameter_set_id */ 0,
+        cfg.level_idc,
+        cfg.keyframe_interval,
+        cfg.keyframe_interval,
+        /* ip_period */ 1,
+        cfg.bitrate_bps,
+        /* max_num_ref_frames */ 1,
+        cfg.width_mbs,
+        cfg.height_mbs,
+        &seq_fields,
+        /* bit_depth_luma_minus8 */ 0,
+        /* bit_depth_chroma_minus8 */ 0,
+        /* num_ref_frames_in_pic_order_cnt_cycle */ 0,
+        /* offset_for_non_ref_pic */ 0,
+        /* offset_for_top_to_bottom_field */ 0,
+        [0i32; 256],
+        frame_crop,
+        vui,
+        /* aspect_ratio_idc */ 0,
+        /* sar_width */ 1,
+        /* sar_height */ 1,
+        /* num_units_in_tick */ 1,
+        /* time_scale */ 2 * cfg.fps,
+    )
+}
+
+fn build_pic_param(
+    cfg: &EncoderCfg,
+    curr_pic: &PictureH264,
+    reference_frames: [PictureH264; 16],
+    coded_buf: VABufferID,
+    is_idr: bool,
+    frame_num: u16,
+) -> EncPictureParameterBufferH264 {
+    let pic_fields = H264EncPicFields::new(
+        /* idr_pic_flag */ if is_idr { 1 } else { 0 },
+        /* reference_pic_flag */ 1,
+        /* entropy_coding_mode_flag */ if cfg.cabac { 1 } else { 0 },
+        /* weighted_pred_flag */ 0,
+        /* weighted_bipred_idc */ 0,
+        /* constrained_intra_pred_flag */ 0,
+        /* transform_8x8_mode_flag */ 0,
+        /* deblocking_filter_control_present_flag */ 1,
+        /* redundant_pic_cnt_present_flag */ 0,
+        /* pic_order_present_flag */ 0,
+        /* pic_scaling_matrix_present_flag */ 0,
+    );
+
+    EncPictureParameterBufferH264::new(
+        clone_pic(curr_pic),
+        reference_frames,
+        coded_buf,
+        /* pic_parameter_set_id */ 0,
+        /* seq_parameter_set_id */ 0,
+        /* last_picture */ 0,
+        frame_num,
+        cfg.initial_qp as u8,
+        /* num_ref_idx_l0_active_minus1 */ 0,
+        /* num_ref_idx_l1_active_minus1 */ 0,
+        /* chroma_qp_index_offset */ 0,
+        /* second_chroma_qp_index_offset */ 0,
+        &pic_fields,
+    )
+}
+
+fn build_slice_param(
+    cfg: &EncoderCfg,
+    is_idr: bool,
+    idr_pic_id: u16,
+    poc_lsb: u16,
+    prev_ref: Option<&PictureH264>,
+) -> EncSliceParameterBufferH264 {
+    let ref_pic_list_0: [PictureH264; 32] = std::array::from_fn(|i| {
+        if i == 0 {
+            prev_ref.map(clone_pic).unwrap_or_else(invalid_picture_h264)
+        } else {
+            invalid_picture_h264()
+        }
+    });
+    let ref_pic_list_1: [PictureH264; 32] =
+        std::array::from_fn(|_| invalid_picture_h264());
+    let _ = is_idr;
+
+    let slice_type: u8 = if is_idr { 2 } else { 0 };
+    let num_mbs = (cfg.width_mbs as u32) * (cfg.height_mbs as u32);
+
+    EncSliceParameterBufferH264::new(
+        /* macroblock_address */ 0,
+        num_mbs,
+        VA_INVALID_ID,
+        slice_type,
+        /* pic_parameter_set_id */ 0,
+        idr_pic_id,
+        poc_lsb,
+        /* delta_pic_order_cnt_bottom */ 0,
+        [0, 0],
+        /* direct_spatial_mv_pred_flag */ 1,
+        /* num_ref_idx_active_override_flag */ 0,
+        /* num_ref_idx_l0_active_minus1 */ 0,
+        /* num_ref_idx_l1_active_minus1 */ 0,
+        ref_pic_list_0,
+        ref_pic_list_1,
+        0,
+        0,
+        0,
+        [0; 32],
+        [0; 32],
+        0,
+        [[0; 2]; 32],
+        [[0; 2]; 32],
+        0,
+        [0; 32],
+        [0; 32],
+        0,
+        [[0; 2]; 32],
+        [[0; 2]; 32],
+        /* cabac_init_idc */ 0,
+        /* slice_qp_delta */ 0,
+        /* disable_deblocking_filter_idc */ 0,
+        /* slice_alpha_c0_offset_div2 */ 2,
+        /* slice_beta_offset_div2 */ 2,
+    )
+}
+
+fn build_rate_control(cfg: &EncoderCfg) -> EncMiscParameterRateControl {
+    EncMiscParameterRateControl::new(
+        cfg.bitrate_bps,
+        /* target_percentage */ 100, // 100 = CBR
+        /* window_size */ 1500,
+        cfg.initial_qp,
+        /* min_qp */ 1,
+        /* basic_unit_size */ 0,
+        RcFlags::new(0, 0, 0, 0, 0, 0, 0, 0, 0),
+        /* icq_quality_factor */ 0,
+        /* max_qp */ 51,
+        /* quality_factor */ 0,
+        /* target_frame_size */ 0,
+    )
+}
+
+fn picture_h264(
+    surface_id: bindings::VASurfaceID,
+    frame_idx: u32,
+    flags: u32,
+    poc: i32,
+) -> PictureH264 {
+    PictureH264::new(surface_id, frame_idx, flags, poc, poc)
+}
+
+fn invalid_picture_h264() -> PictureH264 {
+    PictureH264::new(VA_INVALID_ID, 0, bindings::VA_PICTURE_H264_INVALID, 0, 0)
+}
+
+/// `PictureH264: !Clone`, but the underlying VAPictureH264 is plain
+/// `Copy`. We hand-roll a clone-equivalent so callers can pass the
+/// same picture into both `pic_param.CurrPic` and `slice_param`.
+fn clone_pic(p: &PictureH264) -> PictureH264 {
+    // Re-build from raw fields. The constructor above takes the
+    // same five values we expose elsewhere; we need to peek at the
+    // wrapper internals via its Default impl + raw access.
+    // Cheaper: just re-construct from scratch using `picture_h264`
+    // — both callsites already know what they put in.
+    //
+    // Since `PictureH264` doesn't expose its inner struct, we pass
+    // it through an intermediate FFI struct via transmute. Both
+    // sides are `#[repr(transparent)]` over `VAPictureH264`.
+    //
+    // SAFETY: `PictureH264` is `pub struct PictureH264(VAPictureH264)`
+    // (`cros-libva 0.0.13` `src/buffer/h264.rs:10`). Cloning the
+    // backing FFI type is sound.
+    unsafe {
+        let inner: bindings::VAPictureH264 = std::mem::transmute_copy(p);
+        std::mem::transmute(inner)
+    }
+}
+
+unsafe fn create_packed_header(
+    context: &Rc<Context>,
+    htype: bindings::VAEncPackedHeaderType::Type,
+    bytes: &[u8],
+) -> Result<(VABufferID, VABufferID)> {
+    let dpy = context.display().handle();
+    let ctx = context.id();
+
+    let mut params = bindings::VAEncPackedHeaderParameterBuffer {
+        type_: htype,
+        bit_length: (bytes.len() as u32) * 8,
+        has_emulation_bytes: 1, // we ran emulation_prevent in the header builder
+        ..Default::default()
+    };
+    let mut p_id: VABufferID = 0;
+    check_status(bindings::vaCreateBuffer(
+        dpy,
+        ctx,
+        bindings::VABufferType::VAEncPackedHeaderParameterBufferType,
+        std::mem::size_of::<bindings::VAEncPackedHeaderParameterBuffer>() as u32,
+        1,
+        &mut params as *mut _ as *mut c_void,
+        &mut p_id,
+    ))
+    .map_err(|s| FerricastError::Encoder(format!("packed header param: {s:#x}")))?;
+
+    let mut d_id: VABufferID = 0;
+    let st = check_status(bindings::vaCreateBuffer(
+        dpy,
+        ctx,
+        bindings::VABufferType::VAEncPackedHeaderDataBufferType,
+        bytes.len() as u32,
+        1,
+        bytes.as_ptr() as *mut c_void,
+        &mut d_id,
+    ));
+    if let Err(s) = st {
+        bindings::vaDestroyBuffer(dpy, p_id);
+        return Err(FerricastError::Encoder(format!(
+            "packed header data: {s:#x}"
+        )));
+    }
+    Ok((p_id, d_id))
+}
+
+fn destroy_packed(display: &Rc<Display>, ids: &[VABufferID]) {
+    for id in ids {
+        unsafe {
+            let _ = bindings::vaDestroyBuffer(display.handle(), *id);
+        }
+    }
+}
+
+fn check_status(status: VAStatus) -> std::result::Result<(), VAStatus> {
+    if status == 0 {
+        // VA_STATUS_SUCCESS
+        Ok(())
+    } else {
+        Err(status)
+    }
+}
+
+// -------------------------------------------------------------------
+// Tests-only access to private helpers (compile-time check only).
+// -------------------------------------------------------------------
+#[cfg(test)]
+fn _build_seq_for_test(cfg: &EncoderCfg) -> EncSequenceParameterBufferH264 {
+    build_seq_param(cfg)
 }
