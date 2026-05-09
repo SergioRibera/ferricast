@@ -6,30 +6,20 @@
 //! replayed as the first frame of the next segment, so no frame is
 //! duplicated and every segment is independently decodable.
 //!
-//! Pacing strategy: the segmenter only synthesises duplicate frames
-//! when the upstream `ScreenCapture` actually stalls
-//! (`PACE_STALL_THRESHOLD` = ~3× the configured frame period). When
-//! the upstream is delivering at a stable rate below `target_fps`
-//! (e.g. Mutter's screencast portal commonly settles at 30 fps even
-//! when we ask for 60), we just encode whatever it gives us — the
-//! player decodes at PTS rate and renders at the natural cadence.
-//! Aggressive 1-per-`frame_period` duplication used to make 30 fps
-//! sources visually stutter, with each dup sitting between two real
-//! frames as a one-frame "freeze" the eye perceives as micro-pause.
+//! The capture-pull loop is paced to `config.target_fps`: if the
+//! upstream `ScreenCapture` doesn't deliver a fresh frame inside one
+//! frame period (PipeWire on idle desktops routinely pauses for
+//! hundreds of ms), we re-encode the most recent one with its
+//! timestamp bumped forward. Without this padding the playlist would
+//! stop advancing whenever nothing on screen was changing — players
+//! would stall, exactly the symptom we're fixing.
 //!
-//! Once `segment_target_secs` has elapsed inside a segment we ask
-//! the encoder to emit an IDR via [`VideoEncoder::request_keyframe`]
-//! (a no-op for backends that can't comply, e.g. x264 via the safe
+//! Once `segment_target_secs` has elapsed inside a segment we ask the
+//! encoder to emit an IDR via [`VideoEncoder::request_keyframe`] (a
+//! no-op for backends that can't comply, e.g. x264 via the safe
 //! crate). That keeps segments anchored to wall clock instead of
 //! drifting along the encoder's natural keyint when the actual
 //! framerate is below target.
-//!
-//! PTS is wall-clock based: each frame's PTS is the wall-clock
-//! microseconds since the segmenter's first frame. This makes both
-//! real frames and the rare pace-padded duplicates carry
-//! self-consistent timestamps regardless of upstream delivery rate
-//! — the player paces playback by PTS and renders at whatever
-//! cadence the source actually produced.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,13 +35,6 @@ use ferricast_muxer::mpeg_ts::MpegTs;
 
 use crate::HlsConfig;
 use crate::ring::SegmentRing;
-
-/// Lower bound on how long we wait for a real frame before deciding
-/// the upstream has stalled and synthesising a duplicate. Set
-/// generously above the largest reasonable capture-source frame
-/// period so a stable ≤30 fps source (Mutter's common output) never
-/// triggers a dup — only true stalls (>~50 ms gaps) do.
-const PACE_STALL_FLOOR: Duration = Duration::from_millis(50);
 
 pub async fn run<S, E>(
     mut capture: S,
@@ -72,21 +55,29 @@ where
         ));
     }
     let target = Duration::from_secs_f32(config.segment_target_secs);
-    let frame_period = Duration::from_secs_f64(1.0 / (config.target_fps.max(1) as f64));
-    // Wait at least 3× the frame period before deciding we're stalled
-    // (so even a temporarily late frame at the configured fps doesn't
-    // trigger a dup), but never less than `PACE_STALL_FLOOR` —
-    // upstream sources that settle below the configured fps would
-    // otherwise see a dup every `frame_period` exactly between real
-    // frames, which is what showed up in the user's logs as
-    // dt_ms=21 dup / dt_ms=12 real / dt_ms=21 dup / ... cycles.
-    let pace_stall = (frame_period.saturating_mul(3)).max(PACE_STALL_FLOOR);
+    let frame_period =
+        Duration::from_secs_f64(1.0 / (config.target_fps.max(1) as f64));
+    let frame_period_us = frame_period.as_micros() as u64;
 
-    // Anchor for wall-clock PTS. Set on the very first frame we push
-    // so the first frame lands at PTS≈0 and every later frame is
-    // `now - anchor` µs. Monotonic by construction (`Instant`), so
-    // PTS is always strictly increasing.
-    let mut pts_anchor: Option<Instant> = None;
+    // Synthetic monotonic playback timestamp, in microseconds, fed
+    // to the muxer in place of the encoder's wall-clock timestamp.
+    //
+    // We deliberately ignore `EncodedFrame::timestamp_us` here:
+    //
+    // * Pace-padded duplicate frames are stamped by the segmenter
+    //   with `last_real_ts + N * frame_period`, while real frames
+    //   coming back from the PW worker carry `now_us()` from PW
+    //   capture time. After a capture stall the wall clock jumps
+    //   forward by the stall duration — feeding that raw to the
+    //   muxer produces a PTS discontinuity that decoders display
+    //   as a sudden "catch-up jump".
+    // * A monotonic counter at exactly `frame_period` ticks
+    //   guarantees a smooth playback timeline regardless of the
+    //   capture-side clock. The 33-bit MPEG-TS PTS field has
+    //   ~26.5 h of runway at 60 fps before wrap, plenty for a
+    //   live stream.
+    let mut pts_us: u64 = 0;
+    let frame_period_us_step = frame_period_us;
 
     // Keyframe carried over from the previous segment. The boundary
     // detector consumes one keyframe to know "the new segment starts
@@ -100,16 +91,14 @@ where
     let mut muxer = MpegTs::default();
     muxer.config(parameter_sets.clone())?;
 
-    // Inter-frame dt for diagnosing capture-side throughput. Tagged
-    // with `kind="real"` (fresh PW frame) or `kind="dup"` (pace-pad
-    // copy of the previous one). With the relaxed pacer a healthy
-    // run shows essentially no `dup` lines except during real
-    // capture stalls.
+    // Inter-frame dt for diagnosing capture-side throughput. At 60 fps
+    // we expect ~16-17 ms; values closer to 50-60 ms point at the
+    // PipeWire/Vulkan import path stalling. Logged at DEBUG so it's
+    // off by default but easy to flip on with `RUST_LOG=ferricast_hls=debug`.
     let mut last_frame_at: Option<Instant> = None;
 
     // Most recent real frame, kept around so we can re-encode it as
-    // pace-padding when the capture source actually stalls past
-    // `pace_stall`.
+    // pace-padding when the capture source pauses.
     let mut last_frame: Option<CapturedFrame> = None;
 
     loop {
@@ -129,7 +118,8 @@ where
                         &mut capture,
                         &mut last_frame,
                         &mut last_frame_at,
-                        pace_stall,
+                        frame_period,
+                        frame_period_us,
                     )
                     .await?;
                     match encoder.encode(frame) {
@@ -146,7 +136,8 @@ where
 
         let started = Instant::now();
         let mut requested_idr = false;
-        push_frame(&mut muxer, &first, &mut pts_anchor)?;
+        push_frame(&mut muxer, &first, pts_us)?;
+        pts_us = pts_us.saturating_add(frame_period_us_step);
 
         // Continue pulling frames until we see another keyframe past
         // the target duration. Once we've crossed the target, ask
@@ -159,7 +150,8 @@ where
                 &mut capture,
                 &mut last_frame,
                 &mut last_frame_at,
-                pace_stall,
+                frame_period,
+                frame_period_us,
             )
             .await?;
 
@@ -180,7 +172,8 @@ where
                 pending = Some(encoded);
                 break;
             }
-            push_frame(&mut muxer, &encoded, &mut pts_anchor)?;
+            push_frame(&mut muxer, &encoded, pts_us)?;
+            pts_us = pts_us.saturating_add(frame_period_us_step);
         }
 
         let elapsed = started.elapsed();
@@ -208,42 +201,41 @@ where
     }
 }
 
-/// Pull one frame from `capture`. If the next frame doesn't arrive
-/// within `stall_threshold`, fall back to a duplicate of the last
-/// real frame so the playlist keeps advancing during true capture
-/// stalls. The threshold is large on purpose (≥ `PACE_STALL_FLOOR`,
-/// well above any reasonable steady-state inter-frame gap) so a
-/// source running below the configured `target_fps` doesn't get
-/// peppered with dups between every real frame — those dups looked
-/// like micro-pauses to the user.
+/// Pull one frame, with target-fps pacing. Returns:
+/// * The next real frame from `capture` if it arrives within
+///   `frame_period`.
+/// * A duplicate of the last real frame (with timestamp bumped
+///   forward by one period) otherwise — but only after we've seen at
+///   least one real frame. On cold start the pacer falls through to
+///   an unbounded `await` so we never spin before capture is up.
 async fn next_paced_frame<S>(
     capture: &mut S,
     last_frame: &mut Option<CapturedFrame>,
     last_frame_at: &mut Option<Instant>,
-    stall_threshold: Duration,
+    frame_period: Duration,
+    frame_period_us: u64,
 ) -> Result<CapturedFrame, FerricastError>
 where
     S: ScreenCapture + Send,
 {
-    let (frame, kind) = match timeout(stall_threshold, capture.next_frame()).await {
+    let (frame, kind) = match timeout(frame_period, capture.next_frame()).await {
         Ok(res) => {
             let f = res?;
             *last_frame = Some(f.clone());
             (f, "real")
         }
         Err(_) => {
-            // Capture has actually stalled past `stall_threshold`.
-            // Re-encode the last real frame so the playlist keeps
-            // advancing. Wall-clock PTS in `push_frame` makes the
-            // dup land at its true wall-clock position regardless
-            // of the gap length.
-            match last_frame.as_ref() {
-                Some(stored) => (stored.clone(), "dup"),
+            // Period elapsed without a fresh frame. If we have a
+            // previous one, re-encode it (with bumped timestamp) so
+            // the playlist keeps advancing. Otherwise fall through
+            // to an unbounded await — this only happens before the
+            // very first real frame.
+            match last_frame.as_mut() {
+                Some(stored) => {
+                    bump_timestamp_us(stored, frame_period_us);
+                    (stored.clone(), "dup")
+                }
                 None => {
-                    // No real frame yet — fall through to an
-                    // unbounded await so we don't spin during cold
-                    // start. Only happens before the very first
-                    // capture frame.
                     let f = capture.next_frame().await?;
                     *last_frame = Some(f.clone());
                     (f, "real")
@@ -255,10 +247,20 @@ where
     Ok(frame)
 }
 
+fn bump_timestamp_us(frame: &mut CapturedFrame, delta_us: u64) {
+    match frame {
+        CapturedFrame::Cpu(r) => r.timestamp_us = r.timestamp_us.saturating_add(delta_us),
+        CapturedFrame::Gpu(g) => g.timestamp_us = g.timestamp_us.saturating_add(delta_us),
+    }
+}
+
 /// Records inter-frame wallclock spacing tagged with whether the
 /// frame was a fresh capture (`"real"`) or a pace-pad copy of the
-/// previous one (`"dup"`). With the loosened pacer a healthy run
-/// shows essentially no `dup` lines.
+/// previous one (`"dup"`). Useful for spotting capture-side stalls
+/// vs encoder-side throughput limits at a glance — e.g. a long run
+/// of `kind="dup"` means the encoder/PW pipeline can't keep up with
+/// `target_fps`, while a cluster of `kind="real"` with low `dt_ms`
+/// means PW is delivering bursts.
 fn record_frame_dt(last: &mut Option<Instant>, kind: &'static str) {
     let now = Instant::now();
     if let Some(prev) = *last {
@@ -267,24 +269,16 @@ fn record_frame_dt(last: &mut Option<Instant>, kind: &'static str) {
     *last = Some(now);
 }
 
-/// Convert wall-clock time-since-anchor to a 90 kHz MPEG-TS PTS and
-/// hand the frame to the muxer. The first call sets the anchor at
-/// `Instant::now()` so the very first frame lands at PTS≈0; every
-/// subsequent call computes `now - anchor` in microseconds and
-/// rescales. `Instant` is monotonic, so PTS is too.
 fn push_frame(
     muxer: &mut MpegTs,
     encoded: &EncodedFrame,
-    anchor: &mut Option<Instant>,
+    pts_us: u64,
 ) -> Result<(), FerricastError> {
-    let now = Instant::now();
-    let pts_us = match *anchor {
-        Some(start) => now.saturating_duration_since(start).as_micros() as u64,
-        None => {
-            *anchor = Some(now);
-            0
-        }
-    };
+    // PTS in MPEG-TS 90 kHz units. The synthetic monotonic clock is
+    // already in microseconds, so the conversion is just a rescale —
+    // and saturating so a clock that's been running for ages
+    // doesn't panic on overflow before the spec's 33-bit field
+    // wraps.
     let pts_90k = pts_us.saturating_mul(9) / 100;
     // Baseline H.264 has no B-frames → DTS == PTS.
     muxer.add_frame(encoded, pts_90k, pts_90k)
