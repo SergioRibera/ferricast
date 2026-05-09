@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ferricast_core::{
-    CaptureConfig, CapturedFrame, DmaBufPlane, FerricastError, GpuFrame, RawFrame, Result,
+    CaptureConfig, CapturedFrame, FerricastError, RawFrame, Result,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -67,10 +67,12 @@ struct UserData {
     /// downstream — the moment capture is actually working.
     first_frame_logged: bool,
     /// `Some` when Vulkan came up successfully and we can import
-    /// the dmabuf modifiers we advertised. Wrapped in `Arc` so we
-    /// can hand a clone to every emitted `GpuFrame` (the consumer
-    /// uses it for on-demand readback). `None` collapses the dmabuf
-    /// path to a warning + drop and we rely on the SHM fallback.
+    /// the dmabuf modifiers we advertised. The PW worker thread
+    /// invokes `importer.readback(...)` directly inside
+    /// `handle_process` for non-linear DmaBuf frames so the GPU
+    /// blit-and-copy overlaps with the encoder doing CPU work on the
+    /// previous frame. `None` collapses the dmabuf path to a warning
+    /// + drop and we rely on the SHM fallback.
     importer: Option<Arc<VulkanImporter>>,
 }
 
@@ -471,21 +473,41 @@ fn handle_process(
                 warn!("DmaBuf plane has invalid fd");
                 return;
             }
-            CapturedFrame::Gpu(GpuFrame {
-                width: neg.width,
-                height: neg.height,
+            // Run the Vulkan readback HERE on the PW worker thread —
+            // not lazily on the encoder/segmenter thread via
+            // `frame.into_cpu()`. The two pieces of work used to run
+            // serially on the segmenter (readback ~5-10 ms + encode
+            // ~10-15 ms = ~20-25 ms / frame, capping us at ~40 fps);
+            // doing readback here lets PW thread blit-and-copy the
+            // next frame's pixels in parallel with the segmenter
+            // encoding the previous one, doubling effective fps.
+            //
+            // Failures (lost device, OOM, bad modifier) are logged
+            // and the frame is dropped — `handle_process` is
+            // best-effort by design (already drains stale buffers
+            // every tick).
+            match importer.import_and_readback(
+                raw.fd as RawFd,
+                chunk_offset,
                 stride,
-                format: neg.pixel_format,
-                timestamp_us,
-                plane: DmaBufPlane {
-                    fd: raw.fd as RawFd,
-                    offset: chunk_offset,
+                modifier,
+                neg.width,
+                neg.height,
+                neg.pixel_format,
+            ) {
+                Ok(bytes) => CapturedFrame::Cpu(RawFrame {
+                    width: neg.width,
+                    height: neg.height,
                     stride,
-                    modifier,
-                    size: chunk_size,
-                },
-                importer: Some(Arc::clone(importer) as _),
-            })
+                    format: neg.pixel_format,
+                    data: bytes,
+                    timestamp_us,
+                }),
+                Err(e) => {
+                    warn!(error = %e, "Vulkan readback failed on PW thread — frame dropped");
+                    return;
+                }
+            }
         }
         other => {
             warn!(?other, "unexpected SPA buffer data type");

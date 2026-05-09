@@ -312,15 +312,20 @@ unsafe fn import_image(
 }
 
 /// (Re)allocate the staging buffer if it doesn't exist or is too small.
+/// The new buffer is mapped once and stays mapped for its lifetime —
+/// `vkMapMemory` / `vkUnmapMemory` per frame are pure overhead on
+/// HOST_COHERENT memory (the spec explicitly permits leaving the
+/// mapping live across submits).
 fn ensure_staging(inner: &Inner, state: &mut State, size: u64) -> Result<()> {
     if let Some(s) = &state.staging {
         if s.capacity >= size {
             return Ok(());
         }
         // Old buffer too small. Wait for any pending GPU op then
-        // destroy.
+        // tear it down (unmap before free).
         unsafe {
             let _ = inner.device.device_wait_idle();
+            inner.device.unmap_memory(s.memory);
             inner.device.destroy_buffer(s.buffer, None);
             inner.device.free_memory(s.memory, None);
         }
@@ -362,10 +367,24 @@ fn ensure_staging(inner: &Inner, state: &mut State, size: u64) -> Result<()> {
         )));
     }
 
+    let mapped_ptr = unsafe {
+        inner
+            .device
+            .map_memory(memory, 0, reqs.size, vk::MemoryMapFlags::empty())
+    }
+    .map_err(|e| {
+        unsafe {
+            inner.device.free_memory(memory, None);
+            inner.device.destroy_buffer(buffer, None);
+        }
+        FerricastError::Capture(format!("vk map_memory (staging): {e}"))
+    })? as *mut u8;
+
     state.staging = Some(Staging {
         buffer,
         memory,
         capacity: reqs.size,
+        mapped_ptr,
     });
     Ok(())
 }
@@ -480,16 +499,17 @@ fn record_and_submit(
     Ok(())
 }
 
-fn readback(inner: &Inner, staging: &Staging, size: u64) -> Result<Bytes> {
+fn readback(_inner: &Inner, staging: &Staging, size: u64) -> Result<Bytes> {
+    // Staging memory is persistently mapped at allocation time; the
+    // pointer is valid until the buffer is destroyed in
+    // `ensure_staging` or in the importer's `Drop`. SAFETY: `size`
+    // never exceeds `staging.capacity` (the caller proves this via
+    // `ensure_staging(size)` directly above), so the slice stays
+    // inside the mapped region. Access is single-threaded under the
+    // importer's `Mutex<State>`.
     unsafe {
-        let ptr = inner
-            .device
-            .map_memory(staging.memory, 0, size, vk::MemoryMapFlags::empty())
-            .map_err(|e| FerricastError::Capture(format!("vk map_memory: {e}")))?;
-        let slice = std::slice::from_raw_parts(ptr as *const u8, size as usize);
-        let copy = Bytes::copy_from_slice(slice);
-        inner.device.unmap_memory(staging.memory);
-        Ok(copy)
+        let slice = std::slice::from_raw_parts(staging.mapped_ptr as *const u8, size as usize);
+        Ok(Bytes::copy_from_slice(slice))
     }
 }
 

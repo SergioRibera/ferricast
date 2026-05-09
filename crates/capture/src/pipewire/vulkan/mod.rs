@@ -137,7 +137,26 @@ pub(super) struct Staging {
     pub(super) buffer: vk::Buffer,
     pub(super) memory: vk::DeviceMemory,
     pub(super) capacity: u64,
+    /// Persistent host-visible mapping. Mapped once at creation,
+    /// unmapped only on destruction — `vkMapMemory` / `vkUnmapMemory`
+    /// per frame is pointless overhead for HOST_COHERENT memory and
+    /// the spec explicitly allows leaving the mapping live.
+    ///
+    /// Stored as raw `*mut u8` so we don't fight Rust's lifetime
+    /// model for a pointer whose lifetime is tied to the Vulkan
+    /// device, not the borrow checker. Always non-null while the
+    /// `Staging` exists; only ever read while the importer's `Mutex`
+    /// is held, so the `unsafe impl Send` is sound.
+    pub(super) mapped_ptr: *mut u8,
 }
+
+// SAFETY: `mapped_ptr` is a stable, thread-agnostic pointer into a
+// HOST_COHERENT Vulkan device memory mapping. All reads happen with
+// the importer's `Mutex<State>` held, so it never crosses threads
+// concurrently. The other Vulkan handles in `Staging` are integer
+// IDs (already `Send`), and `*mut u8` would otherwise opt the type
+// out of `Send`.
+unsafe impl Send for Staging {}
 
 pub(super) struct ImportedImage {
     pub(super) image: vk::Image,
@@ -319,6 +338,9 @@ impl Drop for VulkanImporter {
             state.imports.clear();
             state.import_order.clear();
             if let Some(s) = state.staging.take() {
+                if !s.mapped_ptr.is_null() {
+                    dev.unmap_memory(s.memory);
+                }
                 dev.destroy_buffer(s.buffer, None);
                 dev.free_memory(s.memory, None);
             }
