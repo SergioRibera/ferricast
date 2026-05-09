@@ -480,20 +480,20 @@ fn handle_process(
                 warn!("DmaBuf plane has invalid fd");
                 return;
             }
-            // Run the Vulkan readback HERE on the PW worker thread —
-            // not lazily on the encoder/segmenter thread via
-            // `frame.into_cpu()`. The two pieces of work used to run
-            // serially on the segmenter (readback ~5-10 ms + encode
-            // ~10-15 ms = ~20-25 ms / frame, capping us at ~40 fps);
-            // doing readback here lets PW thread blit-and-copy the
-            // next frame's pixels in parallel with the segmenter
-            // encoding the previous one, doubling effective fps.
+            // Pipelined Vulkan readback: submit *this* fd's blit on a
+            // free ring slot and take the bytes of the *previous*
+            // submission off another slot. The first call after
+            // startup or `reset_cache` returns `None` (nothing in
+            // flight yet) and we just drop the iteration; thereafter
+            // every callback sends one frame back. Net effect: the
+            // GPU blit for frame N+1 overlaps with the CPU memcpy of
+            // frame N, hiding the 12-30 ms blit cost behind the
+            // worker's own callback dispatch interval.
             //
             // Failures (lost device, OOM, bad modifier) are logged
             // and the frame is dropped — `handle_process` is
-            // best-effort by design (already drains stale buffers
-            // every tick).
-            match importer.import_and_readback(
+            // best-effort by design.
+            match importer.import_pipelined(
                 raw.fd as RawFd,
                 chunk_offset,
                 stride,
@@ -501,15 +501,22 @@ fn handle_process(
                 neg.width,
                 neg.height,
                 neg.pixel_format,
+                timestamp_us,
             ) {
-                Ok(bytes) => CapturedFrame::Cpu(RawFrame {
-                    width: neg.width,
-                    height: neg.height,
-                    stride,
-                    format: neg.pixel_format,
-                    data: bytes,
-                    timestamp_us,
+                Ok(Some(ready)) => CapturedFrame::Cpu(RawFrame {
+                    width: ready.width,
+                    height: ready.height,
+                    stride: ready.stride,
+                    format: ready.format,
+                    data: ready.bytes,
+                    timestamp_us: ready.timestamp_us,
                 }),
+                Ok(None) => {
+                    // Pipeline priming: the submit went out but
+                    // there's nothing to send back yet. We'll catch
+                    // the bytes on the next callback.
+                    return;
+                }
                 Err(e) => {
                     warn!(error = %e, "Vulkan readback failed on PW thread — frame dropped");
                     return;

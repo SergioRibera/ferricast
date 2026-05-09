@@ -24,4 +24,11 @@ cros-libva = { path = "../../vendor/cros-libva" }
 # build time, the libraries (libcuda.so, libnvidia-encode.so) are
 # dlopen'd at runtime. Missing libs cause `Encoder::new` to error
 # and the factory falls back through VA-API / x264.
-shiguredo_nvcodec = "2026.1.0"
+#
+# Vendored copy of shiguredo_nvcodec 2026.1.0 with the per-frame
+# `cu_mem_alloc` / `nvEncRegisterResource` / `nvEncCreateBitstreamBuffer`
+# pattern replaced by persistent allocations. Upstream's
+# `register_input_resource` is `pub(crate)` so we couldn't add this
+# from outside; the patch lives next to its callers in
+# `vendor/shiguredo_nvcodec/src/encode.rs` (search "ferricast patch").
+shiguredo_nvcodec = { path = "../../vendor/shiguredo_nvcodec" }

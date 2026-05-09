@@ -29,7 +29,8 @@ use ferricast_core::{FerricastError, PixelFormat, Result};
 use tracing::{trace, warn};
 
 use super::{
-    BufferId, ImportedImage, Inner, MAX_IMPORT_CACHE, Staging, State, format as fmt,
+    BufferId, ImportedImage, Inner, MAX_IMPORT_CACHE, PendingMeta, ReadyFrame, Slot, Staging,
+    State, format as fmt,
 };
 
 /// Resolve a dmabuf fd to its stable underlying buffer identity. All
@@ -50,7 +51,10 @@ fn buffer_id(fd: RawFd) -> std::io::Result<BufferId> {
     })
 }
 
-pub(super) fn run(
+/// Synchronous path: drain any in-flight pipelined work, then
+/// submit + wait + read on the next ring slot. Used by the
+/// `DmaBufImporter` trait.
+pub(super) fn run_sync(
     inner: &Inner,
     state: &mut State,
     fd: RawFd,
@@ -69,7 +73,10 @@ pub(super) fn run(
         return Err(FerricastError::Capture("vulkan: staging size is zero".into()));
     }
 
-    // 1. Look up / import the VkImage for this fd.
+    // Flush any pipelined submissions so we don't return their bytes
+    // mistakenly as ours, and so the slot we pick is free to reuse.
+    flush_pending(inner, state)?;
+
     let image = ensure_image(
         inner,
         state,
@@ -82,18 +89,188 @@ pub(super) fn run(
         vk_format,
     )?;
 
-    // 2. Make sure the staging buffer is large enough.
-    ensure_staging(inner, state, staging_size)?;
-    let staging = state.staging.as_ref().expect("ensure_staging populated it");
+    let slot_idx = state.next_slot_idx;
+    state.next_slot_idx = (slot_idx + 1) % state.slots.len();
 
-    // 3. Record + submit + wait.
-    record_and_submit(inner, state, image, staging, width, height, staging_size)?;
+    ensure_staging(inner, &mut state.slots[slot_idx], inner_memory_props(inner), staging_size)?;
+    let slot = &state.slots[slot_idx];
+    let staging = slot.staging.as_ref().expect("ensure_staging populated it");
 
-    // 4. Read out.
-    let bytes = readback(inner, staging, staging_size)?;
+    record_and_submit(inner, slot, image, staging, width, height, staging_size)?;
+    wait_and_reset_fence(inner, slot.fence)?;
+    let bytes = readback_from_staging(staging, staging_size);
 
     trace!(width, height, len = bytes.len(), "vulkan readback ok");
     Ok(bytes)
+}
+
+/// Pipelined path: submit a blit for `fd` to the next free ring slot
+/// and return the bytes (with original metadata) of the previously
+/// submitted frame, if any. The first call after startup or
+/// `reset_cache` returns `Ok(None)`; thereafter every call returns
+/// one frame back. PW worker thread uses this so GPU work for frame
+/// N+1 overlaps with the CPU memcpy of frame N.
+pub(super) fn run_pipelined(
+    inner: &Inner,
+    state: &mut State,
+    fd: RawFd,
+    plane_offset: u32,
+    plane_stride: u32,
+    modifier: u64,
+    width: u32,
+    height: u32,
+    vk_format: vk::Format,
+    pixel_format: PixelFormat,
+    timestamp_us: u64,
+) -> Result<Option<ReadyFrame>> {
+    let bpp = fmt::bytes_per_pixel(pixel_format)
+        .ok_or_else(|| FerricastError::Capture("vulkan: format has no bpp".into()))?;
+    let byte_size = (width as u64) * (height as u64) * (bpp as u64);
+    if byte_size == 0 {
+        return Err(FerricastError::Capture("vulkan: staging size is zero".into()));
+    }
+
+    // 1. Cache lookup / import for the new fd.
+    let image = ensure_image(
+        inner,
+        state,
+        fd,
+        plane_offset,
+        plane_stride,
+        modifier,
+        width,
+        height,
+        vk_format,
+    )?;
+
+    // 2. Pick the next ring slot. If it still has a pending blit
+    //    (ring full), drain *that* one as our return value before
+    //    overwriting it. Otherwise drain the oldest pending if any
+    //    so latency stays bounded at one ring step.
+    let slot_idx = state.next_slot_idx;
+    state.next_slot_idx = (slot_idx + 1) % state.slots.len();
+
+    let previous = if state.slots[slot_idx].pending_meta.is_some() {
+        // Slot we want to write to is still in flight from one or
+        // more rings ago. Drain and remove it from the pending
+        // queue so the index bookkeeping stays consistent.
+        if let Some(pos) = state.pending.iter().position(|&i| i == slot_idx) {
+            state.pending.remove(pos);
+        }
+        Some(drain_slot(inner, &mut state.slots[slot_idx])?)
+    } else if let Some(&oldest) = state.pending.front() {
+        state.pending.pop_front();
+        Some(drain_slot(inner, &mut state.slots[oldest])?)
+    } else {
+        None
+    };
+
+    // 3. Ensure the chosen slot has a big enough staging buffer.
+    ensure_staging(inner, &mut state.slots[slot_idx], inner_memory_props(inner), byte_size)?;
+    let slot = &state.slots[slot_idx];
+    let staging = slot.staging.as_ref().expect("ensure_staging populated it");
+
+    // 4. Record + submit on this slot. DO NOT wait — that's the
+    //    whole point of the ring. The next call (or `flush_pending`)
+    //    will wait on this slot's fence.
+    record_and_submit(inner, slot, image, staging, width, height, byte_size)?;
+
+    // 5. Mark the slot pending so the next ring step knows what to
+    //    rebuild when it drains.
+    let bgra_stride = (width as u64) * (bpp as u64);
+    state.slots[slot_idx].pending_meta = Some(PendingMeta {
+        width,
+        height,
+        stride: bgra_stride as u32,
+        format: pixel_format,
+        timestamp_us,
+        byte_size,
+    });
+    state.pending.push_back(slot_idx);
+
+    if let Some(prev) = &previous {
+        trace!(
+            width = prev.width,
+            height = prev.height,
+            len = prev.bytes.len(),
+            "vulkan pipelined readback ok"
+        );
+    }
+    Ok(previous)
+}
+
+/// Wait for every in-flight pipelined submission, dropping the bytes
+/// (we have no caller waiting on them in the sync path). Used to
+/// reset the ring before a synchronous submit so the slot we pick
+/// isn't still being read by the GPU.
+fn flush_pending(inner: &Inner, state: &mut State) -> Result<()> {
+    while let Some(slot_idx) = state.pending.pop_front() {
+        wait_and_reset_fence(inner, state.slots[slot_idx].fence)?;
+        state.slots[slot_idx].pending_meta = None;
+    }
+    Ok(())
+}
+
+/// Wait on the slot's fence, copy the staging bytes out, clear the
+/// pending marker. The bytes are wrapped with the slot's stored
+/// metadata so the caller can rebuild a `RawFrame`.
+fn drain_slot(inner: &Inner, slot: &mut Slot) -> Result<ReadyFrame> {
+    let meta = slot
+        .pending_meta
+        .take()
+        .ok_or_else(|| FerricastError::Capture("vulkan: drain_slot on idle slot".into()))?;
+    wait_and_reset_fence(inner, slot.fence)?;
+    let staging = slot
+        .staging
+        .as_ref()
+        .ok_or_else(|| FerricastError::Capture("vulkan: drain_slot with no staging".into()))?;
+    let bytes = readback_from_staging(staging, meta.byte_size);
+    Ok(ReadyFrame {
+        bytes,
+        width: meta.width,
+        height: meta.height,
+        stride: meta.stride,
+        format: meta.format,
+        timestamp_us: meta.timestamp_us,
+    })
+}
+
+fn wait_and_reset_fence(inner: &Inner, fence: vk::Fence) -> Result<()> {
+    unsafe {
+        inner
+            .device
+            .wait_for_fences(&[fence], true, u64::MAX)
+            .map_err(|e| FerricastError::Capture(format!("vk wait_for_fences: {e}")))?;
+        inner
+            .device
+            .reset_fences(&[fence])
+            .map_err(|e| FerricastError::Capture(format!("vk reset_fences: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Copy `size` bytes out of the persistently mapped staging into a
+/// fresh `Bytes`. Single CPU memcpy; the spec guarantees the GPU
+/// writes are visible to the host on a `HOST_COHERENT` memory type
+/// once the submission's fence has signalled.
+fn readback_from_staging(staging: &Staging, size: u64) -> Bytes {
+    // SAFETY: `size` ≤ `staging.capacity` (callers prove this via
+    // `ensure_staging(size)` directly above), and the mapping stays
+    // live for the entire lifetime of the `Staging`.
+    unsafe {
+        let slice = std::slice::from_raw_parts(staging.mapped_ptr as *const u8, size as usize);
+        Bytes::copy_from_slice(slice)
+    }
+}
+
+/// Borrow trick: `record_and_submit` needs the queue + queue family
+/// from `Inner` but takes the slot via `&Slot`, so we need a clean
+/// way to expose `memory_props` to `ensure_staging` without holding
+/// a borrow on `Inner` while also passing `&mut Slot`. This
+/// indirection just hands the props back; the alternative is
+/// passing `inner` everywhere, which is fine but more verbose.
+fn inner_memory_props(inner: &Inner) -> &vk::PhysicalDeviceMemoryProperties {
+    &inner.memory_props
 }
 
 /// Look up the cached `VkImage` for the dmabuf behind `fd`, or import
@@ -311,25 +488,32 @@ unsafe fn import_image(
     })
 }
 
-/// (Re)allocate the staging buffer if it doesn't exist or is too small.
-/// The new buffer is mapped once and stays mapped for its lifetime —
-/// `vkMapMemory` / `vkUnmapMemory` per frame are pure overhead on
-/// HOST_COHERENT memory (the spec explicitly permits leaving the
-/// mapping live across submits).
-fn ensure_staging(inner: &Inner, state: &mut State, size: u64) -> Result<()> {
-    if let Some(s) = &state.staging {
+/// (Re)allocate the slot's staging buffer if it doesn't exist or is
+/// too small. The new buffer is mapped once and stays mapped for
+/// its lifetime — `vkMapMemory` / `vkUnmapMemory` per frame are
+/// pure overhead on HOST_COHERENT memory (the spec explicitly
+/// permits leaving the mapping live across submits).
+fn ensure_staging(
+    inner: &Inner,
+    slot: &mut Slot,
+    memory_props: &vk::PhysicalDeviceMemoryProperties,
+    size: u64,
+) -> Result<()> {
+    if let Some(s) = &slot.staging {
         if s.capacity >= size {
             return Ok(());
         }
-        // Old buffer too small. Wait for any pending GPU op then
+        // Old buffer too small. Wait on this slot's fence so the GPU
+        // isn't writing into the buffer we're about to free, then
         // tear it down (unmap before free).
         unsafe {
-            let _ = inner.device.device_wait_idle();
+            let _ = inner.device.wait_for_fences(&[slot.fence], true, u64::MAX);
+            let _ = inner.device.reset_fences(&[slot.fence]);
             inner.device.unmap_memory(s.memory);
             inner.device.destroy_buffer(s.buffer, None);
             inner.device.free_memory(s.memory, None);
         }
-        state.staging = None;
+        slot.staging = None;
     }
 
     let buffer_info = vk::BufferCreateInfo::default()
@@ -341,7 +525,7 @@ fn ensure_staging(inner: &Inner, state: &mut State, size: u64) -> Result<()> {
 
     let reqs = unsafe { inner.device.get_buffer_memory_requirements(buffer) };
     let memory_type = pick_memory_type(
-        &inner.memory_props,
+        memory_props,
         reqs.memory_type_bits,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )
@@ -380,7 +564,7 @@ fn ensure_staging(inner: &Inner, state: &mut State, size: u64) -> Result<()> {
         FerricastError::Capture(format!("vk map_memory (staging): {e}"))
     })? as *mut u8;
 
-    state.staging = Some(Staging {
+    slot.staging = Some(Staging {
         buffer,
         memory,
         capacity: reqs.size,
@@ -390,18 +574,20 @@ fn ensure_staging(inner: &Inner, state: &mut State, size: u64) -> Result<()> {
 }
 
 /// Record the per-frame command buffer (acquire-from-foreign barrier
-/// + image-to-buffer copy + host-read barrier), submit, wait on the
-/// fence and reset both for the next iteration.
+/// + image-to-buffer copy + host-read barrier) and submit it on
+/// `slot`'s fence. Does NOT wait — that's the caller's job (and the
+/// reason for the ring: the wait happens on the *next* iteration so
+/// the GPU and CPU overlap).
 fn record_and_submit(
     inner: &Inner,
-    state: &State,
+    slot: &Slot,
     image: vk::Image,
     staging: &Staging,
     width: u32,
     height: u32,
     staging_size: u64,
 ) -> Result<()> {
-    let cmd = state.command_buffer;
+    let cmd = slot.command_buffer;
     let device = &inner.device;
 
     unsafe {
@@ -485,32 +671,11 @@ fn record_and_submit(
         let cmd_buffers = [cmd];
         let submit = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
         device
-            .queue_submit(inner.queue, &[submit], state.fence)
+            .queue_submit(inner.queue, &[submit], slot.fence)
             .map_err(|e| FerricastError::Capture(format!("vk queue_submit: {e}")))?;
-
-        device
-            .wait_for_fences(&[state.fence], true, u64::MAX)
-            .map_err(|e| FerricastError::Capture(format!("vk wait_for_fences: {e}")))?;
-        device
-            .reset_fences(&[state.fence])
-            .map_err(|e| FerricastError::Capture(format!("vk reset_fences: {e}")))?;
     }
 
     Ok(())
-}
-
-fn readback(_inner: &Inner, staging: &Staging, size: u64) -> Result<Bytes> {
-    // Staging memory is persistently mapped at allocation time; the
-    // pointer is valid until the buffer is destroyed in
-    // `ensure_staging` or in the importer's `Drop`. SAFETY: `size`
-    // never exceeds `staging.capacity` (the caller proves this via
-    // `ensure_staging(size)` directly above), so the slice stays
-    // inside the mapped region. Access is single-threaded under the
-    // importer's `Mutex<State>`.
-    unsafe {
-        let slice = std::slice::from_raw_parts(staging.mapped_ptr as *const u8, size as usize);
-        Ok(Bytes::copy_from_slice(slice))
-    }
 }
 
 fn pick_memory_type(

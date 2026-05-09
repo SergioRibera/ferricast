@@ -218,11 +218,11 @@ async fn next_paced_frame<S>(
 where
     S: ScreenCapture + Send,
 {
-    let frame = match timeout(frame_period, capture.next_frame()).await {
+    let (frame, kind) = match timeout(frame_period, capture.next_frame()).await {
         Ok(res) => {
             let f = res?;
             *last_frame = Some(f.clone());
-            f
+            (f, "real")
         }
         Err(_) => {
             // Period elapsed without a fresh frame. If we have a
@@ -233,17 +233,17 @@ where
             match last_frame.as_mut() {
                 Some(stored) => {
                     bump_timestamp_us(stored, frame_period_us);
-                    stored.clone()
+                    (stored.clone(), "dup")
                 }
                 None => {
                     let f = capture.next_frame().await?;
                     *last_frame = Some(f.clone());
-                    f
+                    (f, "real")
                 }
             }
         }
     };
-    record_frame_dt(last_frame_at);
+    record_frame_dt(last_frame_at, kind);
     Ok(frame)
 }
 
@@ -254,10 +254,17 @@ fn bump_timestamp_us(frame: &mut CapturedFrame, delta_us: u64) {
     }
 }
 
-fn record_frame_dt(last: &mut Option<Instant>) {
+/// Records inter-frame wallclock spacing tagged with whether the
+/// frame was a fresh capture (`"real"`) or a pace-pad copy of the
+/// previous one (`"dup"`). Useful for spotting capture-side stalls
+/// vs encoder-side throughput limits at a glance — e.g. a long run
+/// of `kind="dup"` means the encoder/PW pipeline can't keep up with
+/// `target_fps`, while a cluster of `kind="real"` with low `dt_ms`
+/// means PW is delivering bursts.
+fn record_frame_dt(last: &mut Option<Instant>, kind: &'static str) {
     let now = Instant::now();
     if let Some(prev) = *last {
-        debug!(dt_ms = (now - prev).as_millis() as u64, "frame");
+        debug!(dt_ms = (now - prev).as_millis() as u64, kind, "frame");
     }
     *last = Some(now);
 }
