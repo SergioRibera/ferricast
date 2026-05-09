@@ -59,25 +59,26 @@ where
         Duration::from_secs_f64(1.0 / (config.target_fps.max(1) as f64));
     let frame_period_us = frame_period.as_micros() as u64;
 
-    // Synthetic monotonic playback timestamp, in microseconds, fed
-    // to the muxer in place of the encoder's wall-clock timestamp.
+    // Wall-clock PTS anchor. The very first frame we push sets this
+    // to `Instant::now()`; every later frame's PTS is `now - anchor`
+    // microseconds rescaled to the MPEG-TS 90 kHz field.
     //
-    // We deliberately ignore `EncodedFrame::timestamp_us` here:
+    // Why not a synthetic `frame_count * frame_period_us` counter:
+    // each segment takes ~2.04-2.06 s of wall clock to produce
+    // (capture + encode + force-IDR overhead) but a synthetic
+    // 60 fps counter stamps it with PTS span = exactly 2.000 s.
+    // The player paces consumption by PTS, so it consumes 2.000 s
+    // per segment of wall clock while we produce 2.04 s — ~50 ms
+    // of drift per segment that cumulatively pushed the player
+    // past the ring's eviction line every few minutes (ffplay:
+    // "expired from playlists" → "Packet corrupt"). Wall-clock
+    // PTS makes production wall = consumption wall by
+    // construction; no drift, ring window doesn't need to absorb
+    // anything.
     //
-    // * Pace-padded duplicate frames are stamped by the segmenter
-    //   with `last_real_ts + N * frame_period`, while real frames
-    //   coming back from the PW worker carry `now_us()` from PW
-    //   capture time. After a capture stall the wall clock jumps
-    //   forward by the stall duration — feeding that raw to the
-    //   muxer produces a PTS discontinuity that decoders display
-    //   as a sudden "catch-up jump".
-    // * A monotonic counter at exactly `frame_period` ticks
-    //   guarantees a smooth playback timeline regardless of the
-    //   capture-side clock. The 33-bit MPEG-TS PTS field has
-    //   ~26.5 h of runway at 60 fps before wrap, plenty for a
-    //   live stream.
-    let mut pts_us: u64 = 0;
-    let frame_period_us_step = frame_period_us;
+    // `Instant` is monotonic so PTS is too. The 33-bit MPEG-TS
+    // PTS field has ~26.5 h of runway at 60 fps before wrap.
+    let mut pts_anchor: Option<Instant> = None;
 
     // Keyframe carried over from the previous segment. The boundary
     // detector consumes one keyframe to know "the new segment starts
@@ -136,8 +137,7 @@ where
 
         let started = Instant::now();
         let mut requested_idr = false;
-        push_frame(&mut muxer, &first, pts_us)?;
-        pts_us = pts_us.saturating_add(frame_period_us_step);
+        push_frame(&mut muxer, &first, &mut pts_anchor)?;
 
         // Continue pulling frames until we see another keyframe past
         // the target duration. Once we've crossed the target, ask
@@ -172,8 +172,7 @@ where
                 pending = Some(encoded);
                 break;
             }
-            push_frame(&mut muxer, &encoded, pts_us)?;
-            pts_us = pts_us.saturating_add(frame_period_us_step);
+            push_frame(&mut muxer, &encoded, &mut pts_anchor)?;
         }
 
         let elapsed = started.elapsed();
@@ -272,13 +271,21 @@ fn record_frame_dt(last: &mut Option<Instant>, kind: &'static str) {
 fn push_frame(
     muxer: &mut MpegTs,
     encoded: &EncodedFrame,
-    pts_us: u64,
+    anchor: &mut Option<Instant>,
 ) -> Result<(), FerricastError> {
-    // PTS in MPEG-TS 90 kHz units. The synthetic monotonic clock is
-    // already in microseconds, so the conversion is just a rescale —
-    // and saturating so a clock that's been running for ages
-    // doesn't panic on overflow before the spec's 33-bit field
-    // wraps.
+    // Wall-clock PTS: the very first push sets `anchor` to
+    // `Instant::now()` so frame 0 lands at PTS≈0; every later push
+    // takes `now - anchor` microseconds. `Instant` is monotonic so
+    // PTS is too. Conversion to 90 kHz with saturating math (the
+    // 33-bit field has ~26.5 h of runway before wrapping anyway).
+    let now = Instant::now();
+    let pts_us = match *anchor {
+        Some(start) => now.saturating_duration_since(start).as_micros() as u64,
+        None => {
+            *anchor = Some(now);
+            0
+        }
+    };
     let pts_90k = pts_us.saturating_mul(9) / 100;
     // Baseline H.264 has no B-frames → DTS == PTS.
     muxer.add_frame(encoded, pts_90k, pts_90k)
