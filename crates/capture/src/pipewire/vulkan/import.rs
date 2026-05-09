@@ -128,13 +128,24 @@ fn import_image(
     vk_format: vk::Format,
 ) -> Result<ImportedImage> {
     let plane_count = planes.len();
-    let disjoint = plane_count > 1;
+    // DISJOINT is only required when the memory planes live in
+    // genuinely separate dmabufs. The common multi-plane case
+    // (notably AMD GFX9+ DCC retile) packs main + metadata into a
+    // single dmabuf at different offsets — PipeWire reports the same
+    // fd across every Data entry — and that case must use the
+    // non-disjoint path with a single `VkDeviceMemory` plus all plane
+    // layouts. Using DISJOINT here would import the same fd N times,
+    // each as its own `VkDeviceMemory`, which radv (Mesa's AMD
+    // driver) handles by segfaulting on bind.
+    let first_fd = planes[0].fd;
+    let disjoint = !planes.iter().all(|p| p.fd == first_fd);
 
-    // Dup every fd up front. If anything below fails we close them
-    // via `OwnedFdGuard::Drop`; on success we mark them handed off.
-    let mut fd_guards: Vec<OwnedFdGuard> = Vec::with_capacity(plane_count);
-    for p in planes {
-        let dup_fd = unsafe { libc::dup(p.fd) };
+    // Dup every fd we'll actually import. Non-disjoint only needs
+    // one (the rest are aliases). Disjoint needs one per plane.
+    let import_count = if disjoint { plane_count } else { 1 };
+    let mut fd_guards: Vec<OwnedFdGuard> = Vec::with_capacity(import_count);
+    for i in 0..import_count {
+        let dup_fd = unsafe { libc::dup(planes[i].fd) };
         if dup_fd < 0 {
             return Err(FerricastError::Capture(format!(
                 "dup(dmabuf fd): {}",
@@ -202,21 +213,34 @@ fn import_image(
     })
 }
 
-/// Allocate one `VkDeviceMemory` per plane (importing the dup'd fd)
-/// and bind it to the image. Single-plane uses the classic
-/// `vkBindImageMemory`; multi-plane uses `vkBindImageMemory2` with
-/// `VkBindImagePlaneMemoryInfo` per plane and the image must have
-/// been created with `VK_IMAGE_CREATE_DISJOINT_BIT`.
+/// Allocate `VkDeviceMemory` for the image and bind it.
+///
+/// Two regimes:
+/// * **Single allocation, non-disjoint** (`fd_guards.len() == 1`): one
+///   `vkAllocateMemory` importing the (only) dmabuf fd, sized to the
+///   whole-image memory requirements, bound via `vkBindImageMemory`.
+///   Used for single-plane images and for multi-plane images where
+///   every plane lives in the same dmabuf (AMD GFX9+ DCC retile is
+///   the canonical case).
+/// * **One allocation per memory plane, disjoint**
+///   (`fd_guards.len() > 1`): per-plane requirements via
+///   `VkImagePlaneMemoryRequirementsInfo`, per-plane `vkAllocateMemory`
+///   importing the corresponding dmabuf fd, all bound in a single
+///   `vkBindImageMemory2` call with `VkBindImagePlaneMemoryInfo`. The
+///   image must have been created with `VK_IMAGE_CREATE_DISJOINT_BIT`.
+///   `VkMemoryDedicatedAllocateInfo` is intentionally NOT chained in
+///   the disjoint path — VUID-VkMemoryDedicatedAllocateInfo-image-01797
+///   forbids it for disjoint images and radv crashes outright when
+///   it's set.
 fn allocate_and_bind(
     inner: &Inner,
     image: vk::Image,
     fd_guards: &mut [OwnedFdGuard],
     disjoint: bool,
 ) -> Result<Vec<vk::DeviceMemory>> {
-    let plane_count = fd_guards.len();
-    let mut memories: Vec<vk::DeviceMemory> = Vec::with_capacity(plane_count);
+    let import_count = fd_guards.len();
+    let mut memories: Vec<vk::DeviceMemory> = Vec::with_capacity(import_count);
 
-    // Free any successful allocations so far on partial failure.
     let cleanup = |inner: &Inner, mems: &[vk::DeviceMemory]| unsafe {
         for m in mems {
             inner.device.free_memory(*m, None);
@@ -224,9 +248,6 @@ fn allocate_and_bind(
     };
 
     for (i, fd_guard) in fd_guards.iter_mut().enumerate() {
-        // Get this plane's memory requirements. The disjoint case
-        // needs `VkImagePlaneMemoryRequirementsInfo` chained in to
-        // tell Vulkan which plane we're asking about.
         let mut plane_info = vk::ImagePlaneMemoryRequirementsInfo::default()
             .plane_aspect(MEMORY_PLANE_ASPECTS[i]);
         let mut info = vk::ImageMemoryRequirementsInfo2::default().image(image);
@@ -252,7 +273,7 @@ fn allocate_and_bind(
         if let Err(e) = res {
             cleanup(inner, &memories);
             return Err(FerricastError::Capture(format!(
-                "vk get_memory_fd_properties (plane {i}): {e}"
+                "vk get_memory_fd_properties (alloc {i}): {e}"
             )));
         }
 
@@ -264,7 +285,7 @@ fn allocate_and_bind(
         let Some(memory_type_index) = memory_type_index else {
             cleanup(inner, &memories);
             return Err(FerricastError::Capture(format!(
-                "vk: no memory type matches dmabuf import constraints (plane {i})"
+                "vk: no memory type matches dmabuf import constraints (alloc {i})"
             )));
         };
 
@@ -272,18 +293,22 @@ fn allocate_and_bind(
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
             .fd(fd_guard.raw());
         let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
-        let alloc_info = vk::MemoryAllocateInfo::default()
+        let mut alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(reqs.memory_requirements.size)
             .memory_type_index(memory_type_index)
-            .push_next(&mut dedicated)
             .push_next(&mut import_info);
+        // Dedicated allocation is only legal (and useful) for the
+        // single-allocation path.
+        if !disjoint {
+            alloc_info = alloc_info.push_next(&mut dedicated);
+        }
 
         let memory = match unsafe { inner.device.allocate_memory(&alloc_info, None) } {
             Ok(m) => m,
             Err(e) => {
                 cleanup(inner, &memories);
                 return Err(FerricastError::Capture(format!(
-                    "vk allocate_memory(import) (plane {i}): {e}"
+                    "vk allocate_memory(import) (alloc {i}): {e}"
                 )));
             }
         };
@@ -291,15 +316,10 @@ fn allocate_and_bind(
         memories.push(memory);
     }
 
-    // Bind. Single plane: classic `vkBindImageMemory`. Multi-plane:
-    // `vkBindImageMemory2` with one `VkBindImagePlaneMemoryInfo` per
-    // plane chained into the corresponding `VkBindImageMemoryInfo`.
     if disjoint {
-        // Two parallel storage Vecs that outlive the bind call. Each
-        // `BindImageMemoryInfo` carries a raw `p_next` pointer into
-        // `plane_infos`; the borrow checker can't track this through
-        // FFI so we keep both Vecs in scope until after the call.
-        let mut plane_infos: Vec<vk::BindImagePlaneMemoryInfo<'_>> = (0..plane_count)
+        // One BindImagePlaneMemoryInfo per plane chained into a
+        // BindImageMemoryInfo; submit all in a single bind2 call.
+        let mut plane_infos: Vec<vk::BindImagePlaneMemoryInfo<'_>> = (0..import_count)
             .map(|i| vk::BindImagePlaneMemoryInfo::default().plane_aspect(MEMORY_PLANE_ASPECTS[i]))
             .collect();
 
