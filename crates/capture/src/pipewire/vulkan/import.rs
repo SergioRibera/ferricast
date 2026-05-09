@@ -2,39 +2,48 @@
 //!
 //! Hot-path layout:
 //!
-//! 1. Look up the dmabuf fd in [`State::imports`]. If it's there with
-//!    matching dimensions / modifier, reuse the `VkImage` — the
-//!    expensive `vkAllocateMemory(import)` + `vkBindImageMemory`
-//!    already paid for it on the first frame.
-//! 2. If not cached: dup the fd (Vulkan takes ownership of the dup),
-//!    create a fresh `VkImage` with the explicit modifier layout,
-//!    import the memory, bind, store in the cache.
+//! 1. Look up the dmabuf in [`State::imports`] (keyed by the first
+//!    plane's fd). If it's there with matching dimensions / modifier
+//!    / plane count, reuse the `VkImage` — the expensive
+//!    `vkAllocateMemory(import)` + `vkBindImageMemory` already paid
+//!    for it on the first frame.
+//! 2. If not cached: dup the fds (Vulkan takes ownership of the dups),
+//!    create a fresh `VkImage` with explicit per-plane modifier
+//!    layouts, import each plane's memory, bind, store in the cache.
+//!    Multi-plane modifiers (e.g. AMD GFX9+ DCC retile) use
+//!    `VK_IMAGE_CREATE_DISJOINT_BIT` and bind one allocation per
+//!    plane via `VkBindImagePlaneMemoryInfo`. Single-plane modifiers
+//!    use the simpler non-disjoint binding.
 //! 3. Ensure the persistent staging buffer is at least
 //!    `width * height * bpp` bytes; recreate larger if needed.
 //! 4. Reset the cached command buffer + fence, record
 //!    `vkCmdCopyImageToBuffer`, submit and wait.
 //! 5. Map the staging memory, `Bytes::copy_from_slice` to a packed
 //!    linear copy, unmap.
-//!
-//! Steady-state cost is dominated by the GPU blit + the host copy
-//! out — orders of magnitude cheaper than the per-frame
-//! create/destroy pattern this replaced.
 
 use std::os::fd::RawFd;
 
 use ash::vk;
 use bytes::Bytes;
-use ferricast_core::{FerricastError, PixelFormat, Result};
+use ferricast_core::{DmaBufPlane, FerricastError, PixelFormat, Result};
 use tracing::{trace, warn};
 
 use super::{format as fmt, ImportedImage, Inner, Staging, State};
 
+/// Memory plane aspect bits for `VkBindImagePlaneMemoryInfo`. The
+/// modifier extension defines four memory-plane aspects; we index
+/// them by plane number.
+const MEMORY_PLANE_ASPECTS: [vk::ImageAspectFlags; 4] = [
+    vk::ImageAspectFlags::MEMORY_PLANE_0_EXT,
+    vk::ImageAspectFlags::MEMORY_PLANE_1_EXT,
+    vk::ImageAspectFlags::MEMORY_PLANE_2_EXT,
+    vk::ImageAspectFlags::MEMORY_PLANE_3_EXT,
+];
+
 pub(super) fn run(
     inner: &Inner,
     state: &mut State,
-    fd: RawFd,
-    plane_offset: u32,
-    plane_stride: u32,
+    planes: &[DmaBufPlane],
     modifier: u64,
     width: u32,
     height: u32,
@@ -47,52 +56,48 @@ pub(super) fn run(
     if staging_size == 0 {
         return Err(FerricastError::Capture("vulkan: staging size is zero".into()));
     }
+    if planes.is_empty() {
+        return Err(FerricastError::Capture("vulkan: zero planes".into()));
+    }
+    if planes.len() > MEMORY_PLANE_ASPECTS.len() {
+        return Err(FerricastError::Capture(format!(
+            "vulkan: dmabuf has {} planes, only {} supported",
+            planes.len(),
+            MEMORY_PLANE_ASPECTS.len()
+        )));
+    }
 
-    // 1. Look up / import the VkImage for this fd.
-    let image = ensure_image(
-        inner,
-        state,
-        fd,
-        plane_offset,
-        plane_stride,
-        modifier,
-        width,
-        height,
-        vk_format,
-    )?;
-
-    // 2. Make sure the staging buffer is large enough.
+    let image = ensure_image(inner, state, planes, modifier, width, height, vk_format)?;
     ensure_staging(inner, state, staging_size)?;
     let staging = state.staging.as_ref().expect("ensure_staging populated it");
-
-    // 3. Record + submit + wait.
     record_and_submit(inner, state, image, staging, width, height, staging_size)?;
-
-    // 4. Read out.
     let bytes = readback(inner, staging, staging_size)?;
 
     trace!(width, height, len = bytes.len(), "vulkan readback ok");
     Ok(bytes)
 }
 
-/// Look up the cached `VkImage` for the given dmabuf fd, or import a
-/// fresh one and stash it.
+/// Look up the cached `VkImage` for the given dmabuf, or import a
+/// fresh one and stash it. Cache key is the first plane's fd —
+/// PipeWire reuses fds within a negotiation cycle and never aliases
+/// distinct buffers under the same first-plane fd.
 fn ensure_image(
     inner: &Inner,
     state: &mut State,
-    fd: RawFd,
-    plane_offset: u32,
-    plane_stride: u32,
+    planes: &[DmaBufPlane],
     modifier: u64,
     width: u32,
     height: u32,
     vk_format: vk::Format,
 ) -> Result<vk::Image> {
-    if let Some(existing) = state.imports.get(&fd) {
+    let key = planes[0].fd;
+
+    if let Some(existing) = state.imports.get(&key) {
         if existing.width == width
             && existing.height == height
             && existing.format == vk_format
             && existing.modifier == modifier
+            && existing.plane_count as usize == planes.len()
         {
             return Ok(existing.image);
         }
@@ -101,53 +106,52 @@ fn ensure_image(
         unsafe {
             let _ = inner.device.device_wait_idle();
             inner.device.destroy_image(existing.image, None);
-            inner.device.free_memory(existing.memory, None);
+            for mem in &existing.memories {
+                inner.device.free_memory(*mem, None);
+            }
         }
-        state.imports.remove(&fd);
+        state.imports.remove(&key);
     }
 
-    // Import: dup the fd (Vulkan owns the dup; PipeWire keeps the
-    // original).
-    let dup_fd = unsafe { libc::dup(fd) };
-    if dup_fd < 0 {
-        return Err(FerricastError::Capture(format!(
-            "dup(dmabuf fd): {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let mut fd_guard = OwnedFdGuard::new(dup_fd);
-
-    let imported = unsafe {
-        import_image(
-            inner,
-            &mut fd_guard,
-            plane_offset,
-            plane_stride,
-            modifier,
-            width,
-            height,
-            vk_format,
-        )?
-    };
-    state.imports.insert(fd, imported);
-    Ok(state.imports.get(&fd).unwrap().image)
+    let imported = import_image(inner, planes, modifier, width, height, vk_format)?;
+    state.imports.insert(key, imported);
+    Ok(state.imports.get(&key).unwrap().image)
 }
 
-/// SAFETY: `fd_guard` owns a valid duped dmabuf fd. On success the
-/// fd ownership transfers to Vulkan (we mark it `forget`).
-unsafe fn import_image(
+/// Build the `VkImage` and import every plane's memory.
+fn import_image(
     inner: &Inner,
-    fd_guard: &mut OwnedFdGuard,
-    plane_offset: u32,
-    plane_stride: u32,
+    planes: &[DmaBufPlane],
     modifier: u64,
     width: u32,
     height: u32,
     vk_format: vk::Format,
 ) -> Result<ImportedImage> {
-    let plane_layouts = [vk::SubresourceLayout::default()
-        .offset(plane_offset as u64)
-        .row_pitch(plane_stride as u64)];
+    let plane_count = planes.len();
+    let disjoint = plane_count > 1;
+
+    // Dup every fd up front. If anything below fails we close them
+    // via `OwnedFdGuard::Drop`; on success we mark them handed off.
+    let mut fd_guards: Vec<OwnedFdGuard> = Vec::with_capacity(plane_count);
+    for p in planes {
+        let dup_fd = unsafe { libc::dup(p.fd) };
+        if dup_fd < 0 {
+            return Err(FerricastError::Capture(format!(
+                "dup(dmabuf fd): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        fd_guards.push(OwnedFdGuard::new(dup_fd));
+    }
+
+    let plane_layouts: Vec<vk::SubresourceLayout> = planes
+        .iter()
+        .map(|p| {
+            vk::SubresourceLayout::default()
+                .offset(p.offset as u64)
+                .row_pitch(p.stride as u64)
+        })
+        .collect();
 
     let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
         .drm_format_modifier(modifier)
@@ -156,7 +160,13 @@ unsafe fn import_image(
     let mut external = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
 
+    let mut flags = vk::ImageCreateFlags::empty();
+    if disjoint {
+        flags |= vk::ImageCreateFlags::DISJOINT;
+    }
+
     let image_info = vk::ImageCreateInfo::default()
+        .flags(flags)
         .image_type(vk::ImageType::TYPE_2D)
         .format(vk_format)
         .extent(vk::Extent3D { width, height, depth: 1 })
@@ -170,89 +180,160 @@ unsafe fn import_image(
         .push_next(&mut external)
         .push_next(&mut explicit);
 
-    let image = unsafe {
-        inner
-            .device
-            .create_image(&image_info, None)
-            .map_err(|e| FerricastError::Capture(format!("vk create_image: {e}")))?
+    let image = unsafe { inner.device.create_image(&image_info, None) }
+        .map_err(|e| FerricastError::Capture(format!("vk create_image: {e}")))?;
+
+    let memories = match allocate_and_bind(inner, image, &mut fd_guards, disjoint) {
+        Ok(m) => m,
+        Err(e) => {
+            unsafe { inner.device.destroy_image(image, None) };
+            return Err(e);
+        }
     };
 
-    let mut mem_reqs = vk::MemoryRequirements2::default();
-    unsafe {
-        inner.device.get_image_memory_requirements2(
-            &vk::ImageMemoryRequirementsInfo2::default().image(image),
-            &mut mem_reqs,
+    Ok(ImportedImage {
+        image,
+        memories,
+        width,
+        height,
+        format: vk_format,
+        modifier,
+        plane_count: plane_count as u32,
+    })
+}
+
+/// Allocate one `VkDeviceMemory` per plane (importing the dup'd fd)
+/// and bind it to the image. Single-plane uses the classic
+/// `vkBindImageMemory`; multi-plane uses `vkBindImageMemory2` with
+/// `VkBindImagePlaneMemoryInfo` per plane and the image must have
+/// been created with `VK_IMAGE_CREATE_DISJOINT_BIT`.
+fn allocate_and_bind(
+    inner: &Inner,
+    image: vk::Image,
+    fd_guards: &mut [OwnedFdGuard],
+    disjoint: bool,
+) -> Result<Vec<vk::DeviceMemory>> {
+    let plane_count = fd_guards.len();
+    let mut memories: Vec<vk::DeviceMemory> = Vec::with_capacity(plane_count);
+
+    // Free any successful allocations so far on partial failure.
+    let cleanup = |inner: &Inner, mems: &[vk::DeviceMemory]| unsafe {
+        for m in mems {
+            inner.device.free_memory(*m, None);
+        }
+    };
+
+    for (i, fd_guard) in fd_guards.iter_mut().enumerate() {
+        // Get this plane's memory requirements. The disjoint case
+        // needs `VkImagePlaneMemoryRequirementsInfo` chained in to
+        // tell Vulkan which plane we're asking about.
+        let mut plane_info = vk::ImagePlaneMemoryRequirementsInfo::default()
+            .plane_aspect(MEMORY_PLANE_ASPECTS[i]);
+        let mut info = vk::ImageMemoryRequirementsInfo2::default().image(image);
+        if disjoint {
+            info = info.push_next(&mut plane_info);
+        }
+
+        let mut reqs = vk::MemoryRequirements2::default();
+        unsafe {
+            inner
+                .device
+                .get_image_memory_requirements2(&info, &mut reqs);
+        }
+
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        let res = unsafe {
+            inner.external_memory_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                fd_guard.raw(),
+                &mut fd_props,
+            )
+        };
+        if let Err(e) = res {
+            cleanup(inner, &memories);
+            return Err(FerricastError::Capture(format!(
+                "vk get_memory_fd_properties (plane {i}): {e}"
+            )));
+        }
+
+        let memory_type_index = pick_memory_type(
+            &inner.memory_props,
+            reqs.memory_requirements.memory_type_bits & fd_props.memory_type_bits,
+            vk::MemoryPropertyFlags::empty(),
         );
-    }
+        let Some(memory_type_index) = memory_type_index else {
+            cleanup(inner, &memories);
+            return Err(FerricastError::Capture(format!(
+                "vk: no memory type matches dmabuf import constraints (plane {i})"
+            )));
+        };
 
-    let mut fd_props = vk::MemoryFdPropertiesKHR::default();
-    let res = unsafe {
-        inner.external_memory_fd.get_memory_fd_properties(
-            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-            fd_guard.raw(),
-            &mut fd_props,
-        )
-    };
-    if let Err(e) = res {
-        unsafe { inner.device.destroy_image(image, None) };
-        return Err(FerricastError::Capture(format!(
-            "vk get_memory_fd_properties: {e}"
-        )));
-    }
+        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(fd_guard.raw());
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.memory_requirements.size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut dedicated)
+            .push_next(&mut import_info);
 
-    let memory_type_index = pick_memory_type(
-        &inner.memory_props,
-        mem_reqs.memory_requirements.memory_type_bits & fd_props.memory_type_bits,
-        vk::MemoryPropertyFlags::empty(),
-    );
-    let Some(memory_type_index) = memory_type_index else {
-        unsafe { inner.device.destroy_image(image, None) };
-        return Err(FerricastError::Capture(
-            "vk: no memory type matches dmabuf import constraints".into(),
-        ));
-    };
-
-    let mut import_info = vk::ImportMemoryFdInfoKHR::default()
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-        .fd(fd_guard.raw());
-    let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(mem_reqs.memory_requirements.size)
-        .memory_type_index(memory_type_index)
-        .push_next(&mut dedicated)
-        .push_next(&mut import_info);
-
-    let memory = unsafe {
-        match inner.device.allocate_memory(&alloc_info, None) {
+        let memory = match unsafe { inner.device.allocate_memory(&alloc_info, None) } {
             Ok(m) => m,
             Err(e) => {
-                inner.device.destroy_image(image, None);
+                cleanup(inner, &memories);
                 return Err(FerricastError::Capture(format!(
-                    "vk allocate_memory(import): {e}"
+                    "vk allocate_memory(import) (plane {i}): {e}"
                 )));
             }
-        }
-    };
-    fd_guard.forget(); // Vulkan now owns the fd.
+        };
+        fd_guard.forget(); // Vulkan now owns the dup'd fd.
+        memories.push(memory);
+    }
 
-    if let Err(e) = unsafe { inner.device.bind_image_memory(image, memory, 0) } {
-        unsafe {
-            inner.device.free_memory(memory, None);
-            inner.device.destroy_image(image, None);
+    // Bind. Single plane: classic `vkBindImageMemory`. Multi-plane:
+    // `vkBindImageMemory2` with one `VkBindImagePlaneMemoryInfo` per
+    // plane chained into the corresponding `VkBindImageMemoryInfo`.
+    if disjoint {
+        // Two parallel storage Vecs that outlive the bind call. Each
+        // `BindImageMemoryInfo` carries a raw `p_next` pointer into
+        // `plane_infos`; the borrow checker can't track this through
+        // FFI so we keep both Vecs in scope until after the call.
+        let mut plane_infos: Vec<vk::BindImagePlaneMemoryInfo<'_>> = (0..plane_count)
+            .map(|i| vk::BindImagePlaneMemoryInfo::default().plane_aspect(MEMORY_PLANE_ASPECTS[i]))
+            .collect();
+
+        let binds: Vec<vk::BindImageMemoryInfo<'_>> = memories
+            .iter()
+            .zip(plane_infos.iter_mut())
+            .map(|(mem, plane_info)| {
+                vk::BindImageMemoryInfo::default()
+                    .image(image)
+                    .memory(*mem)
+                    .memory_offset(0)
+                    .push_next(plane_info)
+            })
+            .collect();
+
+        let res = unsafe { inner.device.bind_image_memory2(&binds) };
+        // Keep `binds` (and the `plane_infos` it borrows from) alive
+        // across the FFI call.
+        drop(binds);
+        drop(plane_infos);
+        if let Err(e) = res {
+            cleanup(inner, &memories);
+            return Err(FerricastError::Capture(format!(
+                "vk bind_image_memory2 (disjoint): {e}"
+            )));
         }
+    } else if let Err(e) = unsafe { inner.device.bind_image_memory(image, memories[0], 0) } {
+        cleanup(inner, &memories);
         return Err(FerricastError::Capture(format!(
             "vk bind_image_memory: {e}"
         )));
     }
 
-    Ok(ImportedImage {
-        image,
-        memory,
-        width,
-        height,
-        format: vk_format,
-        modifier,
-    })
+    Ok(memories)
 }
 
 /// (Re)allocate the staging buffer if it doesn't exist or is too small.

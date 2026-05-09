@@ -182,12 +182,15 @@ fn run(
         Some(imp) => format::SUPPORTED_FORMATS
             .iter()
             .filter_map(|f| {
-                let mods = imp.supported_modifiers(*f);
-                if mods.is_empty() {
+                let caps = imp.supported_modifiers(*f);
+                if caps.is_empty() {
                     None
                 } else {
-                    debug!(format = ?f, modifiers = mods.len(), "GPU format supported");
-                    Some(GpuFormat { format: *f, modifiers: mods })
+                    debug!(format = ?f, modifiers = caps.len(), "GPU format supported");
+                    Some(GpuFormat {
+                        format: *f,
+                        modifiers: caps.into_iter().map(|c| c.modifier).collect(),
+                    })
                 }
             })
             .collect(),
@@ -372,18 +375,18 @@ fn handle_process(
 
     let datas = buffer.datas_mut();
     let plane_count = datas.len();
-    let Some(plane) = datas.first_mut() else {
+    let Some(first) = datas.first() else {
         warn!("PipeWire buffer had no data planes");
         return;
     };
 
-    let chunk = plane.chunk();
+    let chunk = first.chunk();
     let mut stride = chunk.stride() as u32;
     let chunk_size = chunk.size();
     let chunk_offset = chunk.offset();
-    let plane_type = plane.type_();
-    let plane_fd = plane.as_raw().fd;
-    let plane_maxsize = plane.as_raw().maxsize;
+    let plane_type = first.type_();
+    let plane_fd = first.as_raw().fd;
+    let plane_maxsize = first.as_raw().maxsize;
 
     if !ud.first_buffer_logged {
         info!(
@@ -426,14 +429,15 @@ fn handle_process(
     //   (no point in deferring since mmap is cheap and any consumer
     //   needs the bytes anyway).
     // * DmaBuf with tiled/compressed modifier + GPU importer → emit
-    //   `Gpu` carrying the fd. Readback is deferred until the
-    //   encoder actually asks for CPU bytes (or VA-API consumes the
-    //   fd directly).
+    //   `Gpu` carrying every memory plane the modifier requires.
+    //   Readback is deferred until the encoder actually asks for CPU
+    //   bytes (or a GPU-aware encoder consumes the fds directly).
     // * DmaBuf with tiled modifier + no importer → drop with
     //   warning. Should be unreachable because we wouldn't have
     //   negotiated those modifiers in the first place.
     let captured: CapturedFrame = match plane_type {
         DataType::MemFd | DataType::MemPtr => {
+            let plane = datas.first_mut().expect("checked above");
             let Some(bytes) = read_cpu_buffer(plane, chunk_offset, plane_size) else {
                 return;
             };
@@ -447,6 +451,7 @@ fn handle_process(
             })
         }
         DataType::DmaBuf if neg.modifier_is_cpu_readable() => {
+            let plane = datas.first_mut().expect("checked above");
             let Some(bytes) = read_dmabuf_mmap(plane, chunk_offset, plane_size) else {
                 return;
             };
@@ -467,26 +472,34 @@ fn handle_process(
                 );
                 return;
             };
-            // The Vulkan import path only handles single-plane
-            // buffers. We filter multi-plane modifiers out of the
-            // EnumFormat list (see vulkan::modifiers::query), but if
-            // the compositor still hands us a multi-plane DmaBuf for
-            // some reason, drop it with a clear warning rather than
-            // letting `vk create_image` fail with the cryptic
-            // ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT.
-            if plane_count > 1 {
-                warn!(
-                    plane_count,
-                    modifier = ?neg.modifier,
-                    "DmaBuf with multi-plane layout — frame dropped (importer is single-plane)"
-                );
-                return;
-            }
             let modifier = neg.modifier.unwrap_or(0);
-            let raw = plane.as_raw();
-            if raw.fd < 0 {
-                warn!("DmaBuf plane has invalid fd");
-                return;
+            let mut planes: Vec<DmaBufPlane> = Vec::with_capacity(plane_count);
+            for d in datas.iter() {
+                let raw = d.as_raw();
+                if raw.fd < 0 {
+                    warn!(
+                        plane_index = planes.len(),
+                        plane_count,
+                        "DmaBuf plane has invalid fd — frame dropped"
+                    );
+                    return;
+                }
+                let pchunk = d.chunk();
+                let p_stride = pchunk.stride() as u32;
+                let p_offset = pchunk.offset();
+                planes.push(DmaBufPlane {
+                    fd: raw.fd as RawFd,
+                    offset: p_offset,
+                    // The first memory plane defaults to `width * bpp`
+                    // when the source reports stride=0; auxiliary
+                    // planes (e.g. DCC metadata) have driver-defined
+                    // strides, so we trust whatever they advertise.
+                    stride: if planes.is_empty() && p_stride == 0 {
+                        stride
+                    } else {
+                        p_stride
+                    },
+                });
             }
             CapturedFrame::Gpu(GpuFrame {
                 width: neg.width,
@@ -494,13 +507,8 @@ fn handle_process(
                 stride,
                 format: neg.pixel_format,
                 timestamp_us,
-                plane: DmaBufPlane {
-                    fd: raw.fd as RawFd,
-                    offset: chunk_offset,
-                    stride,
-                    modifier,
-                    size: chunk_size,
-                },
+                planes,
+                modifier,
                 importer: Some(Arc::clone(importer) as _),
             })
         }

@@ -34,6 +34,8 @@ mod import;
 mod init;
 mod modifiers;
 
+pub(super) use modifiers::ModifierCaps;
+
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::sync::Mutex;
@@ -121,11 +123,16 @@ pub(super) struct Staging {
 
 pub(super) struct ImportedImage {
     pub(super) image: vk::Image,
-    pub(super) memory: vk::DeviceMemory,
+    /// One `VkDeviceMemory` per memory plane the modifier requires.
+    /// Single-plane modifiers store one allocation; multi-plane
+    /// modifiers (e.g. AMD DCC retile) store one per plane and the
+    /// image was created with `VK_IMAGE_CREATE_DISJOINT_BIT`.
+    pub(super) memories: Vec<vk::DeviceMemory>,
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) format: vk::Format,
     pub(super) modifier: u64,
+    pub(super) plane_count: u32,
 }
 
 impl VulkanImporter {
@@ -150,9 +157,10 @@ impl VulkanImporter {
     }
 
     /// DRM modifiers the GPU can import/export for the given video
-    /// format. Pass these to PipeWire's `VideoModifier` choice in the
-    /// EnumFormat pod.
-    pub(crate) fn supported_modifiers(&self, format: VideoFormat) -> Vec<u64> {
+    /// format, paired with their required memory plane count. Pass
+    /// these to PipeWire's `VideoModifier` choice in the EnumFormat
+    /// pod.
+    pub(crate) fn supported_modifiers(&self, format: VideoFormat) -> Vec<ModifierCaps> {
         let Some(vk_format) = format::video_format_to_vk(format) else {
             debug!(?format, "no VkFormat mapping, treating as unsupported");
             return Vec::new();
@@ -166,14 +174,12 @@ impl VulkanImporter {
         }
     }
 
-    /// Import a dmabuf plane (using cached `VkImage` if we've seen
-    /// the fd before), blit it into the persistent staging buffer
-    /// and copy the result out as `Bytes`.
+    /// Import a dmabuf (one or more memory planes) into a `VkImage`
+    /// using the cached entry when available, blit it into the
+    /// persistent staging buffer and copy the result out as `Bytes`.
     pub(crate) fn import_and_readback(
         &self,
-        fd: RawFd,
-        plane_offset: u32,
-        plane_stride: u32,
+        planes: &[DmaBufPlane],
         modifier: u64,
         width: u32,
         height: u32,
@@ -184,13 +190,16 @@ impl VulkanImporter {
                 "Vulkan: unsupported PixelFormat {format:?}"
             )));
         };
+        if planes.is_empty() {
+            return Err(FerricastError::Capture(
+                "Vulkan: import_and_readback called with zero planes".into(),
+            ));
+        }
         let mut state = self.state.lock().expect("vulkan state mutex poisoned");
         import::run(
             &self.inner,
             &mut state,
-            fd,
-            plane_offset,
-            plane_stride,
+            planes,
             modifier,
             width,
             height,
@@ -211,7 +220,9 @@ impl VulkanImporter {
             let _ = self.inner.device.device_wait_idle();
             for img in state.imports.values() {
                 self.inner.device.destroy_image(img.image, None);
-                self.inner.device.free_memory(img.memory, None);
+                for mem in &img.memories {
+                    self.inner.device.free_memory(*mem, None);
+                }
             }
         }
         state.imports.clear();
@@ -226,20 +237,13 @@ impl VulkanImporter {
 impl DmaBufImporter for VulkanImporter {
     fn readback(
         &self,
-        plane: &DmaBufPlane,
+        planes: &[DmaBufPlane],
+        modifier: u64,
         width: u32,
         height: u32,
         format: PixelFormat,
     ) -> Result<Bytes> {
-        self.import_and_readback(
-            plane.fd,
-            plane.offset,
-            plane.stride,
-            plane.modifier,
-            width,
-            height,
-            format,
-        )
+        self.import_and_readback(planes, modifier, width, height, format)
     }
 }
 
@@ -292,7 +296,9 @@ impl Drop for VulkanImporter {
         unsafe {
             for img in state.imports.values() {
                 dev.destroy_image(img.image, None);
-                dev.free_memory(img.memory, None);
+                for mem in &img.memories {
+                    dev.free_memory(*mem, None);
+                }
             }
             state.imports.clear();
             if let Some(s) = state.staging.take() {

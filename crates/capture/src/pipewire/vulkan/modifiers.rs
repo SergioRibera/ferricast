@@ -20,7 +20,7 @@ use tracing::trace;
 
 use super::Inner;
 
-pub(super) fn query(inner: &Inner, format: vk::Format) -> Result<Vec<u64>> {
+pub(super) fn query(inner: &Inner, format: vk::Format) -> Result<Vec<ModifierCaps>> {
     // Pass 1: ask Vulkan for the count. The chained struct holds a
     // `&mut` to `list_pass1`, so we run it in its own scope so that
     // borrow ends before we read `drm_format_modifier_count`.
@@ -66,39 +66,20 @@ pub(super) fn query(inner: &Inner, format: vk::Format) -> Result<Vec<u64>> {
         ));
     }
 
-    // We only keep modifiers that:
-    //   * advertise `TRANSFER_SRC` — anything storage-only /
-    //     sampled-only would still arrive in the dmabuf path but our
-    //     staging-copy would fail.
-    //   * use a single memory plane. Multi-plane modifiers (e.g. AMD
-    //     GFX9+ DCC retile, where there's a main plane plus a
-    //     compression-metadata plane) need every plane's
-    //     `VkSubresourceLayout` passed to
-    //     `VkImageDrmFormatModifierExplicitCreateInfoEXT`. The
-    //     PipeWire `process` path currently only consumes
-    //     `datas.first_mut()`, and `import::import_image` only ships
-    //     one `SubresourceLayout`, so importing a multi-plane
-    //     modifier fails with `ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`
-    //     on devices like AMD Raphael / RDNA3 iGPUs that prefer
-    //     compressed modifiers. Filter them out here so we never
-    //     advertise something we can't import.
+    // We only keep modifiers that advertise `TRANSFER_SRC` — anything
+    // storage-only / sampled-only would still arrive in the dmabuf
+    // path but our staging-copy would fail. Multi-plane modifiers
+    // (e.g. AMD GFX9+ DCC retile) are fine: the import path uses
+    // `VK_IMAGE_CREATE_DISJOINT_BIT` and binds each plane separately.
     let needed = vk::FormatFeatureFlags::TRANSFER_SRC;
-    let (single_plane, multi_plane): (Vec<_>, Vec<_>) = storage
+    let modifiers: Vec<ModifierCaps> = storage
         .iter()
         .filter(|p| p.drm_format_modifier_tiling_features.contains(needed))
-        .partition(|p| p.drm_format_modifier_plane_count == 1);
-    let modifiers: Vec<u64> = single_plane
-        .iter()
-        .map(|p| p.drm_format_modifier)
+        .map(|p| ModifierCaps {
+            modifier: p.drm_format_modifier,
+            plane_count: p.drm_format_modifier_plane_count,
+        })
         .collect();
-
-    if !multi_plane.is_empty() {
-        trace!(
-            ?format,
-            dropped = multi_plane.len(),
-            "skipped multi-plane DRM modifiers (importer only handles single-plane)"
-        );
-    }
 
     trace!(
         ?format,
@@ -108,4 +89,14 @@ pub(super) fn query(inner: &Inner, format: vk::Format) -> Result<Vec<u64>> {
     );
 
     Ok(modifiers)
+}
+
+/// A modifier the GPU advertises plus the number of memory planes it
+/// requires. We pass plane count through so the import path can size
+/// its `pPlaneLayouts` array and choose between the single-allocation
+/// and disjoint binding paths without re-querying.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ModifierCaps {
+    pub modifier: u64,
+    pub plane_count: u32,
 }

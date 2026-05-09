@@ -31,7 +31,7 @@ pub struct RawFrame {
 /// * Read it back to CPU memory on demand via [`importer`], for
 ///   encoders that only consume `RawFrame` (x264).
 ///
-/// Cloning a `GpuFrame` is cheap — the fd is borrowed (Vulkan keeps
+/// Cloning a `GpuFrame` is cheap — the fds are borrowed (Vulkan keeps
 /// the cached `VkImage` alive via the importer's internal cache) and
 /// the importer handle is `Arc`-shared.
 #[derive(Clone)]
@@ -41,7 +41,17 @@ pub struct GpuFrame {
     pub stride: u32,
     pub format: PixelFormat,
     pub timestamp_us: u64,
-    pub plane: DmaBufPlane,
+    /// One entry per memory plane the negotiated DRM modifier
+    /// requires. Single-plane modifiers (LINEAR / most tiled
+    /// uncompressed layouts) carry one entry; multi-plane modifiers
+    /// (e.g. AMD GFX9+ DCC retile, where there's a main plane plus a
+    /// compression-metadata plane) carry as many as the modifier
+    /// dictates. Order matches PipeWire's `buffer.datas` order, which
+    /// is also the order Vulkan's `pPlaneLayouts` expects.
+    pub planes: Vec<DmaBufPlane>,
+    /// DRM format modifier for the whole image. Same value for every
+    /// plane.
+    pub modifier: u64,
     /// `None` means readback isn't possible (this frame came from a
     /// path that didn't have a GPU importer attached). In practice
     /// always populated when the PipeWire DmaBuf path produces a
@@ -57,22 +67,23 @@ impl std::fmt::Debug for GpuFrame {
             .field("stride", &self.stride)
             .field("format", &self.format)
             .field("timestamp_us", &self.timestamp_us)
-            .field("plane", &self.plane)
+            .field("planes", &self.planes)
+            .field("modifier", &self.modifier)
             .field("has_importer", &self.importer.is_some())
             .finish()
     }
 }
 
-/// One DMA-BUF plane. Single-plane formats (BGRA / BGRx / RGBA /
-/// RGBx) are the common case; multi-plane (NV12, I420) would carry
-/// a `Vec<DmaBufPlane>` once those formats are wired through.
+/// One DMA-BUF memory plane. Pixel-format planes (NV12 luma/chroma)
+/// and modifier-driven memory planes (DCC main + metadata) are both
+/// represented this way; the consumer interprets which is which based
+/// on the `PixelFormat` + `modifier` carried on the parent
+/// [`GpuFrame`].
 #[derive(Debug, Clone, Copy)]
 pub struct DmaBufPlane {
     pub fd: RawFd,
     pub offset: u32,
     pub stride: u32,
-    pub modifier: u64,
-    pub size: u32,
 }
 
 /// Object-safe trait that lets a `GpuFrame` be read back to CPU
@@ -81,7 +92,8 @@ pub struct DmaBufPlane {
 pub trait DmaBufImporter: Send + Sync {
     fn readback(
         &self,
-        plane: &DmaBufPlane,
+        planes: &[DmaBufPlane],
+        modifier: u64,
         width: u32,
         height: u32,
         format: PixelFormat,
@@ -140,7 +152,7 @@ impl CapturedFrame {
                         "GpuFrame has no DmaBuf importer attached; can't read back to CPU".into(),
                     )
                 })?;
-                let bytes = importer.readback(&g.plane, g.width, g.height, g.format)?;
+                let bytes = importer.readback(&g.planes, g.modifier, g.width, g.height, g.format)?;
                 Ok(RawFrame {
                     width: g.width,
                     height: g.height,
