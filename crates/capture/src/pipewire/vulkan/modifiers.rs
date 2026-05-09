@@ -66,15 +66,39 @@ pub(super) fn query(inner: &Inner, format: vk::Format) -> Result<Vec<u64>> {
         ));
     }
 
-    // We only keep modifiers we can transfer-blit out of. Anything
-    // that's storage-only / sampled-only would still arrive in the
-    // dmabuf path but our staging-copy would fail.
+    // We only keep modifiers that:
+    //   * advertise `TRANSFER_SRC` — anything storage-only /
+    //     sampled-only would still arrive in the dmabuf path but our
+    //     staging-copy would fail.
+    //   * use a single memory plane. Multi-plane modifiers (e.g. AMD
+    //     GFX9+ DCC retile, where there's a main plane plus a
+    //     compression-metadata plane) need every plane's
+    //     `VkSubresourceLayout` passed to
+    //     `VkImageDrmFormatModifierExplicitCreateInfoEXT`. The
+    //     PipeWire `process` path currently only consumes
+    //     `datas.first_mut()`, and `import::import_image` only ships
+    //     one `SubresourceLayout`, so importing a multi-plane
+    //     modifier fails with `ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`
+    //     on devices like AMD Raphael / RDNA3 iGPUs that prefer
+    //     compressed modifiers. Filter them out here so we never
+    //     advertise something we can't import.
     let needed = vk::FormatFeatureFlags::TRANSFER_SRC;
-    let modifiers: Vec<u64> = storage
+    let (single_plane, multi_plane): (Vec<_>, Vec<_>) = storage
         .iter()
         .filter(|p| p.drm_format_modifier_tiling_features.contains(needed))
+        .partition(|p| p.drm_format_modifier_plane_count == 1);
+    let modifiers: Vec<u64> = single_plane
+        .iter()
         .map(|p| p.drm_format_modifier)
         .collect();
+
+    if !multi_plane.is_empty() {
+        trace!(
+            ?format,
+            dropped = multi_plane.len(),
+            "skipped multi-plane DRM modifiers (importer only handles single-plane)"
+        );
+    }
 
     trace!(
         ?format,

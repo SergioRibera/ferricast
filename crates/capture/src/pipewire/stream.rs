@@ -371,6 +371,7 @@ fn handle_process(
     }
 
     let datas = buffer.datas_mut();
+    let plane_count = datas.len();
     let Some(plane) = datas.first_mut() else {
         warn!("PipeWire buffer had no data planes");
         return;
@@ -387,6 +388,7 @@ fn handle_process(
     if !ud.first_buffer_logged {
         info!(
             ?plane_type,
+            plane_count,
             chunk_size,
             chunk_offset,
             stride,
@@ -465,6 +467,21 @@ fn handle_process(
                 );
                 return;
             };
+            // The Vulkan import path only handles single-plane
+            // buffers. We filter multi-plane modifiers out of the
+            // EnumFormat list (see vulkan::modifiers::query), but if
+            // the compositor still hands us a multi-plane DmaBuf for
+            // some reason, drop it with a clear warning rather than
+            // letting `vk create_image` fail with the cryptic
+            // ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT.
+            if plane_count > 1 {
+                warn!(
+                    plane_count,
+                    modifier = ?neg.modifier,
+                    "DmaBuf with multi-plane layout — frame dropped (importer is single-plane)"
+                );
+                return;
+            }
             let modifier = neg.modifier.unwrap_or(0);
             let raw = plane.as_raw();
             if raw.fd < 0 {
