@@ -105,7 +105,14 @@ pub(super) fn spawn(
     config: CaptureConfig,
     shared: SharedFormat,
 ) -> Result<WorkerHandle> {
-    let (frame_tx, frame_rx) = mpsc::channel::<CapturedFrame>(4);
+    // Capacity 1 with `try_send`: when the consumer (segmenter) falls
+    // behind, additional frames are dropped on the producer side
+    // instead of queueing. That, combined with `next_frame()`'s
+    // drain-to-newest, ensures the encoder always sees the freshest
+    // available frame and never a back-to-back burst of stale ones
+    // after a capture stall (which the viewer perceives as "freeze
+    // then catch-up jump").
+    let (frame_tx, frame_rx) = mpsc::channel::<CapturedFrame>(1);
     let (error_tx, error_rx) = mpsc::channel::<String>(1);
     let (term_tx, term_rx) = pw::channel::channel::<Terminate>();
 

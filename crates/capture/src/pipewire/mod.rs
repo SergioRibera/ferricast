@@ -102,7 +102,22 @@ impl ScreenCapture for PipeWireCapture {
                 Err(FerricastError::Capture(format!("PipeWire: {msg}")))
             }
             frame = worker.frames.recv() => {
-                frame.ok_or_else(|| FerricastError::Capture("PipeWire stream ended".into()))
+                let mut latest = frame
+                    .ok_or_else(|| FerricastError::Capture("PipeWire stream ended".into()))?;
+                // Drain anything else queued in the channel: when the PW
+                // worker temporarily falls behind the segmenter (or vice
+                // versa) the channel can hold several frames, and after a
+                // capture stall the burst that PW catches up with would
+                // otherwise be encoded back-to-back with their original
+                // wall-clock timestamps — the player perceives that as
+                // "stutter then jump". We always keep only the freshest
+                // frame so the encoder produces one fresh frame after a
+                // stall and then continues at the natural pace, not a
+                // catch-up burst.
+                while let Ok(newer) = worker.frames.try_recv() {
+                    latest = newer;
+                }
+                Ok(latest)
             }
         }
     }
