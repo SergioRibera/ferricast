@@ -41,6 +41,8 @@
           wayland
 
           vulkan-loader
+	  vulkan-validation-layers
+
           libGL
           fontconfig
           freetype

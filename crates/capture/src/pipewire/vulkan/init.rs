@@ -30,6 +30,9 @@ const REQUIRED_DEVICE_EXTS: &[&CStr] = &[
     ash::ext::external_memory_dma_buf::NAME,
     // Create a `VkImage` with an explicit DRM modifier layout.
     ash::ext::image_drm_format_modifier::NAME,
+
+    ash::khr::image_format_list::NAME,
+
     // Required by `VK_EXT_external_memory_dma_buf` per the spec.
     ash::khr::external_memory::NAME,
     // Used to query memory & format properties with the `2`
@@ -100,9 +103,17 @@ fn create_instance(entry: &ash::Entry) -> Result<ash::Instance> {
     let ext_ptrs: Vec<*const i8> =
         INSTANCE_EXTS.iter().map(|c| c.as_ptr()).collect();
 
+
+        let layer_names = [std::ffi::CString::new("VK_LAYER_KHRONOS_validation").unwrap()];
+let layer_names_raw: Vec<*const i8> = layer_names
+    .iter()
+    .map(|raw_name| raw_name.as_ptr())
+    .collect();
+
     let create_info = vk::InstanceCreateInfo::default()
         .application_info(&app_info)
-        .enabled_extension_names(&ext_ptrs);
+        .enabled_extension_names(&ext_ptrs)
+        .enabled_layer_names(&layer_names_raw);
 
     unsafe { entry.create_instance(&create_info, None) }
         .map_err(|e| FerricastError::Capture(format!("create_instance: {e}")))
