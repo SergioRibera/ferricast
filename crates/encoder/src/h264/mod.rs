@@ -172,6 +172,23 @@ impl VideoEncoder for H264Encoder {
             H264Encoder::X264(e) => e.get_headers(),
         }
     }
+
+    fn request_keyframe(&mut self) {
+        match self {
+            // No backend wired up yet; the request is dropped.
+            // Once `configure()` runs the next call lands on a
+            // real backend.
+            H264Encoder::Pending => {}
+            H264Encoder::Vaapi(e) => e.request_keyframe(),
+            H264Encoder::Nvenc(e) => e.request_keyframe(),
+            // x264 via the safe `x264` crate has no exposed knob to
+            // override `picture.i_type`; the segmenter pace path
+            // still bumps frames at fps but segment cuts will fall
+            // on the encoder's natural keyint until/unless we drop
+            // to x264 FFI.
+            H264Encoder::X264(_) => {}
+        }
+    }
 }
 
 /// Returns true when a VA-API H.264 encoder can be brought up on

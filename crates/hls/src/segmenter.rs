@@ -5,15 +5,31 @@
 //! consumed across the segment boundary are stashed in `pending` and
 //! replayed as the first frame of the next segment, so no frame is
 //! duplicated and every segment is independently decodable.
+//!
+//! The capture-pull loop is paced to `config.target_fps`: if the
+//! upstream `ScreenCapture` doesn't deliver a fresh frame inside one
+//! frame period (PipeWire on idle desktops routinely pauses for
+//! hundreds of ms), we re-encode the most recent one with its
+//! timestamp bumped forward. Without this padding the playlist would
+//! stop advancing whenever nothing on screen was changing — players
+//! would stall, exactly the symptom we're fixing.
+//!
+//! Once `segment_target_secs` has elapsed inside a segment we ask the
+//! encoder to emit an IDR via [`VideoEncoder::request_keyframe`] (a
+//! no-op for backends that can't comply, e.g. x264 via the safe
+//! crate). That keeps segments anchored to wall clock instead of
+//! drifting along the encoder's natural keyint when the actual
+//! framerate is below target.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::RwLock;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-use ferricast_core::{EncodedFrame, FerricastError, ScreenCapture, VideoEncoder};
+use ferricast_core::{CapturedFrame, EncodedFrame, FerricastError, ScreenCapture, VideoEncoder};
 use ferricast_muxer::Muxer;
 use ferricast_muxer::mpeg_ts::MpegTs;
 
@@ -39,6 +55,9 @@ where
         ));
     }
     let target = Duration::from_secs_f32(config.segment_target_secs);
+    let frame_period =
+        Duration::from_secs_f64(1.0 / (config.target_fps.max(1) as f64));
+    let frame_period_us = frame_period.as_micros() as u64;
 
     // Anchor capture-clock microseconds → MPEG-TS 90 kHz PTS. Set on
     // the first frame so PTS starts near 0 and the 33-bit field has
@@ -63,38 +82,68 @@ where
     // off by default but easy to flip on with `RUST_LOG=ferricast_hls=debug`.
     let mut last_frame_at: Option<Instant> = None;
 
+    // Most recent real frame, kept around so we can re-encode it as
+    // pace-padding when the capture source pauses.
+    let mut last_frame: Option<CapturedFrame> = None;
+
     loop {
         muxer.start_segment();
 
         // First frame of the segment must be a keyframe. Either we
         // carried one over from the previous iteration, or we drain
-        // frames here until the encoder produces one.
+        // frames here until the encoder produces one. On cold start
+        // request a keyframe up front so we don't waste an entire
+        // GOP waiting for the encoder's natural interval to fire.
         let first = match pending.take() {
             Some(f) => f,
-            None => loop {
-                let frame = capture.next_frame().await?;
-                record_frame_dt(&mut last_frame_at);
-                match encoder.encode(frame) {
-                    Ok(e) if e.is_keyframe => break e,
-                    Ok(_) => continue, // pre-IDR frame, drop
-                    Err(err) => {
-                        warn!(error = %err, "encoder.encode failed, dropping frame");
-                        continue;
+            None => {
+                encoder.request_keyframe();
+                loop {
+                    let frame = next_paced_frame(
+                        &mut capture,
+                        &mut last_frame,
+                        &mut last_frame_at,
+                        frame_period,
+                        frame_period_us,
+                    )
+                    .await?;
+                    match encoder.encode(frame) {
+                        Ok(e) if e.is_keyframe => break e,
+                        Ok(_) => continue, // pre-IDR frame, drop
+                        Err(err) => {
+                            warn!(error = %err, "encoder.encode failed, dropping frame");
+                            continue;
+                        }
                     }
                 }
-            },
+            }
         };
 
         let started = Instant::now();
+        let mut requested_idr = false;
         push_frame(&mut muxer, &first, &mut pts_anchor_us)?;
 
         // Continue pulling frames until we see another keyframe past
-        // the target duration. That next keyframe is *not* part of
-        // this segment — it gets stashed in `pending` and starts the
-        // next one.
+        // the target duration. Once we've crossed the target, ask
+        // the encoder for an IDR — that pulls the segment boundary
+        // back onto wall clock instead of waiting for whatever the
+        // natural keyint produces (which would make segments far
+        // longer than `target` whenever effective fps < target).
         loop {
-            let frame = capture.next_frame().await?;
-            record_frame_dt(&mut last_frame_at);
+            let frame = next_paced_frame(
+                &mut capture,
+                &mut last_frame,
+                &mut last_frame_at,
+                frame_period,
+                frame_period_us,
+            )
+            .await?;
+
+            if !requested_idr && started.elapsed() >= target {
+                encoder.request_keyframe();
+                requested_idr = true;
+            }
+
             let encoded = match encoder.encode(frame) {
                 Ok(e) => e,
                 Err(err) => {
@@ -132,6 +181,59 @@ where
                 "segment ready"
             );
         }
+    }
+}
+
+/// Pull one frame, with target-fps pacing. Returns:
+/// * The next real frame from `capture` if it arrives within
+///   `frame_period`.
+/// * A duplicate of the last real frame (with timestamp bumped
+///   forward by one period) otherwise — but only after we've seen at
+///   least one real frame. On cold start the pacer falls through to
+///   an unbounded `await` so we never spin before capture is up.
+async fn next_paced_frame<S>(
+    capture: &mut S,
+    last_frame: &mut Option<CapturedFrame>,
+    last_frame_at: &mut Option<Instant>,
+    frame_period: Duration,
+    frame_period_us: u64,
+) -> Result<CapturedFrame, FerricastError>
+where
+    S: ScreenCapture + Send,
+{
+    let frame = match timeout(frame_period, capture.next_frame()).await {
+        Ok(res) => {
+            let f = res?;
+            *last_frame = Some(f.clone());
+            f
+        }
+        Err(_) => {
+            // Period elapsed without a fresh frame. If we have a
+            // previous one, re-encode it (with bumped timestamp) so
+            // the playlist keeps advancing. Otherwise fall through
+            // to an unbounded await — this only happens before the
+            // very first real frame.
+            match last_frame.as_mut() {
+                Some(stored) => {
+                    bump_timestamp_us(stored, frame_period_us);
+                    stored.clone()
+                }
+                None => {
+                    let f = capture.next_frame().await?;
+                    *last_frame = Some(f.clone());
+                    f
+                }
+            }
+        }
+    };
+    record_frame_dt(last_frame_at);
+    Ok(frame)
+}
+
+fn bump_timestamp_us(frame: &mut CapturedFrame, delta_us: u64) {
+    match frame {
+        CapturedFrame::Cpu(r) => r.timestamp_us = r.timestamp_us.saturating_add(delta_us),
+        CapturedFrame::Gpu(g) => g.timestamp_us = g.timestamp_us.saturating_add(delta_us),
     }
 }
 

@@ -58,6 +58,16 @@ pub struct HlsConfig {
     /// Number of segments retained in the live ring. Must be ≥ 3 so
     /// players can prebuffer.
     pub keep_segments: usize,
+    /// Frames-per-second target the segmenter paces to. Must agree
+    /// with the encoder's configured fps. Used to:
+    /// 1. Synthesise duplicate frames when the upstream capture
+    ///    stalls (PipeWire on idle GNOME desktops can pause for
+    ///    hundreds of ms — without this the segmenter would block
+    ///    inside `next_frame().await` and the HLS playlist would
+    ///    stop advancing).
+    /// 2. Anchor segment boundaries to wall clock by requesting a
+    ///    forced IDR once `segment_target_secs` has elapsed.
+    pub target_fps: u32,
 }
 
 impl Default for HlsConfig {
@@ -66,6 +76,7 @@ impl Default for HlsConfig {
             segment_target_secs: 2.0,
             playlist_target_duration: 4,
             keep_segments: 6,
+            target_fps: 60,
         }
     }
 }

@@ -44,4 +44,19 @@ pub trait VideoEncoder: Send {
 
     fn flush(self) -> Result<Vec<EncodedFrame>>;
     fn get_headers(&mut self) -> Result<Vec<u8>>;
+
+    /// Ask the encoder to emit an IDR (instantaneous decoder refresh
+    /// keyframe) on the next [`encode`] call, in addition to whatever
+    /// natural keyframes its internal interval would produce. The
+    /// HLS segmenter uses this to anchor segment boundaries to wall
+    /// clock when the upstream capture stalls (PipeWire on idle
+    /// desktops can pause for hundreds of ms) or runs slower than
+    /// the target framerate, which would otherwise let segments
+    /// overshoot `segment_target_secs` until the next natural IDR.
+    ///
+    /// Default is a no-op so backends that can't influence keyframe
+    /// placement (e.g. x264 via the safe `x264` crate, which doesn't
+    /// expose `i_type`) keep working — they simply rely on their
+    /// internal interval.
+    fn request_keyframe(&mut self) {}
 }
