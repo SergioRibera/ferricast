@@ -22,19 +22,22 @@
 //!   (called on format renegotiation).
 //!
 //! Performance note: the importer keeps a persistent command buffer,
-//! fence, staging buffer and a `HashMap<fd, VkImage>` cache. PipeWire
-//! reuses the same handful of fds within a negotiation cycle, so the
-//! `vkAllocateMemory` + `vkBindImageMemory` cost (the most expensive
-//! pieces of dmabuf import) only pays for the first frame per fd.
-//! Subsequent frames record-and-submit a single command buffer and
-//! memcpy from the staging buffer.
+//! fence, staging buffer and a `HashMap<BufferId, VkImage>` cache.
+//! PipeWire reuses the same handful of underlying dmabuf objects from
+//! a small pool, but compositors (notably Mutter on NVIDIA) routinely
+//! hand out a fresh `dup`'d fd for each buffer borrow, so the `RawFd`
+//! number is not stable. We key the cache on `(st_dev, st_ino)` of the
+//! fd instead, which is invariant across `dup`. With that key the
+//! expensive `vkAllocateMemory` + `vkBindImageMemory` only pay once
+//! per pool entry; subsequent frames record-and-submit a single
+//! command buffer and memcpy from the staging buffer.
 
 mod format;
 mod import;
 mod init;
 mod modifiers;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
 use std::sync::Mutex;
 
@@ -93,7 +96,23 @@ pub(super) struct Inner {
     pub(super) memory_props: vk::PhysicalDeviceMemoryProperties,
 }
 
-/// Per-frame mutable cache. Lives behind a `RefCell` because the PW
+/// Stable identity for a dmabuf-backed buffer. PipeWire's screencast
+/// portal frequently `dup`s the same underlying dmabuf and hands us a
+/// fresh fd number, but `(st_dev, st_ino)` is the same for every dup
+/// of the same buffer — so it is a safe key for our import cache.
+#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
+pub(super) struct BufferId {
+    pub(super) dev: u64,
+    pub(super) ino: u64,
+}
+
+/// Cap on how many imported `VkImage`s we keep cached. Real PipeWire
+/// pools are 4-8 buffers; this cap exists only as a safety net for
+/// pathological compositors that mint a new buffer every frame. When
+/// exceeded, the oldest entry (by insertion order) is destroyed.
+pub(super) const MAX_IMPORT_CACHE: usize = 16;
+
+/// Per-frame mutable cache. Lives behind a `Mutex` because the PW
 /// worker thread is the only consumer and the borrow is scoped to a
 /// single `import_and_readback` call.
 pub(super) struct State {
@@ -106,11 +125,12 @@ pub(super) struct State {
     /// Persistent host-visible staging buffer. Recreated only when a
     /// format renegotiation needs more bytes than we have.
     pub(super) staging: Option<Staging>,
-    /// Imported dmabuf images keyed by their original fd. Within one
-    /// negotiation cycle PipeWire reuses the same handful of fds, so
-    /// the expensive `vkAllocateMemory(import)` only happens once
-    /// per pool entry. Cleared by `reset_cache` on renegotiation.
-    pub(super) imports: HashMap<RawFd, ImportedImage>,
+    /// Imported dmabuf images keyed by stable buffer identity (see
+    /// [`BufferId`]). Cleared by `reset_cache` on renegotiation.
+    pub(super) imports: HashMap<BufferId, ImportedImage>,
+    /// FIFO of cache keys in insertion order, used to evict the
+    /// oldest entry once `imports.len() > MAX_IMPORT_CACHE`.
+    pub(super) import_order: VecDeque<BufferId>,
 }
 
 pub(super) struct Staging {
@@ -215,6 +235,7 @@ impl VulkanImporter {
             }
         }
         state.imports.clear();
+        state.import_order.clear();
         debug!("Vulkan import cache cleared");
     }
 }
@@ -265,6 +286,7 @@ impl State {
             fence,
             staging: None,
             imports: HashMap::new(),
+            import_order: VecDeque::new(),
         })
     }
 }
@@ -295,6 +317,7 @@ impl Drop for VulkanImporter {
                 dev.free_memory(img.memory, None);
             }
             state.imports.clear();
+            state.import_order.clear();
             if let Some(s) = state.staging.take() {
                 dev.destroy_buffer(s.buffer, None);
                 dev.free_memory(s.memory, None);

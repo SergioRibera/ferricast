@@ -57,6 +57,12 @@ where
     let mut muxer = MpegTs::default();
     muxer.config(parameter_sets.clone())?;
 
+    // Inter-frame dt for diagnosing capture-side throughput. At 60 fps
+    // we expect ~16-17 ms; values closer to 50-60 ms point at the
+    // PipeWire/Vulkan import path stalling. Logged at DEBUG so it's
+    // off by default but easy to flip on with `RUST_LOG=ferricast_hls=debug`.
+    let mut last_frame_at: Option<Instant> = None;
+
     loop {
         muxer.start_segment();
 
@@ -67,6 +73,7 @@ where
             Some(f) => f,
             None => loop {
                 let frame = capture.next_frame().await?;
+                record_frame_dt(&mut last_frame_at);
                 match encoder.encode(frame) {
                     Ok(e) if e.is_keyframe => break e,
                     Ok(_) => continue, // pre-IDR frame, drop
@@ -87,6 +94,7 @@ where
         // next one.
         loop {
             let frame = capture.next_frame().await?;
+            record_frame_dt(&mut last_frame_at);
             let encoded = match encoder.encode(frame) {
                 Ok(e) => e,
                 Err(err) => {
@@ -125,6 +133,14 @@ where
             );
         }
     }
+}
+
+fn record_frame_dt(last: &mut Option<Instant>) {
+    let now = Instant::now();
+    if let Some(prev) = *last {
+        debug!(dt_ms = (now - prev).as_millis() as u64, "frame");
+    }
+    *last = Some(now);
 }
 
 fn push_frame(

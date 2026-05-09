@@ -2,7 +2,8 @@
 //!
 //! Hot-path layout:
 //!
-//! 1. Look up the dmabuf fd in [`State::imports`]. If it's there with
+//! 1. `fstat(fd)` to get a stable [`BufferId`] for the underlying
+//!    dmabuf and look it up in [`State::imports`]. If it's there with
 //!    matching dimensions / modifier, reuse the `VkImage` — the
 //!    expensive `vkAllocateMemory(import)` + `vkBindImageMemory`
 //!    already paid for it on the first frame.
@@ -27,7 +28,27 @@ use bytes::Bytes;
 use ferricast_core::{FerricastError, PixelFormat, Result};
 use tracing::{trace, warn};
 
-use super::{format as fmt, ImportedImage, Inner, Staging, State};
+use super::{
+    BufferId, ImportedImage, Inner, MAX_IMPORT_CACHE, Staging, State, format as fmt,
+};
+
+/// Resolve a dmabuf fd to its stable underlying buffer identity. All
+/// `dup`s of the same fd return the same `(st_dev, st_ino)`, which is
+/// what we want for the import cache key — fd numbers are not stable.
+fn buffer_id(fd: RawFd) -> std::io::Result<BufferId> {
+    // SAFETY: `libc::fstat` only writes through `&mut st`; on error it
+    // returns -1 and leaves `errno` set, in which case we don't read
+    // `st`.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::fstat(fd, &mut st) };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(BufferId {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+    })
+}
 
 pub(super) fn run(
     inner: &Inner,
@@ -75,8 +96,10 @@ pub(super) fn run(
     Ok(bytes)
 }
 
-/// Look up the cached `VkImage` for the given dmabuf fd, or import a
-/// fresh one and stash it.
+/// Look up the cached `VkImage` for the dmabuf behind `fd`, or import
+/// a fresh one and stash it. Cache is keyed on the underlying buffer's
+/// `(st_dev, st_ino)`, not the fd number, because compositors hand out
+/// a fresh `dup`'d fd per frame for the same physical buffer.
 fn ensure_image(
     inner: &Inner,
     state: &mut State,
@@ -88,23 +111,30 @@ fn ensure_image(
     height: u32,
     vk_format: vk::Format,
 ) -> Result<vk::Image> {
-    if let Some(existing) = state.imports.get(&fd) {
+    let key = buffer_id(fd).map_err(|e| {
+        FerricastError::Capture(format!("fstat(dmabuf fd) for cache key: {e}"))
+    })?;
+
+    if let Some(existing) = state.imports.get(&key) {
         if existing.width == width
             && existing.height == height
             && existing.format == vk_format
             && existing.modifier == modifier
         {
+            trace!(?key, "vulkan import cache HIT");
             return Ok(existing.image);
         }
-        // Stale — same fd numerical, but the buffer behind it has
-        // changed shape. Destroy and re-import.
+        // Stale — same buffer identity, but reported shape has
+        // changed (renegotiation in flight). Destroy and re-import.
         unsafe {
             let _ = inner.device.device_wait_idle();
             inner.device.destroy_image(existing.image, None);
             inner.device.free_memory(existing.memory, None);
         }
-        state.imports.remove(&fd);
+        state.imports.remove(&key);
+        state.import_order.retain(|k| *k != key);
     }
+    trace!(?key, "vulkan import cache MISS — importing");
 
     // Import: dup the fd (Vulkan owns the dup; PipeWire keeps the
     // original).
@@ -129,8 +159,34 @@ fn ensure_image(
             vk_format,
         )?
     };
-    state.imports.insert(fd, imported);
-    Ok(state.imports.get(&fd).unwrap().image)
+    let image = imported.image;
+    state.imports.insert(key, imported);
+    state.import_order.push_back(key);
+
+    // FIFO evict the oldest entry if the cache grew past its cap.
+    // Real PipeWire pools are much smaller than this — only an
+    // anomalous compositor that mints fresh buffers every frame would
+    // ever trigger it.
+    while state.imports.len() > MAX_IMPORT_CACHE {
+        let Some(victim) = state.import_order.pop_front() else {
+            break;
+        };
+        if victim == key {
+            // Don't evict the entry we just inserted, even in the
+            // degenerate case of a 1-element cap.
+            state.import_order.push_back(victim);
+            break;
+        }
+        if let Some(old) = state.imports.remove(&victim) {
+            unsafe {
+                let _ = inner.device.device_wait_idle();
+                inner.device.destroy_image(old.image, None);
+                inner.device.free_memory(old.memory, None);
+            }
+        }
+    }
+
+    Ok(image)
 }
 
 /// SAFETY: `fd_guard` owns a valid duped dmabuf fd. On success the
@@ -484,6 +540,54 @@ impl Drop for OwnedFdGuard {
     fn drop(&mut self) {
         if !self.handed_off && self.fd >= 0 {
             unsafe { libc::close(self.fd) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::buffer_id;
+    use std::ffi::CString;
+    use std::os::fd::RawFd;
+
+    fn make_memfd(name: &str) -> RawFd {
+        let cname = CString::new(name).unwrap();
+        // libc 0.2.183 exposes `memfd_create` on Linux. The flag value
+        // (0) is fine — we don't need close-on-exec or sealing.
+        let fd = unsafe { libc::memfd_create(cname.as_ptr(), 0) };
+        assert!(
+            fd >= 0,
+            "memfd_create failed: {}",
+            std::io::Error::last_os_error()
+        );
+        fd
+    }
+
+    /// Two distinct fds for the same underlying buffer (one obtained
+    /// by `dup`) must produce the same [`super::BufferId`] — that is
+    /// the invariant the import cache relies on to avoid re-importing
+    /// every PipeWire frame.
+    #[test]
+    fn dupd_fds_share_buffer_id() {
+        let a = make_memfd("ferricast-buffer-id-a");
+        let a_dup = unsafe { libc::dup(a) };
+        assert!(a_dup >= 0, "dup failed: {}", std::io::Error::last_os_error());
+        assert_ne!(a, a_dup, "dup should return a new fd number");
+
+        let id_a = buffer_id(a).expect("fstat a");
+        let id_a_dup = buffer_id(a_dup).expect("fstat a_dup");
+        assert_eq!(id_a, id_a_dup, "dup'd fds must share BufferId");
+
+        // A separately-created memfd has a different inode and so a
+        // different BufferId, even though it's on the same filesystem.
+        let b = make_memfd("ferricast-buffer-id-b");
+        let id_b = buffer_id(b).expect("fstat b");
+        assert_ne!(id_a, id_b, "distinct buffers must have distinct BufferIds");
+
+        unsafe {
+            libc::close(a);
+            libc::close(a_dup);
+            libc::close(b);
         }
     }
 }
