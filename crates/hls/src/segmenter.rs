@@ -59,26 +59,30 @@ where
         Duration::from_secs_f64(1.0 / (config.target_fps.max(1) as f64));
     let frame_period_us = frame_period.as_micros() as u64;
 
-    // Wall-clock PTS anchor. The very first frame we push sets this
-    // to `Instant::now()`; every later frame's PTS is `now - anchor`
-    // microseconds rescaled to the MPEG-TS 90 kHz field.
+    // Adaptive PTS rate. Start at the configured frame period, then
+    // refine after each segment using `measured = wall_span /
+    // frames_pushed`. Per-frame PTS increments stay uniform inside
+    // any one segment (so a single slow encode doesn't surface as a
+    // visible freeze the way wall-clock PTS does), but the rate
+    // gradually converges to actual production cadence so PTS span
+    // ≈ wall span and the player consumes segments at the rate we
+    // produce them — no drift, no segment eviction race.
     //
-    // Why not a synthetic `frame_count * frame_period_us` counter:
-    // each segment takes ~2.04-2.06 s of wall clock to produce
-    // (capture + encode + force-IDR overhead) but a synthetic
-    // 60 fps counter stamps it with PTS span = exactly 2.000 s.
-    // The player paces consumption by PTS, so it consumes 2.000 s
-    // per segment of wall clock while we produce 2.04 s — ~50 ms
-    // of drift per segment that cumulatively pushed the player
-    // past the ring's eviction line every few minutes (ffplay:
-    // "expired from playlists" → "Packet corrupt"). Wall-clock
-    // PTS makes production wall = consumption wall by
-    // construction; no drift, ring window doesn't need to absorb
-    // anything.
+    // Why not pure synthetic (`frame_count * frame_period_us`):
+    // each segment took ~2.05 s of wall clock to produce but a
+    // synthetic 60 fps stamp gave it PTS span = exactly 2.000 s.
+    // Players paced consumption by PTS, not EXTINF, so they ran
+    // 50 ms slower than the producer per segment — the "expired
+    // from playlists" + "Packet corrupt" tail.
     //
-    // `Instant` is monotonic so PTS is too. The 33-bit MPEG-TS
-    // PTS field has ~26.5 h of runway at 60 fps before wrap.
-    let mut pts_anchor: Option<Instant> = None;
+    // Why not pure wall-clock (`now - anchor`): exposes encoder
+    // time variance directly. NVENC encodes most frames in ~5 ms
+    // but occasionally takes 30-40 ms (complex frame, GPU
+    // contention); each slow encode became a visible freeze of
+    // the preceding frame because the player held it until the
+    // late frame's PTS arrived.
+    let mut pts_us: u64 = 0;
+    let mut effective_frame_period_us: u64 = frame_period_us;
 
     // Keyframe carried over from the previous segment. The boundary
     // detector consumes one keyframe to know "the new segment starts
@@ -137,7 +141,10 @@ where
 
         let started = Instant::now();
         let mut requested_idr = false;
-        push_frame(&mut muxer, &first, &mut pts_anchor)?;
+        let mut frames_in_segment: u64 = 0;
+        push_frame(&mut muxer, &first, pts_us)?;
+        pts_us = pts_us.saturating_add(effective_frame_period_us);
+        frames_in_segment += 1;
 
         // Continue pulling frames until we see another keyframe past
         // the target duration. Once we've crossed the target, ask
@@ -172,10 +179,36 @@ where
                 pending = Some(encoded);
                 break;
             }
-            push_frame(&mut muxer, &encoded, &mut pts_anchor)?;
+            push_frame(&mut muxer, &encoded, pts_us)?;
+            pts_us = pts_us.saturating_add(effective_frame_period_us);
+            frames_in_segment += 1;
         }
 
         let elapsed = started.elapsed();
+
+        // Refine the per-frame PTS increment based on this segment's
+        // actual production: `wall / frames`. EMA-smoothed (7/8 old,
+        // 1/8 new) so a one-off slow segment doesn't yank the rate
+        // around. After ~5-10 segments the value converges to the
+        // real per-frame wall cost (~17 ms typical at 60 fps target
+        // with NVENC), which makes PTS span ≈ wall span and stops
+        // the player drifting away from the live edge.
+        //
+        // Skip the very first segment (frames_in_segment can be
+        // dominated by warmup).
+        if frames_in_segment >= 30 {
+            let measured =
+                (elapsed.as_micros() as u64).saturating_div(frames_in_segment);
+            // Clamp to avoid pathological measurements (e.g. a long
+            // capture stall during the segment) hijacking the rate.
+            // Stay within ±50 % of the configured frame period.
+            let lo = frame_period_us / 2;
+            let hi = frame_period_us.saturating_mul(3) / 2;
+            let measured_clamped = measured.clamp(lo, hi);
+            effective_frame_period_us =
+                (effective_frame_period_us.saturating_mul(7) + measured_clamped) / 8;
+        }
+
         let bytes = Bytes::from(muxer.drain());
         let size_bytes = bytes.len();
         let seq = ring.write().await.push(elapsed.as_secs_f32(), false, bytes);
@@ -187,6 +220,7 @@ where
                 seq,
                 duration_ms = elapsed.as_millis() as u64,
                 size_kb = size_bytes / 1024,
+                effective_frame_period_us,
                 "segment ready"
             );
         } else {
@@ -194,6 +228,7 @@ where
                 seq,
                 duration_ms = elapsed.as_millis() as u64,
                 size_kb = size_bytes / 1024,
+                effective_frame_period_us,
                 "segment ready"
             );
         }
@@ -271,21 +306,12 @@ fn record_frame_dt(last: &mut Option<Instant>, kind: &'static str) {
 fn push_frame(
     muxer: &mut MpegTs,
     encoded: &EncodedFrame,
-    anchor: &mut Option<Instant>,
+    pts_us: u64,
 ) -> Result<(), FerricastError> {
-    // Wall-clock PTS: the very first push sets `anchor` to
-    // `Instant::now()` so frame 0 lands at PTS≈0; every later push
-    // takes `now - anchor` microseconds. `Instant` is monotonic so
-    // PTS is too. Conversion to 90 kHz with saturating math (the
-    // 33-bit field has ~26.5 h of runway before wrapping anyway).
-    let now = Instant::now();
-    let pts_us = match *anchor {
-        Some(start) => now.saturating_duration_since(start).as_micros() as u64,
-        None => {
-            *anchor = Some(now);
-            0
-        }
-    };
+    // Caller-provided monotonic PTS in microseconds. Uniform
+    // increments inside any one segment keep the player's display
+    // intervals smooth; the increment value itself is refined per
+    // segment so PTS span tracks wall-clock production over time.
     let pts_90k = pts_us.saturating_mul(9) / 100;
     // Baseline H.264 has no B-frames → DTS == PTS.
     muxer.add_frame(encoded, pts_90k, pts_90k)
