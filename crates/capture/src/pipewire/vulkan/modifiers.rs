@@ -96,7 +96,7 @@ pub(super) fn query(inner: &Inner, format: vk::Format) -> Result<Vec<ModifierCap
 /// its `pPlaneLayouts` array and choose between the single-allocation
 /// and disjoint binding paths without re-querying.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct ModifierCaps {
+pub struct ModifierCaps {
     pub modifier: u64,
     pub plane_count: u32,
 }

@@ -34,7 +34,7 @@ mod import;
 mod init;
 mod modifiers;
 
-pub(super) use modifiers::ModifierCaps;
+pub use modifiers::ModifierCaps;
 
 use std::collections::HashMap;
 use std::os::fd::RawFd;
