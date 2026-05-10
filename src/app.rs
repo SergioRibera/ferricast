@@ -4,11 +4,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use ferricast_capture::{NativeCapture, PipeWireCapture, X11Capture};
-use ferricast_core::{CaptureSource, Codec, Device, StreamConfig};
+use ferricast_capture::NativeCapture;
+use ferricast_core::{CaptureSource, Device, StreamConfig};
 
-use crate::manager::{ManagerEvent, StreamManager};
-use crate::tray::TrayAction; // solo para reutilizar el tipo de event_rx si aplica
+use crate::manager::StreamManager;
 
 #[derive(Default)]
 pub struct AppState {
@@ -65,7 +64,6 @@ impl App for FerricastApp {
                             move || {
                                 let sm = sm.clone();
                                 spawn(async move {
-                                    
                                     let capture = NativeCapture::new();
                                     let encoder = H264Encoder::default();
                                     let source = CaptureSource::FullScreen { monitor: None };

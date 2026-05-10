@@ -38,9 +38,9 @@ description = "Unified screen and video streaming for Linux"
 ferricast-core.workspace = true
 ferricast-capture.workspace = true
 ferricast-chromecast.workspace = true
-ferricast-dial.workspace = true
-ferricast-airplay.workspace = true
-ferricast-miracast.workspace = true
+# ferricast-dial.workspace = true
+# ferricast-airplay.workspace = true
+# ferricast-miracast.workspace = true
 ferricast-encoder.workspace = true
 ferricast-hls.workspace = true
 freya = { version = "0.4.0-rc.11", features = ["icons", "router", "radio"] }
@@ -48,7 +48,6 @@ freya = { version = "0.4.0-rc.11", features = ["icons", "router", "radio"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-traysys = { version = "0.1", path = "vendor/traysys" }
 rustls = { version = "0.23", features = ["ring"] }
 uuid.workspace = true
 rust_cast = { version = "0.21.0", features = ["thread_safe"] }
