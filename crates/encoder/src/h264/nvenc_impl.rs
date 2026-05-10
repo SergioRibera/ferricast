@@ -56,6 +56,11 @@ pub struct NvencH264Encoder {
     /// Bumped every successful `encode()`; used as the bitstream
     /// timestamp the muxer translates into PTS/DTS.
     frame_count: u64,
+    /// Set by [`request_keyframe`]; OR-ed into the natural
+    /// interval-based IDR decision on the next [`encode`] call so
+    /// the segmenter can anchor segment boundaries to wall clock
+    /// when the capture stalls.
+    pending_keyframe: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -144,6 +149,7 @@ impl NvencH264Encoder {
                 keyframe_interval: cfg.keyframe_interval.max(1),
             },
             frame_count: 0,
+            pending_keyframe: false,
         })
     }
 }
@@ -193,7 +199,8 @@ impl VideoEncoder for NvencH264Encoder {
             )));
         }
 
-        let force_idr = self.frame_count % (self.cfg.keyframe_interval as u64) == 0;
+        let force_idr = self.frame_count % (self.cfg.keyframe_interval as u64) == 0
+            || std::mem::take(&mut self.pending_keyframe);
         let options = EncodeOptions {
             force_intra: false,
             force_idr,
@@ -237,6 +244,10 @@ impl VideoEncoder for NvencH264Encoder {
         // Without B-frames there's no reorder queue, so an end-of-
         // stream flush wouldn't yield anything. Return empty.
         Ok(Vec::new())
+    }
+
+    fn request_keyframe(&mut self) {
+        self.pending_keyframe = true;
     }
 
     fn get_headers(&mut self) -> Result<Vec<u8>> {

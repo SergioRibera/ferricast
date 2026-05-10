@@ -135,6 +135,11 @@ struct EncoderCfg {
 #[derive(Default)]
 struct FrameState {
     frame_idx: u32,
+    /// Frame index of the most recent IDR. Used to compute
+    /// `frame_num` for the next P-picture without assuming IDRs land
+    /// on a GOP-aligned boundary (segmenter-forced IDRs can fire
+    /// mid-GOP).
+    last_idr_frame_idx: u32,
     /// Picture-order-count (×2 per frame, mod `MaxPicOrderCntLsb`).
     poc: u32,
     /// Toggles 0..1 every IDR. Sent in the slice header.
@@ -149,6 +154,11 @@ struct FrameState {
     prev_frame_num: u32,
     /// POC of the previous reference.
     prev_poc: u32,
+    /// Set by [`VaapiH264Encoder::request_keyframe`]; OR-ed into the
+    /// natural interval-based IDR decision on the next encode so
+    /// the HLS segmenter can anchor segment boundaries to wall
+    /// clock without reconfiguring the encoder.
+    pending_keyframe: bool,
 }
 
 unsafe impl Send for VaapiH264Encoder {}
@@ -454,6 +464,10 @@ impl VideoEncoder for VaapiH264Encoder {
         Ok(Vec::new())
     }
 
+    fn request_keyframe(&mut self) {
+        self.state.borrow_mut().pending_keyframe = true;
+    }
+
     fn get_headers(&mut self) -> Result<Vec<u8>> {
         // SPS + PPS, AnnexB-prefixed, ready to live at the start of
         // every HLS segment. The bitstream we hand out from
@@ -565,13 +579,16 @@ fn run_encode(
     state: &mut FrameState,
 ) -> Result<(Vec<u8>, bool, u32, u32)> {
     let cfg = &enc.cfg;
-    let is_idr = state.frame_idx % cfg.keyframe_interval == 0;
+    let is_idr = state.frame_idx % cfg.keyframe_interval == 0
+        || std::mem::take(&mut state.pending_keyframe);
     let frame_num = if is_idr {
         0
     } else {
         // frame_num counts reference frames since last IDR (mod
-        // 2^(log2_max_frame_num_minus4+4) = 2^8 = 256).
-        ((state.frame_idx - state.frame_idx_at_last_idr(cfg.keyframe_interval)) & 0xff) as u16
+        // 2^(log2_max_frame_num_minus4+4) = 2^8 = 256). We track
+        // `last_idr_frame_idx` explicitly so segmenter-forced IDRs
+        // mid-GOP don't break this counter.
+        ((state.frame_idx - state.last_idr_frame_idx) & 0xff) as u16
     };
     let poc = if is_idr { 0 } else { state.poc };
 
@@ -755,6 +772,9 @@ fn run_encode(
 
     // Update state for the next frame.
     let frame_idx_now = state.frame_idx;
+    if is_idr {
+        state.last_idr_frame_idx = state.frame_idx;
+    }
     state.frame_idx += 1;
     state.poc = if is_idr { 2 } else { state.poc + 2 };
     state.prev_recon = Some(cur_recon_idx);
@@ -765,14 +785,6 @@ fn run_encode(
     }
 
     Ok((bitstream, is_idr, frame_idx_now, poc))
-}
-
-/// Helper kept inline so `state` updates and `frame_num` math live
-/// next to each other.
-impl FrameState {
-    fn frame_idx_at_last_idr(&self, gop: u32) -> u32 {
-        (self.frame_idx / gop) * gop
-    }
 }
 
 fn build_seq_param(cfg: &EncoderCfg) -> EncSequenceParameterBufferH264 {

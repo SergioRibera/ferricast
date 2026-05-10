@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ferricast_core::{
-    CaptureConfig, CapturedFrame, DmaBufPlane, FerricastError, GpuFrame, RawFrame, Result,
+    CaptureConfig, CapturedFrame, FerricastError, RawFrame, Result,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -67,10 +67,12 @@ struct UserData {
     /// downstream — the moment capture is actually working.
     first_frame_logged: bool,
     /// `Some` when Vulkan came up successfully and we can import
-    /// the dmabuf modifiers we advertised. Wrapped in `Arc` so we
-    /// can hand a clone to every emitted `GpuFrame` (the consumer
-    /// uses it for on-demand readback). `None` collapses the dmabuf
-    /// path to a warning + drop and we rely on the SHM fallback.
+    /// the dmabuf modifiers we advertised. The PW worker thread
+    /// invokes `importer.readback(...)` directly inside
+    /// `handle_process` for non-linear DmaBuf frames so the GPU
+    /// blit-and-copy overlaps with the encoder doing CPU work on the
+    /// previous frame. `None` collapses the dmabuf path to a warning
+    /// + drop and we rely on the SHM fallback.
     importer: Option<Arc<VulkanImporter>>,
 }
 
@@ -103,7 +105,14 @@ pub(super) fn spawn(
     config: CaptureConfig,
     shared: SharedFormat,
 ) -> Result<WorkerHandle> {
-    let (frame_tx, frame_rx) = mpsc::channel::<CapturedFrame>(4);
+    // Capacity 1 with `try_send`: when the consumer (segmenter) falls
+    // behind, additional frames are dropped on the producer side
+    // instead of queueing. That, combined with `next_frame()`'s
+    // drain-to-newest, ensures the encoder always sees the freshest
+    // available frame and never a back-to-back burst of stale ones
+    // after a capture stall (which the viewer perceives as "freeze
+    // then catch-up jump").
+    let (frame_tx, frame_rx) = mpsc::channel::<CapturedFrame>(1);
     let (error_tx, error_rx) = mpsc::channel::<String>(1);
     let (term_tx, term_rx) = pw::channel::channel::<Terminate>();
 
@@ -471,21 +480,48 @@ fn handle_process(
                 warn!("DmaBuf plane has invalid fd");
                 return;
             }
-            CapturedFrame::Gpu(GpuFrame {
-                width: neg.width,
-                height: neg.height,
+            // Pipelined Vulkan readback: submit *this* fd's blit on a
+            // free ring slot and take the bytes of the *previous*
+            // submission off another slot. The first call after
+            // startup or `reset_cache` returns `None` (nothing in
+            // flight yet) and we just drop the iteration; thereafter
+            // every callback sends one frame back. Net effect: the
+            // GPU blit for frame N+1 overlaps with the CPU memcpy of
+            // frame N, hiding the 12-30 ms blit cost behind the
+            // worker's own callback dispatch interval.
+            //
+            // Failures (lost device, OOM, bad modifier) are logged
+            // and the frame is dropped — `handle_process` is
+            // best-effort by design.
+            match importer.import_pipelined(
+                raw.fd as RawFd,
+                chunk_offset,
                 stride,
-                format: neg.pixel_format,
+                modifier,
+                neg.width,
+                neg.height,
+                neg.pixel_format,
                 timestamp_us,
-                plane: DmaBufPlane {
-                    fd: raw.fd as RawFd,
-                    offset: chunk_offset,
-                    stride,
-                    modifier,
-                    size: chunk_size,
-                },
-                importer: Some(Arc::clone(importer) as _),
-            })
+            ) {
+                Ok(Some(ready)) => CapturedFrame::Cpu(RawFrame {
+                    width: ready.width,
+                    height: ready.height,
+                    stride: ready.stride,
+                    format: ready.format,
+                    data: ready.bytes,
+                    timestamp_us: ready.timestamp_us,
+                }),
+                Ok(None) => {
+                    // Pipeline priming: the submit went out but
+                    // there's nothing to send back yet. We'll catch
+                    // the bytes on the next callback.
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = %e, "Vulkan readback failed on PW thread — frame dropped");
+                    return;
+                }
+            }
         }
         other => {
             warn!(?other, "unexpected SPA buffer data type");

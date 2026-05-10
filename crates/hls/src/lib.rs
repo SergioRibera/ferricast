@@ -42,11 +42,22 @@ pub use ring::SegmentRing;
 
 /// Tunables that govern segment cadence and buffering.
 ///
-/// Sensible defaults for desktop screen casting (2 s segments, 6
+/// Sensible defaults for desktop screen casting (2 s segments, 12
 /// retained, target duration 4 s on the wire) are exposed via
 /// [`HlsConfig::default`]. The playlist target duration is
 /// deliberately larger than the segment target so the unavoidable
 /// keyframe-delay tail never violates RFC 8216 §4.3.3.1.
+///
+/// The ring is sized generously — players (ffplay, hls.js, native
+/// AVPlayer) typically start playback 3 segments behind the live
+/// edge, and the small drift between segment wall-clock production
+/// (~2.0-2.1 s, includes encode overhead) and player PTS-paced
+/// consumption (exactly 2.000 s with the synthetic 60 fps PTS
+/// counter) cumulatively pushes them toward the eviction line.
+/// 12 retained segments × 2 s = 24 s window, leaving ~18 s of
+/// margin past the player's initial offset; that's enough to
+/// absorb several minutes of slow drift without any segment ever
+/// expiring under the player's feet.
 #[derive(Debug, Clone, Copy)]
 pub struct HlsConfig {
     /// Wallclock target a single segment tries to fit into. Real
@@ -56,8 +67,22 @@ pub struct HlsConfig {
     /// `ceil(segment_target_secs)` plus headroom.
     pub playlist_target_duration: u8,
     /// Number of segments retained in the live ring. Must be ≥ 3 so
-    /// players can prebuffer.
+    /// players can prebuffer. Sized to give the player ~18 s of
+    /// margin past the typical 3-segment live-edge offset — see
+    /// the type-level docs for why under-sizing this caused ffplay
+    /// to log "expired from playlists" + "Packet corrupt" every
+    /// few segments after a couple minutes of streaming.
     pub keep_segments: usize,
+    /// Frames-per-second target the segmenter paces to. Must agree
+    /// with the encoder's configured fps. Used to:
+    /// 1. Synthesise duplicate frames when the upstream capture
+    ///    stalls (PipeWire on idle GNOME desktops can pause for
+    ///    hundreds of ms — without this the segmenter would block
+    ///    inside `next_frame().await` and the HLS playlist would
+    ///    stop advancing).
+    /// 2. Anchor segment boundaries to wall clock by requesting a
+    ///    forced IDR once `segment_target_secs` has elapsed.
+    pub target_fps: u32,
 }
 
 impl Default for HlsConfig {
@@ -65,7 +90,8 @@ impl Default for HlsConfig {
         Self {
             segment_target_secs: 2.0,
             playlist_target_duration: 4,
-            keep_segments: 6,
+            keep_segments: 12,
+            target_fps: 60,
         }
     }
 }

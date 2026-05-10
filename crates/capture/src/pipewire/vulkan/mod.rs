@@ -21,20 +21,26 @@
 //! * [`VulkanImporter::reset_cache`] — invalidate per-frame caches
 //!   (called on format renegotiation).
 //!
-//! Performance note: the importer keeps a persistent command buffer,
-//! fence, staging buffer and a `HashMap<fd, VkImage>` cache. PipeWire
-//! reuses the same handful of fds within a negotiation cycle, so the
-//! `vkAllocateMemory` + `vkBindImageMemory` cost (the most expensive
-//! pieces of dmabuf import) only pays for the first frame per fd.
-//! Subsequent frames record-and-submit a single command buffer and
-//! memcpy from the staging buffer.
+//! Performance note: the importer keeps a `RING_DEPTH`-slot ring of
+//! `(command_buffer, fence, staging)` plus a `HashMap<BufferId,
+//! VkImage>` cache, allowing GPU work for frame N+1 to overlap with
+//! the CPU memcpy of frame N. PipeWire reuses the same handful of
+//! underlying dmabuf objects from a small pool, but compositors
+//! (notably Mutter on NVIDIA) routinely hand out a fresh `dup`'d fd
+//! for each buffer borrow, so the `RawFd` number is not stable. We
+//! key the cache on `(st_dev, st_ino)` of the fd instead, which is
+//! invariant across `dup`. With that key the expensive
+//! `vkAllocateMemory` + `vkBindImageMemory` only pay once per pool
+//! entry; subsequent frames record-and-submit on a free ring slot
+//! and return the previous slot's bytes (see
+//! [`VulkanImporter::submit_and_take_previous`]).
 
 mod format;
 mod import;
 mod init;
 mod modifiers;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
 use std::sync::Mutex;
 
@@ -93,31 +99,117 @@ pub(super) struct Inner {
     pub(super) memory_props: vk::PhysicalDeviceMemoryProperties,
 }
 
-/// Per-frame mutable cache. Lives behind a `RefCell` because the PW
+/// Stable identity for a dmabuf-backed buffer. PipeWire's screencast
+/// portal frequently `dup`s the same underlying dmabuf and hands us a
+/// fresh fd number, but `(st_dev, st_ino)` is the same for every dup
+/// of the same buffer — so it is a safe key for our import cache.
+#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
+pub(super) struct BufferId {
+    pub(super) dev: u64,
+    pub(super) ino: u64,
+}
+
+/// Cap on how many imported `VkImage`s we keep cached. Real PipeWire
+/// pools are 4-8 buffers; this cap exists only as a safety net for
+/// pathological compositors that mint a new buffer every frame. When
+/// exceeded, the oldest entry (by insertion order) is destroyed.
+pub(super) const MAX_IMPORT_CACHE: usize = 16;
+
+/// Number of `(command_buffer, fence, staging)` slots in the
+/// pipeline ring. Two is enough to hide the GPU blit behind one
+/// CPU memcpy: while the worker memcopies frame N out of slot A,
+/// the GPU is already blitting frame N+1 into slot B. A deeper ring
+/// would only buy more latency without throughput, since the GPU
+/// queue serialises blits anyway.
+pub(super) const RING_DEPTH: usize = 2;
+
+/// Per-frame mutable cache. Lives behind a `Mutex` because the PW
 /// worker thread is the only consumer and the borrow is scoped to a
-/// single `import_and_readback` call.
+/// single `import_and_readback` / `submit_and_take_previous` call.
 pub(super) struct State {
-    /// Single primary command buffer. Reset and re-recorded every
-    /// frame instead of allocating a fresh one (vkAllocate is
-    /// surprisingly expensive on some drivers).
+    /// `RING_DEPTH` independent submission slots. Entry 0 is also
+    /// what the synchronous `import_and_readback` path uses (after
+    /// flushing any in-flight pipelined submissions).
+    pub(super) slots: Vec<Slot>,
+    /// Round-robin counter. The next pipelined submit lands on
+    /// `slots[next_slot_idx]`, and `next_slot_idx` advances modulo
+    /// `RING_DEPTH` afterwards.
+    pub(super) next_slot_idx: usize,
+    /// Slot indices with a submission currently in flight, in the
+    /// order they were submitted (oldest first). Drained from the
+    /// front by [`VulkanImporter::submit_and_take_previous`].
+    pub(super) pending: VecDeque<usize>,
+    /// Imported dmabuf images keyed by stable buffer identity (see
+    /// [`BufferId`]). Cleared by `reset_cache` on renegotiation.
+    pub(super) imports: HashMap<BufferId, ImportedImage>,
+    /// FIFO of cache keys in insertion order, used to evict the
+    /// oldest entry once `imports.len() > MAX_IMPORT_CACHE`.
+    pub(super) import_order: VecDeque<BufferId>,
+}
+
+/// One ring entry: command buffer that records the blit, fence that
+/// signals when the GPU is done, persistent host-visible staging the
+/// blit copies into, and the metadata of any submission currently in
+/// flight on this slot.
+pub(super) struct Slot {
     pub(super) command_buffer: vk::CommandBuffer,
-    /// Reused fence. Reset after each `wait_for_fences`.
     pub(super) fence: vk::Fence,
-    /// Persistent host-visible staging buffer. Recreated only when a
-    /// format renegotiation needs more bytes than we have.
     pub(super) staging: Option<Staging>,
-    /// Imported dmabuf images keyed by their original fd. Within one
-    /// negotiation cycle PipeWire reuses the same handful of fds, so
-    /// the expensive `vkAllocateMemory(import)` only happens once
-    /// per pool entry. Cleared by `reset_cache` on renegotiation.
-    pub(super) imports: HashMap<RawFd, ImportedImage>,
+    /// `Some` while the slot has a submitted-but-not-yet-drained
+    /// blit. The metadata travels alongside the bytes when the slot
+    /// is drained so the caller can reconstruct a `RawFrame`.
+    pub(super) pending_meta: Option<PendingMeta>,
+}
+
+/// Everything needed to rebuild a `RawFrame` from a slot's staging
+/// buffer once its blit completes.
+#[derive(Clone, Copy)]
+pub(super) struct PendingMeta {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) stride: u32,
+    pub(super) format: PixelFormat,
+    pub(super) timestamp_us: u64,
+    pub(super) byte_size: u64,
+}
+
+/// Result of a pipelined `submit_and_take_previous` call. The bytes
+/// belong to the *previously* submitted frame (one ring step back);
+/// the metadata travels with them so the caller can rebuild a
+/// `RawFrame`.
+pub(crate) struct ReadyFrame {
+    pub(crate) bytes: Bytes,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) stride: u32,
+    pub(crate) format: PixelFormat,
+    pub(crate) timestamp_us: u64,
 }
 
 pub(super) struct Staging {
     pub(super) buffer: vk::Buffer,
     pub(super) memory: vk::DeviceMemory,
     pub(super) capacity: u64,
+    /// Persistent host-visible mapping. Mapped once at creation,
+    /// unmapped only on destruction — `vkMapMemory` / `vkUnmapMemory`
+    /// per frame is pointless overhead for HOST_COHERENT memory and
+    /// the spec explicitly allows leaving the mapping live.
+    ///
+    /// Stored as raw `*mut u8` so we don't fight Rust's lifetime
+    /// model for a pointer whose lifetime is tied to the Vulkan
+    /// device, not the borrow checker. Always non-null while the
+    /// `Staging` exists; only ever read while the importer's `Mutex`
+    /// is held, so the `unsafe impl Send` is sound.
+    pub(super) mapped_ptr: *mut u8,
 }
+
+// SAFETY: `mapped_ptr` is a stable, thread-agnostic pointer into a
+// HOST_COHERENT Vulkan device memory mapping. All reads happen with
+// the importer's `Mutex<State>` held, so it never crosses threads
+// concurrently. The other Vulkan handles in `Staging` are integer
+// IDs (already `Send`), and `*mut u8` would otherwise opt the type
+// out of `Send`.
+unsafe impl Send for Staging {}
 
 pub(super) struct ImportedImage {
     pub(super) image: vk::Image,
@@ -166,9 +258,11 @@ impl VulkanImporter {
         }
     }
 
-    /// Import a dmabuf plane (using cached `VkImage` if we've seen
-    /// the fd before), blit it into the persistent staging buffer
-    /// and copy the result out as `Bytes`.
+    /// Synchronous import + readback. Drains any in-flight pipeline
+    /// first (so the result is for *this* fd, not the previous one)
+    /// and returns the linear pixel bytes. Used by the
+    /// `DmaBufImporter` trait for any caller that hasn't switched to
+    /// the pipelined API.
     pub(crate) fn import_and_readback(
         &self,
         fd: RawFd,
@@ -185,7 +279,7 @@ impl VulkanImporter {
             )));
         };
         let mut state = self.state.lock().expect("vulkan state mutex poisoned");
-        import::run(
+        import::run_sync(
             &self.inner,
             &mut state,
             fd,
@@ -199,10 +293,54 @@ impl VulkanImporter {
         )
     }
 
-    /// Wipe the imported-image cache. Called when PipeWire
-    /// renegotiates: the old fds are about to be closed and any new
-    /// stream may pick a different format, so cached `VkImage`s
-    /// would be stale.
+    /// Pipelined entry point used by the PW worker. Submits a blit
+    /// for `fd` to a fresh ring slot and returns the bytes (with
+    /// original metadata) of the *previous* frame submitted on
+    /// another slot, if any. The very first call after startup or
+    /// after `reset_cache` returns `Ok(None)` — there's nothing in
+    /// flight yet — and every subsequent call returns one frame.
+    /// Net effect: GPU work for frame N+1 overlaps with the CPU
+    /// memcpy for frame N.
+    ///
+    /// Public name spelled `import_pipelined` (instead of
+    /// `submit_and_take_previous`) because that's how it reads at
+    /// the call site in `handle_process`.
+    pub(crate) fn import_pipelined(
+        &self,
+        fd: RawFd,
+        plane_offset: u32,
+        plane_stride: u32,
+        modifier: u64,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        timestamp_us: u64,
+    ) -> Result<Option<ReadyFrame>> {
+        let Some(vk_format) = format::pixel_format_to_vk(format) else {
+            return Err(FerricastError::Capture(format!(
+                "Vulkan: unsupported PixelFormat {format:?}"
+            )));
+        };
+        let mut state = self.state.lock().expect("vulkan state mutex poisoned");
+        import::run_pipelined(
+            &self.inner,
+            &mut state,
+            fd,
+            plane_offset,
+            plane_stride,
+            modifier,
+            width,
+            height,
+            vk_format,
+            format,
+            timestamp_us,
+        )
+    }
+
+    /// Wipe the imported-image cache and drop any in-flight
+    /// pipelined work. Called when PipeWire renegotiates: the old
+    /// fds are about to be closed and any new stream may pick a
+    /// different format, so cached `VkImage`s would be stale.
     pub(crate) fn reset_cache(&self) {
         let mut state = self.state.lock().expect("vulkan state mutex poisoned");
         // Wait until any in-flight submit completes before we destroy
@@ -215,6 +353,14 @@ impl VulkanImporter {
             }
         }
         state.imports.clear();
+        state.import_order.clear();
+        // Drop any in-flight pipeline state — the bytes those slots
+        // were going to produce are now meaningless because the
+        // images they reference are gone.
+        for slot in state.slots.iter_mut() {
+            slot.pending_meta = None;
+        }
+        state.pending.clear();
         debug!("Vulkan import cache cleared");
     }
 }
@@ -245,26 +391,36 @@ impl DmaBufImporter for VulkanImporter {
 
 impl State {
     fn create(inner: &Inner) -> Result<Self> {
-        // Allocate one primary command buffer.
+        // Allocate `RING_DEPTH` primary command buffers in one call.
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(inner.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
+            .command_buffer_count(RING_DEPTH as u32);
         let cmd_buffers = unsafe { inner.device.allocate_command_buffers(&cmd_alloc) }
             .map_err(|e| FerricastError::Capture(format!("vk allocate_command_buffers: {e}")))?;
 
-        let fence = unsafe {
-            inner
-                .device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
+        let mut slots = Vec::with_capacity(RING_DEPTH);
+        for cmd in cmd_buffers {
+            let fence = unsafe {
+                inner
+                    .device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+            }
+            .map_err(|e| FerricastError::Capture(format!("vk create_fence: {e}")))?;
+            slots.push(Slot {
+                command_buffer: cmd,
+                fence,
+                staging: None,
+                pending_meta: None,
+            });
         }
-        .map_err(|e| FerricastError::Capture(format!("vk create_fence: {e}")))?;
 
         Ok(Self {
-            command_buffer: cmd_buffers[0],
-            fence,
-            staging: None,
+            slots,
+            next_slot_idx: 0,
+            pending: VecDeque::new(),
             imports: HashMap::new(),
+            import_order: VecDeque::new(),
         })
     }
 }
@@ -295,15 +451,30 @@ impl Drop for VulkanImporter {
                 dev.free_memory(img.memory, None);
             }
             state.imports.clear();
-            if let Some(s) = state.staging.take() {
-                dev.destroy_buffer(s.buffer, None);
-                dev.free_memory(s.memory, None);
+            state.import_order.clear();
+            state.pending.clear();
+            // Tear down each ring slot. `device_wait_idle` above
+            // guarantees the GPU isn't still touching any of these
+            // resources, so destruction order within the slot is
+            // free.
+            let mut cmd_to_free: Vec<vk::CommandBuffer> = Vec::with_capacity(state.slots.len());
+            for slot in state.slots.drain(..) {
+                if let Some(s) = slot.staging {
+                    if !s.mapped_ptr.is_null() {
+                        dev.unmap_memory(s.memory);
+                    }
+                    dev.destroy_buffer(s.buffer, None);
+                    dev.free_memory(s.memory, None);
+                }
+                if slot.fence != vk::Fence::null() {
+                    dev.destroy_fence(slot.fence, None);
+                }
+                if slot.command_buffer != vk::CommandBuffer::null() {
+                    cmd_to_free.push(slot.command_buffer);
+                }
             }
-            if state.fence != vk::Fence::null() {
-                dev.destroy_fence(state.fence, None);
-            }
-            if state.command_buffer != vk::CommandBuffer::null() {
-                dev.free_command_buffers(self.inner.command_pool, &[state.command_buffer]);
+            if !cmd_to_free.is_empty() {
+                dev.free_command_buffers(self.inner.command_pool, &cmd_to_free);
             }
         }
     }
