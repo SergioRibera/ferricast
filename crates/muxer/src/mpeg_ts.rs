@@ -88,9 +88,8 @@ impl Muxer for MpegTs {
             // (shouldn't happen with zerolatency tune, but guard so we
             // don't emit a slice-less PES that the H.264 decoder
             // rejects with "missing picture in access unit").
-            return Err(FerricastError::Encoder(
-                "muxer.add_frame received empty encoded frame".into(),
-            ));
+            tracing::warn!("Empty frame, skipping");  
+            return Ok(());
         }
         if !self.psi_emitted {
             self.emit_pat();

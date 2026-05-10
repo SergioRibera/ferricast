@@ -135,11 +135,6 @@ struct EncoderCfg {
 #[derive(Default)]
 struct FrameState {
     frame_idx: u32,
-    /// Frame index of the most recent IDR. Used to compute
-    /// `frame_num` for the next P-picture without assuming IDRs land
-    /// on a GOP-aligned boundary (segmenter-forced IDRs can fire
-    /// mid-GOP).
-    last_idr_frame_idx: u32,
     /// Picture-order-count (×2 per frame, mod `MaxPicOrderCntLsb`).
     poc: u32,
     /// Toggles 0..1 every IDR. Sent in the slice header.
@@ -585,10 +580,8 @@ fn run_encode(
         0
     } else {
         // frame_num counts reference frames since last IDR (mod
-        // 2^(log2_max_frame_num_minus4+4) = 2^8 = 256). We track
-        // `last_idr_frame_idx` explicitly so segmenter-forced IDRs
-        // mid-GOP don't break this counter.
-        ((state.frame_idx - state.last_idr_frame_idx) & 0xff) as u16
+        // 2^(log2_max_frame_num_minus4+4) = 2^8 = 256).
+        ((state.frame_idx - state.frame_idx_at_last_idr(cfg.keyframe_interval)) & 0xff) as u16
     };
     let poc = if is_idr { 0 } else { state.poc };
 
@@ -728,6 +721,7 @@ fn run_encode(
         check_status(bindings::vaBeginPicture(dpy, ctx, target))
             .map_err(|s| FerricastError::Encoder(format!("vaBeginPicture: {s:#x}")))?;
 
+        println!("{:?}", all_ids.len());
         let render_status = bindings::vaRenderPicture(
             dpy,
             ctx,
@@ -772,9 +766,6 @@ fn run_encode(
 
     // Update state for the next frame.
     let frame_idx_now = state.frame_idx;
-    if is_idr {
-        state.last_idr_frame_idx = state.frame_idx;
-    }
     state.frame_idx += 1;
     state.poc = if is_idr { 2 } else { state.poc + 2 };
     state.prev_recon = Some(cur_recon_idx);
@@ -785,6 +776,14 @@ fn run_encode(
     }
 
     Ok((bitstream, is_idr, frame_idx_now, poc))
+}
+
+/// Helper kept inline so `state` updates and `frame_num` math live
+/// next to each other.
+impl FrameState {
+    fn frame_idx_at_last_idr(&self, gop: u32) -> u32 {
+        (self.frame_idx / gop) * gop
+    }
 }
 
 fn build_seq_param(cfg: &EncoderCfg) -> EncSequenceParameterBufferH264 {

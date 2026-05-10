@@ -78,6 +78,8 @@ impl VideoEncoder for H264Encoder {
                 // libva, profile mismatch, ...) try NVENC; if that
                 // also fails, fall back to x264. We always end up
                 // with a working encoder — x264 is the floor.
+               // TODO: fix this for x11!
+                /*
                 match VaapiH264Encoder::probe_with(config.clone()) {
                     Ok(enc) => {
                         info!(
@@ -91,6 +93,7 @@ impl VideoEncoder for H264Encoder {
                     }
                     Err(e) => info!(error = %e, "VA-API unavailable, trying NVENC"),
                 }
+               */
 
                 match NvencH264Encoder::probe_with(config.clone()) {
                     Ok(enc) => {

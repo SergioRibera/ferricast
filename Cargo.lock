@@ -1709,6 +1709,7 @@ name = "ferricast-muxer"
 version = "0.1.0"
 dependencies = [
  "ferricast-core",
+ "tracing",
 ]
 
 [[package]]
