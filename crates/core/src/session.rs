@@ -16,7 +16,16 @@ impl Default for StreamConfig {
         Self {
             width: 1920,
             height: 1080,
-            fps: 30,
+            // 60 matches typical desktop refresh rates. Some
+            // xdg-desktop-portal backends only complete the
+            // EnumFormat negotiation when the default framerate the
+            // sender advertises matches what the compositor wants to
+            // produce — `default: 30, range: 0-1000` was reproducibly
+            // failing with `Paused → Error("no more input formats")`
+            // on Niri+pipewire-shm. The actual value the encoder
+            // ends up using is overridden by `ScreenCapture::
+            // get_framerate()` once the format settles.
+            fps: 60,
             bitrate_kbps: 5000,
             codec: crate::Codec::H264,
         }

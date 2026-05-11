@@ -2,12 +2,16 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use ferricast_core::{
-    CaptureConfig, CaptureSource, CastSession, Device, Discovery, DiscoveryEvent, EncodedFrame, EncoderConfig, FerricastError, ProtocolHandler, Result, ScreenCapture, StreamConfig, VideoEncoder
+    CaptureConfig, CaptureSource, CastSession, CapturedFrame, Device, Discovery, DiscoveryEvent,
+    EncodedFrame, EncoderConfig, FerricastError, ProtocolHandler, Result, ScreenCapture,
+    StreamConfig, VideoEncoder,
 };
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -61,6 +65,12 @@ struct RegisteredProtocol {
 struct ActiveStream {
     device: Device,
     cancel_tx: mpsc::Sender<()>,
+    /// Handle to the spawned streaming task. Kept so `stop_stream`
+    /// can `await` until the task has actually torn down its
+    /// capture/encoder/session — without this, `shutdown()` can
+    /// return while PipeWire/CASTv2 cleanup is still racing the
+    /// process exit and the OS reaps fds + threads abruptly.
+    task: JoinHandle<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -236,26 +246,147 @@ impl StreamManager {
                 FerricastError::Protocol(format!("No handler for {}", device.protocol))
             })?;
 
+        // Apply the device's fps ceiling BEFORE start so the
+        // PipeWire worker's internal throttle anchors to the right
+        // rate from buffer 0 — otherwise the worker burns CPU on
+        // Vulkan readbacks at the compositor's refresh (60 Hz
+        // typical) for frames the encoder will never consume.
+        let device_fps_cap = device.capabilities.max_fps;
+        let initial_fps = match device_fps_cap {
+            Some(cap) => config.fps.min(cap),
+            None => config.fps,
+        };
+
         // Start capture first so the portal picker shows before connecting.
         let capture_config = CaptureConfig {
-            fps: config.fps,
+            fps: initial_fps,
             width: Some(config.width),
             height: Some(config.height),
             show_cursor: true,
         };
 
         capture.start(source, capture_config).await?;
-        tracing::info!(device_id = %device_id, "Capture started, connecting to device");
 
-        let size = capture.get_screen_size();
+        // Block on the first frame: PipeWire's format negotiation and
+        // buffer setup happen on its main-loop thread asynchronously,
+        // so `capture.start().await` returning doesn't mean the
+        // negotiated format is available yet. Pulling a frame is the
+        // simplest barrier — backends only emit frames once the
+        // format is acked, so by the time this resolves
+        // `get_screen_size` / `get_framerate` are populated.
+        //
+        // Without this the encoder gets configured with (0, 0) and
+        // x264 dies with "invalid width x height (0x0)" while
+        // PipeWire tears its own stream down with "no more input
+        // formats" — same root cause.
+        tracing::info!(device_id = %device_id, "awaiting first frame from capture (30s ceiling)");
+        let first_frame = match tokio::time::timeout(
+            Duration::from_secs(30),
+            capture.next_frame(),
+        )
+        .await
+        {
+            Ok(Ok(f)) => {
+                tracing::info!(
+                    device_id = %device_id,
+                    "first frame received from capture"
+                );
+                f
+            }
+            Ok(Err(e)) => {
+                tracing::error!(
+                    device_id = %device_id,
+                    %e,
+                    "capture returned error before first frame"
+                );
+                return Err(e);
+            }
+            Err(_) => {
+                tracing::error!(
+                    device_id = %device_id,
+                    "capture.next_frame() did not return within 30s — \
+                     the capture worker isn't delivering buffers \
+                     (compositor idle, or worker stalled)"
+                );
+                return Err(FerricastError::Timeout(
+                    "capture.next_frame() exceeded 30s".into(),
+                ));
+            }
+        };
+        tracing::info!(device_id = %device_id, "Capture negotiated, connecting to device");
+
+        let (width, height) = capture.get_screen_size();
+        let pixel_format = capture.get_pixel_format();
+        // Prefer the framerate the source actually delivers; fall
+        // back to the user's hint if the backend doesn't report one
+        // (X11 polling or a backend that hasn't negotiated yet).
+        let negotiated_fps = capture.get_framerate();
+        let mut effective_fps = if negotiated_fps > 0 {
+            negotiated_fps
+        } else {
+            config.fps
+        };
+        let mut effective_bitrate_kbps = config.bitrate_kbps;
+        let mut effective_h264_profile: Option<ferricast_core::H264Profile> = None;
+
+        // Apply receiver-side hardware limits before we configure
+        // the encoder. `DeviceCapabilities` is populated by the
+        // protocol's discovery code (chromecast/discovery.rs reads
+        // the `md` mDNS field and maps it to a known device class)
+        // so this caps for the right reason on the right device:
+        // 1st-gen Chromecast → 1080p@30 Main, Ultra → 4K@30 High,
+        // Google TV → 1080p@60 High, etc.
+        let caps = &device.capabilities;
+        if let Some(max_fps) = caps.max_fps {
+            if effective_fps > max_fps {
+                tracing::warn!(
+                    device = %device.name,
+                    requested_fps = effective_fps,
+                    max_fps,
+                    "device cap: lowering encode fps to receiver's decoder ceiling"
+                );
+                effective_fps = max_fps;
+            }
+        }
+        if let Some(max_bitrate) = caps.max_bitrate_kbps {
+            if effective_bitrate_kbps > max_bitrate {
+                tracing::warn!(
+                    device = %device.name,
+                    requested_kbps = effective_bitrate_kbps,
+                    max_kbps = max_bitrate,
+                    "device cap: lowering bitrate to receiver's decoder ceiling"
+                );
+                effective_bitrate_kbps = max_bitrate;
+            }
+        }
+        if let Some(prof) = caps.max_h264_profile {
+            effective_h264_profile = Some(prof);
+        }
+
+        tracing::info!(
+            device = %device.name,
+            model = %device.model.as_deref().unwrap_or(""),
+            width,
+            height,
+            negotiated_fps,
+            effective_fps,
+            effective_bitrate_kbps,
+            ?effective_h264_profile,
+            requires_audio = caps.requires_audio,
+            ?pixel_format,
+            "encoder configured against device capabilities"
+        );
 
         encoder.configure(&EncoderConfig {
-            pixel_format: capture.get_pixel_format(),
-            width: size.0 as u32,
-            height: size.1 as u32,
+            pixel_format,
+            width: width as u32,
+            height: height as u32,
+            fps: effective_fps,
+            bitrate_kbps: effective_bitrate_kbps,
+            max_h264_profile: effective_h264_profile,
             ..Default::default()
         })?;
-        
+
 
         let mut session = (proto.create_session)()?;
         session.connect(&device).await?;
@@ -268,7 +399,7 @@ impl StreamManager {
         let device_name = device.name.clone();
         let did = device.id;
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
 
             let _ = event_tx
                 .send(ManagerEvent::StreamStarted {
@@ -277,15 +408,99 @@ impl StreamManager {
                 })
                 .await;
 
+            // The frame we already pulled to barrier on negotiation
+            // is the first frame of this loop — dropping it would
+            // waste an entire keyframe interval on backends that
+            // emit IDR on the very first frame.
+            let mut seed = Some(first_frame);
+
+            // Pacing for event-driven capture sources. Wayland
+            // compositors only emit a new dmabuf when the screen
+            // actually changes — meaning a stream-paused user
+            // (e.g. waiting for the chromecast to start displaying)
+            // can go many seconds with no new frame. Receivers
+            // that need a steady cadence (HLS chromecast, DASH,
+            // anything muxed into MPEG-TS) starve under that:
+            // their segmenter expects 1 keyframe / second and
+            // can't close a segment without two of them.
+            //
+            // Pace at `effective_fps`: if `capture.next_frame()`
+            // doesn't deliver inside one frame period, re-emit
+            // the most recent real frame with its timestamp
+            // bumped forward. The encoder treats it as a fresh
+            // input and produces another encoded frame; the
+            // downstream session sees a steady stream regardless
+            // of what's happening on screen.
+            let frame_period = Duration::from_secs_f64(1.0 / (effective_fps.max(1) as f64));
+            let frame_period_us = (1_000_000.0 / (effective_fps.max(1) as f64)) as u64;
+            let mut last_frame: Option<CapturedFrame> = None;
+
+            // Wall-clock keyframe pacing. The HLS segmenter closes a
+            // segment at the *next* keyframe after the configured
+            // target_secs elapses. NVENC's natural \"every N frames\"
+            // keyframe schedule drifts vs wallclock — at 30 fps a
+            // 60-frame interval is *nominally* 2 s but actually
+            // lands anywhere from 1.95 s to 2.05 s depending on
+            // pacing jitter. When NVENC's IDR lands a few ms
+            // before the segmenter's 2 s mark, the segmenter
+            // pushes the keyframe through and waits another full
+            // interval — producing a 4 s segment instead of 2 s.
+            // The chromecast then has to fetch ~2 MB chunks and
+            // visible BUFFERING events appear.
+            //
+            // Fix: ask the encoder for an IDR on wall-clock
+            // boundaries instead of relying on its natural
+            // interval. Segments come out at exactly target_secs
+            // wide, sizes stay tight, BUFFERING events disappear.
+            //
+            // 4 s matches HlsConfig::default().segment_target_secs.
+            // Could be plumbed through later if we ship a
+            // non-default HlsConfig.
+            let keyframe_interval = Duration::from_secs(4);
+            let mut next_keyframe_at = Instant::now();
+
             loop {
                 tokio::select! {
                     _ = cancel_rx.recv() => {
                         tracing::info!(?did, "Stream cancelled");
                         break;
                     }
-                    frame_result = capture.next_frame() => {
+                    frame_result = async {
+                        if let Some(f) = seed.take() {
+                            last_frame = Some(f.clone());
+                            return Ok(f);
+                        }
+                        match tokio::time::timeout(frame_period, capture.next_frame()).await {
+                            Ok(Ok(f)) => {
+                                last_frame = Some(f.clone());
+                                Ok(f)
+                            }
+                            Ok(Err(e)) => Err(e),
+                            Err(_) => match last_frame.as_mut() {
+                                Some(stored) => {
+                                    bump_timestamp(stored, frame_period_us);
+                                    Ok(stored.clone())
+                                }
+                                None => capture.next_frame().await,
+                            },
+                        }
+                    } => {
                         match frame_result {
                             Ok(raw_frame) => {
+                                // Wall-clock keyframe pacing — see comment at
+                                // `keyframe_interval` declaration. Without this
+                                // segments alternate 2 s / 4 s and the
+                                // chromecast hits BUFFERING on the 4 s ones.
+                                let now = Instant::now();
+                                if now >= next_keyframe_at {
+                                    encoder.request_keyframe();
+                                    // Step forward in fixed increments so a
+                                    // late frame doesn't shift the whole
+                                    // schedule and accumulate drift.
+                                    while next_keyframe_at <= now {
+                                        next_keyframe_at += keyframe_interval;
+                                    }
+                                }
                                 match encoder.encode(raw_frame) {
                                     Ok(encoded) => {
                                         if let Err(e) = session.send_frame(&encoded).await {
@@ -333,6 +548,7 @@ impl StreamManager {
             ActiveStream {
                 device,
                 cancel_tx,
+                task,
             },
         );
 
@@ -342,8 +558,22 @@ impl StreamManager {
     pub async fn stop_stream(&self, device_id: Uuid) -> Result<()> {
         let stream = self.active_streams.lock().await.remove(&device_id);
         if let Some(stream) = stream {
-            let _ = stream.cancel_tx.send(()).await;
             tracing::info!(name = %stream.device.name, "Stopping stream");
+            // Signal the loop to break, then wait for the task to
+            // actually finish — capture.stop() / session.stop() run
+            // *inside* the task and we want them done before we
+            // return so the caller (e.g. ctrl-c handler) can rely on
+            // "stop_stream returned" meaning "no more PipeWire
+            // worker thread / TLS connection / HLS listener alive".
+            let _ = stream.cancel_tx.send(()).await;
+            // 5s ceiling: if cleanup wedges (PipeWire main loop
+            // refusing to quit, TLS write blocked behind a dead
+            // peer) we'd rather log + move on than hang forever.
+            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(?e, "stream task panicked during shutdown"),
+                Err(_) => tracing::warn!(name = %stream.device.name, "stream task did not finish in 5s, abandoning"),
+            }
             Ok(())
         } else {
             Err(FerricastError::NoActiveSession)
@@ -356,5 +586,18 @@ impl StreamManager {
             let _ = self.stop_stream(id).await;
         }
         self.stop_discovery().await
+    }
+}
+
+/// Forward `frame`'s timestamp by `delta_us` microseconds. Used by
+/// the manager loop's pacing fallback: when the upstream capture
+/// stalls (Wayland compositor not emitting frames because nothing
+/// on screen has changed) we re-emit the most recent real frame
+/// with a synthetic monotonic timestamp so the downstream encoder
+/// + segmenter keeps producing output at the configured fps.
+fn bump_timestamp(frame: &mut CapturedFrame, delta_us: u64) {
+    match frame {
+        CapturedFrame::Cpu(r) => r.timestamp_us = r.timestamp_us.saturating_add(delta_us),
+        CapturedFrame::Gpu(g) => g.timestamp_us = g.timestamp_us.saturating_add(delta_us),
     }
 }

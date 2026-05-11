@@ -23,7 +23,7 @@
 use std::os::fd::RawFd;
 use std::ptr;
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ferricast_core::{
@@ -66,6 +66,19 @@ struct UserData {
     /// Set when we've logged the first non-empty frame forwarded
     /// downstream — the moment capture is actually working.
     first_frame_logged: bool,
+    /// Target frame period derived from `CaptureConfig::fps`. Used
+    /// to throttle Vulkan readback so we don't waste CPU on
+    /// memcpy'ing 8 MB at 60 fps when the consumer only encodes at
+    /// 30 fps. Without this, the worker dutifully runs the full
+    /// Vulkan import + blit + memcpy for every buffer PipeWire
+    /// delivers (which on a 60 Hz compositor is 60/s = ~480 MB/s of
+    /// memory bandwidth) even though the downstream encoder only
+    /// consumes every second frame.
+    frame_period: Duration,
+    /// Wallclock instant of the last buffer we *processed* (not
+    /// dropped). Used together with `frame_period` to decide
+    /// whether to skip the next arriving buffer.
+    last_processed_at: Option<Instant>,
     /// `Some` when Vulkan came up successfully and we can import
     /// the dmabuf modifiers we advertised. The PW worker thread
     /// invokes `importer.readback(...)` directly inside
@@ -209,6 +222,13 @@ fn run(
         shared: Arc::clone(&shared),
         first_buffer_logged: false,
         first_frame_logged: false,
+        // CaptureConfig.fps is the manager-imposed cap (which
+        // already factors in DeviceCapabilities::max_fps). Use
+        // 0.95 of the period so a buffer that arrives ~one
+        // refresh tick early still gets processed instead of
+        // being dropped by a hair.
+        frame_period: Duration::from_secs_f64(0.95 / (config.fps.max(1) as f64)),
+        last_processed_at: None,
         importer,
     };
 
@@ -364,6 +384,29 @@ fn handle_process(
         return;
     };
 
+    // Throttle to `ud.frame_period`. The Wayland compositor emits
+    // a buffer per refresh (60 Hz typical) regardless of what
+    // framerate the consumer wants. Doing the full Vulkan import
+    // + blit + ~8 MB readback on every one of those buffers when
+    // the encoder only consumes at 30 fps is pure CPU/PCIe waste
+    // (≈ 240 MB/s of memcpy + GPU work we throw away). When the
+    // arrival is too soon after the last processed frame, drain
+    // and discard everything — quick path, no GPU work, no
+    // memcpy. PW reuses the buffer slot on the next round.
+    let now = Instant::now();
+    if let Some(prev) = ud.last_processed_at {
+        if now.duration_since(prev) < ud.frame_period {
+            let mut dropped = 0;
+            while stream.dequeue_buffer().is_some() {
+                dropped += 1;
+            }
+            if dropped > 0 {
+                trace!(dropped, "throttle: discarded buffer(s) before Vulkan path");
+            }
+            return;
+        }
+    }
+
     // Drain stale buffers and keep only the newest.
     let mut drained = 0;
     let mut newest = None;
@@ -378,6 +421,12 @@ fn handle_process(
     if drained > 1 {
         trace!(drained, "drained stale buffers, keeping newest");
     }
+    // Anchor for the next throttle decision *only* once we've
+    // committed to doing real work for this buffer. Otherwise a
+    // sequence of quick drops would never re-anchor and we'd
+    // accidentally process the very next buffer instead of waiting
+    // a full period.
+    ud.last_processed_at = Some(now);
 
     let datas = buffer.datas_mut();
     let Some(plane) = datas.first_mut() else {

@@ -145,6 +145,14 @@ pub(super) struct State {
     /// FIFO of cache keys in insertion order, used to evict the
     /// oldest entry once `imports.len() > MAX_IMPORT_CACHE`.
     pub(super) import_order: VecDeque<BufferId>,
+    /// `false` until the very first pipelined submission has been
+    /// drained back to the consumer. While `false`,
+    /// [`run_pipelined`] drains synchronously instead of returning
+    /// `Ok(None)` — this avoids the priming deadlock when the
+    /// upstream (event-driven Wayland compositors) only sends a
+    /// new buffer when the screen actually changes. Reset to
+    /// `false` by [`reset_cache`] on renegotiation.
+    pub(super) primed: bool,
 }
 
 /// One ring entry: command buffer that records the blit, fence that
@@ -361,6 +369,10 @@ impl VulkanImporter {
             slot.pending_meta = None;
         }
         state.pending.clear();
+        // Renegotiation = a fresh stream that will need to be
+        // primed again. Clear the flag so the next first frame
+        // drains synchronously.
+        state.primed = false;
         debug!("Vulkan import cache cleared");
     }
 }
@@ -421,6 +433,7 @@ impl State {
             pending: VecDeque::new(),
             imports: HashMap::new(),
             import_order: VecDeque::new(),
+            primed: false,
         })
     }
 }

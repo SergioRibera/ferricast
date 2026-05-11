@@ -8,8 +8,8 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use ferricast_core::{
-    Codec, Device, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError, MdnsDiscovery,
-    Result,
+    Codec, Device, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError, H264Profile,
+    MdnsDiscovery, Result,
 };
 
 const CHROMECAST_SERVICE_TYPE: &str = "_googlecast._tcp.local.";
@@ -119,14 +119,8 @@ impl Discovery for ChromecastDiscovery {
                             .and_then(|v| v.parse::<u32>().ok())
                             .unwrap_or(0);
 
-                        let capabilities = DeviceCapabilities {
-                            supports_audio: ca & CA_AUDIO_OUT != 0 || ca == 0,
-                            supports_video: ca & CA_VIDEO_OUT != 0 || ca == 0,
-                            supports_screen_mirror: ca & CA_VIDEO_OUT != 0 || ca == 0,
-                            max_width: Some(1920),
-                            max_height: Some(1080),
-                            supported_codecs: vec![Codec::H264, Codec::Vp8],
-                        };
+                        let capabilities =
+                            capabilities_for_model(model.as_deref().unwrap_or(""), ca);
 
                     
                         let addr: std::net::IpAddr = match info.get_addresses_v4().iter().next() {
@@ -228,4 +222,96 @@ impl Discovery for ChromecastDiscovery {
     fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
+}
+
+/// Build a [`DeviceCapabilities`] profile keyed on the chromecast
+/// `md` mDNS field (the model name advertised by the device) plus
+/// the `ca` capability bitmask. This is the single source of truth
+/// for "what will this receiver actually play" — the manager reads
+/// the resulting caps before configuring capture / encoder so we
+/// never blast a 4K HDR HEVC stream at a 1st-gen Chromecast.
+///
+/// Identification is heuristic based on the model string Google
+/// hands out in mDNS. There's no documented programmatic capability
+/// API on chromecast, so we work backwards from the known specs of
+/// each product line. Conservative on unknowns — the default
+/// branch matches `md == "Chromecast"` which is the oldest
+/// (1st/2nd/3rd gen) hardware and has the strictest constraints.
+fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
+    let supports_video = ca & CA_VIDEO_OUT != 0 || ca == 0;
+    let supports_audio = ca & CA_AUDIO_OUT != 0 || ca == 0;
+
+    // Floor: oldest generic Chromecasts (md == "Chromecast"),
+    // ve=05, ca=201221 in the wild. Decoder rated for 1080p @ 30
+    // fps Main profile and rejects HLS without audio. Bitrate
+    // ceiling from Cast spec for that hardware class.
+    let mut caps = DeviceCapabilities {
+        supports_audio,
+        supports_video,
+        supports_screen_mirror: supports_video,
+        max_width: Some(1920),
+        max_height: Some(1080),
+        max_fps: Some(30),
+        // 3.5 Mbps not 5 Mbps. Cast docs claim the 1st-gen
+        // hardware decoder is rated for 5 Mbps but in practice
+        // sustaining that over Wi-Fi 2.4 GHz to a chromecast with
+        // a tiny single-band antenna leads to per-segment spikes
+        // (CBR ≠ flat — scene complexity matters) exceeding the
+        // receiver's network buffer. The player aborts with
+        // `detailedErrorCode=301` (MEDIA_NETWORK) after a few
+        // resets and we see the stream cut out. 3.5 Mbps keeps
+        // peaks under ~5 Mbps and runs reliably end-to-end.
+        max_bitrate_kbps: Some(3_500),
+        requires_audio: true,
+        max_h264_profile: Some(H264Profile::Main),
+        supported_codecs: vec![Codec::H264, Codec::Vp8],
+    };
+
+    // Lowercased once so each branch can use cheap `contains`.
+    let md_lc = md.to_lowercase();
+
+    if md_lc.contains("ultra") {
+        // Chromecast Ultra: 4K @ 30 fps with HDR, or 1080p @ 60 fps.
+        // H.264 High up to L5.1, HEVC Main10, VP9. Newer firmware
+        // accepts video-only HLS.
+        caps.max_width = Some(3840);
+        caps.max_height = Some(2160);
+        caps.max_fps = Some(30);
+        caps.max_bitrate_kbps = Some(30_000);
+        caps.requires_audio = false;
+        caps.max_h264_profile = Some(H264Profile::High);
+        caps.supported_codecs.extend([Codec::H265, Codec::Vp9]);
+    } else if md_lc.contains("google tv") || md_lc.contains("android tv") {
+        // Cast-built-in on Google / Android TV. Decoder is the
+        // TV's hardware codec — uniformly capable of 1080p @ 60
+        // High @ L4.2 minimum. Doesn't insist on audio.
+        caps.max_fps = Some(60);
+        caps.max_bitrate_kbps = Some(15_000);
+        caps.requires_audio = false;
+        caps.max_h264_profile = Some(H264Profile::High);
+    } else if md_lc == "chromecast audio" {
+        // No display.
+        caps.supports_video = false;
+        caps.supports_screen_mirror = false;
+        caps.max_width = None;
+        caps.max_height = None;
+        caps.max_fps = None;
+        caps.max_h264_profile = None;
+        caps.supported_codecs.clear();
+    } else if md_lc == "chromecast" {
+        // Matches the conservative defaults above explicitly so
+        // this branch documents the floor.
+    } else {
+        // Unknown model. Most third-party Cast-built-in devices
+        // (smart speakers with screens, soundbars, TVs that
+        // identify by SKU like "TV-BD5") have decoders at least
+        // on par with Google TV. Bias slightly above floor but
+        // below Ultra to be safe.
+        caps.max_fps = Some(60);
+        caps.max_bitrate_kbps = Some(10_000);
+        caps.requires_audio = false;
+        caps.max_h264_profile = Some(H264Profile::High);
+    }
+
+    caps
 }

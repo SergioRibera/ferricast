@@ -1,160 +1,745 @@
+//! Chromecast (CASTv2) session.
+//!
+//! Lifecycle, in the order [`StreamManager`] drives:
+//!
+//! 1. [`ChromecastSession::connect`] — open a TLS channel to the
+//!    receiver, do the connection / heartbeat handshake, launch the
+//!    Default Media Receiver app, latch its `transport_id` /
+//!    `session_id`, spawn a background read loop (PONG + status
+//!    ingestion) and a heartbeat ticker.
+//! 2. [`ChromecastSession::setup_stream`] — store config. We don't
+//!    bind HLS or send `LOAD` yet because the segmenter needs SPS /
+//!    PPS, which only show up in the bitstream at the first IDR.
+//! 3. [`ChromecastSession::send_frame`] — forward each encoded frame
+//!    to the HLS segmenter. On the very first keyframe we extract
+//!    SPS/PPS, spin up the segmenter, wait for the first segment to
+//!    materialise, then send `LOAD` so the cast device begins
+//!    pulling from us.
+//! 4. [`ChromecastSession::stop`] — best-effort `STOP` on the
+//!    receiver, drop the writer (closes TLS), abort background
+//!    tasks, drop the HLS sink (closes its listener and segmenter).
+
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Duration;
 
-use rust_cast::{channels::{heartbeat::HeartbeatResponse, media::Media, receiver::CastDeviceApp}, CastDevice, ChannelMessage};
-use rustls::pki_types::ServerName;
-use serde::de;
-use tokio::sync::Mutex;
-use tracing::debug;
+use bytes::BytesMut;
+use ferricast_core::{
+    CastSession, Codec, Device, EncodedFrame, FerricastError, Result, StreamConfig,
+};
+use ferricast_hls::{HlsConfig, HlsFrameSink};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tracing::{debug, info, trace, warn};
 
-use ferricast_core::{CastSession, Device, EncodedFrame, Result, StreamConfig};
+use crate::castv2::{
+    CastMessage, DEFAULT_MEDIA_RECEIVER_APP_ID, DEFAULT_RECEIVER_ID, DEFAULT_SENDER_ID, MediaInfo,
+    ReceiverStatusPayload, close_message, connect_message, get_status_message, launch_message,
+    load_media_message, namespace, ping_message, pong_message, stop_app_message,
+};
+use crate::h264_params::extract_sps_pps;
+use crate::wire::{self, SharedWriter};
 
-type TlsStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
+/// Channel depth between the manager-driven `send_frame` and the HLS
+/// segmenter. Generous enough that a brief stall in the segmenter
+/// (file IO, lock contention) doesn't backpressure the encoder, but
+/// small enough to drop frames quickly if the player can't keep up.
+const FRAME_QUEUE_DEPTH: usize = 64;
 
-const DEFAULT_DESTINATION_ID: &str = "receiver-0";
-
-
-/// A shared, split TLS writer half protected by a mutex so multiple tasks
-/// (heartbeat, frame sender) can write concurrently.
-type SharedWriter = Arc<Mutex<tokio::io::WriteHalf<TlsStream>>>;
-
-const URL: &'static str = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
+/// How often we ping the receiver. The Chromecast disconnects
+/// senders that go silent for ~10 s.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub struct ChromecastSession {
-    device: Option<CastDevice<'static>>,
-    handle: Option<tokio::task::JoinHandle<()>>
+    /// All TLS / app-launch state, populated by [`Self::connect`].
+    /// `None` before connect or after `stop`.
+    state: Option<ConnectedState>,
+    /// HLS / streaming state, populated lazily on the first keyframe.
+    stream: Option<StreamState>,
+    /// Encoder config carried from `setup_stream` so the HLS sink is
+    /// sized correctly when the first frame arrives.
+    cfg: Option<StreamConfig>,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct DeviceInfo {
-    name: String,
-    addr: std::net::IpAddr,
-    port: u16,
+struct ConnectedState {
+    writer: SharedWriter,
+    /// Application transport ID, used as the destination for all
+    /// media-namespace messages once the receiver app is launched.
+    transport_id: String,
+    /// Session ID returned by LAUNCH. Required by STOP; otherwise
+    /// the receiver refuses to tear the app down.
+    session_id: String,
+    /// Local IP from the receiver's perspective (the LAN side of the
+    /// TCP socket). Used to build the HLS URL we hand back.
+    local_ip: IpAddr,
+    /// Mirror of `device.capabilities.requires_audio` so the HLS
+    /// bootstrap path knows whether to ask the MPEG-TS muxer to
+    /// inject a silent AAC track. Old generic Chromecasts need
+    /// this; Ultra / Google TV don't.
+    requires_audio: bool,
+    /// Monotonic CASTv2 request-id counter, shared with the read
+    /// loop so requests and responses don't collide.
+    request_id: Arc<AtomicI64>,
+    /// Live flag flipped to `false` by the read loop on EOF / fatal
+    /// error, and read by [`Self::is_alive`].
+    alive: Arc<AtomicBool>,
+    /// Background tasks: read loop + heartbeat ticker. Aborted in
+    /// `stop` so we don't leak them on stream restart.
+    read_handle: JoinHandle<()>,
+    heartbeat_handle: JoinHandle<()>,
+}
+
+struct StreamState {
+    /// Sender into the HLS segmenter task. Dropping it (via `stop`)
+    /// makes the segmenter drain and exit cleanly.
+    frame_tx: mpsc::Sender<EncodedFrame>,
+    /// HLS endpoint. Owns the TCP listener + segmenter task; held
+    /// solely for its Drop side-effect (cleanup) — the wait+LOAD
+    /// task gets its own clone of the readiness future.
+    _sink: HlsFrameSink,
+    /// Background task that waits for the first segment to land and
+    /// then sends `LOAD` to the receiver. Spawned because doing it
+    /// inline in `send_frame` deadlocks the manager loop — the
+    /// segmenter only emits a segment after seeing 1+ keyframe past
+    /// `target_duration`, and those keyframes can only arrive
+    /// *through* `send_frame` calls. Blocking inside one starves the
+    /// rest. Aborted in `Drop` so it doesn't leak past the session.
+    load_task: JoinHandle<()>,
+}
+
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        self.load_task.abort();
+    }
 }
 
 impl CastSession for ChromecastSession {
     async fn connect(&mut self, device: &Device) -> Result<()> {
-        let device = CastDevice::connect_without_host_verification(device.addr.to_string(), device.port).unwrap();
+        if device.protocol != "chromecast" {
+            return Err(FerricastError::Protocol(format!(
+                "ChromecastSession cannot connect to a {:?} device",
+                device.protocol
+            )));
+        }
+        if self.state.is_some() {
+            return Err(FerricastError::SessionAlreadyActive(device.name.clone()));
+        }
 
-        println!("connecting");
-        device.connection.connect(DEFAULT_DESTINATION_ID.to_string()).unwrap();
-        device.heartbeat.ping().unwrap();
-    
-        device.receiver.set_volume(0.25).unwrap();
+        info!(
+            name = %device.name,
+            addr = %device.addr,
+            port = device.port,
+            "connecting to chromecast"
+        );
+        let (reader, writer, local_ip) = wire::connect(device.addr, device.port).await?;
 
-    
-        println!("connected");
+        // Step 1: spawn the read loop *before* sending anything on
+        // the wire. Some chromecast firmwares immediately respond
+        // after CONNECT with status / heartbeat traffic that has
+        // to be drained or the TLS / TCP receive buffers fill and
+        // backpressure our writes. Putting the read loop in charge
+        // from the start also means PINGs from the receiver get
+        // PONG'd unconditionally — including during the launch
+        // handshake — without any "during launch / after launch"
+        // branching like the old code had.
+        //
+        // The read loop publishes the launched app's
+        // (transport_id, session_id) through a one-shot. We block
+        // on it after sending LAUNCH.
+        let alive = Arc::new(AtomicBool::new(true));
+        let (app_tx, app_rx) = oneshot::channel::<Result<(String, String)>>();
+        let read_alive = alive.clone();
+        let read_writer = writer.clone();
+        let read_handle = tokio::spawn(read_loop(
+            reader,
+            read_writer,
+            read_alive,
+            Some((DEFAULT_MEDIA_RECEIVER_APP_ID.to_string(), app_tx)),
+        ));
 
-        let device_app = CastDeviceApp::DefaultMediaReceiver;
-        println!("{:?}", device_app);
+        // Step 2: virtual-connect to receiver-0 so subsequent control
+        // messages (LAUNCH, GET_STATUS, …) are accepted.
+        wire::send(
+            &writer,
+            &connect_message(DEFAULT_SENDER_ID, DEFAULT_RECEIVER_ID)
+                .map_err(|e| FerricastError::Protocol(format!("build CONNECT: {e}")))?,
+        )
+        .await?;
 
-        let app = device.receiver.launch_app(&device_app).unwrap();
-        println!("launched");
+        // Step 3: ping the heartbeat namespace. Some Chromecast
+        // firmwares (notably 1st-gen / older Audio devices, but also
+        // some newer ones in odd states) close the TLS connection
+        // mid-handshake when LAUNCH arrives without a prior
+        // heartbeat — they treat the absence as "sender doesn't
+        // implement the protocol" and bail. rust_cast and
+        // pychromecast both ping right here. The ping is fire-and-
+        // forget; we don't wait for a PONG before continuing.
+        wire::send(
+            &writer,
+            &ping_message().map_err(|e| FerricastError::Protocol(format!("build PING: {e}")))?,
+        )
+        .await?;
 
-        device.connection.connect(app.transport_id.as_str()).unwrap();
+        // Step 4: launch the Default Media Receiver. The read loop
+        // will catch the resulting RECEIVER_STATUS and publish the
+        // app's transport_id / session_id through the oneshot.
+        let request_id = Arc::new(AtomicI64::new(1));
+        let launch_id = request_id.fetch_add(1, Ordering::Relaxed);
+        wire::send(
+            &writer,
+            &launch_message(launch_id, DEFAULT_MEDIA_RECEIVER_APP_ID)
+                .map_err(|e| FerricastError::Protocol(format!("build LAUNCH: {e}")))?,
+        )
+        .await?;
 
-        device.media.load(app.transport_id.as_str(), app.session_id.as_str(), &Media {
-            content_id: URL.to_string(),
-            content_type: "application/x-mpegurl".to_string(),
-            metadata: None,
-            stream_type: rust_cast::channels::media::StreamType::Live,
-            duration: None,
-        }).unwrap();
-        println!("sending media");
+        // Step 4b: force a RECEIVER_STATUS dump. Some firmwares
+        // treat LAUNCH for an already-running app as idempotent
+        // and *don't* re-broadcast STATUS — observed in practice
+        // as PONG arriving after PING but no RECEIVER_STATUS ever
+        // following LAUNCH on a chromecast that's been recently
+        // talked to. GET_STATUS forces the current state out
+        // unconditionally; the read loop catches the result the
+        // same way it would a launch-triggered STATUS. Cheap
+        // belt-and-suspenders.
+        let status_id = request_id.fetch_add(1, Ordering::Relaxed);
+        wire::send(
+            &writer,
+            &get_status_message(status_id)
+                .map_err(|e| FerricastError::Protocol(format!("build GET_STATUS: {e}")))?,
+        )
+        .await?;
 
-        let handle = tokio::spawn(async move {
-            loop {
-                match device.receive() { 
-                        Ok(ChannelMessage::Heartbeat(res)) => {
-                            tracing::info!("Heartbeat: {:?}", res);
-
-                            if let HeartbeatResponse::Ping = res {
-                                device.heartbeat.pong().unwrap();
-                            }
-                        }
-                        Ok(ChannelMessage::Connection(res)) => println!("Connection {:?}", res),
-                        Ok(ChannelMessage::Media(res)) => println!("Media {:?}", res),
-                        Ok(ChannelMessage::Receiver(res)) => println!("Receiver {:?}", res),
-                        Ok(ChannelMessage::Raw(res)) => tracing::error!("Support for the following message type is not yet "),
-                        Err(_) => {},
-                }
+        // Step 5: wait for the launch ack. Cap at 15 s — receivers
+        // that don't ack in that window are typically wedged and
+        // need a power cycle.
+        let (transport_id, session_id) = match tokio::time::timeout(
+            Duration::from_secs(15),
+            app_rx,
+        )
+        .await
+        {
+            Ok(Ok(Ok(ids))) => ids,
+            Ok(Ok(Err(e))) => return Err(e),
+            Ok(Err(_)) => {
+                return Err(FerricastError::Connection(
+                    "read loop exited before launch ack".into(),
+                ));
             }
-        });
-     
-        
+            Err(_) => {
+                return Err(FerricastError::Timeout(
+                    "waiting for receiver to launch app (15s)".into(),
+                ));
+            }
+        };
+        debug!(transport_id, session_id, "DefaultMediaReceiver launched");
 
-        self.handle = Some(handle);
-        //self.device = Some(device);
-        
+        // Step 6: virtual-connect to the launched app's transport so
+        // we can address it from the media namespace.
+        wire::send(
+            &writer,
+            &connect_message(DEFAULT_SENDER_ID, &transport_id)
+                .map_err(|e| FerricastError::Protocol(format!("build app CONNECT: {e}")))?,
+        )
+        .await?;
+
+        // Step 7: spawn the heartbeat ticker (read loop is already
+        // running and PONGs the receiver's pings — this side keeps
+        // our half warm with periodic outgoing pings).
+        let hb_writer = writer.clone();
+        let hb_alive = alive.clone();
+        let heartbeat_handle = tokio::spawn(heartbeat_loop(hb_writer, hb_alive));
+
+        self.state = Some(ConnectedState {
+            writer,
+            transport_id,
+            session_id,
+            local_ip,
+            requires_audio: device.capabilities.requires_audio,
+            request_id,
+            alive,
+            read_handle,
+            heartbeat_handle,
+        });
         Ok(())
     }
 
     async fn setup_stream(&mut self, config: &StreamConfig) -> Result<()> {
-         
+        let _ = self
+            .state
+            .as_ref()
+            .ok_or(FerricastError::NoActiveSession)?;
+
+        if config.codec != Codec::H264 {
+            return Err(FerricastError::UnsupportedCodec {
+                codec: config.codec,
+                protocol: "chromecast",
+            });
+        }
+
+        info!(
+            width = config.width,
+            height = config.height,
+            fps = config.fps,
+            bitrate_kbps = config.bitrate_kbps,
+            "chromecast stream configured"
+        );
+        self.cfg = Some(config.clone());
         Ok(())
     }
 
     async fn send_frame(&mut self, frame: &EncodedFrame) -> Result<()> {
+        if frame.codec != Codec::H264 {
+            return Err(FerricastError::UnsupportedCodec {
+                codec: frame.codec,
+                protocol: "chromecast",
+            });
+        }
+
+        // Lazy init on the first keyframe: the segmenter needs SPS +
+        // PPS, which only appear at IDR access units. Pre-IDR frames
+        // are dropped (the segmenter would drop them anyway).
+        if self.stream.is_none() {
+            if !frame.is_keyframe {
+                trace!("dropping pre-keyframe before HLS init");
+                return Ok(());
+            }
+            self.bootstrap_hls(frame).await?;
+        }
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| FerricastError::Streaming("HLS stream not initialised".into()))?;
+
+        // try_send avoids stalling the upstream encoder when the
+        // segmenter falls behind. Recovery happens at the next IDR.
+        match stream.frame_tx.try_send(frame.clone()) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!("HLS segmenter backlogged, dropping frame");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(FerricastError::Streaming(
+                    "HLS segmenter channel closed".into(),
+                ));
+            }
+        }
+
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<()> {
+        // Drop HLS first so the segmenter sees EOF on its channel
+        // before we kill the TLS link.
+        self.stream.take();
+
+        let Some(state) = self.state.take() else {
+            return Ok(());
+        };
+
+        // Best-effort STOP — receiver will time us out anyway.
+        let stop_id = state.request_id.fetch_add(1, Ordering::Relaxed);
+        if let Ok(stop_msg) = stop_app_message(stop_id, &state.session_id) {
+            if let Err(e) = wire::send(&state.writer, &stop_msg).await {
+                warn!(%e, "STOP message failed");
+            }
+        }
+        if let Ok(close) = close_message(DEFAULT_SENDER_ID, DEFAULT_RECEIVER_ID) {
+            let _ = wire::send(&state.writer, &close).await;
+        }
+
+        state.alive.store(false, Ordering::Relaxed);
+        state.read_handle.abort();
+        state.heartbeat_handle.abort();
+        let _ = state.read_handle.await;
+        let _ = state.heartbeat_handle.await;
+
+        info!("chromecast session stopped");
         Ok(())
     }
 
     fn is_alive(&self) -> bool {
-        false
+        self.state
+            .as_ref()
+            .map(|s| s.alive.load(Ordering::Relaxed))
+            .unwrap_or(false)
     }
 }
 
-#[derive(Debug)]
-struct NoCertVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        debug!("accepting chromecast self-signed certificate");
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+impl Drop for ChromecastSession {
+    /// Defensive cleanup: if the session is dropped without `stop()`
+    /// being called (e.g. process aborted, panic in the streaming
+    /// loop) abort the read + heartbeat tasks so their handles don't
+    /// outlive the runtime they were spawned on.
+    ///
+    /// `StreamState`'s drop handles HLS shutdown automatically
+    /// (HlsFrameSink and the load_task JoinHandle abort on drop), so
+    /// we only need to deal with `ConnectedState` here.
+    fn drop(&mut self) {
+        if let Some(state) = self.state.as_ref() {
+            state.alive.store(false, Ordering::Relaxed);
+            state.read_handle.abort();
+            state.heartbeat_handle.abort();
+        }
     }
+}
 
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+impl ChromecastSession {
+    /// Build the HLS frame sink and stash it in `self.stream`.
+    /// Called exactly once, on the first keyframe; subsequent
+    /// `send_frame` calls become straight forwards into the channel.
+    ///
+    /// Spawns a background task that waits for the segmenter's first
+    /// segment and then sends `LOAD` to the receiver. It can't run
+    /// inline because the segmenter needs more frames to produce a
+    /// segment, and those frames only flow through subsequent
+    /// `send_frame` calls — blocking here would prevent that.
+    async fn bootstrap_hls(&mut self, first_keyframe: &EncodedFrame) -> Result<()> {
+        let state = self
+            .state
+            .as_ref()
+            .ok_or(FerricastError::NoActiveSession)?;
+        let local_ip = state.local_ip;
+        let writer = state.writer.clone();
+        let transport_id = state.transport_id.clone();
+        let request_id_counter = state.request_id.clone();
+        let requires_audio = state.requires_audio;
+
+        let _ = self
+            .cfg
+            .as_ref()
+            .ok_or_else(|| FerricastError::Streaming("setup_stream not called".into()))?;
+
+        let parameter_sets = extract_sps_pps(&first_keyframe.data);
+        if parameter_sets.is_empty() {
+            return Err(FerricastError::Encoder(
+                "first keyframe carries no SPS/PPS; cannot bootstrap HLS".into(),
+            ));
+        }
+        info!(
+            param_set_bytes = parameter_sets.len(),
+            "extracted SPS/PPS from first keyframe"
+        );
+
+        let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(FRAME_QUEUE_DEPTH);
+
+        // Bind on every interface but advertise the LAN-side IP we
+        // observed during TLS connect — `0.0.0.0` is unroutable.
+        // `inject_silent_audio` comes from the device's
+        // `DeviceCapabilities::requires_audio` — old Chromecast 1st/
+        // 2nd gen need a silent audio track to not reject the HLS
+        // stream with LOAD_FAILED.
+        let hls_config = HlsConfig {
+            inject_silent_audio: requires_audio,
+            ..Default::default()
+        };
+        let sink =
+            HlsFrameSink::start("0.0.0.0:0", frame_rx, parameter_sets, hls_config).await?;
+        let local_addr = sink.local_addr();
+        let media_url = format!("http://{}:{}/index.m3u8", local_ip, local_addr.port());
+        // Error level on purpose: this URL is the single piece of
+        // diagnostic info a user needs when chromecast playback
+        // doesn't show anything — they can paste it into VLC /
+        // browser to confirm the local server is serving valid HLS
+        // independently of the receiver.
+        tracing::error!(
+            url = %media_url,
+            "chromecast HLS endpoint ready (open this URL in a player to verify)"
+        );
+
+        let ready = sink.first_segment_ready();
+        let load_url = media_url.clone();
+        let probe_port = local_addr.port();
+        let load_task = tokio::spawn(async move {
+            ready.await;
+
+            // Self-test: try fetching the playlist over loopback
+            // before pointing the receiver at it. If we can't reach
+            // our own server, neither can the chromecast — and the
+            // log makes the failure mode obvious instead of "TV
+            // shows black, no errors anywhere".
+            match self_test_playlist(probe_port).await {
+                Ok(snippet) => tracing::error!(
+                    bytes = snippet.len(),
+                    body_head = %snippet,
+                    "HLS self-test OK; sending LOAD"
+                ),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "HLS self-test FAILED — chromecast almost certainly can't reach the URL either"
+                ),
+            }
+
+            let request_id = request_id_counter.fetch_add(1, Ordering::Relaxed);
+            let media = MediaInfo {
+                content_id: load_url.clone(),
+                // Default Media Receiver accepts the lowercase form
+                // (the spec is case-insensitive but some receiver
+                // versions are picky and the lowercase variant is
+                // what every reference HLS sample uses).
+                content_type: "application/x-mpegurl".to_string(),
+                stream_type: Some("LIVE".to_string()),
+                duration: None,
+            };
+            let msg = match load_media_message(request_id, &transport_id, media) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(%e, "failed to build LOAD message");
+                    return;
+                }
+            };
+            match wire::send(&writer, &msg).await {
+                Ok(()) => tracing::error!(url = %load_url, "sent LOAD to chromecast"),
+                Err(e) => tracing::error!(%e, "LOAD send failed"),
+            }
+        });
+
+        // Seed the keyframe ourselves so the segmenter doesn't have
+        // to wait for the next IDR (which is `keyframe_interval`
+        // frames away). Use try_send so we never block here either —
+        // the channel was just created so it's empty and try_send
+        // will succeed.
+        if let Err(e) = frame_tx.try_send(first_keyframe.clone()) {
+            warn!(?e, "could not seed first keyframe (channel full at init)");
+        }
+
+        self.stream = Some(StreamState {
+            frame_tx,
+            _sink: sink,
+            load_task,
+        });
+        Ok(())
     }
+}
 
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+/// Background read loop. Drains every message the receiver sends
+/// us, dispatches them by namespace, and (optionally) signals when
+/// the receiver launches the app we asked for.
+///
+/// `launch_watch` is `Some(app_id, tx)` during the connect handshake
+/// — the loop scans every RECEIVER_STATUS and resolves the oneshot
+/// once it sees an entry with our app_id and fully-populated
+/// transport_id + session_id. Once resolved, the watch is dropped
+/// and steady-state reads no longer touch it.
+async fn read_loop<R>(
+    mut reader: R,
+    writer: SharedWriter,
+    alive: Arc<AtomicBool>,
+    mut launch_watch: Option<(String, oneshot::Sender<Result<(String, String)>>)>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = BytesMut::with_capacity(8 * 1024);
+    loop {
+        match wire::recv(&mut reader, &mut buf).await {
+            Ok(Some(msg)) => {
+                // PING from the receiver → must PONG or it'll close
+                // us for being unresponsive. Cheap, always do it.
+                if msg.namespace == namespace::HEARTBEAT
+                    && msg.message_type().as_deref() == Some("PING")
+                {
+                    if let Ok(pong) = pong_message() {
+                        if let Err(e) = wire::send(&writer, &pong).await {
+                            warn!(%e, "pong send failed");
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
+                // CLOSE on the connection namespace = receiver tore
+                // us down. If we're still waiting for launch ack,
+                // surface the explicit cause via the oneshot
+                // instead of letting it hang until timeout.
+                if msg.namespace == namespace::CONNECTION
+                    && msg.message_type().as_deref() == Some("CLOSE")
+                {
+                    let err = FerricastError::Connection(format!(
+                        "receiver sent CLOSE on connection namespace; payload: {:?}",
+                        msg.payload_utf8
+                    ));
+                    if let Some((_, tx)) = launch_watch.take() {
+                        let _ = tx.send(Err(err));
+                    } else {
+                        warn!(payload = ?msg.payload_utf8, "receiver sent CLOSE in steady state");
+                    }
+                    break;
+                }
+
+                if msg.namespace == namespace::RECEIVER {
+                    info!(
+                        payload = msg.payload_utf8.as_deref().unwrap_or("(none)"),
+                        "RECEIVER_STATUS"
+                    );
+                    if let Some((app_id, _)) = launch_watch.as_ref() {
+                        match try_extract_app(&msg, app_id) {
+                            ExtractApp::Found(transport_id, session_id) => {
+                                info!(
+                                    transport_id = %transport_id,
+                                    session_id = %session_id,
+                                    "receiver app fully launched"
+                                );
+                                if let Some((_, tx)) = launch_watch.take() {
+                                    let _ = tx.send(Ok((transport_id, session_id)));
+                                }
+                            }
+                            ExtractApp::Pending(reason) => {
+                                info!(%reason, "launch ack pending, sending GET_STATUS to nudge");
+                                // Some firmwares emit only ONE
+                                // bootstrap RECEIVER_STATUS without
+                                // populated IDs and then go quiet.
+                                // Poke them to re-emit the full
+                                // record. Fire-and-forget; the
+                                // response comes back here.
+                                let req_id = msg.payload_utf8
+                                    .as_deref()
+                                    .and_then(|p| {
+                                        serde_json::from_str::<crate::castv2::GenericPayload>(p).ok()
+                                    })
+                                    .and_then(|g| g.request_id)
+                                    .map(|x| x.wrapping_add(1))
+                                    .unwrap_or(1);
+                                if let Ok(get_status) = crate::castv2::get_status_message(req_id) {
+                                    let _ = wire::send(&writer, &get_status).await;
+                                }
+                            }
+                            ExtractApp::Skip => {}
+                        }
+                    }
+                } else if msg.namespace == namespace::MEDIA {
+                    let mtype = msg.message_type();
+                    if matches!(
+                        mtype.as_deref(),
+                        Some("LOAD_FAILED") | Some("INVALID_REQUEST") | Some("INVALID_PLAYER_STATE")
+                    ) {
+                        tracing::error!(
+                            ty = ?mtype,
+                            payload = ?msg.payload_utf8,
+                            "chromecast rejected our media"
+                        );
+                    } else {
+                        tracing::error!(
+                            ty = ?mtype,
+                            payload = ?msg.payload_utf8,
+                            "chromecast media status"
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                info!("chromecast read loop: peer closed");
+                if let Some((_, tx)) = launch_watch.take() {
+                    let _ = tx.send(Err(FerricastError::Connection(
+                        "receiver closed before launch ack \
+                         (try rebooting the chromecast — its session \
+                         state may be stuck from a prior run)"
+                            .into(),
+                    )));
+                }
+                break;
+            }
+            Err(e) => {
+                warn!(%e, "chromecast read loop terminating");
+                if let Some((_, tx)) = launch_watch.take() {
+                    let _ = tx.send(Err(e));
+                }
+                break;
+            }
+        }
     }
+    alive.store(false, Ordering::Relaxed);
+}
 
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ED448,
-        ]
+enum ExtractApp {
+    /// Successful: the launched app is fully populated.
+    Found(String, String),
+    /// We saw a STATUS but our app isn't usable yet (missing,
+    /// half-populated). Caller should keep waiting.
+    Pending(String),
+    /// Not relevant (couldn't parse, or no status block).
+    Skip,
+}
+
+fn try_extract_app(msg: &CastMessage, app_id: &str) -> ExtractApp {
+    let payload: ReceiverStatusPayload = match msg.parse_payload() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(%e, payload = ?msg.payload_utf8, "RECEIVER_STATUS parse failed");
+            return ExtractApp::Skip;
+        }
+    };
+    let Some(status) = payload.status else {
+        return ExtractApp::Pending("status block absent".into());
+    };
+    let Some(app) = status
+        .applications
+        .iter()
+        .find(|a| a.app_id.eq_ignore_ascii_case(app_id))
+    else {
+        return ExtractApp::Pending(format!(
+            "our app not in applications list ({} entries)",
+            status.applications.len()
+        ));
+    };
+    if app.transport_id.is_empty() || app.session_id.is_empty() {
+        return ExtractApp::Pending(format!(
+            "app entry incomplete (transport_id='{}', session_id='{}')",
+            app.transport_id, app.session_id
+        ));
+    }
+    ExtractApp::Found(app.transport_id.clone(), app.session_id.clone())
+}
+
+/// Background heartbeat ticker. Stops as soon as the read loop
+/// flips `alive` to `false` or a ping write fails.
+async fn heartbeat_loop(writer: SharedWriter, alive: Arc<AtomicBool>) {
+    let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
+    // First tick fires immediately; skip it so we don't ping before
+    // launch settles.
+    tick.tick().await;
+    while alive.load(Ordering::Relaxed) {
+        tick.tick().await;
+        let Ok(ping) = ping_message() else { break };
+        if let Err(e) = wire::send(&writer, &ping).await {
+            debug!(%e, "heartbeat ping failed, exiting heartbeat loop");
+            break;
+        }
+    }
+}
+
+
+/// Loopback HTTP/1.0 GET against our own HLS endpoint. Returns the
+/// first ~512 bytes of the response body so the caller can sanity-
+/// check it actually looks like a `#EXTM3U` playlist before pointing
+/// the receiver at it.
+///
+/// 5 s ceiling so a wedged listener doesn't keep `LOAD` from ever
+/// firing — if the local server can't answer in 5 s on localhost
+/// something is profoundly wrong and the receiver wouldn't have
+/// fared any better.
+async fn self_test_playlist(port: u16) -> Result<String> {
+    let probe = async move {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .map_err(|e| FerricastError::Streaming(format!("self-test connect: {e}")))?;
+        tokio::io::AsyncWriteExt::write_all(
+            &mut s,
+            b"GET /index.m3u8 HTTP/1.0\r\nHost: localhost\r\n\r\n",
+        )
+        .await
+        .map_err(|e| FerricastError::Streaming(format!("self-test write: {e}")))?;
+        let mut buf = [0u8; 512];
+        let n = tokio::io::AsyncReadExt::read(&mut s, &mut buf)
+            .await
+            .map_err(|e| FerricastError::Streaming(format!("self-test read: {e}")))?;
+        Ok::<String, FerricastError>(String::from_utf8_lossy(&buf[..n]).into_owned())
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(5), probe).await {
+        Ok(r) => r,
+        Err(_) => Err(FerricastError::Timeout(
+            "self-test fetch exceeded 5s".into(),
+        )),
     }
 }

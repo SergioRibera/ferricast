@@ -51,4 +51,18 @@ pub trait ScreenCapture: Send {
     fn is_running(&self) -> bool;
     fn get_pixel_format(&self) -> PixelFormat;
     fn get_screen_size(&self) -> (usize, usize);
+
+    /// Effective framerate the source is currently delivering at.
+    ///
+    /// For backends that negotiate (PipeWire / portal) this returns
+    /// the value the compositor agreed to — which is what the encoder
+    /// must be configured with so PTS spacing matches real frame
+    /// arrival cadence. Returns `0` before negotiation completes;
+    /// callers should treat that as "use the configured fps fallback".
+    ///
+    /// Default impl returns `0`; backends that don't negotiate (X11
+    /// pull, native polling) override only if they have a real value.
+    fn get_framerate(&self) -> u32 {
+        0
+    }
 }

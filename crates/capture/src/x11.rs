@@ -12,6 +12,10 @@ pub struct X11Capture {
     pixmap: Option<Format>,
     is_running: AtomicBool,
     size: (usize, usize),
+    /// fps the caller asked for in `start()`. X11 has no real
+    /// negotiation — we just poll on demand — so we surface the
+    /// configured value so downstream paces correctly.
+    fps: u32,
     buffer_ptr: AtomicPtr<u8>,
 }
 
@@ -25,6 +29,7 @@ impl X11Capture {
             pixmap: None,
             is_running: AtomicBool::new(false),
             size: (0,0),
+            fps: 0,
             buffer_ptr: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -94,7 +99,8 @@ impl ScreenCapture for X11Capture {
             self.screen = Some(screen);
             self.is_running = AtomicBool::new(true);
             self.size = (w, h);
-            self.pixmap = Some(pixmap); 
+            self.fps = config.fps;
+            self.pixmap = Some(pixmap);
         Ok(())
     }
     async fn stop(&mut self) -> ferricast_core::Result<()> {
@@ -172,5 +178,8 @@ impl ScreenCapture for X11Capture {
     }
     fn get_screen_size(&self) -> (usize, usize) {
         self.size
+    }
+    fn get_framerate(&self) -> u32 {
+        self.fps
     }
 }

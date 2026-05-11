@@ -35,9 +35,39 @@ const SYNC_BYTE: u8 = 0x47;
 const PID_PAT: u16 = 0x0000;
 const PID_PMT: u16 = 0x1000;
 const PID_VIDEO: u16 = 0x0100;
+const PID_AUDIO: u16 = 0x0101;
 
 const STREAM_TYPE_H264: u8 = 0x1B;
+const STREAM_TYPE_AAC_ADTS: u8 = 0x0F;
 const PES_STREAM_ID_VIDEO: u8 = 0xE0;
+const PES_STREAM_ID_AUDIO: u8 = 0xC0;
+
+/// One AAC LC ADTS frame at 48 kHz / stereo / silence.
+///
+/// Older Chromecast Default Media Receiver firmwares (1st/2nd gen,
+/// `md=Chromecast` in mDNS) reject HLS streams that don't carry an
+/// audio track — the LOAD lands, the receiver builds a media
+/// session, then immediately responds with
+/// `LOAD_FAILED, idleReason=ERROR` because the demuxer expects two
+/// elementary streams. Other players (VLC, hls.js, ffmpeg) don't
+/// care and will play video-only HLS happily, which is why our
+/// stream tests fine elsewhere but fails on the cast device.
+///
+/// Inject one silent AAC frame per ~21 ms (1024 samples / 48 kHz)
+/// to satisfy the receiver. Total per-stream overhead: ~600 B/s.
+///
+/// Bytes are a hand-crafted silent AAC LC frame for stereo 48 kHz:
+/// * 7-byte ADTS header (no CRC, profile=LC, sfi=3 → 48k,
+///   channel_config=2, frame_length=13)
+/// * 6-byte raw_data_block carrying a CPE with zero scale factors
+///   and zero spectrum (= digital silence).
+const SILENT_AAC_FRAME: [u8; 13] = [
+    0xFF, 0xF1, 0x4C, 0x80, 0x01, 0xBF, 0xFC, 0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C,
+];
+
+/// 1024 samples at 48 kHz = 1024/48000 s = 21.333 ms.
+/// In MPEG-TS 90 kHz ticks: 1024 × (90000 / 48000) = 1920.
+const AAC_FRAME_TICKS_90K: u64 = 1920;
 
 /// Distance (in 90 kHz ticks) by which PCR is biased *behind* PTS so
 /// that `PCR <= first_PTS_in_packet` holds even with rounding. ~2 ms.
@@ -63,7 +93,35 @@ pub struct MpegTs {
     cc_pat: u8,
     cc_pmt: u8,
     cc_video: u8,
+    cc_audio: u8,
+    /// Whether to advertise an audio stream in the PMT and inject
+    /// silent AAC frames inline with video. Off by default (some
+    /// receivers reject the extra ES; bandwidth is wasted on
+    /// receivers that accept video-only). The chromecast pipeline
+    /// flips this on when the target device's
+    /// `DeviceCapabilities::requires_audio` is true.
+    inject_silent_audio: bool,
+    /// Next audio PTS to emit, in 90 kHz ticks. Advances by
+    /// `AAC_FRAME_TICKS_90K` for each silent AAC frame inserted.
+    /// `None` until the first video frame has anchored the timeline;
+    /// after that the audio side is kept caught up to (slightly
+    /// behind) the video PTS so the receiver sees both streams
+    /// progressing in lockstep.
+    audio_pts_90k: Option<u64>,
     out: Vec<u8>,
+}
+
+impl MpegTs {
+    /// Toggle silent-audio injection. Set by the chromecast HLS
+    /// pipeline when the target device is an older Chromecast
+    /// (`md == "Chromecast"`) whose firmware rejects video-only
+    /// HLS streams with `LOAD_FAILED`. Newer receivers (Ultra,
+    /// Google TV) accept video-only and we can save ~6 KB/s by
+    /// leaving this off.
+    pub fn with_silent_audio(mut self, inject: bool) -> Self {
+        self.inject_silent_audio = inject;
+        self
+    }
 }
 
 impl Muxer for MpegTs {
@@ -110,6 +168,38 @@ impl Muxer for MpegTs {
             pcr,
         );
 
+        // Catch the audio side up to (just behind) the video PTS,
+        // but only when this muxer instance was configured to inject
+        // a silent audio track. The chromecast HLS pipeline turns
+        // this on for `requires_audio` receivers (1st/2nd gen
+        // Chromecast) and leaves it off everywhere else.
+        if self.inject_silent_audio {
+            let mut apts = self.audio_pts_90k.unwrap_or(pts_90k);
+            let mut frames_emitted = 0;
+            while apts <= pts_90k {
+                let aac_pes = build_audio_pes(&SILENT_AAC_FRAME, apts);
+                write_pes_to_ts(
+                    &mut self.out,
+                    PID_AUDIO,
+                    &mut self.cc_audio,
+                    &aac_pes,
+                    /* keyframe (random_access_indicator) */ false,
+                    pcr,
+                );
+                apts = apts.saturating_add(AAC_FRAME_TICKS_90K);
+                frames_emitted += 1;
+                // Safety cap: at most ~4 frames per video frame
+                // (≈ 85 ms of audio) — anything beyond that means
+                // the video PTS jumped non-monotonically and we'd
+                // rather not flood the TS with thousands of resync
+                // frames.
+                if frames_emitted >= 4 {
+                    break;
+                }
+            }
+            self.audio_pts_90k = Some(apts);
+        }
+
         Ok(())
     }
 
@@ -134,7 +224,7 @@ impl MpegTs {
     }
 
     fn emit_pmt(&mut self) {
-        let section = build_pmt_section();
+        let section = build_pmt_section(self.inject_silent_audio);
         write_psi_packet(&mut self.out, PID_PMT, &mut self.cc_pmt, &section);
     }
 }
@@ -162,23 +252,33 @@ fn build_pat_section() -> Vec<u8> {
     s
 }
 
-fn build_pmt_section() -> Vec<u8> {
-    // section_length: prog_num(2) + flags(1) + sec_num(1) +
+fn build_pmt_section(with_audio: bool) -> Vec<u8> {
+    // section_length covers prog_num(2) + flags(1) + sec_num(1) +
     // last_sec_num(1) + PCR_PID(2) + program_info_len(2) +
-    // stream_loop(5) + CRC(4) = 18 bytes.
-    let mut s = Vec::with_capacity(22);
+    // stream_loop + CRC(4).
+    // stream_loop is 5 bytes per stream (type + EPID + ES_info_len).
+    let stream_count = if with_audio { 2 } else { 1 };
+    let section_length: u16 = (13 + 5 * stream_count) as u16;
+    let mut s = Vec::with_capacity(4 + section_length as usize);
     s.push(0x02); // table_id = PMT
-    s.extend_from_slice(&(0xB000u16 | 18).to_be_bytes()); // ssi=1, section_length=18
+    s.extend_from_slice(&(0xB000u16 | section_length).to_be_bytes());
     s.extend_from_slice(&1u16.to_be_bytes()); // program_number
     s.push(0xC1); // reserved=11, version=0, current_next=1
     s.push(0x00); // section_number
     s.push(0x00); // last_section_number
     s.extend_from_slice(&(0xE000u16 | PID_VIDEO).to_be_bytes()); // PCR_PID
     s.extend_from_slice(&0xF000u16.to_be_bytes()); // program_info_length=0
-    // Stream loop: H.264 video.
+    // Stream loop: H.264 always; AAC only when the caller asked
+    // for silent-audio injection (older Chromecasts that reject
+    // video-only HLS — see `MpegTs::with_silent_audio`).
     s.push(STREAM_TYPE_H264);
     s.extend_from_slice(&(0xE000u16 | PID_VIDEO).to_be_bytes()); // elementary_PID
     s.extend_from_slice(&0xF000u16.to_be_bytes()); // ES_info_length=0
+    if with_audio {
+        s.push(STREAM_TYPE_AAC_ADTS);
+        s.extend_from_slice(&(0xE000u16 | PID_AUDIO).to_be_bytes()); // elementary_PID
+        s.extend_from_slice(&0xF000u16.to_be_bytes()); // ES_info_length=0
+    }
     let crc = crc32_mpeg2(&s);
     s.extend_from_slice(&crc.to_be_bytes());
     s
@@ -225,6 +325,25 @@ fn build_pes(payload: &[u8], pts_90k: u64, dts_90k: u64) -> Vec<u8> {
     pes.push(0x0A);
     pes.extend_from_slice(&encode_ts(0b0011, pts_90k));
     pes.extend_from_slice(&encode_ts(0b0001, dts_90k));
+    pes.extend_from_slice(payload);
+    pes
+}
+
+/// Audio PES carrying one (or more) ADTS-framed AAC access units.
+/// Unlike video, audio PES MUST carry a non-zero `PES_packet_length`
+/// — `0` is only legal for video. PTS is included; DTS is omitted
+/// (audio has no reordering, so DTS == PTS implicitly).
+fn build_audio_pes(payload: &[u8], pts_90k: u64) -> Vec<u8> {
+    // header: prefix(3) + stream_id(1) + length(2) + flags(2) +
+    //         header_data_length(1) + PTS(5) = 14 bytes header, then payload.
+    let pes_body_len = 3 /* flags+hdr_len */ + 5 /* PTS */ + payload.len();
+    let mut pes = Vec::with_capacity(6 + pes_body_len);
+    pes.extend_from_slice(&[0x00, 0x00, 0x01, PES_STREAM_ID_AUDIO]);
+    pes.extend_from_slice(&(pes_body_len as u16).to_be_bytes());
+    pes.push(0x84); // '10' marker + alignment_indicator=1
+    pes.push(0x80); // PTS_DTS_flags=10 (PTS only)
+    pes.push(0x05); // PES_header_data_length
+    pes.extend_from_slice(&encode_ts(0b0010, pts_90k));
     pes.extend_from_slice(payload);
     pes
 }
@@ -420,10 +539,12 @@ mod tests {
 
     #[test]
     fn pmt_crc_round_trip() {
-        let s = build_pmt_section();
-        let body = &s[..s.len() - 4];
-        let appended = u32::from_be_bytes(s[s.len() - 4..].try_into().unwrap());
-        assert_eq!(crc32_mpeg2(body), appended);
+        for with_audio in [false, true] {
+            let s = build_pmt_section(with_audio);
+            let body = &s[..s.len() - 4];
+            let appended = u32::from_be_bytes(s[s.len() - 4..].try_into().unwrap());
+            assert_eq!(crc32_mpeg2(body), appended, "with_audio={with_audio}");
+        }
     }
 
     #[test]

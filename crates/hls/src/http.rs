@@ -30,12 +30,17 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 /// response, returns. Errors only when the socket itself misbehaves
 /// — protocol-level failures are converted to HTTP error responses.
 pub async fn handle(socket: TcpStream, ring: Arc<RwLock<SegmentRing>>) -> Result<()> {
+    let peer = socket
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "?".into());
     let (read_half, mut write_half) = socket.into_split();
     let mut reader = BufReader::new(read_half);
 
     let request = match read_request(&mut reader).await {
         Ok(r) => r,
         Err(e) => {
+            tracing::warn!(%peer, %e, "HLS bad request");
             // Best-effort error response; ignore write failures since
             // the peer may already have hung up.
             let _ = write_status(&mut write_half, 400, "Bad Request", b"").await;
@@ -43,15 +48,21 @@ pub async fn handle(socket: TcpStream, ring: Arc<RwLock<SegmentRing>>) -> Result
         }
     };
 
-    match (request.method.as_str(), request.path.as_str()) {
+    // Per-request access log at info level. Lets us see whether the
+    // chromecast (or any other player) is actually polling, what
+    // it's polling for, and the response we gave it. Without this,
+    // diagnosing \"receiver got stuck in LOADING\" is a guessing game
+    // because the only signal from the cast device is its terse
+    // MEDIA_STATUS payload.
+    let (status, body_len) = match (request.method.as_str(), request.path.as_str()) {
         ("OPTIONS", _) => {
-            // CORS preflight. No body, but include the same access
-            // headers the actual responses do.
             write_options(&mut write_half).await?;
+            (204, 0usize)
         }
         ("GET" | "HEAD", "/" | "/playlist.m3u8" | "/index.m3u8") => {
             let body = build_playlist(&ring).await?;
             let send_body = request.method == "GET";
+            let len = body.len();
             write_ok(
                 &mut write_half,
                 "application/vnd.apple.mpegurl",
@@ -60,10 +71,18 @@ pub async fn handle(socket: TcpStream, ring: Arc<RwLock<SegmentRing>>) -> Result
                 /* cacheable */ false,
             )
             .await?;
+            (200, len)
         }
         ("GET" | "HEAD", path) if is_segment_path(path) => {
             let Some(seq) = parse_segment_seq(path) else {
                 write_status(&mut write_half, 400, "Bad Request", b"").await?;
+                tracing::info!(
+                    %peer,
+                    method = %request.method,
+                    path = %request.path,
+                    status = 400,
+                    "HLS"
+                );
                 return Ok(());
             };
             let segment = {
@@ -73,6 +92,7 @@ pub async fn handle(socket: TcpStream, ring: Arc<RwLock<SegmentRing>>) -> Result
             match segment {
                 Some(s) => {
                     let send_body = request.method == "GET";
+                    let len = s.data.len();
                     write_ok(
                         &mut write_half,
                         "video/mp2t",
@@ -81,16 +101,28 @@ pub async fn handle(socket: TcpStream, ring: Arc<RwLock<SegmentRing>>) -> Result
                         /* cacheable */ true,
                     )
                     .await?;
+                    (200, len)
                 }
                 None => {
                     write_status(&mut write_half, 404, "Not Found", b"").await?;
+                    (404, 0)
                 }
             }
         }
         _ => {
             write_status(&mut write_half, 404, "Not Found", b"").await?;
+            (404, 0)
         }
-    }
+    };
+
+    tracing::info!(
+        %peer,
+        method = %request.method,
+        path = %request.path,
+        status,
+        body_len,
+        "HLS"
+    );
 
     finalize(write_half).await;
     Ok(())

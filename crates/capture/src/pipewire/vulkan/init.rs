@@ -64,7 +64,19 @@ pub(super) fn build() -> Result<Inner> {
         device.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
                 .queue_family_index(queue_family_index)
-                .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                // TRANSIENT: each command buffer is short-lived
+                // (record once, submit once, reset on next use).
+                // RESET_COMMAND_BUFFER: required because
+                // `record_and_submit` calls `vkResetCommandBuffer`
+                // per frame; without this flag the call is
+                // undefined behaviour per the Vulkan spec, and on
+                // NVIDIA's proprietary driver it manifests as
+                // multi-second GPU stalls (validation layer
+                // VUID-vkResetCommandBuffer-commandBuffer-00046).
+                .flags(
+                    vk::CommandPoolCreateFlags::TRANSIENT
+                        | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                ),
             None,
         )
     }

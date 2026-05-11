@@ -1,6 +1,8 @@
 pub mod castv2;
 pub mod discovery;
+mod h264_params;
 pub mod session;
+mod wire;
 
 pub use castv2::{
     CastMessage, CastV2Error, GenericPayload, PayloadType, ProtocolVersion,

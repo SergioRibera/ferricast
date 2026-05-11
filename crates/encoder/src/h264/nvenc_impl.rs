@@ -104,9 +104,38 @@ impl NvencH264Encoder {
             .map_err(|e| FerricastError::Encoder(format!("NVENC: query_caps: {e}")))?;
         debug!("NVENC H.264 caps query OK");
 
+        // Map the cross-crate profile constraint onto NVENC's
+        // GUID-based profile enum. `max_h264_profile == None`
+        // defaults to Main — the conservative floor that every
+        // receiver protocol (Chromecast 1st gen and up, Miracast,
+        // AirPlay 2) can decode. The manager fills this in from
+        // the target device's `DeviceCapabilities` so a
+        // Chromecast Ultra / Google TV / Android TV gets High
+        // (≈10-20% better compression) while a 1st-gen
+        // Chromecast falls back to Main automatically.
+        let profile = match cfg.max_h264_profile {
+            Some(ferricast_core::H264Profile::High) => H264Profile::High,
+            Some(ferricast_core::H264Profile::Baseline) => H264Profile::Baseline,
+            // Main or unspecified → Main (safe default).
+            _ => H264Profile::Main,
+        };
+
         let nvcfg = NvCfg {
             codec: CodecConfig::H264(H264EncoderConfig {
-                profile: Some(H264Profile::High),
+                // Profile from `DeviceCapabilities`. Old generic
+                // Chromecasts (md = \"Chromecast\") choke on High-
+                // profile features (CABAC, 8x8 transform, weighted
+                // prediction); they get Main from the device-side
+                // capability table. Newer receivers (Ultra,
+                // Android TV, Google TV) negotiate High and benefit
+                // from the better compression. Symptom of getting
+                // this wrong on an old device was the
+                // LOADING-forever state we hit in the field:
+                // receiver accepts the LOAD, transitions to
+                // playerState=IDLE / extendedStatus=LOADING, hardware
+                // decoder silently rejects the bitstream, never
+                // progresses.
+                profile: Some(profile),
                 idr_period: Some(cfg.keyframe_interval.max(1)),
             }),
             width: cfg.width.max(16),

@@ -10,7 +10,6 @@
 use bytes::{Buf, BufMut, BytesMut};
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use thiserror::Error;
 use tracing::{debug, trace};
 
@@ -64,10 +63,20 @@ pub enum PayloadType {
 ///   6 = payload_utf8
 ///   7 = payload_binary
 ///
+/// `protocol_version` and `payload_type` are wrapped in `Option`
+/// even though they're conceptually required — that forces prost to
+/// emit the tag on the wire even when the value is the proto3
+/// default (0). The official schema is proto2 with `required`
+/// semantics; some chromecast firmwares reject CastMessages that
+/// lack tag=1 / tag=5 entirely (which is what plain `i32` fields do
+/// when they happen to be zero — `CASTV2_1_0 = 0` and `STRING = 0`
+/// are the only values we ever send for these). Without this, the
+/// receiver silently FINs the TLS channel right after our LAUNCH
+/// message lands.
 #[derive(Clone, PartialEq, Message)]
 pub struct CastMessage {
-    #[prost(enumeration = "ProtocolVersion", tag = "1")]
-    pub protocol_version: i32,
+    #[prost(enumeration = "ProtocolVersion", optional, tag = "1")]
+    pub protocol_version: Option<i32>,
 
     #[prost(string, tag = "2")]
     pub source_id: String,
@@ -78,8 +87,8 @@ pub struct CastMessage {
     #[prost(string, tag = "4")]
     pub namespace: String,
 
-    #[prost(enumeration = "PayloadType", tag = "5")]
-    pub payload_type: i32,
+    #[prost(enumeration = "PayloadType", optional, tag = "5")]
+    pub payload_type: Option<i32>,
 
     #[prost(string, optional, tag = "6")]
     pub payload_utf8: Option<String>,
@@ -148,12 +157,20 @@ pub struct ConnectPayload {
 }
 
 impl ConnectPayload {
+    /// Minimal CONNECT — just `{"type":"CONNECT"}`. We initially
+    /// shipped userAgent / connType / origin because the official
+    /// proto schema documents them, but several chromecast firmwares
+    /// (notably 1st-gen audio devices and certain Google TV
+    /// versions) silently close the TLS channel when those fields
+    /// are present from a sender they don't recognise. Both
+    /// pychromecast and rust_cast send plain `{type:CONNECT}` and
+    /// it's the lowest-common-denominator form.
     pub fn connect() -> Self {
         Self {
             msg_type: "CONNECT".into(),
-            user_agent: Some("ferricast/0.1".into()),
-            conn_type: Some(0),
-            origin: Some(serde_json::json!({})),
+            user_agent: None,
+            conn_type: None,
+            origin: None,
         }
     }
 
@@ -215,18 +232,25 @@ pub struct ReceiverStatus {
     pub volume: Option<VolumeInfo>,
 }
 
+/// One application entry inside a `RECEIVER_STATUS` payload. Every
+/// field except `app_id` is optional because real receivers send
+/// progressively-populated entries during the launch sequence —
+/// e.g. an early status may have `appId` + `transportId` but lack
+/// `displayName` and `sessionId`. With strict types serde would
+/// reject the whole payload and `wait_for_app` would silently
+/// continue, never finding the app it was looking for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplicationInfo {
     #[serde(rename = "appId")]
     pub app_id: String,
 
-    #[serde(rename = "displayName")]
+    #[serde(rename = "displayName", default)]
     pub display_name: String,
 
-    #[serde(rename = "transportId")]
+    #[serde(rename = "transportId", default)]
     pub transport_id: String,
 
-    #[serde(rename = "sessionId")]
+    #[serde(rename = "sessionId", default)]
     pub session_id: String,
 
     #[serde(default)]
@@ -405,11 +429,11 @@ impl CastMessage {
             json
         );
         Ok(Self {
-            protocol_version: ProtocolVersion::Castv21_0 as i32,
+            protocol_version: Some(ProtocolVersion::Castv21_0 as i32),
             source_id: source_id.into(),
             destination_id: destination_id.into(),
             namespace: namespace.into(),
-            payload_type: PayloadType::String as i32,
+            payload_type: Some(PayloadType::String as i32),
             payload_utf8: Some(json),
             payload_binary: None,
         })
@@ -423,11 +447,11 @@ impl CastMessage {
         data: Vec<u8>,
     ) -> Self {
         Self {
-            protocol_version: ProtocolVersion::Castv21_0 as i32,
+            protocol_version: Some(ProtocolVersion::Castv21_0 as i32),
             source_id: source_id.into(),
             destination_id: destination_id.into(),
             namespace: namespace.into(),
-            payload_type: PayloadType::Binary as i32,
+            payload_type: Some(PayloadType::Binary as i32),
             payload_utf8: None,
             payload_binary: Some(data),
         }

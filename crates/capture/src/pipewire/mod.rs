@@ -153,4 +153,18 @@ impl ScreenCapture for PipeWireCapture {
             .map(|n| (n.width as usize, n.height as usize))
             .unwrap_or((0, 0))
     }
+
+    /// Returns the framerate the compositor agreed on. The negotiated
+    /// fraction is a `num/denom` pair (e.g. 60/1, 24000/1001 for
+    /// NTSC) — we round to the nearest whole fps because every
+    /// downstream encoder we wrap takes an integer.
+    fn get_framerate(&self) -> u32 {
+        let Some(n) = self.snapshot() else { return 0 };
+        let f = n.framerate;
+        if f.denom == 0 {
+            return 0;
+        }
+        // Round-to-nearest so 24000/1001 surfaces as 24, not 23.
+        ((f.num as u64 + (f.denom as u64 / 2)) / f.denom as u64) as u32
+    }
 }

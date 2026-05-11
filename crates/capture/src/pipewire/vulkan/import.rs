@@ -123,6 +123,7 @@ pub(super) fn run_pipelined(
     pixel_format: PixelFormat,
     timestamp_us: u64,
 ) -> Result<Option<ReadyFrame>> {
+    let started = std::time::Instant::now();
     let bpp = fmt::bytes_per_pixel(pixel_format)
         .ok_or_else(|| FerricastError::Capture("vulkan: format has no bpp".into()))?;
     let byte_size = (width as u64) * (height as u64) * (bpp as u64);
@@ -186,6 +187,37 @@ pub(super) fn run_pipelined(
         timestamp_us,
         byte_size,
     });
+
+    // 6. Pipeline-priming workaround. The clean pipelined design
+    //    returns `Ok(None)` on the very first call (because there's
+    //    no previous submission to drain) and gives the consumer a
+    //    frame on the *second* call. That works fine when the
+    //    upstream pushes buffers continuously — true on most X11
+    //    captures, true on Wayland while something animates on
+    //    screen. But event-driven compositors (Niri, GNOME Mutter
+    //    in idle, sway) only emit a new dmabuf when the screen
+    //    actually changes; if the user clicks "cast" and then sits
+    //    still, no second buffer arrives and the consumer blocks
+    //    indefinitely. Reproduced as a 24 s gap between
+    //    `first buffer received` and `first frame ready` in real
+    //    runs.
+    //
+    //    Drain *this* submission synchronously on the first call
+    //    only: wait on the fence we just submitted and return its
+    //    bytes. After that the `primed` flag stays true and the
+    //    rest of the stream is fully pipelined as designed.
+    if !state.primed {
+        let drained = drain_slot(inner, &mut state.slots[slot_idx])?;
+        state.primed = true;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        tracing::info!(
+            elapsed_ms,
+            "vulkan first-frame primed synchronously \
+             (subsequent frames will be pipelined)"
+        );
+        return Ok(Some(drained));
+    }
+
     state.pending.push_back(slot_idx);
 
     if let Some(prev) = &previous {
@@ -194,6 +226,14 @@ pub(super) fn run_pipelined(
             height = prev.height,
             len = prev.bytes.len(),
             "vulkan pipelined readback ok"
+        );
+    }
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if elapsed_ms > 50 {
+        tracing::warn!(
+            elapsed_ms,
+            primed = previous.is_none(),
+            "vulkan pipelined import slow (>50ms) — see prior wait_for_fences logs for the blocking step"
         );
     }
     Ok(previous)
@@ -236,6 +276,7 @@ fn drain_slot(inner: &Inner, slot: &mut Slot) -> Result<ReadyFrame> {
 }
 
 fn wait_and_reset_fence(inner: &Inner, fence: vk::Fence) -> Result<()> {
+    let started = std::time::Instant::now();
     unsafe {
         inner
             .device
@@ -245,6 +286,18 @@ fn wait_and_reset_fence(inner: &Inner, fence: vk::Fence) -> Result<()> {
             .device
             .reset_fences(&[fence])
             .map_err(|e| FerricastError::Capture(format!("vk reset_fences: {e}")))?;
+    }
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    // Anything past one frame period (~16 ms at 60 fps) at this
+    // step means GPU contention or driver weirdness — log loudly so
+    // we know whether a stall is on us or upstream.
+    if elapsed_ms > 50 {
+        tracing::warn!(
+            elapsed_ms,
+            "vk wait_for_fences blocked unusually long — GPU contention or driver issue"
+        );
+    } else {
+        tracing::trace!(elapsed_ms, "vk wait_for_fences");
     }
     Ok(())
 }

@@ -74,27 +74,15 @@ impl VideoEncoder for H264Encoder {
     fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
         match self {
             H264Encoder::Pending => {
-                // Try VA-API first; if that fails (NVIDIA, no
-                // libva, profile mismatch, ...) try NVENC; if that
-                // also fails, fall back to x264. We always end up
-                // with a working encoder — x264 is the floor.
-               // TODO: fix this for x11!
-                /*
-                match VaapiH264Encoder::probe_with(config.clone()) {
-                    Ok(enc) => {
-                        info!(
-                            width = config.width,
-                            height = config.height,
-                            fps = config.fps,
-                            "H.264 encoder backend: VA-API"
-                        );
-                        *self = H264Encoder::Vaapi(enc);
-                        return Ok(());
-                    }
-                    Err(e) => info!(error = %e, "VA-API unavailable, trying NVENC"),
-                }
-               */
-
+                // Try NVENC first; if that fails (no NVIDIA, libs
+                // missing) try VA-API; if that fails fall back to
+                // x264. NVENC takes priority over VA-API because
+                // multi-GPU systems (NVIDIA dGPU + AMD iGPU is a
+                // very common laptop / Ryzen-with-graphics combo)
+                // would otherwise pick the iGPU's VA-API and force
+                // every frame across PCIe twice — capture on NVIDIA
+                // → readback to CPU → upload to AMD VA-API. NVENC
+                // keeps the entire pipeline on the discrete GPU.
                 match NvencH264Encoder::probe_with(config.clone()) {
                     Ok(enc) => {
                         info!(
@@ -108,11 +96,25 @@ impl VideoEncoder for H264Encoder {
                     }
                     Err(e) => info!(
                         error = %e,
-                        "NVENC unavailable, falling back to x264. \
+                        "NVENC unavailable, trying VA-API. \
                          If you expected NVENC, ensure libcuda.so.1 + \
                          libnvidia-encode.so.1 are on LD_LIBRARY_PATH \
                          (NixOS: /run/opengl-driver/lib)."
                     ),
+                }
+
+                match VaapiH264Encoder::probe_with(config.clone()) {
+                    Ok(enc) => {
+                        info!(
+                            width = config.width,
+                            height = config.height,
+                            fps = config.fps,
+                            "H.264 encoder backend: VA-API"
+                        );
+                        *self = H264Encoder::Vaapi(enc);
+                        return Ok(());
+                    }
+                    Err(e) => info!(error = %e, "VA-API unavailable, falling back to x264"),
                 }
 
                 info!("H.264 encoder backend: x264 (software)");

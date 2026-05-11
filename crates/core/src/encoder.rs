@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::frame::{CapturedFrame, EncodedFrame};
-use crate::{Codec, PixelFormat};
+use crate::{Codec, H264Profile, PixelFormat};
 
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
@@ -10,7 +10,13 @@ pub struct EncoderConfig {
     pub bitrate_kbps: u32,
     pub fps: u32,
     pub keyframe_interval: u32,
-    pub pixel_format: PixelFormat
+    pub pixel_format: PixelFormat,
+    /// Upper bound on the H.264 profile the encoder is allowed to
+    /// emit. Set by the manager from the target device's
+    /// `DeviceCapabilities::max_h264_profile` so we never produce a
+    /// bitstream the receiver's hardware decoder can't handle.
+    /// `None` = encoder picks its own default.
+    pub max_h264_profile: Option<H264Profile>,
 }
 
 impl Default for EncoderConfig {
@@ -23,6 +29,7 @@ impl Default for EncoderConfig {
             fps: 60,
             keyframe_interval: 60,
             pixel_format: PixelFormat::Bgra,
+            max_h264_profile: None,
         }
     }
 }

@@ -28,15 +28,16 @@ mod http;
 mod ring;
 mod segmenter;
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, ToSocketAddrs};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{error, info, trace};
 
-use ferricast_core::{FerricastError, Result, ScreenCapture, VideoEncoder};
+use ferricast_core::{EncodedFrame, FerricastError, Result, ScreenCapture, VideoEncoder};
 
 pub use ring::SegmentRing;
 
@@ -83,15 +84,33 @@ pub struct HlsConfig {
     /// 2. Anchor segment boundaries to wall clock by requesting a
     ///    forced IDR once `segment_target_secs` has elapsed.
     pub target_fps: u32,
+    /// Whether the underlying MPEG-TS muxer should advertise an
+    /// audio elementary stream and inject silent AAC frames inline
+    /// with video. Required for older Chromecasts whose firmware
+    /// rejects HLS streams with only a video PID — they respond
+    /// with `LOAD_FAILED, idleReason=ERROR`. The chromecast HLS
+    /// pipeline turns this on when the target device's
+    /// `DeviceCapabilities::requires_audio` is true. Leave off for
+    /// receivers that accept video-only HLS (saves ~6 KB/s).
+    pub inject_silent_audio: bool,
 }
 
 impl Default for HlsConfig {
     fn default() -> Self {
         Self {
-            segment_target_secs: 2.0,
-            playlist_target_duration: 4,
+            // 4 s segments halve the IDR rate vs 2 s. On 1st-gen
+            // Chromecast over 2.4 GHz Wi-Fi, one IDR at 1080p is
+            // ~250 KB; at 2 s segments that overhead alone is
+            // ~0.5 Mbps on top of the average bitrate, which was
+            // enough to push sustained throughput past what the
+            // receiver's Wi-Fi could pull and trigger
+            // detailedErrorCode=301 after a few minutes. Trade-off
+            // is +2 s of buffering latency at startup.
+            segment_target_secs: 4.0,
+            playlist_target_duration: 8,
             keep_segments: 12,
             target_fps: 60,
+            inject_silent_audio: false,
         }
     }
 }
@@ -181,7 +200,7 @@ impl HlsServer {
         let ring = self.ring.clone();
         tokio::spawn(async move {
             if let Err(e) = http::handle(socket, ring).await {
-                debug!(peer = %peer, error = %e, "HLS connection ended");
+                trace!(peer = %peer, error = %e, "HLS connection ended");
             }
         });
         Ok(())
@@ -197,7 +216,7 @@ impl HlsServer {
                     let ring = self.ring.clone();
                     tokio::spawn(async move {
                         if let Err(e) = http::handle(socket, ring).await {
-                            debug!(peer = %peer, error = %e, "HLS connection ended");
+                            trace!(peer = %peer, error = %e, "HLS connection ended");
                         }
                     });
                 }
@@ -207,5 +226,137 @@ impl HlsServer {
                 }
             }
         }
+    }
+}
+
+/// Self-managed HLS endpoint backed by an external frame channel.
+///
+/// Unlike [`HlsServer`], this handle spawns its own accept loop on
+/// construction so the caller doesn't have to drive it; dropping the
+/// handle aborts the accept loop and dropping the [`mpsc::Sender`]
+/// the caller still holds shuts the segmenter down.
+///
+/// Used by receiver protocols (Chromecast, …) whose capture+encode
+/// loop is already driven by the global stream manager — they don't
+/// need a long-running `run()` future, they just need a URL the
+/// receiver can pull from.
+pub struct HlsFrameSink {
+    addr: SocketAddr,
+    ring: Arc<RwLock<SegmentRing>>,
+    _segmenter: JoinHandle<()>,
+    accept: JoinHandle<()>,
+}
+
+impl HlsFrameSink {
+    /// Bind on `addr`, spawn the segmenter (fed by `frames`) and the
+    /// HTTP accept loop, and return immediately. The HLS playlist
+    /// won't have any segments yet — call [`Self::wait_first_segment`]
+    /// before pointing a player at the URL.
+    pub async fn start<A: ToSocketAddrs>(
+        addr: A,
+        frames: mpsc::Receiver<EncodedFrame>,
+        parameter_sets: Vec<u8>,
+        config: HlsConfig,
+    ) -> Result<Self> {
+        if config.keep_segments < 3 {
+            return Err(FerricastError::Hls(format!(
+                "keep_segments={} too small (minimum 3)",
+                config.keep_segments
+            )));
+        }
+        if (config.playlist_target_duration as f32) < config.segment_target_secs {
+            return Err(FerricastError::Hls(format!(
+                "playlist_target_duration={}s < segment_target_secs={}s",
+                config.playlist_target_duration, config.segment_target_secs
+            )));
+        }
+
+        let listener = TcpListener::bind(addr).await?;
+        let local = listener.local_addr().map_err(FerricastError::from)?;
+
+        let ring = Arc::new(RwLock::new(SegmentRing::new(config.keep_segments)));
+        let segmenter_ring = ring.clone();
+        let segmenter = tokio::spawn(async move {
+            if let Err(e) =
+                segmenter::run_from_frames(frames, parameter_sets, segmenter_ring, config).await
+            {
+                error!(error = %e, "HLS frame-source segmenter exited");
+            }
+        });
+
+        let accept_ring = ring.clone();
+        let accept = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((socket, peer)) => {
+                        let r = accept_ring.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = http::handle(socket, r).await {
+                                trace!(peer = %peer, error = %e, "HLS connection ended");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!(error = %e, "HLS frame-sink accept failed");
+                        return;
+                    }
+                }
+            }
+        });
+
+        info!(
+            listen = %local,
+            segment_target_s = config.segment_target_secs,
+            playlist_target_s = config.playlist_target_duration,
+            keep = config.keep_segments,
+            "HLS frame sink ready"
+        );
+
+        Ok(Self {
+            addr: local,
+            ring,
+            _segmenter: segmenter,
+            accept,
+        })
+    }
+
+    /// Bound socket address (always reflects the actual port even if
+    /// the caller asked for `:0`).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Wait until at least one segment has been pushed to the ring.
+    /// Cheap polling — segments emit within `segment_target_secs +
+    /// keyframe_lag` so this resolves in under a second on typical
+    /// streams.
+    pub async fn wait_first_segment(&self) {
+        ring::wait_for_first_segment(&self.ring).await;
+    }
+
+    /// Owned future that resolves when the first segment lands.
+    ///
+    /// Same semantics as [`Self::wait_first_segment`] but doesn't
+    /// borrow `self`, so it can be awaited from a `tokio::spawn`
+    /// task that doesn't hold a reference to the sink. Used by
+    /// receiver protocols (Chromecast `LOAD`, …) that need to delay
+    /// a signaling message until the playlist is actually playable
+    /// without blocking the frame-feeding code path.
+    pub fn first_segment_ready(&self) -> impl Future<Output = ()> + Send + 'static {
+        let ring = self.ring.clone();
+        async move {
+            ring::wait_for_first_segment(&ring).await;
+        }
+    }
+}
+
+impl Drop for HlsFrameSink {
+    fn drop(&mut self) {
+        // Abort the accept loop so the listener fd is reclaimed.
+        // The segmenter exits on its own as soon as the caller drops
+        // their `mpsc::Sender`, so we don't have to abort it here —
+        // but we abort defensively in case the sender outlives us.
+        self.accept.abort();
+        self._segmenter.abort();
     }
 }

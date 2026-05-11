@@ -75,9 +75,10 @@ pub(super) struct NegotiatedFormat {
     pub height: u32,
     pub pixel_format: PixelFormat,
     pub spa_format: VideoFormat,
-    /// Negotiated framerate. Currently informational; downstream
-    /// encoders read it once GPU-import lands.
-    #[allow(dead_code)]
+    /// Negotiated framerate. Returned by `get_framerate()` so the
+    /// encoder + segmenter pace to whatever the compositor actually
+    /// delivers (e.g. 24 / 30 / 60 / 144) rather than the
+    /// configured-fps hint, which is only a preference.
     pub framerate: Fraction,
     /// DRM modifier when the negotiated buffer is a DmaBuf, `None` for shm.
     pub modifier: Option<u64>,

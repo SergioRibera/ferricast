@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -93,7 +93,7 @@ where
     // Single muxer reused across segments. Its continuity-counter
     // state must persist or ffmpeg's MPEG-TS demuxer flags every
     // boundary as a packet error.
-    let mut muxer = MpegTs::default();
+    let mut muxer = MpegTs::default().with_silent_audio(config.inject_silent_audio);
     muxer.config(parameter_sets.clone())?;
 
     // Inter-frame dt for diagnosing capture-side throughput. At 60 fps
@@ -301,6 +301,135 @@ fn record_frame_dt(last: &mut Option<Instant>, kind: &'static str) {
         debug!(dt_ms = (now - prev).as_millis() as u64, kind, "frame");
     }
     *last = Some(now);
+}
+
+/// Like [`run`], but the source of encoded frames is an external
+/// channel rather than an owned capture/encoder pair. Used by
+/// receiver protocols (Chromecast HLS, …) whose capture+encode is
+/// already driven by [`crate::HlsFrameSink`]'s caller (typically
+/// `StreamManager`) and just need segments served over HTTP.
+///
+/// The receiver dropping (sender closed) cleanly drains the current
+/// segment and returns, which is how the chromecast session signals
+/// shutdown.
+///
+/// PTS accounting follows the same adaptive scheme as [`run`]:
+/// uniform per-frame increment of `effective_frame_period_us` inside
+/// each segment, refined after each segment using observed wall span
+/// ÷ frames pushed. Without this the player drifts away from the
+/// live edge and segments expire underneath it.
+pub async fn run_from_frames(
+    mut frames: mpsc::Receiver<EncodedFrame>,
+    parameter_sets: Vec<u8>,
+    ring: Arc<RwLock<SegmentRing>>,
+    config: HlsConfig,
+) -> Result<(), FerricastError> {
+    if parameter_sets.is_empty() {
+        return Err(FerricastError::Encoder(
+            "empty H.264 parameter sets; refusing to start segmenter".into(),
+        ));
+    }
+    let target = Duration::from_secs_f32(config.segment_target_secs);
+    let frame_period_us =
+        (1_000_000_f64 / (config.target_fps.max(1) as f64)) as u64;
+
+    let mut pts_us: u64 = 0;
+    let mut effective_frame_period_us: u64 = frame_period_us;
+    let mut pending: Option<EncodedFrame> = None;
+
+    let mut muxer = MpegTs::default().with_silent_audio(config.inject_silent_audio);
+    muxer.config(parameter_sets.clone())?;
+
+    loop {
+        muxer.start_segment();
+
+        // Wait for a keyframe to start the segment. Pre-IDR frames
+        // are dropped by the upstream session, but if any sneak
+        // through we drop them here for the same reason `run` does:
+        // every segment must begin at a random-access point.
+        let first = match pending.take() {
+            Some(f) => f,
+            None => loop {
+                match frames.recv().await {
+                    Some(f) if f.is_keyframe => break f,
+                    Some(_) => continue,
+                    None => return Ok(()),
+                }
+            },
+        };
+
+        let started = Instant::now();
+        let mut frames_in_segment: u64 = 0;
+        push_frame(&mut muxer, &first, pts_us)?;
+        pts_us = pts_us.saturating_add(effective_frame_period_us);
+        frames_in_segment += 1;
+
+        loop {
+            let encoded = match frames.recv().await {
+                Some(f) => f,
+                None => {
+                    // Sender hung up — drain whatever we have so the
+                    // player gets a final segment and can stop
+                    // cleanly.
+                    let elapsed = started.elapsed();
+                    let bytes = Bytes::from(muxer.drain());
+                    if !bytes.is_empty() {
+                        ring.write()
+                            .await
+                            .push(elapsed.as_secs_f32(), false, bytes);
+                    }
+                    return Ok(());
+                }
+            };
+
+            if encoded.is_keyframe && started.elapsed() >= target {
+                pending = Some(encoded);
+                break;
+            }
+            push_frame(&mut muxer, &encoded, pts_us)?;
+            pts_us = pts_us.saturating_add(effective_frame_period_us);
+            frames_in_segment += 1;
+        }
+
+        let elapsed = started.elapsed();
+
+        // Same EMA refinement as `run`: skip the warmup segment, then
+        // pull the per-frame PTS increment toward the actual wall
+        // cost so PTS span ≈ wall span over time.
+        if frames_in_segment >= 30 {
+            let measured =
+                (elapsed.as_micros() as u64).saturating_div(frames_in_segment);
+            let lo = frame_period_us / 2;
+            let hi = frame_period_us.saturating_mul(3) / 2;
+            let measured_clamped = measured.clamp(lo, hi);
+            effective_frame_period_us =
+                (effective_frame_period_us.saturating_mul(7) + measured_clamped) / 8;
+        }
+
+        let bytes = Bytes::from(muxer.drain());
+        let size_bytes = bytes.len();
+        let seq = ring
+            .write()
+            .await
+            .push(elapsed.as_secs_f32(), false, bytes);
+        if seq < 3 {
+            info!(
+                seq,
+                duration_ms = elapsed.as_millis() as u64,
+                size_kb = size_bytes / 1024,
+                effective_frame_period_us,
+                "segment ready"
+            );
+        } else {
+            debug!(
+                seq,
+                duration_ms = elapsed.as_millis() as u64,
+                size_kb = size_bytes / 1024,
+                effective_frame_period_us,
+                "segment ready"
+            );
+        }
+    }
 }
 
 fn push_frame(
