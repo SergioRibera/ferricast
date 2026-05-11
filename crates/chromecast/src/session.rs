@@ -34,9 +34,10 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 
 use crate::castv2::{
-    CastMessage, DEFAULT_MEDIA_RECEIVER_APP_ID, DEFAULT_RECEIVER_ID, DEFAULT_SENDER_ID, MediaInfo,
-    ReceiverStatusPayload, close_message, connect_message, get_status_message, launch_message,
-    load_media_message, namespace, ping_message, pong_message, stop_app_message,
+    CastMessage, DEFAULT_MEDIA_RECEIVER_APP_ID, DEFAULT_RECEIVER_ID, DEFAULT_SENDER_ID,
+    MediaDetailedErrorCode, MediaInfo, MediaStatusPayload, ReceiverStatusPayload, close_message,
+    connect_message, get_status_message, launch_message, load_media_message, namespace,
+    ping_message, pong_message, stop_app_message,
 };
 use crate::h264_params::extract_sps_pps;
 use crate::wire::{self, SharedWriter};
@@ -79,6 +80,14 @@ struct ConnectedState {
     /// inject a silent AAC track. Old generic Chromecasts need
     /// this; Ultra / Google TV don't.
     requires_audio: bool,
+    /// Mirror of `device.capabilities.supports_low_latency_hls`.
+    /// Controls whether `bootstrap_hls` enables LL-HLS (parts,
+    /// blocking reload, EXT-X-VERSION:6) on the HLS server. Old
+    /// Chromecasts choke on the v6 playlist and end up in a
+    /// LOADING-forever state; their capabilities row carries
+    /// `false` here so the HLS endpoint stays in classic HLS
+    /// mode (no parts, EXT-X-VERSION:3) for them.
+    supports_low_latency_hls: bool,
     /// Monotonic CASTv2 request-id counter, shared with the read
     /// loop so requests and responses don't collide.
     request_id: Arc<AtomicI64>,
@@ -257,6 +266,7 @@ impl CastSession for ChromecastSession {
             session_id,
             local_ip,
             requires_audio: device.capabilities.requires_audio,
+            supports_low_latency_hls: device.capabilities.supports_low_latency_hls,
             request_id,
             alive,
             read_handle,
@@ -431,20 +441,37 @@ impl ChromecastSession {
         // `DeviceCapabilities::requires_audio` — old Chromecast 1st/
         // 2nd gen need a silent audio track to not reject the HLS
         // stream with LOAD_FAILED.
+        let adaptive_for_hls = self
+            .cfg
+            .as_ref()
+            .and_then(|c| c.adaptive.clone());
+        // LL-HLS opt-in, gated on `DeviceCapabilities::
+        // supports_low_latency_hls`. The 1st/2nd-gen Chromecast
+        // firmware demonstrably stalls in the LOADING-forever
+        // state when handed a `#EXT-X-VERSION:6` playlist (field-
+        // tested: receiver enters IDLE/extendedStatus=LOADING and
+        // never fetches any segment or part). Conservative default
+        // is `false` in `capabilities_for_model`; only flip it on
+        // for device classes where it's been verified to work.
+        // Classic-HLS receivers get the legacy code path
+        // (EXT-X-VERSION:3, whole-segment fetches), identical to
+        // what we were shipping before the LL-HLS commit landed.
+        let part_target_secs = if state.supports_low_latency_hls {
+            Some(0.5)
+        } else {
+            None
+        };
         let hls_config = HlsConfig {
             inject_silent_audio: requires_audio,
+            adaptive: adaptive_for_hls,
+            part_target_secs,
             ..Default::default()
         };
         let sink =
             HlsFrameSink::start("0.0.0.0:0", frame_rx, parameter_sets, hls_config).await?;
         let local_addr = sink.local_addr();
         let media_url = format!("http://{}:{}/index.m3u8", local_ip, local_addr.port());
-        // Error level on purpose: this URL is the single piece of
-        // diagnostic info a user needs when chromecast playback
-        // doesn't show anything — they can paste it into VLC /
-        // browser to confirm the local server is serving valid HLS
-        // independently of the receiver.
-        tracing::error!(
+        info!(
             url = %media_url,
             "chromecast HLS endpoint ready (open this URL in a player to verify)"
         );
@@ -461,7 +488,7 @@ impl ChromecastSession {
             // log makes the failure mode obvious instead of "TV
             // shows black, no errors anywhere".
             match self_test_playlist(probe_port).await {
-                Ok(snippet) => tracing::error!(
+                Ok(snippet) => info!(
                     bytes = snippet.len(),
                     body_head = %snippet,
                     "HLS self-test OK; sending LOAD"
@@ -491,7 +518,7 @@ impl ChromecastSession {
                 }
             };
             match wire::send(&writer, &msg).await {
-                Ok(()) => tracing::error!(url = %load_url, "sent LOAD to chromecast"),
+                Ok(()) => info!(url = %load_url, "sent LOAD to chromecast"),
                 Err(e) => tracing::error!(%e, "LOAD send failed"),
             }
         });
@@ -532,6 +559,15 @@ async fn read_loop<R>(
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut buf = BytesMut::with_capacity(8 * 1024);
+    // Per-session diagnostic state. None of this is hot-path; it's
+    // here to make the log a coherent timeline of receiver
+    // behaviour, not a stream of disconnected events.
+    let mut last_player_state: Option<String> = None;
+    let mut state_entered_at = std::time::Instant::now();
+    let mut last_current_time: Option<f64> = None;
+    let mut last_seekable_end: Option<f64> = None;
+    let mut last_status_at = std::time::Instant::now();
+
     loop {
         match wire::recv(&mut reader, &mut buf).await {
             Ok(Some(msg)) => {
@@ -550,20 +586,45 @@ async fn read_loop<R>(
                 }
 
                 // CLOSE on the connection namespace = receiver tore
-                // us down. If we're still waiting for launch ack,
-                // surface the explicit cause via the oneshot
-                // instead of letting it hang until timeout.
+                // us down. Two flavours we care about:
+                //
+                // - src == DEFAULT_RECEIVER_ID ("receiver-0"): the
+                //   whole platform connection is gone (rare; usually
+                //   means the chromecast rebooted or its TCP stack
+                //   gave up).
+                // - src == app transport_id (the UUID-looking one):
+                //   the Default Media Receiver app exited on the
+                //   receiver — observed when the receiver decides
+                //   playback is unrecoverable after sustained
+                //   BUFFERING. Continuing to push frames at this
+                //   point is pointless; nothing on the receiver
+                //   will pull them.
+                //
+                // Either way it's fatal for the streaming session:
+                // break out, the loop's exit path flips `alive` to
+                // false, and the stream manager's watchdog notices
+                // and tears the rest of the pipeline down.
                 if msg.namespace == namespace::CONNECTION
                     && msg.message_type().as_deref() == Some("CLOSE")
                 {
                     let err = FerricastError::Connection(format!(
-                        "receiver sent CLOSE on connection namespace; payload: {:?}",
-                        msg.payload_utf8
+                        "receiver sent CLOSE on connection namespace from src={:?}; payload: {:?}",
+                        msg.source_id, msg.payload_utf8
                     ));
                     if let Some((_, tx)) = launch_watch.take() {
                         let _ = tx.send(Err(err));
+                    } else if msg.source_id == DEFAULT_RECEIVER_ID {
+                        tracing::error!(
+                            src = %msg.source_id,
+                            payload = ?msg.payload_utf8,
+                            "platform receiver-0 sent CLOSE — chromecast disconnected the sender entirely"
+                        );
                     } else {
-                        warn!(payload = ?msg.payload_utf8, "receiver sent CLOSE in steady state");
+                        tracing::error!(
+                            src = %msg.source_id,
+                            payload = ?msg.payload_utf8,
+                            "receiver app sent CLOSE — Default Media Receiver exited (likely after sustained BUFFERING); session is dead"
+                        );
                     }
                     break;
                 }
@@ -612,15 +673,169 @@ async fn read_loop<R>(
                     let mtype = msg.message_type();
                     if matches!(
                         mtype.as_deref(),
-                        Some("LOAD_FAILED") | Some("INVALID_REQUEST") | Some("INVALID_PLAYER_STATE")
+                        Some("LOAD_FAILED")
+                            | Some("INVALID_REQUEST")
+                            | Some("INVALID_PLAYER_STATE")
+                            | Some("ERROR")
                     ) {
+                        // Parse `detailedErrorCode` (when present)
+                        // into the named enum ported from rust_cast.
+                        // The enum is exhaustive over what Google
+                        // documents, so the log line goes from a
+                        // bare integer to a self-describing variant
+                        // (`SegmentNetwork(301)` instead of `301`).
+                        let detailed_raw = msg
+                            .payload_utf8
+                            .as_deref()
+                            .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                            .and_then(|v| v.get("detailedErrorCode").and_then(|c| c.as_i64()));
+                        let detailed = detailed_raw.map(MediaDetailedErrorCode::from_code);
                         tracing::error!(
                             ty = ?mtype,
+                            detailed_code = ?detailed_raw,
+                            detailed = ?detailed,
+                            retryable = detailed.map(|d| d.is_retryable()),
                             payload = ?msg.payload_utf8,
-                            "chromecast rejected our media"
+                            "chromecast rejected our media (session is terminal)"
                         );
+                        // Per-code hints aimed at the user reading
+                        // the log to figure out what to do next.
+                        match detailed {
+                            Some(MediaDetailedErrorCode::SegmentNetwork) => tracing::error!(
+                                "SegmentNetwork (301): receiver gave up fetching a segment. \
+                                 On 1st/2nd-gen Chromecast this is firmware-internal — the link \
+                                 is usually fine. Auto-reconnect supervisor will rebuild the \
+                                 session; if it loops, lower StreamConfig::bitrate_kbps or use \
+                                 newer Cast hardware."
+                            ),
+                            Some(MediaDetailedErrorCode::MediaSrcNotSupported) => tracing::error!(
+                                "MediaSrcNotSupported (104): the receiver's decoder rejected the \
+                                 bitstream. Check `max_h264_profile` in capabilities_for_model() \
+                                 — older Chromecasts choke on High profile."
+                            ),
+                            Some(MediaDetailedErrorCode::LoadFailed) => tracing::error!(
+                                "LoadFailed (905): receiver couldn't start the load. Check that \
+                                 the HLS URL we advertised is reachable from the device's network \
+                                 (the `HLS self-test OK` line on startup should confirm)."
+                            ),
+                            _ => {}
+                        }
+                        break;
+                    } else if mtype.as_deref() == Some("MEDIA_STATUS") {
+                        // Receiver pushes MEDIA_STATUS every couple
+                        // of seconds. We surface state transitions
+                        // at info!/warn! (loud) and steady-state
+                        // repeats at debug! (quiet by default but
+                        // available for deep dives via
+                        // `RUST_LOG=ferricast_chromecast=debug`).
+                        // Either way every line carries the full
+                        // diagnostic bundle so the log is a coherent
+                        // timeline.
+                        let parsed: Option<MediaStatusPayload> = msg
+                            .payload_utf8
+                            .as_deref()
+                            .and_then(|p| serde_json::from_str(p).ok());
+                        let s0 = parsed.as_ref().and_then(|p| p.status.first());
+                        let new_state = s0.and_then(|s| s.player_state.clone());
+                        let current_time = s0.and_then(|s| s.current_time);
+                        let idle_reason = s0.and_then(|s| s.idle_reason.clone());
+                        let extended_status = s0.and_then(|s| s.extended_status.clone());
+                        let seekable = s0.and_then(|s| s.live_seekable_range.clone());
+                        let playback_rate = s0.and_then(|s| s.playback_rate);
+
+                        // Derived diagnostics:
+                        //   * advance_s: how much currentTime moved
+                        //     between two consecutive MEDIA_STATUS
+                        //     samples. Equals wall delta when the
+                        //     player is healthy (1× playback). When
+                        //     the receiver buffers, this collapses
+                        //     to ~0 even though wall time keeps
+                        //     advancing — exposes BUFFERING the
+                        //     receiver doesn't always announce.
+                        //   * lag_s: seekable.end - currentTime,
+                        //     i.e. distance from the live edge.
+                        //     Should hover around 1-2 segments;
+                        //     growing unboundedly = player falling
+                        //     behind, 301 imminent.
+                        //   * window_s: seekable.end - seekable.start,
+                        //     the receiver's view of how much
+                        //     playable history we have. If this
+                        //     shrinks to ~0 the receiver is about to
+                        //     fall off the back of the playlist.
+                        let now = std::time::Instant::now();
+                        let wall_delta = now.duration_since(last_status_at).as_secs_f64();
+                        last_status_at = now;
+                        let advance_s = match (current_time, last_current_time) {
+                            (Some(c), Some(p)) => Some(c - p),
+                            _ => None,
+                        };
+                        let lag_s = match (current_time, seekable.as_ref()) {
+                            (Some(c), Some(r)) => Some(r.end - c),
+                            _ => None,
+                        };
+                        let window_s = seekable.as_ref().map(|r| r.end - r.start);
+                        if let Some(c) = current_time {
+                            last_current_time = Some(c);
+                        }
+                        if let Some(r) = seekable.as_ref() {
+                            last_seekable_end = Some(r.end);
+                        }
+                        let _ = last_seekable_end; // referenced for future starvation watchdog
+
+                        let state_changed = new_state != last_player_state;
+                        let prev_state_dur = if state_changed {
+                            let d = state_entered_at.elapsed();
+                            state_entered_at = now;
+                            Some(d.as_millis() as u64)
+                        } else {
+                            None
+                        };
+
+                        // Pick log level based on what changed.
+                        // BUFFERING entry / IDLE entry get warn,
+                        // other entries get info, no-change repeats
+                        // get debug.
+                        let level_warn = matches!(
+                            new_state.as_deref(),
+                            Some("BUFFERING") | Some("IDLE")
+                        ) && state_changed;
+
+                        macro_rules! emit {
+                            ($macro:ident, $msg:literal) => {
+                                tracing::$macro!(
+                                    state = ?new_state,
+                                    prev_state = ?last_player_state,
+                                    prev_state_ms = ?prev_state_dur,
+                                    ?current_time,
+                                    ?advance_s,
+                                    wall_delta_s = format_args!("{wall_delta:.2}"),
+                                    ?lag_s,
+                                    ?window_s,
+                                    ?idle_reason,
+                                    ?extended_status,
+                                    ?playback_rate,
+                                    $msg
+                                )
+                            };
+                        }
+
+                        if level_warn {
+                            match new_state.as_deref() {
+                                Some("BUFFERING") => emit!(warn, "MEDIA_STATUS: chromecast entered BUFFERING"),
+                                Some("IDLE") => emit!(warn, "MEDIA_STATUS: chromecast entered IDLE (receiver may have stopped)"),
+                                _ => {}
+                            }
+                        } else if state_changed {
+                            emit!(info, "MEDIA_STATUS: state transition");
+                        } else {
+                            emit!(debug, "MEDIA_STATUS: steady");
+                        }
+
+                        if state_changed {
+                            last_player_state = new_state;
+                        }
                     } else {
-                        tracing::error!(
+                        debug!(
                             ty = ?mtype,
                             payload = ?msg.payload_utf8,
                             "chromecast media status"

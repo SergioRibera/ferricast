@@ -252,19 +252,27 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         max_width: Some(1920),
         max_height: Some(1080),
         max_fps: Some(30),
-        // 3.5 Mbps not 5 Mbps. Cast docs claim the 1st-gen
-        // hardware decoder is rated for 5 Mbps but in practice
-        // sustaining that over Wi-Fi 2.4 GHz to a chromecast with
-        // a tiny single-band antenna leads to per-segment spikes
-        // (CBR ≠ flat — scene complexity matters) exceeding the
-        // receiver's network buffer. The player aborts with
-        // `detailedErrorCode=301` (MEDIA_NETWORK) after a few
-        // resets and we see the stream cut out. 3.5 Mbps keeps
-        // peaks under ~5 Mbps and runs reliably end-to-end.
-        max_bitrate_kbps: Some(3_500),
+        // 2.5 Mbps, not 5. The Cast HW datasheet rates the 1st/2nd
+        // gen decoder at 5 Mbps and we tried 3.5 Mbps as a safety
+        // margin, but field-tested both: even 3.5 Mbps in CBR mode
+        // (with NVENC's default VBV buffer) spikes to ~6 Mbps on
+        // scene changes, and 2.4 GHz Wi-Fi to a single-band Cast
+        // antenna can't sustain that. The receiver aborts with
+        // `detailedErrorCode=301` (MEDIA_NETWORK) after ~1 min.
+        // 2.5 Mbps average keeps peaks under ~4 Mbps and runs
+        // reliably end-to-end. 1080p@30 at 2.5 Mbps is acceptable
+        // for screen sharing (mostly low motion). Newer hardware
+        // (Ultra / Google TV / Android TV) overrides this in the
+        // branches below.
+        max_bitrate_kbps: Some(2_500),
         requires_audio: true,
         max_h264_profile: Some(H264Profile::Main),
         supported_codecs: vec![Codec::H264, Codec::Vp8],
+        // 1st/2nd-gen Chromecast firmware's HLS parser locks up on
+        // EXT-X-VERSION:6 / EXT-X-PART-INF (field-tested). Newer
+        // model branches below override to `true` only where it's
+        // been verified to actually work.
+        supports_low_latency_hls: false,
     };
 
     // Lowercased once so each branch can use cheap `contains`.

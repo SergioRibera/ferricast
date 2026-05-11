@@ -196,17 +196,33 @@ where
         //
         // Skip the very first segment (frames_in_segment can be
         // dominated by warmup).
+        //
+        // The clamp is asymmetric: 1/2 the configured period at the
+        // bottom (a hard "never claim more than 2× target_fps" guard
+        // that catches absurd `elapsed` measurements), 3× at the
+        // top so we *can* track production well below target without
+        // pinning the rate. The previous symmetric ±50 % cap pinned
+        // PTS at ~40 fps when target was 60 even when real
+        // production was ~30 fps; that made each segment's PTS span
+        // shorter than its wall span, the player consumed faster
+        // than we produced, and the receiver hit BUFFERING every
+        // segment.
         if frames_in_segment >= 30 {
             let measured =
                 (elapsed.as_micros() as u64).saturating_div(frames_in_segment);
-            // Clamp to avoid pathological measurements (e.g. a long
-            // capture stall during the segment) hijacking the rate.
-            // Stay within ±50 % of the configured frame period.
             let lo = frame_period_us / 2;
-            let hi = frame_period_us.saturating_mul(3) / 2;
+            let hi = frame_period_us.saturating_mul(3);
             let measured_clamped = measured.clamp(lo, hi);
             effective_frame_period_us =
                 (effective_frame_period_us.saturating_mul(7) + measured_clamped) / 8;
+            if measured > hi {
+                warn!(
+                    measured_us = measured,
+                    cap_us = hi,
+                    effective_frame_period_us,
+                    "segment production below 1/3 of target_fps; PTS pacing capped (player will drift)"
+                );
+            }
         }
 
         let bytes = Bytes::from(muxer.drain());
@@ -215,11 +231,18 @@ where
         // First few segments at INFO so the user can sanity-check
         // cadence (segments far longer than target = encoder keyint
         // too high). Steady-state goes to DEBUG to keep logs quiet.
+        // Encoded bitrate per segment. Pairs naturally with the
+        // HLS handler's per-segment "encoded_kbps" log so the user
+        // can see "segmenter produced 1800 kbps, receiver pulled it
+        // at X mbps over Y seconds" all in one timeline.
+        let encoded_kbps =
+            ((size_bytes as f64 * 8.0) / 1000.0 / elapsed.as_secs_f64().max(0.001)) as u32;
         if seq < 3 {
             info!(
                 seq,
                 duration_ms = elapsed.as_millis() as u64,
                 size_kb = size_bytes / 1024,
+                encoded_kbps,
                 effective_frame_period_us,
                 "segment ready"
             );
@@ -228,6 +251,7 @@ where
                 seq,
                 duration_ms = elapsed.as_millis() as u64,
                 size_kb = size_bytes / 1024,
+                encoded_kbps,
                 effective_frame_period_us,
                 "segment ready"
             );
@@ -332,6 +356,16 @@ pub async fn run_from_frames(
     let target = Duration::from_secs_f32(config.segment_target_secs);
     let frame_period_us =
         (1_000_000_f64 / (config.target_fps.max(1) as f64)) as u64;
+    // LL-HLS: when `part_target_secs` is set, we publish partial
+    // segments ("parts") into the ring as they're ready, instead of
+    // waiting for the segment to close. This keeps clients fed at
+    // sub-second granularity, which on flaky-firmware receivers
+    // (1st/2nd-gen Chromecast) reduces the chance the receiver's
+    // own prefetch state machine wedges on stale TCP connections.
+    let part_target: Option<Duration> = config.part_target_secs.map(Duration::from_secs_f32);
+    if let Some(pt) = config.part_target_secs {
+        ring.write().await.enable_low_latency(pt);
+    }
 
     let mut pts_us: u64 = 0;
     let mut effective_frame_period_us: u64 = frame_period_us;
@@ -343,10 +377,6 @@ pub async fn run_from_frames(
     loop {
         muxer.start_segment();
 
-        // Wait for a keyframe to start the segment. Pre-IDR frames
-        // are dropped by the upstream session, but if any sneak
-        // through we drop them here for the same reason `run` does:
-        // every segment must begin at a random-access point.
         let first = match pending.take() {
             Some(f) => f,
             None => loop {
@@ -364,21 +394,27 @@ pub async fn run_from_frames(
         pts_us = pts_us.saturating_add(effective_frame_period_us);
         frames_in_segment += 1;
 
+        // LL-HLS state for this segment.
+        // `local_parts` collects each part's bytes locally so we can
+        // splice them into the full segment body at close time —
+        // because clients that didn't fetch parts (or arrived after
+        // the segment closed) still need the regular `/segment-N.ts`
+        // to serve a complete contiguous TS body. The ring also
+        // already has these parts published via `push_pending_part`,
+        // but those are slices the muxer drained piecemeal; we keep
+        // a parallel copy here so reconstructing the segment doesn't
+        // require holding the ring write lock for a long time.
+        let mut local_parts: Vec<Bytes> = Vec::new();
+        let mut part_start = Instant::now();
+        let mut first_part_of_segment = true;
+
+        let mut sender_hung_up = false;
         loop {
             let encoded = match frames.recv().await {
                 Some(f) => f,
                 None => {
-                    // Sender hung up — drain whatever we have so the
-                    // player gets a final segment and can stop
-                    // cleanly.
-                    let elapsed = started.elapsed();
-                    let bytes = Bytes::from(muxer.drain());
-                    if !bytes.is_empty() {
-                        ring.write()
-                            .await
-                            .push(elapsed.as_secs_f32(), false, bytes);
-                    }
-                    return Ok(());
+                    sender_hung_up = true;
+                    break;
                 }
             };
 
@@ -389,35 +425,104 @@ pub async fn run_from_frames(
             push_frame(&mut muxer, &encoded, pts_us)?;
             pts_us = pts_us.saturating_add(effective_frame_period_us);
             frames_in_segment += 1;
+
+            // LL-HLS: if we've held bytes long enough, flush them as
+            // a part. The muxer's continuity counters carry across
+            // the drain (they live in `self`, not in `out`), so the
+            // concatenation of all parts within this segment is a
+            // valid TS stream identical to a single drain at close.
+            if let Some(pt) = part_target {
+                if part_start.elapsed() >= pt {
+                    let part_bytes = Bytes::from(muxer.drain());
+                    if !part_bytes.is_empty() {
+                        let part_dur = part_start.elapsed().as_secs_f32();
+                        local_parts.push(part_bytes.clone());
+                        ring.write().await.push_pending_part(
+                            part_dur,
+                            first_part_of_segment,
+                            part_bytes,
+                        );
+                        first_part_of_segment = false;
+                        part_start = Instant::now();
+                    }
+                }
+            }
         }
 
         let elapsed = started.elapsed();
 
-        // Same EMA refinement as `run`: skip the warmup segment, then
-        // pull the per-frame PTS increment toward the actual wall
-        // cost so PTS span ≈ wall span over time.
         if frames_in_segment >= 30 {
             let measured =
                 (elapsed.as_micros() as u64).saturating_div(frames_in_segment);
             let lo = frame_period_us / 2;
-            let hi = frame_period_us.saturating_mul(3) / 2;
+            let hi = frame_period_us.saturating_mul(3);
             let measured_clamped = measured.clamp(lo, hi);
             effective_frame_period_us =
                 (effective_frame_period_us.saturating_mul(7) + measured_clamped) / 8;
+            if measured > hi {
+                warn!(
+                    measured_us = measured,
+                    cap_us = hi,
+                    effective_frame_period_us,
+                    "segment production below 1/3 of target_fps; PTS pacing capped (player will drift)"
+                );
+            }
         }
 
-        let bytes = Bytes::from(muxer.drain());
-        let size_bytes = bytes.len();
-        let seq = ring
-            .write()
-            .await
-            .push(elapsed.as_secs_f32(), false, bytes);
+        // Drain whatever's left in the muxer at segment close. In
+        // LL-HLS mode this becomes the final part of the segment;
+        // in classic mode it's the entire segment body.
+        let final_drain = Bytes::from(muxer.drain());
+
+        let (full_segment_bytes, seq) = if part_target.is_some() {
+            // Push the trailing part if we have leftover bytes.
+            if !final_drain.is_empty() {
+                let part_dur = part_start.elapsed().as_secs_f32();
+                local_parts.push(final_drain.clone());
+                ring.write().await.push_pending_part(
+                    part_dur,
+                    first_part_of_segment,
+                    final_drain,
+                );
+            }
+            // Concatenate all parts to form the segment body the
+            // `/segment-N.ts` endpoint will serve.
+            let total: usize = local_parts.iter().map(|b| b.len()).sum();
+            let mut full = bytes::BytesMut::with_capacity(total);
+            for p in &local_parts {
+                full.extend_from_slice(p);
+            }
+            let body = Bytes::from(full);
+            let size = body.len();
+            let seq = ring.write().await.complete_pending_segment(
+                elapsed.as_secs_f32(),
+                false,
+                body,
+            );
+            (size, seq)
+        } else {
+            // Classic HLS — single drain → one push.
+            let size = final_drain.len();
+            let seq = ring.write().await.push(
+                elapsed.as_secs_f32(),
+                false,
+                final_drain,
+            );
+            (size, seq)
+        };
+
+        let size_bytes = full_segment_bytes;
+        let encoded_kbps =
+            ((size_bytes as f64 * 8.0) / 1000.0 / elapsed.as_secs_f64().max(0.001)) as u32;
+        let parts_count = local_parts.len();
         if seq < 3 {
             info!(
                 seq,
                 duration_ms = elapsed.as_millis() as u64,
                 size_kb = size_bytes / 1024,
+                encoded_kbps,
                 effective_frame_period_us,
+                parts = parts_count,
                 "segment ready"
             );
         } else {
@@ -425,9 +530,15 @@ pub async fn run_from_frames(
                 seq,
                 duration_ms = elapsed.as_millis() as u64,
                 size_kb = size_bytes / 1024,
+                encoded_kbps,
                 effective_frame_period_us,
+                parts = parts_count,
                 "segment ready"
             );
+        }
+
+        if sender_hung_up {
+            return Ok(());
         }
     }
 }

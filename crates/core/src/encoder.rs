@@ -66,4 +66,24 @@ pub trait VideoEncoder: Send {
     /// expose `i_type`) keep working — they simply rely on their
     /// internal interval.
     fn request_keyframe(&mut self) {}
+
+    /// Live-update the encoder's target average bitrate in kbps,
+    /// without tearing down the encoding session.
+    ///
+    /// Used by the adaptive bitrate controller
+    /// ([`crate::AdaptiveBitrateState`]): when the HLS server
+    /// observes that the receiver's link is saturated, it drops the
+    /// target so the encoder's next macroblock budget shrinks; when
+    /// the link recovers it raises it back up.
+    ///
+    /// Returns `Ok(())` even on backends that can't honour the
+    /// request — the caller should always make adjustments on a
+    /// best-effort basis. NVENC reconfigures live (no GOP gap);
+    /// x264 via the safe crate has no exposed knob and is a no-op
+    /// (the natural fallback is "screen-share users on x264 get
+    /// what they get"). Default is no-op so existing impls don't
+    /// have to opt in.
+    fn set_bitrate_kbps(&mut self, _kbps: u32) -> Result<()> {
+        Ok(())
+    }
 }

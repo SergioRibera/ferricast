@@ -27,6 +27,7 @@
 mod http;
 mod ring;
 mod segmenter;
+mod stats;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -40,6 +41,12 @@ use tracing::{error, info, trace};
 use ferricast_core::{EncodedFrame, FerricastError, Result, ScreenCapture, VideoEncoder};
 
 pub use ring::SegmentRing;
+
+/// Number of initial segment GETs the HLS server averages before
+/// feeding the adaptive controller a one-shot bandwidth probe. Re-
+/// exported here so external binaries can mention it in their own
+/// startup logs without duplicating the constant.
+pub const PROBE_SAMPLES_FOR_DOC: usize = stats::SessionStats::PROBE_SAMPLES;
 
 /// Tunables that govern segment cadence and buffering.
 ///
@@ -59,7 +66,11 @@ pub use ring::SegmentRing;
 /// margin past the player's initial offset; that's enough to
 /// absorb several minutes of slow drift without any segment ever
 /// expiring under the player's feet.
-#[derive(Debug, Clone, Copy)]
+// Previously `Copy`. The `adaptive` field forced removing it
+// because `Arc` isn't `Copy`. Call sites now clone explicitly;
+// zero cost, the existing builders all own their config and
+// don't depend on implicit copies.
+#[derive(Debug, Clone)]
 pub struct HlsConfig {
     /// Wallclock target a single segment tries to fit into. Real
     /// segments end at the next keyframe after this elapses.
@@ -93,6 +104,30 @@ pub struct HlsConfig {
     /// `DeviceCapabilities::requires_audio` is true. Leave off for
     /// receivers that accept video-only HLS (saves ~6 KB/s).
     pub inject_silent_audio: bool,
+
+    /// Optional adaptive-bitrate controller shared with the encoder
+    /// loop. When provided, the HTTP segment handler records each
+    /// delivery's `budget_used_pct` into the controller; the encoder
+    /// loop polls its `target_kbps` and live-reconfigures when the
+    /// recommended bitrate moves. `None` disables the feedback loop
+    /// entirely (legacy path / non-cast HLS where the consumer
+    /// doesn't have a live encoder it can downshift).
+    pub adaptive: Option<Arc<ferricast_core::AdaptiveBitrateState>>,
+
+    /// Low-Latency HLS opt-in. When `Some(seconds)`, the segmenter
+    /// flushes a "part" every `secs` of accumulated wall time
+    /// inside each segment, the ring publishes them immediately so
+    /// the HTTP handler can serve them at `/part-N.M.ts`, and the
+    /// playlist gets `#EXT-X-PART-INF` / `#EXT-X-SERVER-CONTROL`
+    /// / per-segment `#EXT-X-PART` tags. Clients that understand
+    /// LL-HLS get sub-second fetch granularity; clients that don't
+    /// see the same classic `#EXTINF`/segment list and keep
+    /// working unchanged. `None` (default) leaves the segmenter in
+    /// classic mode: one body per segment, no parts.
+    ///
+    /// Recommended values: 0.2–0.5 s. Smaller means more overhead
+    /// and a longer playlist; larger reduces the latency benefit.
+    pub part_target_secs: Option<f32>,
 }
 
 impl Default for HlsConfig {
@@ -111,6 +146,8 @@ impl Default for HlsConfig {
             keep_segments: 12,
             target_fps: 60,
             inject_silent_audio: false,
+            adaptive: None,
+            part_target_secs: None,
         }
     }
 }
@@ -121,6 +158,8 @@ impl Default for HlsConfig {
 pub struct HlsServer {
     listener: TcpListener,
     ring: Arc<RwLock<SegmentRing>>,
+    adaptive: Option<Arc<ferricast_core::AdaptiveBitrateState>>,
+    stats: Arc<stats::SessionStats>,
     /// Cancels the capture loop when the server is dropped.
     _segmenter: JoinHandle<()>,
 }
@@ -162,7 +201,7 @@ impl HlsServer {
 
         let ring = Arc::new(RwLock::new(SegmentRing::new(config.keep_segments)));
         let writer = ring.clone();
-        let cfg = config;
+        let cfg = config.clone();
         let segmenter = tokio::spawn(async move {
             if let Err(e) = segmenter::run(capture, encoder, writer, cfg).await {
                 error!(error = %e, "HLS segmenter loop exited");
@@ -182,6 +221,8 @@ impl HlsServer {
         Ok(Self {
             listener,
             ring,
+            adaptive: config.adaptive.clone(),
+            stats: Arc::new(stats::SessionStats::new()),
             _segmenter: segmenter,
         })
     }
@@ -198,8 +239,10 @@ impl HlsServer {
     pub async fn accept_one(&self) -> Result<()> {
         let (socket, peer) = self.listener.accept().await?;
         let ring = self.ring.clone();
+        let adaptive = self.adaptive.clone();
+        let stats = self.stats.clone();
         tokio::spawn(async move {
-            if let Err(e) = http::handle(socket, ring).await {
+            if let Err(e) = http::handle(socket, ring, adaptive, stats).await {
                 trace!(peer = %peer, error = %e, "HLS connection ended");
             }
         });
@@ -214,8 +257,10 @@ impl HlsServer {
             match self.listener.accept().await {
                 Ok((socket, peer)) => {
                     let ring = self.ring.clone();
+                    let adaptive = self.adaptive.clone();
+                    let stats = self.stats.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = http::handle(socket, ring).await {
+                        if let Err(e) = http::handle(socket, ring, adaptive, stats).await {
                             trace!(peer = %peer, error = %e, "HLS connection ended");
                         }
                     });
@@ -276,22 +321,37 @@ impl HlsFrameSink {
 
         let ring = Arc::new(RwLock::new(SegmentRing::new(config.keep_segments)));
         let segmenter_ring = ring.clone();
+        let adaptive_for_segmenter = config.adaptive.clone();
+        let cfg_for_segmenter = config.clone();
         let segmenter = tokio::spawn(async move {
-            if let Err(e) =
-                segmenter::run_from_frames(frames, parameter_sets, segmenter_ring, config).await
+            if let Err(e) = segmenter::run_from_frames(
+                frames,
+                parameter_sets,
+                segmenter_ring,
+                cfg_for_segmenter,
+            )
+            .await
             {
                 error!(error = %e, "HLS frame-source segmenter exited");
             }
+            // Drop reference once the segmenter exits so the
+            // adaptive state can be freed.
+            drop(adaptive_for_segmenter);
         });
 
         let accept_ring = ring.clone();
+        let accept_adaptive = config.adaptive.clone();
+        let stats = Arc::new(stats::SessionStats::new());
+        let accept_stats = stats.clone();
         let accept = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((socket, peer)) => {
                         let r = accept_ring.clone();
+                        let a = accept_adaptive.clone();
+                        let s = accept_stats.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = http::handle(socket, r).await {
+                            if let Err(e) = http::handle(socket, r, a, s).await {
                                 trace!(peer = %peer, error = %e, "HLS connection ended");
                             }
                         });

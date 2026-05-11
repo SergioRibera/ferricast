@@ -47,6 +47,21 @@ pub struct DeviceCapabilities {
     /// encoder picks its own default.
     pub max_h264_profile: Option<H264Profile>,
     pub supported_codecs: Vec<crate::Codec>,
+    /// Whether the receiver's HLS player understands Low-Latency
+    /// HLS (RFC 8216bis): `#EXT-X-VERSION:6`,
+    /// `#EXT-X-SERVER-CONTROL`, `#EXT-X-PART-INF`, `#EXT-X-PART`,
+    /// and `?_HLS_msn=…&_HLS_part=…` blocking playlist reload.
+    ///
+    /// Conservative default: `false`. The 1st/2nd-gen Chromecast
+    /// firmware (`md=Chromecast`) demonstrably trips into a
+    /// LOADING-forever state when handed a v6 playlist — the
+    /// EXT-X-VERSION:6 line alone seems to be enough to brick the
+    /// load. Newer hardware (Ultra, Google TV, Android TV) ships
+    /// with CAF builds that support LL-HLS, but we still default
+    /// to `false` because firmware versions vary; opt in per
+    /// device class in `capabilities_for_model` only where it's
+    /// been field-tested.
+    pub supports_low_latency_hls: bool,
 }
 
 /// H.264 profile constraint. Used by [`DeviceCapabilities`] and

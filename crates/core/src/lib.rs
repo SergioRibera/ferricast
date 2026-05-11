@@ -1,3 +1,4 @@
+pub mod adaptive;
 pub mod capture;
 pub mod device;
 pub mod discovery;
@@ -8,6 +9,7 @@ pub mod net;
 pub mod protocol;
 pub mod session;
 
+pub use adaptive::AdaptiveBitrateState;
 pub use capture::{CaptureConfig, CaptureSource, ScreenCapture, WindowIdentifier};
 pub use device::{Device, DeviceCapabilities, DiscoveryEvent, H264Profile};
 pub use discovery::{Discovery, MdnsDiscovery};

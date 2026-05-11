@@ -363,6 +363,55 @@ pub struct MediaStatus {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media: Option<MediaInfo>,
+
+    /// Receiver's reason for going idle, when `playerState == "IDLE"`.
+    /// Possible values per Cast docs: `CANCELLED`, `INTERRUPTED`,
+    /// `FINISHED`, `ERROR`. `ERROR` is the one that signals our
+    /// stream just got terminated; combined with the surrounding
+    /// `detailedErrorCode=301` it pinpoints the specific failure.
+    #[serde(rename = "idleReason", skip_serializing_if = "Option::is_none")]
+    pub idle_reason: Option<String>,
+
+    /// Free-form receiver-side error breadcrumb. Some Default Media
+    /// Receiver builds populate this with strings like
+    /// `"PLAYBACK_FAILED"` or `"NETWORK_ERROR"` even when
+    /// `playerState != IDLE`. Worth logging verbatim.
+    #[serde(rename = "extendedStatus", skip_serializing_if = "Option::is_none")]
+    pub extended_status: Option<serde_json::Value>,
+
+    /// The window of stream time the receiver is willing to seek to
+    /// — its view of "live edge" minus its buffer. Comparing
+    /// `current_time` against `live_seekable_range.end - start`
+    /// shows how far the player has fallen behind the live edge,
+    /// which is the leading indicator of a coming BUFFERING
+    /// cascade.
+    #[serde(rename = "liveSeekableRange", skip_serializing_if = "Option::is_none")]
+    pub live_seekable_range: Option<LiveSeekableRange>,
+
+    /// Bitmask of supported media commands. Logging this once per
+    /// session is enough; the value doesn't change.
+    #[serde(rename = "supportedMediaCommands", skip_serializing_if = "Option::is_none")]
+    pub supported_media_commands: Option<i64>,
+
+    #[serde(rename = "playbackRate", skip_serializing_if = "Option::is_none")]
+    pub playback_rate: Option<f64>,
+
+    /// Receiver-reported video info (resolution, hdr type). Helps
+    /// confirm the receiver actually picked up the resolution we
+    /// advertised in SPS — mismatch means the receiver renegotiated
+    /// internally (rare but possible on some old Sony / VIZIO TVs).
+    #[serde(rename = "videoInfo", skip_serializing_if = "Option::is_none")]
+    pub video_info: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveSeekableRange {
+    pub start: f64,
+    pub end: f64,
+    #[serde(rename = "isMovingWindow", default)]
+    pub is_moving_window: bool,
+    #[serde(rename = "isLiveDone", default)]
+    pub is_live_done: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -619,6 +668,175 @@ pub fn load_media_message(
     )
 }
 
+/// Detailed error codes the Cast Application Framework receiver can
+/// surface alongside an `ERROR` media-namespace message. Mirrors the
+/// upstream constant table at
+/// <https://developers.google.com/android/reference/com/google/android/gms/cast/MediaError.DetailedErrorCode>
+/// — Google guarantees the integer values, so this enum's
+/// `#[repr(i64)]` is stable across firmware revisions.
+///
+/// We turn the integer payload into this enum on receipt so the
+/// log + recovery code can pattern-match on a named variant
+/// (`SegmentNetwork`, `MediaSrcNotSupported`, …) instead of a magic
+/// number. Ported from `rust_cast`'s `MediaDetailedErrorCode` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+pub enum MediaDetailedErrorCode {
+    /// 100 — `MEDIA_UNKNOWN`. The HTMLMediaElement threw an error,
+    /// but CAF doesn't recognise the specific cause.
+    MediaUnknown = 100,
+    /// 101 — `MEDIA_ABORTED`. User agent aborted fetching the
+    /// resource at the user's request.
+    MediaAborted = 101,
+    /// 102 — `MEDIA_DECODE`. Decoder error after the resource was
+    /// known to be usable.
+    MediaDecode = 102,
+    /// 103 — `MEDIA_NETWORK`. Network error stopped fetching the
+    /// media resource after it was established as usable.
+    MediaNetwork = 103,
+    /// 104 — `MEDIA_SRC_NOT_SUPPORTED`. The resource indicated by
+    /// `src` was not suitable for the receiver decoder.
+    MediaSrcNotSupported = 104,
+    /// 110 — `SOURCE_BUFFER_FAILURE`.
+    SourceBufferFailure = 110,
+    /// 200/201/202/203 — media keys (DRM) failures.
+    MediakeysUnknown = 200,
+    MediakeysNetwork = 201,
+    MediakeysUnsupported = 202,
+    MediakeysWebcrypto = 203,
+    /// 300 — `NETWORK_UNKNOWN`.
+    NetworkUnknown = 300,
+    /// 301 — `SEGMENT_NETWORK`. A segment fails to download. This
+    /// is the catch-all the Default Media Receiver throws on
+    /// 1st/2nd-gen Chromecast hardware when the receiver's HLS
+    /// fetcher gives up (typically after TCP RST bursts from the
+    /// device's own kernel — not actually a network bandwidth
+    /// problem).
+    SegmentNetwork = 301,
+    /// 311–316 — HLS-specific network / parse failures.
+    HlsNetworkMasterPlaylist = 311,
+    HlsNetworkPlaylist = 312,
+    HlsNetworkNoKeyResponse = 313,
+    HlsNetworkKeyLoad = 314,
+    HlsNetworkInvalidSegment = 315,
+    HlsSegmentParsing = 316,
+    /// 321/322 — DASH-specific network failures.
+    DashNetwork = 321,
+    DashNoInit = 322,
+    /// 331/332 — Smooth Streaming network failures.
+    SmoothNetwork = 331,
+    SmoothNoMediaData = 332,
+    /// 400/411/412 — manifest parse failures.
+    ManifestUnknown = 400,
+    HlsManifestMaster = 411,
+    HlsManifestPlaylist = 412,
+    /// 420–423 — DASH manifest parse failures.
+    DashManifestUnknown = 420,
+    DashManifestNoPeriods = 421,
+    DashManifestNoMimeType = 422,
+    DashInvalidSegmentInfo = 423,
+    /// 431 — Smooth manifest parse failure.
+    SmoothManifest = 431,
+    /// 500 — `SEGMENT_UNKNOWN`.
+    SegmentUnknown = 500,
+    /// 600 — `TEXT_UNKNOWN` (subtitle / closed-caption error).
+    TextUnknown = 600,
+    /// 900 — `APP`. Outside-framework error (event handler threw).
+    App = 900,
+    /// 901/902 — break (ad-pod) failures.
+    BreakClipLoadingError = 901,
+    BreakSeekInterceptorError = 902,
+    /// 903 — `IMAGE_ERROR`.
+    ImageError = 903,
+    /// 904 — `LOAD_INTERRUPTED`. The current load was cancelled by
+    /// another load (or an unload).
+    LoadInterrupted = 904,
+    /// 905 — `LOAD_FAILED`.
+    LoadFailed = 905,
+    /// 906 — `MEDIA_ERROR_MESSAGE`. Free-form error pushed by the
+    /// receiver app to the sender.
+    MediaErrorMessage = 906,
+    /// 999 — `GENERIC`.
+    Generic = 999,
+    /// Catch-all for codes the Cast SDK adds after this enum was
+    /// last ported. Carries the raw integer so the log still says
+    /// something useful.
+    Unknown(i64),
+}
+
+impl MediaDetailedErrorCode {
+    pub fn from_code(code: i64) -> Self {
+        match code {
+            100 => Self::MediaUnknown,
+            101 => Self::MediaAborted,
+            102 => Self::MediaDecode,
+            103 => Self::MediaNetwork,
+            104 => Self::MediaSrcNotSupported,
+            110 => Self::SourceBufferFailure,
+            200 => Self::MediakeysUnknown,
+            201 => Self::MediakeysNetwork,
+            202 => Self::MediakeysUnsupported,
+            203 => Self::MediakeysWebcrypto,
+            300 => Self::NetworkUnknown,
+            301 => Self::SegmentNetwork,
+            311 => Self::HlsNetworkMasterPlaylist,
+            312 => Self::HlsNetworkPlaylist,
+            313 => Self::HlsNetworkNoKeyResponse,
+            314 => Self::HlsNetworkKeyLoad,
+            315 => Self::HlsNetworkInvalidSegment,
+            316 => Self::HlsSegmentParsing,
+            321 => Self::DashNetwork,
+            322 => Self::DashNoInit,
+            331 => Self::SmoothNetwork,
+            332 => Self::SmoothNoMediaData,
+            400 => Self::ManifestUnknown,
+            411 => Self::HlsManifestMaster,
+            412 => Self::HlsManifestPlaylist,
+            420 => Self::DashManifestUnknown,
+            421 => Self::DashManifestNoPeriods,
+            422 => Self::DashManifestNoMimeType,
+            423 => Self::DashInvalidSegmentInfo,
+            431 => Self::SmoothManifest,
+            500 => Self::SegmentUnknown,
+            600 => Self::TextUnknown,
+            900 => Self::App,
+            901 => Self::BreakClipLoadingError,
+            902 => Self::BreakSeekInterceptorError,
+            903 => Self::ImageError,
+            904 => Self::LoadInterrupted,
+            905 => Self::LoadFailed,
+            906 => Self::MediaErrorMessage,
+            999 => Self::Generic,
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Whether reconnecting the session is a reasonable response.
+    /// Network / segment-network / load-failed errors usually clear
+    /// up on a fresh LAUNCH; decoder / unsupported-format errors
+    /// won't because nothing about the stream we send is going to
+    /// change between attempts.
+    pub fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::MediaNetwork
+                | Self::NetworkUnknown
+                | Self::SegmentNetwork
+                | Self::SegmentUnknown
+                | Self::HlsNetworkMasterPlaylist
+                | Self::HlsNetworkPlaylist
+                | Self::HlsNetworkInvalidSegment
+                | Self::DashNetwork
+                | Self::SmoothNetwork
+                | Self::LoadInterrupted
+                | Self::LoadFailed
+                | Self::MediaErrorMessage
+                | Self::Generic
+                | Self::Unknown(_)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +860,47 @@ mod tests {
 
         assert_eq!(msg, decoded);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn detailed_error_code_known_values() {
+        assert_eq!(
+            MediaDetailedErrorCode::from_code(301),
+            MediaDetailedErrorCode::SegmentNetwork
+        );
+        assert_eq!(
+            MediaDetailedErrorCode::from_code(104),
+            MediaDetailedErrorCode::MediaSrcNotSupported
+        );
+        assert_eq!(
+            MediaDetailedErrorCode::from_code(905),
+            MediaDetailedErrorCode::LoadFailed
+        );
+        assert_eq!(
+            MediaDetailedErrorCode::from_code(999),
+            MediaDetailedErrorCode::Generic
+        );
+    }
+
+    #[test]
+    fn detailed_error_code_unknown_falls_through() {
+        match MediaDetailedErrorCode::from_code(42_424) {
+            MediaDetailedErrorCode::Unknown(n) => assert_eq!(n, 42_424),
+            other => panic!("expected Unknown(42424), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detailed_error_code_retryable_classification() {
+        // Network-class errors are retryable — a fresh LOAD often
+        // recovers them on flaky hardware.
+        assert!(MediaDetailedErrorCode::SegmentNetwork.is_retryable());
+        assert!(MediaDetailedErrorCode::MediaNetwork.is_retryable());
+        assert!(MediaDetailedErrorCode::LoadFailed.is_retryable());
+        // Decoder-class errors aren't — nothing about retrying
+        // changes the bitstream we'd send.
+        assert!(!MediaDetailedErrorCode::MediaSrcNotSupported.is_retryable());
+        assert!(!MediaDetailedErrorCode::MediaDecode.is_retryable());
     }
 
     #[test]

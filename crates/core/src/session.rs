@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use crate::adaptive::AdaptiveBitrateState;
 use crate::device::Device;
 use crate::error::Result;
 use crate::frame::EncodedFrame;
@@ -9,6 +12,15 @@ pub struct StreamConfig {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub codec: crate::Codec,
+
+    /// Optional adaptive bitrate controller. When provided, the
+    /// receiver protocol (e.g. Chromecast) plumbs it into its HLS
+    /// server, and the stream manager polls it on the hot path to
+    /// live-reconfigure the encoder when the receiver's link is
+    /// under sustained pressure. `None` (default) keeps the
+    /// pre-adaptive behaviour: fixed bitrate from configure, no
+    /// runtime feedback.
+    pub adaptive: Option<Arc<AdaptiveBitrateState>>,
 }
 
 impl Default for StreamConfig {
@@ -28,6 +40,7 @@ impl Default for StreamConfig {
             fps: 60,
             bitrate_kbps: 5000,
             codec: crate::Codec::H264,
+            adaptive: None,
         }
     }
 }

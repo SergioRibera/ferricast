@@ -46,7 +46,8 @@ use ferricast_core::{
 };
 use shiguredo_nvcodec::{
     BufferFormat, CodecConfig, EncodeOptions, Encoder as NvEncoder, EncoderCodec, EncoderConfig as NvCfg,
-    H264EncoderConfig, H264Profile, PictureType, Preset, RateControlMode, TuningInfo,
+    H264EncoderConfig, H264Profile, PictureType, Preset, RateControlMode, ReconfigureParams,
+    TuningInfo,
 };
 use tracing::{debug, info};
 
@@ -160,8 +161,32 @@ impl NvencH264Encoder {
             device_id: 0,
         };
 
-        let encoder = NvEncoder::new(nvcfg)
+        let mut encoder = NvEncoder::new(nvcfg)
             .map_err(|e| FerricastError::Encoder(format!("NVENC: open session: {e}")))?;
+        // Lock the peak bitrate to the average so NVENC can't spike
+        // 2× into scene changes. NVENC's CBR with only
+        // `average_bitrate` set still allows large per-frame peaks
+        // (default `maxBitRate` is implementation-defined and in
+        // practice ~2× average). On a 1st-/2nd-gen Chromecast
+        // pulling HLS over 2.4 GHz Wi-Fi those peaks blow past what
+        // the receiver's buffer can absorb and the player aborts
+        // with `detailedErrorCode=301` (MEDIA_NETWORK_ERROR) after a
+        // few segments. Forcing max == average gives true CBR; the
+        // encoder lowers per-frame quality on busy frames instead of
+        // spending bandwidth, which is the right trade-off for screen
+        // share where most frames are easy.
+        let avg = (cfg.bitrate_kbps as u32).saturating_mul(1000).max(500_000);
+        if let Err(e) = encoder.reconfigure(ReconfigureParams {
+            average_bitrate: Some(avg),
+            max_bitrate: Some(avg),
+            ..Default::default()
+        }) {
+            // Non-fatal: the encoder is usable, just with default
+            // peak. Worst case we still hit 301 on weak Wi-Fi
+            // chromecasts; log loud so it's obvious if this
+            // regresses.
+            tracing::warn!(error = %e, "NVENC: failed to lock max_bitrate to average; CBR will allow peaks");
+        }
         info!(
             width = cfg.width,
             height = cfg.height,
@@ -277,6 +302,27 @@ impl VideoEncoder for NvencH264Encoder {
 
     fn request_keyframe(&mut self) {
         self.pending_keyframe = true;
+    }
+
+    fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
+        // NVENC supports live bitrate reconfiguration without a GOP
+        // boundary. Pass both `average_bitrate` and `max_bitrate` set
+        // to the same value so the true-CBR invariant from
+        // `probe_with` is preserved — without this, max would keep
+        // its previous (possibly higher) value and the controller's
+        // downshift would be subverted by NVENC's peak headroom.
+        let bps = (kbps as u32).saturating_mul(1000).max(500_000);
+        self.encoder
+            .reconfigure(ReconfigureParams {
+                average_bitrate: Some(bps),
+                max_bitrate: Some(bps),
+                ..Default::default()
+            })
+            .map_err(|e| {
+                FerricastError::Encoder(format!("NVENC live reconfigure (bitrate): {e}"))
+            })?;
+        info!(kbps, "NVENC bitrate live-reconfigured");
+        Ok(())
     }
 
     fn get_headers(&mut self) -> Result<Vec<u8>> {

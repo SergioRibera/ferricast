@@ -59,7 +59,11 @@ impl<T: CastSession> ErasedSession for T {
 struct RegisteredProtocol {
     protocol: &'static str,
     create_discovery: Box<dyn Fn() -> Box<dyn ErasedDiscovery> + Send + Sync>,
-    create_session: Box<dyn Fn() -> Result<Box<dyn ErasedSession>> + Send + Sync>,
+    /// Wrapped in `Arc` instead of `Box` so the streaming task can
+    /// hold its own clone — needed for auto-reconnect, which builds
+    /// a fresh session on `is_alive()` going false (chromecast 301,
+    /// receiver-app crash) without tearing down capture/encoder.
+    create_session: Arc<dyn Fn() -> Result<Box<dyn ErasedSession>> + Send + Sync>,
 }
 
 struct ActiveStream {
@@ -84,9 +88,24 @@ pub enum ManagerEvent {
     StreamStopped {
         device_id: Uuid,
     },
+    /// Fatal stream error — the stream task has terminated and won't
+    /// recover on its own. Apps typically surface this to the user
+    /// (toast, retry button) since at this point the manager has
+    /// already exhausted its own auto-reconnect budget.
     StreamError {
         device_id: Uuid,
         message: String,
+    },
+    /// Non-fatal: the receiver session went away mid-stream (e.g.
+    /// Chromecast `detailedErrorCode=301`, app exit), and the
+    /// manager is attempting to recreate it. Capture/encoder keep
+    /// running; the receiver will go dark for a few seconds.
+    /// Apps can use this to show a "reconnecting…" indicator
+    /// without tearing down their own state.
+    StreamReconnecting {
+        device_id: Uuid,
+        attempt: u32,
+        reason: String,
     },
     DiscoveryError {
         protocol: &'static str,
@@ -132,7 +151,7 @@ impl StreamManager {
             create_discovery: Box::new(move || {
                 Box::new(h_disc.create_discovery()) as Box<dyn ErasedDiscovery>
             }),
-            create_session: Box::new(move || {
+            create_session: Arc::new(move || {
                 let session = h_sess.create_session()?;
                 Ok(Box::new(session) as Box<dyn ErasedSession>)
             }),
@@ -388,9 +407,33 @@ impl StreamManager {
         })?;
 
 
+        // Adaptive bitrate state — shared between the receiver's HLS
+        // server (records per-segment delivery pressure) and this
+        // stream task (reads the recommended target on the hot path).
+        // The HLS endpoint inside `session` will pick it up from
+        // `StreamConfig::adaptive` in `setup_stream`. Initial target
+        // is the already-clamped `effective_bitrate_kbps` so the
+        // controller's ceiling matches what the manager negotiated.
+        let adaptive = ferricast_core::AdaptiveBitrateState::new(effective_bitrate_kbps);
+        tracing::info!(
+            initial_kbps = effective_bitrate_kbps,
+            ceiling_kbps = adaptive.ceiling_kbps,
+            floor_kbps = adaptive.floor_kbps,
+            "adaptive: controller initialised; bandwidth probe will fire after first {} segments",
+            ferricast_hls::PROBE_SAMPLES_FOR_DOC,
+        );
+        let session_config = StreamConfig {
+            adaptive: Some(adaptive.clone()),
+            ..config.clone()
+        };
+
         let mut session = (proto.create_session)()?;
         session.connect(&device).await?;
-        session.setup_stream(&config).await?;
+        session.setup_stream(&session_config).await?;
+
+        // Factory the supervisor uses to rebuild a session on
+        // receiver-side disconnect. Cloned `Arc` — cheap and `Send`.
+        let create_session = proto.create_session.clone();
 
         let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
 
@@ -435,109 +478,250 @@ impl StreamManager {
             let frame_period_us = (1_000_000.0 / (effective_fps.max(1) as f64)) as u64;
             let mut last_frame: Option<CapturedFrame> = None;
 
-            // Wall-clock keyframe pacing. The HLS segmenter closes a
-            // segment at the *next* keyframe after the configured
-            // target_secs elapses. NVENC's natural \"every N frames\"
-            // keyframe schedule drifts vs wallclock — at 30 fps a
-            // 60-frame interval is *nominally* 2 s but actually
-            // lands anywhere from 1.95 s to 2.05 s depending on
-            // pacing jitter. When NVENC's IDR lands a few ms
-            // before the segmenter's 2 s mark, the segmenter
-            // pushes the keyframe through and waits another full
-            // interval — producing a 4 s segment instead of 2 s.
-            // The chromecast then has to fetch ~2 MB chunks and
-            // visible BUFFERING events appear.
-            //
-            // Fix: ask the encoder for an IDR on wall-clock
-            // boundaries instead of relying on its natural
-            // interval. Segments come out at exactly target_secs
-            // wide, sizes stay tight, BUFFERING events disappear.
-            //
-            // 4 s matches HlsConfig::default().segment_target_secs.
-            // Could be plumbed through later if we ship a
-            // non-default HlsConfig.
+            // Wall-clock keyframe pacing — see longer comment below.
             let keyframe_interval = Duration::from_secs(4);
             let mut next_keyframe_at = Instant::now();
 
-            loop {
-                tokio::select! {
-                    _ = cancel_rx.recv() => {
-                        tracing::info!(?did, "Stream cancelled");
-                        break;
-                    }
-                    frame_result = async {
-                        if let Some(f) = seed.take() {
-                            last_frame = Some(f.clone());
-                            return Ok(f);
-                        }
-                        match tokio::time::timeout(frame_period, capture.next_frame()).await {
-                            Ok(Ok(f)) => {
-                                last_frame = Some(f.clone());
-                                Ok(f)
+            // Mirror of `adaptive.target_kbps()` we've actually
+            // pushed into the encoder. The HLS server may mutate
+            // the atomic between any two frames; we only need to
+            // call `encoder.set_bitrate_kbps` when it differs from
+            // what's currently configured, otherwise every frame
+            // would round-trip into NVENC's reconfigure call.
+            let mut last_applied_kbps: u32 = effective_bitrate_kbps;
+
+            // Auto-reconnect supervisor state. The receiver can die
+            // mid-stream (Chromecast detailedErrorCode=301, Default
+            // Media Receiver app exit, transient TCP RST burst on
+            // a flaky 2.4 GHz link) without it being a permanent
+            // failure of capture or encoder. The pattern here is
+            // session-scoped retry: only the receiver session is
+            // recreated, capture and encoder keep their internal
+            // state. After `MAX_CONSECUTIVE_FAILURES` quick deaths
+            // in a row we surface a fatal `StreamError` so the app
+            // can fall back to whatever its policy is.
+            const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+            // Reset the failure counter when the stream has been
+            // healthy for at least this long — a stream that ran
+            // fine for 10 min then hit one transient is not the
+            // same case as five 301s in 20 s.
+            const HEALTHY_RESET_AFTER: Duration = Duration::from_secs(60);
+
+            let mut consecutive_failures: u32 = 0;
+            let mut last_failure_at: Option<Instant> = None;
+            let mut active_session: Option<Box<dyn ErasedSession>> = Some(session);
+            let mut fatal_error: Option<String> = None;
+            let mut cancelled = false;
+
+            // Outer (supervisor) loop. Acquires a session, runs the
+            // inner frame loop until that session dies or the user
+            // cancels, then decides whether to retry or surface.
+            'supervisor: loop {
+                let mut session: Box<dyn ErasedSession> = match active_session.take() {
+                    Some(s) => s,
+                    None => {
+                        // Reconnect path.
+                        // Reset counter on long-healthy streaks.
+                        if let Some(t) = last_failure_at {
+                            if t.elapsed() > HEALTHY_RESET_AFTER {
+                                consecutive_failures = 0;
                             }
-                            Ok(Err(e)) => Err(e),
-                            Err(_) => match last_frame.as_mut() {
-                                Some(stored) => {
-                                    bump_timestamp(stored, frame_period_us);
-                                    Ok(stored.clone())
-                                }
-                                None => capture.next_frame().await,
-                            },
                         }
-                    } => {
-                        match frame_result {
-                            Ok(raw_frame) => {
-                                // Wall-clock keyframe pacing — see comment at
-                                // `keyframe_interval` declaration. Without this
-                                // segments alternate 2 s / 4 s and the
-                                // chromecast hits BUFFERING on the 4 s ones.
-                                let now = Instant::now();
-                                if now >= next_keyframe_at {
-                                    encoder.request_keyframe();
-                                    // Step forward in fixed increments so a
-                                    // late frame doesn't shift the whole
-                                    // schedule and accumulate drift.
-                                    while next_keyframe_at <= now {
-                                        next_keyframe_at += keyframe_interval;
-                                    }
+                        consecutive_failures += 1;
+                        if consecutive_failures > MAX_CONSECUTIVE_FAILURES {
+                            fatal_error = Some(format!(
+                                "receiver-side disconnect; gave up after {} consecutive reconnect attempts",
+                                MAX_CONSECUTIVE_FAILURES
+                            ));
+                            break 'supervisor;
+                        }
+                        // Force the adaptive controller to the floor
+                        // before reconnecting. The previous bitrate
+                        // didn't keep the receiver alive; starting
+                        // low gives us the best chance of getting
+                        // through the soft window after the receiver
+                        // app relaunches, when its buffer is still
+                        // empty and any further pressure would
+                        // trigger 301 again.
+                        let floored = adaptive.drop_to_floor();
+                        // Apply immediately so the next encode is
+                        // already at the lower rate (no waiting for
+                        // the inner loop's first iteration to notice).
+                        if let Err(e) = encoder.set_bitrate_kbps(floored) {
+                            tracing::warn!(%e, "reconnect: encoder set_bitrate_kbps failed");
+                        }
+                        last_applied_kbps = floored;
+                        // Request an IDR so the new HLS sink's
+                        // bootstrap finds SPS/PPS on the very first
+                        // frame instead of waiting for the encoder's
+                        // natural GOP boundary.
+                        encoder.request_keyframe();
+
+                        // Backoff: 1 s, 2 s, 4 s, 8 s, 16 s.
+                        let backoff = Duration::from_secs(
+                            1u64 << (consecutive_failures.saturating_sub(1).min(4) as u64),
+                        );
+                        let reason = format!(
+                            "reconnecting (attempt {}/{}, backing off {:?})",
+                            consecutive_failures, MAX_CONSECUTIVE_FAILURES, backoff
+                        );
+                        tracing::warn!(?did, attempt = consecutive_failures, ?backoff, "reconnect: retrying session");
+                        let _ = event_tx
+                            .send(ManagerEvent::StreamReconnecting {
+                                device_id: did,
+                                attempt: consecutive_failures,
+                                reason: reason.clone(),
+                            })
+                            .await;
+                        tokio::select! {
+                            _ = cancel_rx.recv() => {
+                                cancelled = true;
+                                break 'supervisor;
+                            }
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+
+                        let mut s = match (create_session)() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!(%e, "reconnect: create_session failed");
+                                continue 'supervisor;
+                            }
+                        };
+                        if let Err(e) = s.connect(&device).await {
+                            tracing::warn!(%e, "reconnect: session.connect failed");
+                            continue 'supervisor;
+                        }
+                        if let Err(e) = s.setup_stream(&session_config).await {
+                            tracing::warn!(%e, "reconnect: session.setup_stream failed");
+                            let _ = s.stop().await;
+                            continue 'supervisor;
+                        }
+                        tracing::info!(?did, attempt = consecutive_failures, "reconnect: session re-established");
+                        last_failure_at = Some(Instant::now());
+                        s
+                    }
+                };
+
+                // Inner frame loop. Same hot path as before; on
+                // session death we drop out and let the supervisor
+                // recreate.
+                'inner: loop {
+                    tokio::select! {
+                        _ = cancel_rx.recv() => {
+                            tracing::info!(?did, "Stream cancelled");
+                            cancelled = true;
+                            let _ = session.stop().await;
+                            break 'supervisor;
+                        }
+                        frame_result = async {
+                            if let Some(f) = seed.take() {
+                                last_frame = Some(f.clone());
+                                return Ok(f);
+                            }
+                            match tokio::time::timeout(frame_period, capture.next_frame()).await {
+                                Ok(Ok(f)) => {
+                                    last_frame = Some(f.clone());
+                                    Ok(f)
                                 }
-                                match encoder.encode(raw_frame) {
-                                    Ok(encoded) => {
-                                        if let Err(e) = session.send_frame(&encoded).await {
-                                            tracing::error!(%e, "Failed to send frame");
-                                            let _ = event_tx.send(ManagerEvent::StreamError {
-                                                device_id: did,
-                                                message: e.to_string(),
-                                            }).await;
-                                            break;
+                                Ok(Err(e)) => Err(e),
+                                Err(_) => match last_frame.as_mut() {
+                                    Some(stored) => {
+                                        bump_timestamp(stored, frame_period_us);
+                                        Ok(stored.clone())
+                                    }
+                                    None => capture.next_frame().await,
+                                },
+                            }
+                        } => {
+                            match frame_result {
+                                Ok(raw_frame) => {
+                                    let now = Instant::now();
+                                    if now >= next_keyframe_at {
+                                        encoder.request_keyframe();
+                                        while next_keyframe_at <= now {
+                                            next_keyframe_at += keyframe_interval;
                                         }
                                     }
-                                    Err(e) => {
-                                        tracing::error!(%e, "Encoding error");
-                                        let _ = event_tx.send(ManagerEvent::StreamError {
-                                            device_id: did,
-                                            message: e.to_string(),
-                                        }).await;
-                                        break;
+                                    let want_kbps = adaptive.target_kbps();
+                                    if want_kbps != last_applied_kbps {
+                                        match encoder.set_bitrate_kbps(want_kbps) {
+                                            Ok(()) => {
+                                                tracing::info!(
+                                                    from_kbps = last_applied_kbps,
+                                                    to_kbps = want_kbps,
+                                                    "adaptive: encoder bitrate updated"
+                                                );
+                                                last_applied_kbps = want_kbps;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(%e, want_kbps, "adaptive: set_bitrate_kbps failed");
+                                                last_applied_kbps = want_kbps;
+                                            }
+                                        }
+                                    }
+
+                                    match encoder.encode(raw_frame) {
+                                        Ok(encoded) => {
+                                            if let Err(e) = session.send_frame(&encoded).await {
+                                                tracing::error!(%e, "Failed to send frame");
+                                                fatal_error = Some(e.to_string());
+                                                let _ = session.stop().await;
+                                                break 'supervisor;
+                                            }
+                                            // Receiver-side liveness: when
+                                            // the chromecast app dies it
+                                            // sends CLOSE / ERROR 301; the
+                                            // session marks itself not
+                                            // alive but `send_frame` keeps
+                                            // accepting (HLS sink is local
+                                            // and stays up). Catching it
+                                            // here pivots us back to the
+                                            // supervisor for a clean
+                                            // reconnect instead of feeding
+                                            // a dead pipe.
+                                            if !session.is_alive() {
+                                                tracing::warn!(?did, "session reports not alive — entering reconnect supervisor");
+                                                let _ = session.stop().await;
+                                                break 'inner;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(%e, "Encoding error");
+                                            fatal_error = Some(e.to_string());
+                                            let _ = session.stop().await;
+                                            break 'supervisor;
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                tracing::error!(%e, "Capture error");
-                                let _ = event_tx.send(ManagerEvent::StreamError {
-                                    device_id: did,
-                                    message: e.to_string(),
-                                }).await;
-                                break;
+                                Err(e) => {
+                                    tracing::error!(%e, "Capture error");
+                                    fatal_error = Some(e.to_string());
+                                    let _ = session.stop().await;
+                                    break 'supervisor;
+                                }
                             }
                         }
                     }
                 }
             }
 
-            let _ = session.stop().await;
             let _ = capture.stop().await;
             active_streams.lock().await.remove(&did);
+            // Surface a final error if the supervisor gave up.
+            // `StreamStopped` is always emitted afterwards so the
+            // app's "playing → stopped" state machine doesn't need
+            // to special-case error paths — same terminal event,
+            // optional error explainer just before it.
+            if let Some(msg) = fatal_error {
+                let _ = event_tx
+                    .send(ManagerEvent::StreamError {
+                        device_id: did,
+                        message: msg,
+                    })
+                    .await;
+            }
+            let _ = cancelled; // bookkeeping; not all paths read it
             let _ = event_tx
                 .send(ManagerEvent::StreamStopped { device_id: did })
                 .await;
