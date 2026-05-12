@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 
+use bytes::Bytes;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -8,6 +9,7 @@ pub struct Device {
     pub id: Uuid,
     pub name: String,
     pub protocol: &'static str,
+    pub protocol_icon: Bytes,
     pub addr: IpAddr,
     pub port: u16,
     pub model: Option<String>,

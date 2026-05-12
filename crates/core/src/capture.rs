@@ -5,7 +5,7 @@ use crate::PixelFormat;
 #[derive(Debug, Clone)]
 pub enum CaptureSource {
     FullScreen { monitor: Option<String> },
-    Window { identifier: WindowIdentifier },
+    Window { identifier: Option<WindowIdentifier> },
 }
 
 #[derive(Debug, Clone)]

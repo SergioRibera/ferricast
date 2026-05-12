@@ -1,5 +1,6 @@
 use ferricast_encoder::h264::H264Encoder;
 use freya::{prelude::*, radio::*};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -11,7 +12,7 @@ use crate::manager::StreamManager;
 
 #[derive(Default)]
 pub struct AppState {
-    pub devices: Vec<Device>,
+    pub devices: HashMap<Uuid, Device>,
     pub streaming: Vec<Uuid>,
 }
 
@@ -36,7 +37,6 @@ impl App for FerricastApp {
         let devices_radio = use_radio::<AppState, AppChannel>(AppChannel::Devices);
         let streaming_radio = use_radio::<AppState, AppChannel>(AppChannel::Streaming);
         let binding = devices_radio.read();
-        let devices = binding.devices.as_slice();
 
         rect().expanded().background((18, 18, 24)).vertical().child(
             // Body
@@ -46,29 +46,40 @@ impl App for FerricastApp {
                 .vertical()
                 .spacing(8.)
                 .maybe_child(
-                    devices.is_empty().then_some(
+                    binding.devices.is_empty().then_some(
                         label()
                             .text("Buscando dispositivos...")
                             .font_size(13.)
                             .color((140, 140, 160)),
                     ),
                 )
-                .children(devices.iter().map(|device| {
-                    let device_id = device.id;
-                    let is_streaming = streaming_radio.read().streaming.contains(&device_id);
-                    DeviceCard {
+                .maybe(!binding.devices.is_empty(), |r| {
+                    r.child(
+                        ScrollView::new()
+                            .expanded()
+                            .direction(Direction::Vertical)
+                            .children(binding.devices.iter().map(|(device_id, device)| {
+                                let device_id = *device_id;
+                                let is_streaming =
+                                    streaming_radio.read().streaming.contains(&device_id);
+                                DeviceCard {
                         device: device.clone(),
                         is_streaming,
                         on_click: Arc::new({
                             let sm = Arc::clone(&stream_manager);
-                            move || {
+                            move |source| {
                                 let sm = sm.clone();
                                 spawn(async move {
+                                    let sm = sm.lock().await;
+                                    if is_streaming {
+                                        sm.stop_stream(device_id)
+                                            .await
+                                            .expect("Cannot stop stream");
+                                        return;
+                                    }
                                     let capture = NativeCapture::new();
                                     let encoder = H264Encoder::default();
-                                    let source = CaptureSource::FullScreen { monitor: None };
                                     let config = StreamConfig::default();
-                                    let sm = sm.lock().await;
                                     if let Err(e) = sm
                                         .start_stream(device_id, source, capture, encoder, config)
                                         .await
@@ -80,7 +91,9 @@ impl App for FerricastApp {
                         }),
                     }
                     .into()
-                })),
+                            })),
+                    )
+                }),
         )
     }
 }
@@ -91,7 +104,7 @@ impl App for FerricastApp {
 struct DeviceCard {
     device: Device,
     is_streaming: bool,
-    on_click: Arc<dyn Fn() + Send + Sync>,
+    on_click: Arc<dyn Fn(CaptureSource) + Send + Sync>,
 }
 
 impl PartialEq for DeviceCard {
@@ -116,16 +129,6 @@ impl Component for DeviceCard {
         } else {
             (50, 50, 65)
         };
-        let status_text = if is_streaming {
-            "● Transmitiendo"
-        } else {
-            "○ Disponible"
-        };
-        let status_color: (u8, u8, u8) = if is_streaming {
-            (80, 200, 120)
-        } else {
-            (100, 100, 120)
-        };
 
         rect()
             .width(Size::fill())
@@ -137,21 +140,22 @@ impl Component for DeviceCard {
             .cross_align(Alignment::center())
             .horizontal()
             .spacing(12.)
-            .on_press(move |_| (on_click)())
             .child(
                 // Icono de protocolo (círculo de color)
                 rect()
-                    .width(Size::px(36.))
-                    .height(Size::px(36.))
-                    .corner_radius(18.)
-                    .background((247, 109, 39))
                     .center()
-                    .child(
-                        label()
-                            .text(device.protocol[..1].to_uppercase())
-                            .font_size(14.)
-                            .color((255, 255, 255)),
-                    ),
+                    .maybe_child((device.protocol == "chromecast").then(|| {
+                        svg(device.protocol_icon.clone())
+                            .fill(Color::WHITE)
+                            .width(Size::px(36.))
+                            .height(Size::px(36.))
+                    }))
+                    .maybe_child((device.protocol != "chromecast").then(|| {
+                        svg(device.protocol_icon)
+                            .stroke(Color::WHITE)
+                            .width(Size::px(36.))
+                            .height(Size::px(36.))
+                    })),
             )
             .child(
                 // Info del dispositivo
@@ -166,12 +170,30 @@ impl Component for DeviceCard {
                             .color((230, 230, 240)),
                     )
                     .child(
-                        label()
-                            .text(format!("{} - {}", device.protocol, device.addr))
-                            .font_size(12.)
-                            .color((100, 100, 120)),
-                    )
-                    .child(label().text(status_text).font_size(11.).color(status_color)),
+                        rect()
+                            .width(Size::fill())
+                            .horizontal()
+                            .spacing(5.)
+                            .child(TooltipContainer::new(Tooltip::new("Share screen")).child(
+                                share_btn(include_bytes!("../assets/screen.svg")).on_press({
+                                    let on_click = on_click.clone();
+                                    move |_| (on_click)(CaptureSource::FullScreen { monitor: None })
+                                }),
+                            ))
+                            .child(TooltipContainer::new(Tooltip::new("Share app")).child(
+                                share_btn(include_bytes!("../assets/app.svg")).on_press(
+                                    move |_| (on_click)(CaptureSource::Window { identifier: None }),
+                                ),
+                            )),
+                    ),
             )
     }
+}
+
+fn share_btn(b: impl Into<SvgBytes>) -> Rect {
+    rect()
+        .width(Size::px(18.))
+        .height(Size::px(18.))
+        .center()
+        .child(svg(b).expanded().stroke(Color::WHITE))
 }

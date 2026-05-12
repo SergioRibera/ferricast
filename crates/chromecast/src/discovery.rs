@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -13,6 +14,7 @@ use ferricast_core::{
 };
 
 const CHROMECAST_SERVICE_TYPE: &str = "_googlecast._tcp.local.";
+const CHROMECAST_ICON: Bytes = Bytes::from_static(include_bytes!("../../../assets/chromecast.svg"));
 
 const CA_VIDEO_OUT: u32 = 1;
 #[allow(dead_code)]
@@ -140,6 +142,7 @@ impl Discovery for ChromecastDiscovery {
                             id: device_uuid,
                             name: friendly_name,
                             protocol: "chromecast",
+                            protocol_icon: CHROMECAST_ICON,
                             addr,
                             port,
                             model,

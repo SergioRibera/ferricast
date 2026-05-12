@@ -3,6 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use serde::Deserialize;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
@@ -16,6 +17,7 @@ const SSDP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
 
 const DIAL_SEARCH_TARGET: &str = "urn:dial-multiscreen-org:service:dial:1";
+const DIAL_ICON: Bytes = Bytes::from_static(include_bytes!("../../../assets/dial.svg"));
 
 const SSDP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const SSDP_SCAN_INTERVAL: Duration = Duration::from_secs(30);
@@ -145,10 +147,9 @@ impl DialDiscovery {
                 ))
             })?;
 
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| FerricastError::Discovery(format!("reading body from {location_url}: {e}")))?;
+        let body = resp.text().await.map_err(|e| {
+            FerricastError::Discovery(format!("reading body from {location_url}: {e}"))
+        })?;
 
         let desc: DeviceDescriptionRoot = quick_xml::de::from_str(&body).map_err(|e| {
             FerricastError::Discovery(format!("parsing device XML from {location_url}: {e}"))
@@ -202,6 +203,7 @@ impl DialDiscovery {
             id,
             name: desc.device.friendly_name.clone(),
             protocol: "dial",
+            protocol_icon: DIAL_ICON,
             addr,
             port,
             model: desc.device.model_name.clone(),
@@ -239,9 +241,7 @@ impl ferricast_core::Discovery for DialDiscovery {
 
         socket
             .join_multicast_v4(SSDP_MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED)
-            .map_err(|e| {
-                FerricastError::Discovery(format!("join multicast group: {e}"))
-            })?;
+            .map_err(|e| FerricastError::Discovery(format!("join multicast group: {e}")))?;
 
         let socket = Arc::new(socket);
 
@@ -360,13 +360,8 @@ async fn scan_loop(
                         .map(|u| u.port().unwrap_or(80))
                         .unwrap_or(80);
 
-                    let device = DialDiscovery::build_device(
-                        &desc,
-                        &app_url,
-                        addr_ip,
-                        port,
-                        usn.as_deref(),
-                    );
+                    let device =
+                        DialDiscovery::build_device(&desc, &app_url, addr_ip, port, usn.as_deref());
                     let dev_id = device.id;
 
                     info!(

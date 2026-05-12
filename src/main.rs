@@ -12,13 +12,12 @@ use crate::app::*;
 
 mod app;
 
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new(
-                "warn,freya=off,freya_core=off,freya_winit=off,ragnarok=off,ferricast=info,ferricast_capture=info,ferricast_chromecast=trace,ferricast_encoder=info,ferricast_hls=trace",
+                "warn,freya=off,freya_core=off,freya_winit=off,ragnarok=off,ferricast_chromecast=info,ferricast_encoder=info",
             )
         }))
         .init();
@@ -65,13 +64,14 @@ async fn main() {
                             radio_events
                                 .write_channel(AppChannel::Devices)
                                 .devices
-                                .push(device);
+                                .entry(device.id)
+                                .insert_entry(device);
                         }
                         Some(ManagerEvent::DeviceLost(id)) => {
                             radio_events
                                 .write_channel(AppChannel::Devices)
                                 .devices
-                                .retain(|d| d.id != id);
+                                .remove(&id);
                             radio_events
                                 .write_channel(AppChannel::Streaming)
                                 .streaming
