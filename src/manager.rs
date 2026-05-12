@@ -442,6 +442,8 @@ impl StreamManager {
         let device_name = device.name.clone();
         let did = device.id;
 
+        let device_clone = device.clone();
+
         let task = tokio::spawn(async move {
 
             let _ = event_tx
@@ -512,6 +514,7 @@ impl StreamManager {
             let mut active_session: Option<Box<dyn ErasedSession>> = Some(session);
             let mut fatal_error: Option<String> = None;
             let mut cancelled = false;
+   
 
             // Outer (supervisor) loop. Acquires a session, runs the
             // inner frame loop until that session dies or the user
@@ -588,7 +591,7 @@ impl StreamManager {
                                 continue 'supervisor;
                             }
                         };
-                        if let Err(e) = s.connect(&device).await {
+                        if let Err(e) = s.connect(&device_clone).await {
                             tracing::warn!(%e, "reconnect: session.connect failed");
                             continue 'supervisor;
                         }
