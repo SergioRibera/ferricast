@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 
@@ -137,8 +137,14 @@ pub async fn handle(
             }
             ("GET" | "HEAD", path) if is_part_path(path) => {
                 let Some((seg_seq, part_idx)) = parse_part_seq_and_idx(path) else {
-                    write_status(&mut write_half, 400, "Bad Request", b"", !client_wants_close)
-                        .await?;
+                    write_status(
+                        &mut write_half,
+                        400,
+                        "Bad Request",
+                        b"",
+                        !client_wants_close,
+                    )
+                    .await?;
                     if client_wants_close {
                         break;
                     }
@@ -183,8 +189,14 @@ pub async fn handle(
             }
             ("GET" | "HEAD", path) if is_segment_path(path) => {
                 let Some(seq) = parse_segment_seq(path) else {
-                    write_status(&mut write_half, 400, "Bad Request", b"", !client_wants_close)
-                        .await?;
+                    write_status(
+                        &mut write_half,
+                        400,
+                        "Bad Request",
+                        b"",
+                        !client_wants_close,
+                    )
+                    .await?;
                     tracing::info!(
                         %peer,
                         method = %request.method,
@@ -247,10 +259,9 @@ pub async fn handle(
                                 .unwrap_or_default();
                             let budget_ratio = elapsed.as_secs_f32() / seg_dur.max(0.001);
                             let pct = (budget_ratio * 100.0) as u32;
-                            let encoded_kbps = ((total_len as f64 * 8.0)
-                                / 1000.0
-                                / seg_dur.max(0.001) as f64)
-                                as u32;
+                            let encoded_kbps =
+                                ((total_len as f64 * 8.0) / 1000.0 / seg_dur.max(0.001) as f64)
+                                    as u32;
 
                             let tele = stats.record_segment_get(seq, mbps, Instant::now());
                             let gap_ms = tele.inter_request_gap.map(|d| d.as_millis() as u64);
@@ -307,13 +318,8 @@ pub async fn handle(
                             }
 
                             if budget_ratio >= 0.7 {
-                                delivery_warning = Some((
-                                    seq,
-                                    elapsed.as_millis() as u64,
-                                    mbps,
-                                    seg_dur,
-                                    pct,
-                                ));
+                                delivery_warning =
+                                    Some((seq, elapsed.as_millis() as u64, mbps, seg_dur, pct));
                             }
                             let stale_ratio = staleness.as_secs_f32() / seg_dur.max(0.001);
                             if stale_ratio >= 2.0 {
@@ -627,7 +633,14 @@ where
 {
     let mut head = String::with_capacity(384);
     head.push_str("HTTP/1.1 200 OK\r\n");
-    write_common(&mut head, content_type, body.len(), cacheable, range_supported, keep_alive);
+    write_common(
+        &mut head,
+        content_type,
+        body.len(),
+        cacheable,
+        range_supported,
+        keep_alive,
+    );
     head.push_str("\r\n");
 
     w.write_all(head.as_bytes()).await?;
@@ -679,7 +692,14 @@ where
 {
     let mut head = String::with_capacity(192);
     head.push_str(&format!("HTTP/1.1 {} {}\r\n", code, reason));
-    write_common(&mut head, "text/plain", body.len(), false, false, keep_alive);
+    write_common(
+        &mut head,
+        "text/plain",
+        body.len(),
+        false,
+        false,
+        keep_alive,
+    );
     head.push_str("\r\n");
     w.write_all(head.as_bytes()).await?;
     if !body.is_empty() {
@@ -747,7 +767,9 @@ fn write_cors(head: &mut String) {
     head.push_str("Access-Control-Allow-Origin: *\r\n");
     head.push_str("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n");
     head.push_str("Access-Control-Allow-Headers: Range, Origin, Accept\r\n");
-    head.push_str("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n");
+    head.push_str(
+        "Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n",
+    );
 }
 
 // ---------------------------------------------------------------------

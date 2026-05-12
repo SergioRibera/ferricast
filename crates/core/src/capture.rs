@@ -1,11 +1,15 @@
+use crate::PixelFormat;
 use crate::error::Result;
 use crate::frame::CapturedFrame;
-use crate::PixelFormat;
 
 #[derive(Debug, Clone)]
 pub enum CaptureSource {
-    FullScreen { monitor: Option<String> },
-    Window { identifier: Option<WindowIdentifier> },
+    FullScreen {
+        monitor: Option<String>,
+    },
+    Window {
+        identifier: Option<WindowIdentifier>,
+    },
 }
 
 #[derive(Debug, Clone)]

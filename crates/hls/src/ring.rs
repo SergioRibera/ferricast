@@ -236,10 +236,7 @@ impl SegmentRing {
     }
 
     /// Build the live media playlist from the current ring contents.
-    pub fn build_playlist(
-        &self,
-        min_target_duration: u8,
-    ) -> Result<String, FerricastError> {
+    pub fn build_playlist(&self, min_target_duration: u8) -> Result<String, FerricastError> {
         let observed_max = self
             .segments
             .iter()
@@ -278,10 +275,7 @@ impl SegmentRing {
         // and keeping the playlist short matters for the chromecast's
         // tiny HLS parser buffer.
         let parts_window_segments = 3;
-        let parts_visible_from = self
-            .segments
-            .len()
-            .saturating_sub(parts_window_segments);
+        let parts_visible_from = self.segments.len().saturating_sub(parts_window_segments);
 
         for (i, s) in self.segments.iter().enumerate() {
             let mut seg = M3uSegment::new(s.duration_secs, format!("segment-{}.ts", s.seq));
@@ -292,10 +286,8 @@ impl SegmentRing {
                     .parts
                     .iter()
                     .map(|p| {
-                        let mut mp = M3uPart::new(
-                            p.duration_secs,
-                            format!("part-{}.{}.ts", s.seq, p.idx),
-                        );
+                        let mut mp =
+                            M3uPart::new(p.duration_secs, format!("part-{}.{}.ts", s.seq, p.idx));
                         mp.independent = p.independent;
                         mp.last_of_segment = p.idx as usize + 1 == s.parts.len();
                         mp

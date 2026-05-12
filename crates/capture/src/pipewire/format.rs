@@ -19,18 +19,16 @@ use ferricast_core::{FerricastError, PixelFormat, Result};
 
 use pipewire as pw;
 use pw::spa::buffer::DataType as SpaDataType;
+use pw::spa::param::ParamType;
 use pw::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
 use pw::spa::param::video::VideoFormat;
-use pw::spa::param::ParamType;
 use pw::spa::pod::{
-    serialize::PodSerializer, ChoiceValue, Object, Pod, Property, PropertyFlags, Value,
+    ChoiceValue, Object, Pod, Property, PropertyFlags, Value, serialize::PodSerializer,
 };
 use pw::spa::sys::{
     SPA_META_Header, SPA_PARAM_BUFFERS_dataType, SPA_PARAM_META_size, SPA_PARAM_META_type,
 };
-use pw::spa::utils::{
-    Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle, SpaTypes,
-};
+use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle, SpaTypes};
 
 /// `DRM_FORMAT_MOD_LINEAR` — buffer pixels are laid out in row-major order
 /// and can be `mmap`'d for CPU read.
@@ -85,9 +83,7 @@ pub(super) struct NegotiatedFormat {
 }
 
 impl NegotiatedFormat {
-    pub(super) fn from_video_info(
-        info: &pw::spa::param::video::VideoInfoRaw,
-    ) -> Result<Self> {
+    pub(super) fn from_video_info(info: &pw::spa::param::video::VideoInfoRaw) -> Result<Self> {
         let spa_format = info.format();
         let pixel_format = pixel_format(spa_format).ok_or_else(|| {
             FerricastError::Capture(format!(
@@ -165,7 +161,12 @@ fn property_choice_enum_id(key: u32, default: u32, alternatives: Vec<u32>) -> Pr
     }
 }
 
-fn property_choice_range_rect(key: u32, default: Rectangle, min: Rectangle, max: Rectangle) -> Property {
+fn property_choice_range_rect(
+    key: u32,
+    default: Rectangle,
+    min: Rectangle,
+    max: Rectangle,
+) -> Property {
     Property {
         key,
         flags: PropertyFlags::empty(),
@@ -176,7 +177,12 @@ fn property_choice_range_rect(key: u32, default: Rectangle, min: Rectangle, max:
     }
 }
 
-fn property_choice_range_fraction(key: u32, default: Fraction, min: Fraction, max: Fraction) -> Property {
+fn property_choice_range_fraction(
+    key: u32,
+    default: Fraction,
+    min: Fraction,
+    max: Fraction,
+) -> Property {
     Property {
         key,
         flags: PropertyFlags::empty(),
@@ -229,14 +235,26 @@ fn enum_format_skeleton(params: &EnumFormatParams) -> Object {
                     width: params.default_width.max(1),
                     height: params.default_height.max(1),
                 },
-                Rectangle { width: 1, height: 1 },
-                Rectangle { width: 8192, height: 8192 },
+                Rectangle {
+                    width: 1,
+                    height: 1,
+                },
+                Rectangle {
+                    width: 8192,
+                    height: 8192,
+                },
             ),
             property_choice_range_fraction(
                 FormatProperties::VideoFramerate.as_raw(),
-                Fraction { num: params.default_fps.max(1), denom: 1 },
+                Fraction {
+                    num: params.default_fps.max(1),
+                    denom: 1,
+                },
                 Fraction { num: 0, denom: 1 },
-                Fraction { num: 1000, denom: 1 },
+                Fraction {
+                    num: 1000,
+                    denom: 1,
+                },
             ),
         ],
     }
@@ -350,9 +368,7 @@ pub(super) fn param_meta_header_bytes() -> Vec<u8> {
             Property {
                 key: SPA_PARAM_META_size,
                 flags: PropertyFlags::empty(),
-                value: Value::Int(
-                    std::mem::size_of::<pw::spa::sys::spa_meta_header>() as i32,
-                ),
+                value: Value::Int(std::mem::size_of::<pw::spa::sys::spa_meta_header>() as i32),
             },
         ],
     };

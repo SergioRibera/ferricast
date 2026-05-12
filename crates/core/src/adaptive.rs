@@ -123,9 +123,7 @@ impl AdaptiveBitrateState {
         // very first eligible move fires without waiting out a full
         // interval against the process start time. Once we record a
         // real adjustment timestamp the normal cool-down kicks in.
-        if last != 0
-            && now_ns.saturating_sub(last) < Self::MIN_ADJUST_INTERVAL_MS * 1_000_000
-        {
+        if last != 0 && now_ns.saturating_sub(last) < Self::MIN_ADJUST_INTERVAL_MS * 1_000_000 {
             return None;
         }
 
@@ -153,8 +151,7 @@ impl AdaptiveBitrateState {
     /// BUFFERING) tells us a soft step isn't enough.
     pub fn drop_to_floor(&self) -> u32 {
         self.target_kbps.store(self.floor_kbps, Ordering::Relaxed);
-        self.last_adjust_ns
-            .store(monotonic_ns(), Ordering::Relaxed);
+        self.last_adjust_ns.store(monotonic_ns(), Ordering::Relaxed);
         self.floor_kbps
     }
 
@@ -185,8 +182,7 @@ impl AdaptiveBitrateState {
             return None;
         } else if measured_kbps >= current {
             // 70 % of measured, clamped to the controller's bounds.
-            ((measured_kbps as u64 * 7 / 10) as u32)
-                .clamp(self.floor_kbps, self.ceiling_kbps)
+            ((measured_kbps as u64 * 7 / 10) as u32).clamp(self.floor_kbps, self.ceiling_kbps)
         } else {
             // Already over-budget. Drop to measured.
             measured_kbps.clamp(self.floor_kbps, self.ceiling_kbps)
@@ -266,7 +262,11 @@ mod tests {
         // sentinel), bumping 1000 → 1200. Subsequent samples in
         // this loop are blocked by the cool-down.
         s.record_pressure(10);
-        assert_eq!(s.target_kbps(), 1200, "+200 kbps step on first slack sample");
+        assert_eq!(
+            s.target_kbps(),
+            1200,
+            "+200 kbps step on first slack sample"
+        );
         // Now drive it all the way back up and confirm the ceiling.
         for _ in 0..100 {
             force_adjustable(&s);

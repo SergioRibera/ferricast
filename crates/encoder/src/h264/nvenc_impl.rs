@@ -45,9 +45,9 @@ use ferricast_core::{
     VideoEncoder,
 };
 use shiguredo_nvcodec::{
-    BufferFormat, CodecConfig, EncodeOptions, Encoder as NvEncoder, EncoderCodec, EncoderConfig as NvCfg,
-    H264EncoderConfig, H264Profile, PictureType, Preset, RateControlMode, ReconfigureParams,
-    TuningInfo,
+    BufferFormat, CodecConfig, EncodeOptions, Encoder as NvEncoder, EncoderCodec,
+    EncoderConfig as NvCfg, H264EncoderConfig, H264Profile, PictureType, Preset, RateControlMode,
+    ReconfigureParams, TuningInfo,
 };
 use tracing::{debug, info};
 
@@ -281,8 +281,7 @@ impl VideoEncoder for NvencH264Encoder {
 
         let pts = self.frame_count;
         self.frame_count += 1;
-        let is_keyframe =
-            matches!(nv_frame.picture_type(), PictureType::I | PictureType::Idr);
+        let is_keyframe = matches!(nv_frame.picture_type(), PictureType::I | PictureType::Idr);
 
         Ok(EncodedFrame {
             codec: Codec::H264,

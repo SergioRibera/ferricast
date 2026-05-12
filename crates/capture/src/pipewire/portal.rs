@@ -10,8 +10,8 @@
 //! what wlx-capture does and what was needed to make capture work
 //! reliably on Niri+portal-gnome.
 
-use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::PersistMode;
+use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ferricast_core::{CaptureConfig, CaptureSource, FerricastError, Result};
 use tracing::{debug, info};
 
@@ -61,7 +61,11 @@ pub(super) async fn open_session(
         .await
         .map_err(portal_err)?;
 
-    info!(?source_type, ?cursor_mode, "portal sources selected, starting cast");
+    info!(
+        ?source_type,
+        ?cursor_mode,
+        "portal sources selected, starting cast"
+    );
 
     let response = proxy
         .start(&session, None)

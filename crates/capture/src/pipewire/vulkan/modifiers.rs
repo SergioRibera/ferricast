@@ -26,8 +26,7 @@ pub(super) fn query(inner: &Inner, format: vk::Format) -> Result<Vec<u64>> {
     // borrow ends before we read `drm_format_modifier_count`.
     let mut list_pass1 = vk::DrmFormatModifierPropertiesListEXT::default();
     {
-        let mut props_pass1 =
-            vk::FormatProperties2::default().push_next(&mut list_pass1);
+        let mut props_pass1 = vk::FormatProperties2::default().push_next(&mut list_pass1);
         unsafe {
             inner.instance.get_physical_device_format_properties2(
                 inner.physical_device,
@@ -49,8 +48,7 @@ pub(super) fn query(inner: &Inner, format: vk::Format) -> Result<Vec<u64>> {
     {
         let mut list_pass2 = vk::DrmFormatModifierPropertiesListEXT::default()
             .drm_format_modifier_properties(&mut storage);
-        let mut props_pass2 =
-            vk::FormatProperties2::default().push_next(&mut list_pass2);
+        let mut props_pass2 = vk::FormatProperties2::default().push_next(&mut list_pass2);
         unsafe {
             inner.instance.get_physical_device_format_properties2(
                 inner.physical_device,

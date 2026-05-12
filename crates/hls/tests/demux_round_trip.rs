@@ -63,8 +63,7 @@ fn demux(bytes: &[u8]) -> Demux {
         if afc == 0b01 || afc == 0b11 {
             if let Some(prev) = d.expected_cc.get(&pid) {
                 assert_eq!(
-                    cc,
-                    *prev,
+                    cc, *prev,
                     "CC discontinuity on PID {pid:#x} at offset {off}"
                 );
             }
@@ -129,15 +128,12 @@ fn demux(bytes: &[u8]) -> Demux {
                 assert_eq!(crc32_mpeg2(&crc_input), crc, "PMT CRC");
                 // body: prog_num(2) + flags(1) + sec(1) + last_sec(1)
                 //       + PCR_PID(2) + prog_info_len(2) + streams + CRC
-                let prog_info_len =
-                    (((body[7] as usize) & 0x0F) << 8) | body[8] as usize;
+                let prog_info_len = (((body[7] as usize) & 0x0F) << 8) | body[8] as usize;
                 let streams_start = 9 + prog_info_len;
                 let stream_type = body[streams_start];
                 assert_eq!(stream_type, 0x1B, "expected H.264 (0x1B)");
-                let video_pid = u16::from_be_bytes([
-                    body[streams_start + 1] & 0x1F,
-                    body[streams_start + 2],
-                ]);
+                let video_pid =
+                    u16::from_be_bytes([body[streams_start + 1] & 0x1F, body[streams_start + 2]]);
                 d.video_pid = Some(video_pid);
                 d.pmt_seen = true;
             }
@@ -189,7 +185,8 @@ fn decode_ts(b: &[u8]) -> u64 {
 fn muxer_output_demuxes_cleanly() {
     let mut muxer = MpegTs::default();
     let parameter_sets = vec![
-        0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xC0, 0x1E, 0x96, 0x54, 0x05, 0x01, 0x6C, 0x80, // SPS
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xC0, 0x1E, 0x96, 0x54, 0x05, 0x01, 0x6C,
+        0x80, // SPS
         0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x3C, 0x80, // PPS
         0x00, 0x00, 0x00, 0x01, 0x06, 0x05, 0x10, // SEI (x264-style user data prefix)
         0xDC, 0x45, 0xE9, 0xBD, 0xE6, 0xD9, 0x48, 0xB7, 0x96, 0x2C, 0xD8, 0x20, 0xD9, 0x23, 0xEE,
@@ -204,7 +201,11 @@ fn muxer_output_demuxes_cleanly() {
         let mut data = Vec::new();
         data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
         data.push(if kf { 0x65 } else { 0x41 });
-        let payload_len = if kf { 50_000 } else { 5_000 + (i as usize) * 1_000 };
+        let payload_len = if kf {
+            50_000
+        } else {
+            5_000 + (i as usize) * 1_000
+        };
         // Pseudo-random byte pattern; the demuxer just round-trips it.
         // Avoid 0x00 0x00 0x00 0x01 sequences that would be parsed as
         // start codes — H.264 uses emulation-prevention bytes for that

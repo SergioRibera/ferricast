@@ -1,8 +1,6 @@
 use tokio::sync::mpsc;
 
-use ferricast_core::{
-    Discovery, DiscoveryEvent, Result,
-};
+use ferricast_core::{Discovery, DiscoveryEvent, Result};
 
 #[derive(Default)]
 pub struct MiracastDiscovery;
@@ -22,4 +20,3 @@ impl Discovery for MiracastDiscovery {
         false
     }
 }
-

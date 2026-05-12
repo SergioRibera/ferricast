@@ -34,7 +34,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, ToSocketAddrs};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace};
 
@@ -169,12 +169,7 @@ impl HlsServer {
     /// and return. The server is ready to serve as soon as this
     /// resolves — players that connect immediately will see a
     /// non-empty playlist on their first request.
-    pub async fn start<S, E, A>(
-        addr: A,
-        capture: S,
-        encoder: E,
-        config: HlsConfig,
-    ) -> Result<Self>
+    pub async fn start<S, E, A>(addr: A, capture: S, encoder: E, config: HlsConfig) -> Result<Self>
     where
         S: ScreenCapture + Send + 'static,
         E: VideoEncoder + Send + 'static,

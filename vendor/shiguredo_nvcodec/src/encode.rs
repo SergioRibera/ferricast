@@ -960,11 +960,8 @@ impl Encoder {
         let registered_resource = self.registered_resource;
         let output_buffer = self.bitstream_buffer;
 
-        self.lib.cu_memcpy_h_to_d(
-            device_input,
-            frame_data.as_ptr().cast(),
-            frame_data.len(),
-        )?;
+        self.lib
+            .cu_memcpy_h_to_d(device_input, frame_data.as_ptr().cast(), frame_data.len())?;
 
         let (mapped_resource, _mapped_guard) = self.map_input_resource(registered_resource)?;
 

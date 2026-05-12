@@ -12,7 +12,7 @@
 //! `libavcodec/vaapi_encode_h264.c` and ChromiumOS' cros-codecs
 //! H.264 encoder.
 
-use super::bitstream::{finalize_nal, BitWriter};
+use super::bitstream::{BitWriter, finalize_nal};
 
 /// Profile IDCs we target. See §A.2 (profile definitions).
 pub(super) mod profile {
@@ -81,7 +81,10 @@ pub(super) fn build_sps(p: &SpsParams) -> Vec<u8> {
     // Profile-specific seq fields. For Baseline / Main these aren't
     // emitted; only High and above carry chroma_format_idc, bit
     // depth, etc.
-    if matches!(p.profile_idc, profile::HIGH | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128) {
+    if matches!(
+        p.profile_idc,
+        profile::HIGH | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128
+    ) {
         w.write_ue(1); // chroma_format_idc = 1 (4:2:0)
         w.write_ue(0); // bit_depth_luma_minus8
         w.write_ue(0); // bit_depth_chroma_minus8
@@ -131,7 +134,9 @@ pub(super) fn build_sps(p: &SpsParams) -> Vec<u8> {
         w.write_flag(false);
     }
 
-    finalize_nal(w, /* nal_ref_idc = */ 3, /* nal_unit_type SPS = */ 7)
+    finalize_nal(
+        w, /* nal_ref_idc = */ 3, /* nal_unit_type SPS = */ 7,
+    )
 }
 
 fn write_vui(w: &mut BitWriter, v: &VuiParams) {
@@ -219,7 +224,9 @@ pub(super) fn build_pps(p: &PpsParams) -> Vec<u8> {
         w.write_se(0); // second_chroma_qp_index_offset
     }
 
-    finalize_nal(w, /* nal_ref_idc = */ 3, /* nal_unit_type PPS = */ 8)
+    finalize_nal(
+        w, /* nal_ref_idc = */ 3, /* nal_unit_type PPS = */ 8,
+    )
 }
 
 #[cfg(test)]
@@ -238,7 +245,7 @@ mod tests {
             constraint_flags: 0b0100_0000,
             level_idc: 41,
             seq_parameter_set_id: 0,
-            pic_width_in_mbs_minus1: 119, // 1920/16 - 1
+            pic_width_in_mbs_minus1: 119,       // 1920/16 - 1
             pic_height_in_map_units_minus1: 67, // ceil(1080/16) - 1 = 68 - 1
             log2_max_frame_num_minus4: 4,
             log2_max_pic_order_cnt_lsb_minus4: 4,

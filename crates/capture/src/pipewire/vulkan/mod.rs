@@ -46,9 +46,7 @@ use std::sync::Mutex;
 
 use ash::vk;
 use bytes::Bytes;
-use ferricast_core::{
-    DmaBufImporter, DmaBufPlane, FerricastError, PixelFormat, Result,
-};
+use ferricast_core::{DmaBufImporter, DmaBufPlane, FerricastError, PixelFormat, Result};
 use pipewire::spa::param::video::VideoFormat;
 use tracing::{debug, warn};
 
@@ -498,11 +496,9 @@ impl Drop for Inner {
         // SAFETY: VulkanImporter::drop already destroyed all
         // per-frame resources and waited for the GPU to idle.
         unsafe {
-            self.device
-                .destroy_command_pool(self.command_pool, None);
+            self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
     }
 }
-

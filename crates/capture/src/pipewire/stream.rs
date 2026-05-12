@@ -26,9 +26,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use ferricast_core::{
-    CaptureConfig, CapturedFrame, FerricastError, RawFrame, Result,
-};
+use ferricast_core::{CaptureConfig, CapturedFrame, FerricastError, RawFrame, Result};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -37,10 +35,10 @@ use pw::context::Context;
 use pw::main_loop::MainLoop;
 use pw::properties::properties;
 use pw::spa::buffer::DataType;
+use pw::spa::param::ParamType;
 use pw::spa::param::format::{MediaSubtype, MediaType};
 use pw::spa::param::format_utils;
 use pw::spa::param::video::VideoInfoRaw;
-use pw::spa::param::ParamType;
 use pw::spa::utils::Direction;
 use pw::stream::{Stream, StreamFlags, StreamRef, StreamState};
 
@@ -209,7 +207,10 @@ fn run(
                     None
                 } else {
                     debug!(format = ?f, modifiers = mods.len(), "GPU format supported");
-                    Some(GpuFormat { format: *f, modifiers: mods })
+                    Some(GpuFormat {
+                        format: *f,
+                        modifiers: mods,
+                    })
                 }
             })
             .collect(),
@@ -275,7 +276,10 @@ fn run(
             pods.as_mut_slice(),
         )
         .map_err(|e| FerricastError::Capture(format!("Stream::connect: {e}")))?;
-    info!(node_id = portal.node_id, "stream.connect ok, entering main loop");
+    info!(
+        node_id = portal.node_id,
+        "stream.connect ok, entering main loop"
+    );
 
     let _term_attach = term_rx.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
@@ -332,10 +336,12 @@ fn handle_param_changed(
             // pinned to the previous fd / size / modifier so the
             // next frame re-imports cleanly.
             let format_changed = match ud.negotiated {
-                Some(prev) => prev.width != neg.width
-                    || prev.height != neg.height
-                    || prev.spa_format != neg.spa_format
-                    || prev.modifier != neg.modifier,
+                Some(prev) => {
+                    prev.width != neg.width
+                        || prev.height != neg.height
+                        || prev.spa_format != neg.spa_format
+                        || prev.modifier != neg.modifier
+                }
                 None => true,
             };
             if format_changed {
@@ -373,11 +379,7 @@ fn handle_param_changed(
     }
 }
 
-fn handle_process(
-    stream: &StreamRef,
-    ud: &mut UserData,
-    frame_tx: &mpsc::Sender<CapturedFrame>,
-) {
+fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender<CapturedFrame>) {
     let Some(neg) = ud.negotiated else {
         debug!("process tick before format negotiated, dropping all buffers");
         while stream.dequeue_buffer().is_some() {}
@@ -456,10 +458,7 @@ fn handle_process(
     } else {
         trace!(
             ?plane_type,
-            chunk_size,
-            chunk_offset,
-            stride,
-            "buffer dequeued"
+            chunk_size, chunk_offset, stride, "buffer dequeued"
         );
     }
 

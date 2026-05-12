@@ -223,25 +223,21 @@ impl CastSession for ChromecastSession {
         // Step 5: wait for the launch ack. Cap at 15 s — receivers
         // that don't ack in that window are typically wedged and
         // need a power cycle.
-        let (transport_id, session_id) = match tokio::time::timeout(
-            Duration::from_secs(15),
-            app_rx,
-        )
-        .await
-        {
-            Ok(Ok(Ok(ids))) => ids,
-            Ok(Ok(Err(e))) => return Err(e),
-            Ok(Err(_)) => {
-                return Err(FerricastError::Connection(
-                    "read loop exited before launch ack".into(),
-                ));
-            }
-            Err(_) => {
-                return Err(FerricastError::Timeout(
-                    "waiting for receiver to launch app (15s)".into(),
-                ));
-            }
-        };
+        let (transport_id, session_id) =
+            match tokio::time::timeout(Duration::from_secs(15), app_rx).await {
+                Ok(Ok(Ok(ids))) => ids,
+                Ok(Ok(Err(e))) => return Err(e),
+                Ok(Err(_)) => {
+                    return Err(FerricastError::Connection(
+                        "read loop exited before launch ack".into(),
+                    ));
+                }
+                Err(_) => {
+                    return Err(FerricastError::Timeout(
+                        "waiting for receiver to launch app (15s)".into(),
+                    ));
+                }
+            };
         debug!(transport_id, session_id, "DefaultMediaReceiver launched");
 
         // Step 6: virtual-connect to the launched app's transport so
@@ -276,10 +272,7 @@ impl CastSession for ChromecastSession {
     }
 
     async fn setup_stream(&mut self, config: &StreamConfig) -> Result<()> {
-        let _ = self
-            .state
-            .as_ref()
-            .ok_or(FerricastError::NoActiveSession)?;
+        let _ = self.state.as_ref().ok_or(FerricastError::NoActiveSession)?;
 
         if config.codec != Codec::H264 {
             return Err(FerricastError::UnsupportedCodec {
@@ -407,10 +400,7 @@ impl ChromecastSession {
     /// segment, and those frames only flow through subsequent
     /// `send_frame` calls — blocking here would prevent that.
     async fn bootstrap_hls(&mut self, first_keyframe: &EncodedFrame) -> Result<()> {
-        let state = self
-            .state
-            .as_ref()
-            .ok_or(FerricastError::NoActiveSession)?;
+        let state = self.state.as_ref().ok_or(FerricastError::NoActiveSession)?;
         let local_ip = state.local_ip;
         let writer = state.writer.clone();
         let transport_id = state.transport_id.clone();
@@ -441,10 +431,7 @@ impl ChromecastSession {
         // `DeviceCapabilities::requires_audio` — old Chromecast 1st/
         // 2nd gen need a silent audio track to not reject the HLS
         // stream with LOAD_FAILED.
-        let adaptive_for_hls = self
-            .cfg
-            .as_ref()
-            .and_then(|c| c.adaptive.clone());
+        let adaptive_for_hls = self.cfg.as_ref().and_then(|c| c.adaptive.clone());
         // LL-HLS opt-in, gated on `DeviceCapabilities::
         // supports_low_latency_hls`. The 1st/2nd-gen Chromecast
         // firmware demonstrably stalls in the LOADING-forever
@@ -467,8 +454,7 @@ impl ChromecastSession {
             part_target_secs,
             ..Default::default()
         };
-        let sink =
-            HlsFrameSink::start("0.0.0.0:0", frame_rx, parameter_sets, hls_config).await?;
+        let sink = HlsFrameSink::start("0.0.0.0:0", frame_rx, parameter_sets, hls_config).await?;
         let local_addr = sink.local_addr();
         let media_url = format!("http://{}:{}/index.m3u8", local_ip, local_addr.port());
         info!(
@@ -654,10 +640,12 @@ async fn read_loop<R>(
                                 // Poke them to re-emit the full
                                 // record. Fire-and-forget; the
                                 // response comes back here.
-                                let req_id = msg.payload_utf8
+                                let req_id = msg
+                                    .payload_utf8
                                     .as_deref()
                                     .and_then(|p| {
-                                        serde_json::from_str::<crate::castv2::GenericPayload>(p).ok()
+                                        serde_json::from_str::<crate::castv2::GenericPayload>(p)
+                                            .ok()
                                     })
                                     .and_then(|g| g.request_id)
                                     .map(|x| x.wrapping_add(1))
@@ -795,10 +783,9 @@ async fn read_loop<R>(
                         // BUFFERING entry / IDLE entry get warn,
                         // other entries get info, no-change repeats
                         // get debug.
-                        let level_warn = matches!(
-                            new_state.as_deref(),
-                            Some("BUFFERING") | Some("IDLE")
-                        ) && state_changed;
+                        let level_warn =
+                            matches!(new_state.as_deref(), Some("BUFFERING") | Some("IDLE"))
+                                && state_changed;
 
                         macro_rules! emit {
                             ($macro:ident, $msg:literal) => {
@@ -821,8 +808,13 @@ async fn read_loop<R>(
 
                         if level_warn {
                             match new_state.as_deref() {
-                                Some("BUFFERING") => emit!(warn, "MEDIA_STATUS: chromecast entered BUFFERING"),
-                                Some("IDLE") => emit!(warn, "MEDIA_STATUS: chromecast entered IDLE (receiver may have stopped)"),
+                                Some("BUFFERING") => {
+                                    emit!(warn, "MEDIA_STATUS: chromecast entered BUFFERING")
+                                }
+                                Some("IDLE") => emit!(
+                                    warn,
+                                    "MEDIA_STATUS: chromecast entered IDLE (receiver may have stopped)"
+                                ),
                                 _ => {}
                             }
                         } else if state_changed {
@@ -923,7 +915,6 @@ async fn heartbeat_loop(writer: SharedWriter, alive: Arc<AtomicBool>) {
         }
     }
 }
-
 
 /// Loopback HTTP/1.0 GET against our own HLS endpoint. Returns the
 /// first ~512 bytes of the response body so the caller can sanity-

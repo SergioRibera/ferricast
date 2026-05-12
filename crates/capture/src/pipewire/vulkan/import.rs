@@ -70,7 +70,9 @@ pub(super) fn run_sync(
         .ok_or_else(|| FerricastError::Capture("vulkan: format has no bpp".into()))?;
     let staging_size = (width as u64) * (height as u64) * (bpp as u64);
     if staging_size == 0 {
-        return Err(FerricastError::Capture("vulkan: staging size is zero".into()));
+        return Err(FerricastError::Capture(
+            "vulkan: staging size is zero".into(),
+        ));
     }
 
     // Flush any pipelined submissions so we don't return their bytes
@@ -92,7 +94,12 @@ pub(super) fn run_sync(
     let slot_idx = state.next_slot_idx;
     state.next_slot_idx = (slot_idx + 1) % state.slots.len();
 
-    ensure_staging(inner, &mut state.slots[slot_idx], inner_memory_props(inner), staging_size)?;
+    ensure_staging(
+        inner,
+        &mut state.slots[slot_idx],
+        inner_memory_props(inner),
+        staging_size,
+    )?;
     let slot = &state.slots[slot_idx];
     let staging = slot.staging.as_ref().expect("ensure_staging populated it");
 
@@ -128,7 +135,9 @@ pub(super) fn run_pipelined(
         .ok_or_else(|| FerricastError::Capture("vulkan: format has no bpp".into()))?;
     let byte_size = (width as u64) * (height as u64) * (bpp as u64);
     if byte_size == 0 {
-        return Err(FerricastError::Capture("vulkan: staging size is zero".into()));
+        return Err(FerricastError::Capture(
+            "vulkan: staging size is zero".into(),
+        ));
     }
 
     // 1. Cache lookup / import for the new fd.
@@ -167,7 +176,12 @@ pub(super) fn run_pipelined(
     };
 
     // 3. Ensure the chosen slot has a big enough staging buffer.
-    ensure_staging(inner, &mut state.slots[slot_idx], inner_memory_props(inner), byte_size)?;
+    ensure_staging(
+        inner,
+        &mut state.slots[slot_idx],
+        inner_memory_props(inner),
+        byte_size,
+    )?;
     let slot = &state.slots[slot_idx];
     let staging = slot.staging.as_ref().expect("ensure_staging populated it");
 
@@ -341,9 +355,8 @@ fn ensure_image(
     height: u32,
     vk_format: vk::Format,
 ) -> Result<vk::Image> {
-    let key = buffer_id(fd).map_err(|e| {
-        FerricastError::Capture(format!("fstat(dmabuf fd) for cache key: {e}"))
-    })?;
+    let key = buffer_id(fd)
+        .map_err(|e| FerricastError::Capture(format!("fstat(dmabuf fd) for cache key: {e}")))?;
 
     if let Some(existing) = state.imports.get(&key) {
         if existing.width == width
@@ -445,7 +458,11 @@ unsafe fn import_image(
     let image_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(vk_format)
-        .extent(vk::Extent3D { width, height, depth: 1 })
+        .extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
         .mip_levels(1)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
@@ -582,9 +599,7 @@ fn ensure_staging(
         reqs.memory_type_bits,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )
-    .ok_or_else(|| {
-        FerricastError::Capture("vk: no host-visible memory type for staging".into())
-    })?;
+    .ok_or_else(|| FerricastError::Capture("vk: no host-visible memory type for staging".into()))?;
 
     let alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(reqs.size)
@@ -690,7 +705,11 @@ fn record_and_submit(
                     .layer_count(1),
             )
             .image_offset(vk::Offset3D::default())
-            .image_extent(vk::Extent3D { width, height, depth: 1 });
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            });
         device.cmd_copy_image_to_buffer(
             cmd,
             image,
@@ -809,7 +828,11 @@ mod tests {
     fn dupd_fds_share_buffer_id() {
         let a = make_memfd("ferricast-buffer-id-a");
         let a_dup = unsafe { libc::dup(a) };
-        assert!(a_dup >= 0, "dup failed: {}", std::io::Error::last_os_error());
+        assert!(
+            a_dup >= 0,
+            "dup failed: {}",
+            std::io::Error::last_os_error()
+        );
         assert_ne!(a, a_dup, "dup should return a new fd number");
 
         let id_a = buffer_id(a).expect("fstat a");

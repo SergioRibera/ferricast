@@ -34,7 +34,11 @@ pub type SharedWriter = Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>;
 pub async fn connect(
     addr: std::net::IpAddr,
     port: u16,
-) -> Result<(ReadHalf<TlsStream<TcpStream>>, SharedWriter, std::net::IpAddr)> {
+) -> Result<(
+    ReadHalf<TlsStream<TcpStream>>,
+    SharedWriter,
+    std::net::IpAddr,
+)> {
     // TCP connect with a 10 s ceiling. Healthy LAN connect is sub-
     // millisecond; 10 s gives us margin for slow Wi-Fi while still
     // surfacing a wedged target as an error rather than hanging

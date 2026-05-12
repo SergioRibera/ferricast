@@ -37,15 +37,13 @@ pub fn local_addr_for(target: IpAddr) -> Result<IpAddr> {
         IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
         IpAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
     };
-    let s = UdpSocket::bind(bind).map_err(|e| {
-        FerricastError::Other(format!("local_addr_for: bind probe socket: {e}"))
-    })?;
+    let s = UdpSocket::bind(bind)
+        .map_err(|e| FerricastError::Other(format!("local_addr_for: bind probe socket: {e}")))?;
     // Port doesn't matter — `connect` on UDP is purely a routing
     // hint, no SYN goes out. Use 1 (root-only on most systems but
     // we never actually send so we don't need to bind it).
-    s.connect(SocketAddr::new(target, 1)).map_err(|e| {
-        FerricastError::Other(format!("local_addr_for: connect probe socket: {e}"))
-    })?;
+    s.connect(SocketAddr::new(target, 1))
+        .map_err(|e| FerricastError::Other(format!("local_addr_for: connect probe socket: {e}")))?;
     s.local_addr()
         .map(|a| a.ip())
         .map_err(|e| FerricastError::Other(format!("local_addr_for: local_addr: {e}")))

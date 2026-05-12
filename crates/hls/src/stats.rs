@@ -84,13 +84,11 @@ impl SessionStats {
         let prev_get_at = g.last_segment_get_at.replace(completed_at);
         let prev_seq = g.last_fetched_seq.replace(seq);
         g.segment_get_count = g.segment_get_count.saturating_add(1);
-        let probe_avg = if !g.probe_done
-            && g.probe_samples_mbps.len() < Self::PROBE_SAMPLES
-        {
+        let probe_avg = if !g.probe_done && g.probe_samples_mbps.len() < Self::PROBE_SAMPLES {
             g.probe_samples_mbps.push(mbps);
             if g.probe_samples_mbps.len() == Self::PROBE_SAMPLES {
-                let avg = g.probe_samples_mbps.iter().sum::<f64>()
-                    / g.probe_samples_mbps.len() as f64;
+                let avg =
+                    g.probe_samples_mbps.iter().sum::<f64>() / g.probe_samples_mbps.len() as f64;
                 g.probe_done = true;
                 Some(avg)
             } else {

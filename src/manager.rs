@@ -4,12 +4,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use ferricast_core::{
-    CaptureConfig, CaptureSource, CastSession, CapturedFrame, Device, Discovery, DiscoveryEvent,
+    CaptureConfig, CaptureSource, CapturedFrame, CastSession, Device, Discovery, DiscoveryEvent,
     EncodedFrame, EncoderConfig, FerricastError, ProtocolHandler, Result, ScreenCapture,
     StreamConfig, VideoEncoder,
 };
@@ -299,39 +299,35 @@ impl StreamManager {
         // PipeWire tears its own stream down with "no more input
         // formats" — same root cause.
         tracing::info!(device_id = %device_id, "awaiting first frame from capture (30s ceiling)");
-        let first_frame = match tokio::time::timeout(
-            Duration::from_secs(30),
-            capture.next_frame(),
-        )
-        .await
-        {
-            Ok(Ok(f)) => {
-                tracing::info!(
-                    device_id = %device_id,
-                    "first frame received from capture"
-                );
-                f
-            }
-            Ok(Err(e)) => {
-                tracing::error!(
-                    device_id = %device_id,
-                    %e,
-                    "capture returned error before first frame"
-                );
-                return Err(e);
-            }
-            Err(_) => {
-                tracing::error!(
-                    device_id = %device_id,
-                    "capture.next_frame() did not return within 30s — \
-                     the capture worker isn't delivering buffers \
-                     (compositor idle, or worker stalled)"
-                );
-                return Err(FerricastError::Timeout(
-                    "capture.next_frame() exceeded 30s".into(),
-                ));
-            }
-        };
+        let first_frame =
+            match tokio::time::timeout(Duration::from_secs(30), capture.next_frame()).await {
+                Ok(Ok(f)) => {
+                    tracing::info!(
+                        device_id = %device_id,
+                        "first frame received from capture"
+                    );
+                    f
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(
+                        device_id = %device_id,
+                        %e,
+                        "capture returned error before first frame"
+                    );
+                    return Err(e);
+                }
+                Err(_) => {
+                    tracing::error!(
+                        device_id = %device_id,
+                        "capture.next_frame() did not return within 30s — \
+                         the capture worker isn't delivering buffers \
+                         (compositor idle, or worker stalled)"
+                    );
+                    return Err(FerricastError::Timeout(
+                        "capture.next_frame() exceeded 30s".into(),
+                    ));
+                }
+            };
         tracing::info!(device_id = %device_id, "Capture negotiated, connecting to device");
 
         let (width, height) = capture.get_screen_size();
@@ -406,7 +402,6 @@ impl StreamManager {
             ..Default::default()
         })?;
 
-
         // Adaptive bitrate state — shared between the receiver's HLS
         // server (records per-segment delivery pressure) and this
         // stream task (reads the recommended target on the hot path).
@@ -445,7 +440,6 @@ impl StreamManager {
         let device_clone = device.clone();
 
         let task = tokio::spawn(async move {
-
             let _ = event_tx
                 .send(ManagerEvent::StreamStarted {
                     device_id: did,
@@ -514,7 +508,6 @@ impl StreamManager {
             let mut active_session: Option<Box<dyn ErasedSession>> = Some(session);
             let mut fatal_error: Option<String> = None;
             let mut cancelled = false;
-   
 
             // Outer (supervisor) loop. Acquires a session, runs the
             // inner frame loop until that session dies or the user
@@ -568,7 +561,12 @@ impl StreamManager {
                             "reconnecting (attempt {}/{}, backing off {:?})",
                             consecutive_failures, MAX_CONSECUTIVE_FAILURES, backoff
                         );
-                        tracing::warn!(?did, attempt = consecutive_failures, ?backoff, "reconnect: retrying session");
+                        tracing::warn!(
+                            ?did,
+                            attempt = consecutive_failures,
+                            ?backoff,
+                            "reconnect: retrying session"
+                        );
                         let _ = event_tx
                             .send(ManagerEvent::StreamReconnecting {
                                 device_id: did,
@@ -600,7 +598,11 @@ impl StreamManager {
                             let _ = s.stop().await;
                             continue 'supervisor;
                         }
-                        tracing::info!(?did, attempt = consecutive_failures, "reconnect: session re-established");
+                        tracing::info!(
+                            ?did,
+                            attempt = consecutive_failures,
+                            "reconnect: session re-established"
+                        );
                         last_failure_at = Some(Instant::now());
                         s
                     }
@@ -759,7 +761,9 @@ impl StreamManager {
             match tokio::time::timeout(std::time::Duration::from_secs(5), stream.task).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::warn!(?e, "stream task panicked during shutdown"),
-                Err(_) => tracing::warn!(name = %stream.device.name, "stream task did not finish in 5s, abandoning"),
+                Err(_) => {
+                    tracing::warn!(name = %stream.device.name, "stream task did not finish in 5s, abandoning")
+                }
             }
             Ok(())
         } else {

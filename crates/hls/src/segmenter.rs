@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -55,8 +55,7 @@ where
         ));
     }
     let target = Duration::from_secs_f32(config.segment_target_secs);
-    let frame_period =
-        Duration::from_secs_f64(1.0 / (config.target_fps.max(1) as f64));
+    let frame_period = Duration::from_secs_f64(1.0 / (config.target_fps.max(1) as f64));
     let frame_period_us = frame_period.as_micros() as u64;
 
     // Adaptive PTS rate. Start at the configured frame period, then
@@ -208,8 +207,7 @@ where
         // than we produced, and the receiver hit BUFFERING every
         // segment.
         if frames_in_segment >= 30 {
-            let measured =
-                (elapsed.as_micros() as u64).saturating_div(frames_in_segment);
+            let measured = (elapsed.as_micros() as u64).saturating_div(frames_in_segment);
             let lo = frame_period_us / 2;
             let hi = frame_period_us.saturating_mul(3);
             let measured_clamped = measured.clamp(lo, hi);
@@ -354,8 +352,7 @@ pub async fn run_from_frames(
         ));
     }
     let target = Duration::from_secs_f32(config.segment_target_secs);
-    let frame_period_us =
-        (1_000_000_f64 / (config.target_fps.max(1) as f64)) as u64;
+    let frame_period_us = (1_000_000_f64 / (config.target_fps.max(1) as f64)) as u64;
     // LL-HLS: when `part_target_secs` is set, we publish partial
     // segments ("parts") into the ring as they're ready, instead of
     // waiting for the segment to close. This keeps clients fed at
@@ -452,8 +449,7 @@ pub async fn run_from_frames(
         let elapsed = started.elapsed();
 
         if frames_in_segment >= 30 {
-            let measured =
-                (elapsed.as_micros() as u64).saturating_div(frames_in_segment);
+            let measured = (elapsed.as_micros() as u64).saturating_div(frames_in_segment);
             let lo = frame_period_us / 2;
             let hi = frame_period_us.saturating_mul(3);
             let measured_clamped = measured.clamp(lo, hi);
@@ -479,11 +475,9 @@ pub async fn run_from_frames(
             if !final_drain.is_empty() {
                 let part_dur = part_start.elapsed().as_secs_f32();
                 local_parts.push(final_drain.clone());
-                ring.write().await.push_pending_part(
-                    part_dur,
-                    first_part_of_segment,
-                    final_drain,
-                );
+                ring.write()
+                    .await
+                    .push_pending_part(part_dur, first_part_of_segment, final_drain);
             }
             // Concatenate all parts to form the segment body the
             // `/segment-N.ts` endpoint will serve.
@@ -494,20 +488,18 @@ pub async fn run_from_frames(
             }
             let body = Bytes::from(full);
             let size = body.len();
-            let seq = ring.write().await.complete_pending_segment(
-                elapsed.as_secs_f32(),
-                false,
-                body,
-            );
+            let seq =
+                ring.write()
+                    .await
+                    .complete_pending_segment(elapsed.as_secs_f32(), false, body);
             (size, seq)
         } else {
             // Classic HLS — single drain → one push.
             let size = final_drain.len();
-            let seq = ring.write().await.push(
-                elapsed.as_secs_f32(),
-                false,
-                final_drain,
-            );
+            let seq = ring
+                .write()
+                .await
+                .push(elapsed.as_secs_f32(), false, final_drain);
             (size, seq)
         };
 

@@ -30,9 +30,7 @@ const REQUIRED_DEVICE_EXTS: &[&CStr] = &[
     ash::ext::external_memory_dma_buf::NAME,
     // Create a `VkImage` with an explicit DRM modifier layout.
     ash::ext::image_drm_format_modifier::NAME,
-
     ash::khr::image_format_list::NAME,
-
     // Required by `VK_EXT_external_memory_dma_buf` per the spec.
     ash::khr::external_memory::NAME,
     // Used to query memory & format properties with the `2`
@@ -49,9 +47,8 @@ const INSTANCE_EXTS: &[&CStr] = &[ash::khr::external_memory_capabilities::NAME];
 
 pub(super) fn build() -> Result<Inner> {
     let entry = unsafe {
-        ash::Entry::load().map_err(|e| {
-            FerricastError::Capture(format!("Vulkan loader missing: {e}"))
-        })?
+        ash::Entry::load()
+            .map_err(|e| FerricastError::Capture(format!("Vulkan loader missing: {e}")))?
     };
 
     let instance = create_instance(&entry)?;
@@ -82,10 +79,8 @@ pub(super) fn build() -> Result<Inner> {
     }
     .map_err(|e| FerricastError::Capture(format!("create_command_pool: {e}")))?;
 
-    let drm_modifier =
-        ash::ext::image_drm_format_modifier::Device::new(&instance, &device);
-    let external_memory_fd =
-        ash::khr::external_memory_fd::Device::new(&instance, &device);
+    let drm_modifier = ash::ext::image_drm_format_modifier::Device::new(&instance, &device);
+    let external_memory_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
 
     let memory_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
@@ -112,15 +107,13 @@ fn create_instance(entry: &ash::Entry) -> Result<ash::Instance> {
         .engine_version(0)
         .api_version(vk::API_VERSION_1_1);
 
-    let ext_ptrs: Vec<*const i8> =
-        INSTANCE_EXTS.iter().map(|c| c.as_ptr()).collect();
+    let ext_ptrs: Vec<*const i8> = INSTANCE_EXTS.iter().map(|c| c.as_ptr()).collect();
 
-
-        let layer_names = [std::ffi::CString::new("VK_LAYER_KHRONOS_validation").unwrap()];
-let layer_names_raw: Vec<*const i8> = layer_names
-    .iter()
-    .map(|raw_name| raw_name.as_ptr())
-    .collect();
+    let layer_names = [std::ffi::CString::new("VK_LAYER_KHRONOS_validation").unwrap()];
+    let layer_names_raw: Vec<*const i8> = layer_names
+        .iter()
+        .map(|raw_name| raw_name.as_ptr())
+        .collect();
 
     let create_info = vk::InstanceCreateInfo::default()
         .application_info(&app_info)
@@ -134,9 +127,7 @@ let layer_names_raw: Vec<*const i8> = layer_names
 /// Pick the first physical device that supports the dmabuf-import
 /// extensions and has a queue family with `TRANSFER` (or `GRAPHICS`,
 /// which implies transfer). Returns `(device, queue_family_index)`.
-fn pick_physical_device(
-    instance: &ash::Instance,
-) -> Result<(vk::PhysicalDevice, u32)> {
+fn pick_physical_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32)> {
     let devices = unsafe { instance.enumerate_physical_devices() }
         .map_err(|e| FerricastError::Capture(format!("enumerate_physical_devices: {e}")))?;
 
@@ -199,12 +190,8 @@ fn device_supports_required_extensions(
     true
 }
 
-fn pick_queue_family(
-    instance: &ash::Instance,
-    physical_device: vk::PhysicalDevice,
-) -> Option<u32> {
-    let families =
-        unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+fn pick_queue_family(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Option<u32> {
+    let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
 
     // Prefer a dedicated transfer queue, fall back to graphics
     // (which always supports transfer).
@@ -233,8 +220,7 @@ fn create_device(
         .queue_priorities(&priorities);
     let queue_infos = [queue_info];
 
-    let ext_ptrs: Vec<*const i8> =
-        REQUIRED_DEVICE_EXTS.iter().map(|c| c.as_ptr()).collect();
+    let ext_ptrs: Vec<*const i8> = REQUIRED_DEVICE_EXTS.iter().map(|c| c.as_ptr()).collect();
 
     let create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_infos)

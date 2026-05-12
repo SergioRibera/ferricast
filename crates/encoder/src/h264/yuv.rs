@@ -110,7 +110,16 @@ mod tests {
         let src = vec![0u8; (w * h * 4) as usize];
         let mut y = vec![0u8; (w * h) as usize];
         let mut uv = vec![0u8; (w * h / 2) as usize];
-        bgra_to_nv12(&src, (w * 4) as usize, w, h, &mut y, w as usize, &mut uv, w as usize);
+        bgra_to_nv12(
+            &src,
+            (w * 4) as usize,
+            w,
+            h,
+            &mut y,
+            w as usize,
+            &mut uv,
+            w as usize,
+        );
         assert!(y.iter().all(|&v| v == 16), "Y plane should be 16 (black)");
         assert!(uv.iter().all(|&v| v == 128), "UV should be 128 (neutral)");
     }
@@ -123,7 +132,16 @@ mod tests {
         let src = vec![0xFFu8; (w * h * 4) as usize];
         let mut y = vec![0u8; (w * h) as usize];
         let mut uv = vec![0u8; (w * h / 2) as usize];
-        bgra_to_nv12(&src, (w * 4) as usize, w, h, &mut y, w as usize, &mut uv, w as usize);
+        bgra_to_nv12(
+            &src,
+            (w * 4) as usize,
+            w,
+            h,
+            &mut y,
+            w as usize,
+            &mut uv,
+            w as usize,
+        );
         assert!(
             y.iter().all(|&v| (233..=237).contains(&v)),
             "Y plane should be ~235 (white): {:?}",

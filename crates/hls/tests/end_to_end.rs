@@ -57,11 +57,7 @@ fn segment_round_trip() {
     assert_eq!(bytes[0], 0x47);
     // Subsequent packets must also start with sync byte.
     for off in (0..bytes.len()).step_by(188) {
-        assert_eq!(
-            bytes[off],
-            0x47,
-            "packet at offset {off} missing sync byte"
-        );
+        assert_eq!(bytes[off], 0x47, "packet at offset {off} missing sync byte");
     }
 
     // Push into a ring and verify the playlist references it.

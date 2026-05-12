@@ -493,6 +493,9 @@ mod tests {
         let s = w.to_string().unwrap();
         let extinf = s.find("#EXTINF").unwrap();
         let pending = s.find("#EXT-X-PART:DURATION=0.500,URI=\"b.0.ts\"").unwrap();
-        assert!(pending > extinf, "pending parts must come after closed segments");
+        assert!(
+            pending > extinf,
+            "pending parts must come after closed segments"
+        );
     }
 }

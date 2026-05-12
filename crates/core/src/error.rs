@@ -31,7 +31,7 @@ pub enum FerricastError {
 
     #[error("M3u8 Error: {0}")]
     M3u8(String),
-    
+
     #[error("Unsupported codec: {codec:?} for protocol {protocol}")]
     UnsupportedCodec {
         codec: crate::Codec,

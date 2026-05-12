@@ -1,8 +1,17 @@
 use bytes::Bytes;
 use ferricast_core::{FerricastError, ScreenCapture};
-use xcb::{shm::Seg, x::{Format, Pixmap, Screen, ScreenBuf}};
-use std::{sync::{Arc, atomic::{AtomicBool, AtomicPtr, Ordering}}, time::Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicPtr, Ordering},
+    },
+    time::Instant,
+};
 use tracing::info;
+use xcb::{
+    shm::Seg,
+    x::{Format, Pixmap, Screen, ScreenBuf},
+};
 
 pub struct X11Capture {
     seg_id: i32,
@@ -28,7 +37,7 @@ impl X11Capture {
             conn: None,
             pixmap: None,
             is_running: AtomicBool::new(false),
-            size: (0,0),
+            size: (0, 0),
             fps: 0,
             buffer_ptr: AtomicPtr::new(core::ptr::null_mut()),
         }
@@ -37,80 +46,83 @@ impl X11Capture {
 
 impl ScreenCapture for X11Capture {
     async fn start(
-            &mut self,
-            source: ferricast_core::CaptureSource,
-            config: ferricast_core::CaptureConfig,
-        ) -> ferricast_core::Result<()> {
-             info!("Connecting to Xserver");
-             let (conn, screen_num) = xcb::Connection::connect(None).map_err(|_| FerricastError::Capture("Cannot connect to server".to_string()))?;
-             
-                
-             let screen = conn.get_setup().roots().nth(screen_num as usize).unwrap();
-            
-             let pixmap = conn.get_setup().pixmap_formats().iter().find(|f| f.depth() == f.bits_per_pixel()).unwrap();
+        &mut self,
+        source: ferricast_core::CaptureSource,
+        config: ferricast_core::CaptureConfig,
+    ) -> ferricast_core::Result<()> {
+        info!("Connecting to Xserver");
+        let (conn, screen_num) = xcb::Connection::connect(None)
+            .map_err(|_| FerricastError::Capture("Cannot connect to server".to_string()))?;
 
-             let pixmap = pixmap.to_owned();
-             
-             let screen = screen.to_owned();
-             
+        let screen = conn.get_setup().roots().nth(screen_num as usize).unwrap();
 
-             
-             let w = config.width.unwrap_or(screen.width_in_pixels() as u32) as usize;
-             let h = config.height.unwrap_or(screen.height_in_pixels() as u32) as usize;
+        let pixmap = conn
+            .get_setup()
+            .pixmap_formats()
+            .iter()
+            .find(|f| f.depth() == f.bits_per_pixel())
+            .unwrap();
 
+        let pixmap = pixmap.to_owned();
 
-             let root = screen.root();
+        let screen = screen.to_owned();
 
-             let segment = conn.generate_id();
+        let w = config.width.unwrap_or(screen.width_in_pixels() as u32) as usize;
+        let h = config.height.unwrap_or(screen.height_in_pixels() as u32) as usize;
 
-             info!("Creating shared memory");
-             let seg_id = unsafe { libc::shmget(libc::IPC_PRIVATE, w * h * 4, libc::IPC_CREAT | 0o600) };
+        let root = screen.root();
 
+        let segment = conn.generate_id();
 
+        info!("Creating shared memory");
+        let seg_id = unsafe { libc::shmget(libc::IPC_PRIVATE, w * h * 4, libc::IPC_CREAT | 0o600) };
 
-             if seg_id == -1 {
-                 // TODO: should try without it in case that is imposible to create one(?
-                return Err(FerricastError::Capture("Cannot create shared memory".to_string()));
-             }
+        if seg_id == -1 {
+            // TODO: should try without it in case that is imposible to create one(?
+            return Err(FerricastError::Capture(
+                "Cannot create shared memory".to_string(),
+            ));
+        }
 
-            let buffer = unsafe { libc::shmat(seg_id, core::ptr::null(), 0) } as *mut u8;
+        let buffer = unsafe { libc::shmat(seg_id, core::ptr::null(), 0) } as *mut u8;
 
-            if buffer as i32 == -1 {
-                 return Err(FerricastError::Capture("Cannot map shared memory".to_string()));
+        if buffer as i32 == -1 {
+            return Err(FerricastError::Capture(
+                "Cannot map shared memory".to_string(),
+            ));
+        }
 
-            }
+        conn.send_request(&xcb::shm::Attach {
+            shmseg: segment,
+            shmid: seg_id as u32,
+            read_only: false,
+        });
 
-       
+        conn.flush()
+            .map_err(|_| FerricastError::Capture("Cannot flush x11 server".to_string()))?;
 
-             conn.send_request(&xcb::shm::Attach {
-                shmseg: segment,
-                shmid: seg_id as u32,
-                read_only: false,
-             });
+        info!("Connected");
 
-             conn.flush().map_err(|_| FerricastError::Capture("Cannot flush x11 server".to_string()))?;
-
-             info!("Connected");
-
-                  self.buffer_ptr = AtomicPtr::new(buffer);
-            self.seg_id = seg_id;
-            self.segment = Some(segment);
-            self.conn = Some(Arc::new(conn));
-            self.screen = Some(screen);
-            self.is_running = AtomicBool::new(true);
-            self.size = (w, h);
-            self.fps = config.fps;
-            self.pixmap = Some(pixmap);
+        self.buffer_ptr = AtomicPtr::new(buffer);
+        self.seg_id = seg_id;
+        self.segment = Some(segment);
+        self.conn = Some(Arc::new(conn));
+        self.screen = Some(screen);
+        self.is_running = AtomicBool::new(true);
+        self.size = (w, h);
+        self.fps = config.fps;
+        self.pixmap = Some(pixmap);
         Ok(())
     }
     async fn stop(&mut self) -> ferricast_core::Result<()> {
         info!("Closing connection");
         if !self.is_running.load(Ordering::Acquire) {
-            return Err(FerricastError::Capture("Trying to close recorder without starting it".to_string()));
+            return Err(FerricastError::Capture(
+                "Trying to close recorder without starting it".to_string(),
+            ));
         }
-        
+
         let conn = self.conn.as_ref().unwrap();
-        
 
         unsafe {
             if libc::shmctl(self.seg_id, libc::IPC_RMID, core::ptr::null_mut()) == -1 {
@@ -122,8 +134,9 @@ impl ScreenCapture for X11Capture {
             shmseg: self.segment.unwrap(),
         });
 
-        conn.flush().map_err(|_| FerricastError::Capture("Cannot flush x11 server".to_string()))?;
-       
+        conn.flush()
+            .map_err(|_| FerricastError::Capture("Cannot flush x11 server".to_string()))?;
+
         self.is_running.store(false, Ordering::SeqCst);
 
         Ok(())
@@ -133,13 +146,17 @@ impl ScreenCapture for X11Capture {
     }
     async fn next_frame(&mut self) -> ferricast_core::Result<ferricast_core::CapturedFrame> {
         if !self.is_running.load(Ordering::Acquire) {
-            return Err(FerricastError::Capture("Trying to close recorder without starting it".to_string()));
+            return Err(FerricastError::Capture(
+                "Trying to close recorder without starting it".to_string(),
+            ));
         }
 
-
-        let buffer = unsafe { std::slice::from_raw_parts(self.buffer_ptr.load(Ordering::Relaxed), self.size.0 * self.size.1 * 4) };
-
-
+        let buffer = unsafe {
+            std::slice::from_raw_parts(
+                self.buffer_ptr.load(Ordering::Relaxed),
+                self.size.0 * self.size.1 * 4,
+            )
+        };
 
         let conn = self.conn.as_ref().unwrap();
         let screen = self.screen.as_ref().unwrap();
@@ -157,21 +174,20 @@ impl ScreenCapture for X11Capture {
             offset: 0,
         });
 
-        
+        let _reply = conn
+            .wait_for_reply(cookie)
+            .map_err(|_| FerricastError::Capture("Cannot get frame from xserver".to_string()));
 
-        let _reply = conn.wait_for_reply(cookie).map_err(|_| FerricastError::Capture("Cannot get frame from xserver".to_string()));
-
-        
-
-
-        Ok(ferricast_core::CapturedFrame::Cpu(ferricast_core::RawFrame {
-            width: self.size.0 as u32,
-            height: self.size.1 as u32,
-            stride: format.bits_per_pixel() as u32,
-            format: ferricast_core::PixelFormat::Bgra,
-            data: Bytes::from(buffer.to_vec()),
-            timestamp_us: Instant::now().elapsed().as_micros() as u64,
-        }))
+        Ok(ferricast_core::CapturedFrame::Cpu(
+            ferricast_core::RawFrame {
+                width: self.size.0 as u32,
+                height: self.size.1 as u32,
+                stride: format.bits_per_pixel() as u32,
+                format: ferricast_core::PixelFormat::Bgra,
+                data: Bytes::from(buffer.to_vec()),
+                timestamp_us: Instant::now().elapsed().as_micros() as u64,
+            },
+        ))
     }
     fn get_pixel_format(&self) -> ferricast_core::PixelFormat {
         ferricast_core::PixelFormat::Bgra

@@ -147,11 +147,7 @@ pub(super) fn nal_annexb(nal_ref_idc: u8, nal_unit_type: u8, ebsp: &[u8]) -> Vec
 
 /// Build an Annex B NAL unit from a freshly built RBSP — runs
 /// `finish_rbsp` + `emulation_prevent` + `nal_annexb` in sequence.
-pub(super) fn finalize_nal(
-    writer: BitWriter,
-    nal_ref_idc: u8,
-    nal_unit_type: u8,
-) -> Vec<u8> {
+pub(super) fn finalize_nal(writer: BitWriter, nal_ref_idc: u8, nal_unit_type: u8) -> Vec<u8> {
     let rbsp = writer.finish_rbsp();
     let ebsp = emulation_prevent(&rbsp);
     nal_annexb(nal_ref_idc, nal_unit_type, &ebsp)
@@ -202,7 +198,13 @@ mod tests {
         // -1 → ue(2) = "011"
         // 2 → ue(3) = "00100"
         // -2 → ue(4) = "00101"
-        for (v, expected) in [(0, "1"), (1, "010"), (-1, "011"), (2, "00100"), (-2, "00101")] {
+        for (v, expected) in [
+            (0, "1"),
+            (1, "010"),
+            (-1, "011"),
+            (2, "00100"),
+            (-2, "00101"),
+        ] {
             let mut w = BitWriter::new();
             w.write_se(v);
             let mut got = String::new();
@@ -236,10 +238,7 @@ mod tests {
             &[0x00, 0x00, 0x03, 0x01]
         );
         // 00 00 04 → 00 00 04 (above the 0x03 threshold)
-        assert_eq!(
-            emulation_prevent(&[0x00, 0x00, 0x04]),
-            &[0x00, 0x00, 0x04]
-        );
+        assert_eq!(emulation_prevent(&[0x00, 0x00, 0x04]), &[0x00, 0x00, 0x04]);
     }
 
     #[test]

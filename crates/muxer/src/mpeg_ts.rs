@@ -146,7 +146,7 @@ impl Muxer for MpegTs {
             // (shouldn't happen with zerolatency tune, but guard so we
             // don't emit a slice-less PES that the H.264 decoder
             // rejects with "missing picture in access unit").
-            tracing::warn!("Empty frame, skipping");  
+            tracing::warn!("Empty frame, skipping");
             return Ok(());
         }
         if !self.psi_emitted {
@@ -215,7 +215,10 @@ impl MpegTs {
     /// concatenated stream stays valid across the segment boundary.
     pub fn start_segment(&mut self) {
         self.psi_emitted = false;
-        debug_assert!(self.out.is_empty(), "drain() must be called between segments");
+        debug_assert!(
+            self.out.is_empty(),
+            "drain() must be called between segments"
+        );
     }
 
     fn emit_pat(&mut self) {

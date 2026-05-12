@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
@@ -56,9 +56,8 @@ impl Discovery for ChromecastDiscovery {
 
         info!("starting chromecast mDNS discovery");
 
-        let daemon = ServiceDaemon::new().map_err(|e| {
-            FerricastError::Discovery(format!("failed to create mDNS daemon: {e}"))
-        })?;
+        let daemon = ServiceDaemon::new()
+            .map_err(|e| FerricastError::Discovery(format!("failed to create mDNS daemon: {e}")))?;
 
         let receiver = daemon.browse(CHROMECAST_SERVICE_TYPE).map_err(|e| {
             FerricastError::Discovery(format!("failed to browse for chromecast services: {e}"))
@@ -91,10 +90,7 @@ impl Discovery for ChromecastDiscovery {
 
                 match event {
                     ServiceEvent::ServiceResolved(info) => {
-                        debug!(
-                            name = info.get_fullname(),
-                            "chromecast service resolved"
-                        );
+                        debug!(name = info.get_fullname(), "chromecast service resolved");
 
                         let properties = info.get_properties();
                         let txt: HashMap<String, String> = properties
@@ -124,7 +120,6 @@ impl Discovery for ChromecastDiscovery {
                         let capabilities =
                             capabilities_for_model(model.as_deref().unwrap_or(""), ca);
 
-                    
                         let addr: std::net::IpAddr = match info.get_addresses_v4().iter().next() {
                             Some(addr) => (*(*addr)).into(),
                             None => {
@@ -160,8 +155,7 @@ impl Discovery for ChromecastDiscovery {
                             "discovered chromecast device"
                         );
 
-                        if tx.send(DiscoveryEvent::DeviceFound(device)).await.is_err()
-                        {
+                        if tx.send(DiscoveryEvent::DeviceFound(device)).await.is_err() {
                             debug!("discovery event channel closed, stopping");
                             break;
                         }

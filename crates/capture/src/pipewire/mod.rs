@@ -18,8 +18,7 @@ mod vulkan;
 use std::sync::{Arc, RwLock};
 
 use ferricast_core::{
-    CaptureConfig, CaptureSource, CapturedFrame, FerricastError, PixelFormat, Result,
-    ScreenCapture,
+    CaptureConfig, CaptureSource, CapturedFrame, FerricastError, PixelFormat, Result, ScreenCapture,
 };
 use tracing::info;
 

@@ -97,7 +97,6 @@ pub struct CastMessage {
     pub payload_binary: Option<Vec<u8>>,
 }
 
-
 /// Protocol version enum (only CASTV2_1_0 is used in practice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
 #[repr(i32)]
@@ -390,7 +389,10 @@ pub struct MediaStatus {
 
     /// Bitmask of supported media commands. Logging this once per
     /// session is enough; the value doesn't change.
-    #[serde(rename = "supportedMediaCommands", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "supportedMediaCommands",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub supported_media_commands: Option<i64>,
 
     #[serde(rename = "playbackRate", skip_serializing_if = "Option::is_none")]
@@ -567,10 +569,7 @@ impl CastMessage {
     }
 
     pub fn parse_payload<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
-        let payload = self
-            .payload_utf8
-            .as_deref()
-            .unwrap_or("{}");
+        let payload = self.payload_utf8.as_deref().unwrap_or("{}");
         Ok(serde_json::from_str(payload)?)
     }
 
@@ -642,10 +641,7 @@ pub fn launch_message(request_id: i64, app_id: &str) -> Result<CastMessage> {
 }
 
 /// Build a STOP message for the receiver namespace.
-pub fn stop_app_message(
-    request_id: i64,
-    session_id: &str,
-) -> Result<CastMessage> {
+pub fn stop_app_message(request_id: i64, session_id: &str) -> Result<CastMessage> {
     CastMessage::new_json(
         DEFAULT_SENDER_ID,
         DEFAULT_RECEIVER_ID,
