@@ -272,6 +272,26 @@ impl ManagerService {
         // lookup hits the enumerator and we don't want capture-side
         // contention to back up behind a slow enumerator call.
         let cap_source = resolve_source(self.enumerator.as_ref(), &source).await?;
+
+        // Wayland honesty gap: the only capture path today is the
+        // xdg-desktop-portal flow (PipeWire via ashpd), and the
+        // portal owns source selection — it always pops its own
+        // picker dialog, regardless of what id the daemon resolved.
+        // Warn the caller once so the second dialog doesn't look
+        // like a bug. Direct wayland capture-by-id (wlr-screencopy
+        // / ext-image-copy-capture as a streaming source) is a
+        // follow-up.
+        let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let picker_id = matches!(source.kind.as_str(), "monitor" | "window");
+        if on_wayland && picker_id {
+            tracing::warn!(
+                kind = %source.kind,
+                "Wayland capture today goes through xdg-desktop-portal — \
+                 the portal will ignore the picker-issued id and show its own \
+                 selection dialog. Direct id capture is a follow-up."
+            );
+        }
+
         let m = self.manager.lock().await;
         let capture = NativeCapture::new();
         let encoder = H264Encoder::default();
