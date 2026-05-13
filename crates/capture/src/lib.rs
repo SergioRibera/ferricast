@@ -21,6 +21,27 @@ mod x11;
 mod x11_enum;
 #[cfg(feature = "wlroots")]
 mod wlroots_enum;
+#[cfg(feature = "wlroots")]
+mod wayland_thumb;
+
+/// Largest `(w, h)` that fits inside `(max_w, max_h)` while keeping
+/// the aspect ratio of `(src_w, src_h)`. Both dimensions are
+/// clamped to at least 1 so degenerate inputs don't produce a
+/// 0-sized image buffer downstream. Shared by every thumbnail
+/// backend so picker output stays size-consistent across protocols.
+#[cfg(any(feature = "x11", feature = "wlroots"))]
+pub(crate) fn fit_box(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 || max_w == 0 || max_h == 0 {
+        return (1, 1);
+    }
+    let scale = (max_w as f32 / src_w as f32).min(max_h as f32 / src_h as f32);
+    if scale >= 1.0 {
+        return (src_w, src_h);
+    }
+    let w = ((src_w as f32 * scale).round() as u32).max(1);
+    let h = ((src_h as f32 * scale).round() as u32).max(1);
+    (w, h)
+}
 
 #[cfg(any(feature = "pipewire", feature = "x11"))]
 pub use native::NativeCapture;

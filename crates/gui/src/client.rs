@@ -99,6 +99,38 @@ pub fn introspect() {
     print!("{}", ferricast_dbus::INTROSPECTION_XML);
 }
 
+pub async fn thumb(
+    kind: crate::cli::ThumbKind,
+    id: String,
+    max_w: u32,
+    max_h: u32,
+    output: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let p = proxy().await?;
+    let bytes = match kind {
+        crate::cli::ThumbKind::Monitor => p.get_monitor_thumbnail(&id, max_w, max_h).await,
+        crate::cli::ThumbKind::Window => p.get_window_thumbnail(&id, max_w, max_h).await,
+    }
+    .map_err(rewrap)?;
+    if bytes.is_empty() {
+        anyhow::bail!(
+            "daemon returned an empty thumbnail — likely missing protocol (e.g. \
+             ext-image-copy-capture for window thumbnails on this compositor)"
+        );
+    }
+    match output {
+        Some(path) => {
+            std::fs::write(&path, &bytes)?;
+            eprintln!("{} bytes → {}", bytes.len(), path.display());
+        }
+        None => {
+            std::io::stdout().write_all(&bytes)?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn monitors(watch: bool) -> anyhow::Result<()> {
     let p = proxy().await?;
     print_monitors(&p).await?;

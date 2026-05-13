@@ -83,8 +83,34 @@ pub enum Command {
         watch: bool,
     },
 
+    /// Capture a one-shot PNG preview of a monitor or window from
+    /// the daemon. Writes to `--output` (or stdout if omitted) so it
+    /// composes with `feh -`, `wl-copy`, etc.
+    Thumb {
+        /// What to capture.
+        #[arg(value_enum)]
+        kind: ThumbKind,
+        /// Id from `ferricast-gui monitors` / `windows`.
+        #[arg(value_name = "ID")]
+        id: String,
+        /// Maximum PNG width — aspect ratio is preserved.
+        #[arg(long, default_value_t = 640)]
+        max_width: u32,
+        #[arg(long, default_value_t = 360)]
+        max_height: u32,
+        /// Write the PNG to this path. Defaults to stdout (binary).
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+    },
+
     /// Print the D-Bus introspection XML for the daemon's
     /// `Manager1` interface — feed it into `gdbus-codegen`, `pydbus`,
     /// etc.
     Introspect,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum ThumbKind {
+    Monitor,
+    Window,
 }

@@ -76,6 +76,26 @@
     <!-- "monitors", "windows" or empty. -->
     <property name="EnumerationCapabilities" type="as" access="read"/>
 
+    <!--
+      Thumbnails. PNG bytes, downscaled to fit the requested box
+      while preserving aspect ratio. Empty `ay` means "backend can't
+      thumbnail *this* item" (render a placeholder); NotSupported
+      means "this backend has no thumbnail capability at all".
+    -->
+    <method name="GetMonitorThumbnail">
+      <arg name="id"         type="s"  direction="in"/>
+      <arg name="max_width"  type="u"  direction="in"/>
+      <arg name="max_height" type="u"  direction="in"/>
+      <arg name="png"        type="ay" direction="out"/>
+    </method>
+
+    <method name="GetWindowThumbnail">
+      <arg name="id"         type="s"  direction="in"/>
+      <arg name="max_width"  type="u"  direction="in"/>
+      <arg name="max_height" type="u"  direction="in"/>
+      <arg name="png"        type="ay" direction="out"/>
+    </method>
+
     <signal name="DeviceAdded">
       <arg name="device" type="(sssssa{sv})"/>
     </signal>

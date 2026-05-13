@@ -262,6 +262,40 @@ pub trait Manager {
     #[zbus(property)]
     fn enumeration_capabilities(&self) -> zbus::Result<Vec<String>>;
 
+    /// Capture a one-shot preview of the monitor `id`, downscaled
+    /// to fit in `max_width × max_height` (aspect-preserving), and
+    /// return it as PNG bytes ready to feed into an image widget.
+    ///
+    /// Returns:
+    /// - PNG bytes on success.
+    /// - Empty byte array `[]` when the backend doesn't have a
+    ///   capture path *for that specific item* — typical case is
+    ///   Wayland-on-niri asking for a window thumbnail before the
+    ///   compositor exposes `ext-image-copy-capture-v1`. Clients
+    ///   should render a placeholder.
+    /// - `org.freedesktop.DBus.Error.NotSupported` when no
+    ///   thumbnail capability is wired up at all (Stub backends).
+    /// - `org.freedesktop.DBus.Error.InvalidArgs` when `id` doesn't
+    ///   match anything in the latest `ListMonitors` snapshot.
+    fn get_monitor_thumbnail(
+        &self,
+        id: &str,
+        max_width: u32,
+        max_height: u32,
+    ) -> zbus::Result<Vec<u8>>;
+
+    /// Same as [`Manager::get_monitor_thumbnail`] but for a window.
+    /// On Wayland this needs `ext-image-copy-capture-v1`; without it
+    /// the daemon returns an empty array (NOT `NotSupported`) so the
+    /// picker can show a placeholder per-window instead of disabling
+    /// previews entirely.
+    fn get_window_thumbnail(
+        &self,
+        id: &str,
+        max_width: u32,
+        max_height: u32,
+    ) -> zbus::Result<Vec<u8>>;
+
     #[zbus(signal)]
     fn device_added(&self, device: DeviceDto) -> zbus::Result<()>;
 

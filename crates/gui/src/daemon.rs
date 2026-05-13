@@ -189,6 +189,15 @@ fn monitor_to_dto(m: ferricast::MonitorInfo) -> MonitorInfoDto {
     }
 }
 
+/// Hard upper bound on the thumbnail box the picker can ask for.
+/// 4096×4096 is well above what any reasonable picker UI renders
+/// and stops a misbehaving client from asking the daemon to
+/// allocate a 200 MB buffer.
+fn clamp_thumbnail_box(max_w: u32, max_h: u32) -> (u32, u32) {
+    const HARD_CAP: u32 = 4096;
+    (max_w.min(HARD_CAP).max(1), max_h.min(HARD_CAP).max(1))
+}
+
 fn window_to_dto(w: ferricast::WindowInfo) -> WindowInfoDto {
     let (has_geometry, x, y, width, height) = match w.geometry {
         Some(g) => (true, g.x, g.y, g.width, g.height),
@@ -324,6 +333,65 @@ impl ManagerService {
             .into_iter()
             .map(|c| c.as_str().to_string())
             .collect()
+    }
+
+    /// Capture a one-shot PNG preview of the monitor `id`. See the
+    /// proxy doc for the empty-vs-NotSupported convention.
+    async fn get_monitor_thumbnail(
+        &self,
+        id: String,
+        max_width: u32,
+        max_height: u32,
+    ) -> zbus::fdo::Result<Vec<u8>> {
+        // Belt + suspenders: cap the box. A picker that requests a
+        // 16k×16k thumbnail would force a few hundred MB allocation
+        // for nothing. 4k is plenty for any UI surface.
+        let (w, h) = clamp_thumbnail_box(max_width, max_height);
+        match self.enumerator.monitor_thumbnail(&id, w, h).await {
+            Ok(bytes) => Ok(bytes),
+            Err(ferricast::SourceError::Unsupported(_)) => Err(zbus::fdo::Error::NotSupported(
+                format!(
+                    "backend `{}` has no thumbnail capability",
+                    self.enumerator.backend_name()
+                ),
+            )),
+            Err(ferricast::SourceError::NotFound(_)) => Err(zbus::fdo::Error::InvalidArgs(
+                format!("no monitor with id {id:?}"),
+            )),
+            // Treat backend errors as "no preview available right
+            // now" — return an empty array so the picker shows a
+            // placeholder instead of failing the whole listing.
+            // The reason still goes into the daemon log for debug.
+            Err(e) => {
+                tracing::warn!(%e, id, "monitor thumbnail failed; returning empty");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    async fn get_window_thumbnail(
+        &self,
+        id: String,
+        max_width: u32,
+        max_height: u32,
+    ) -> zbus::fdo::Result<Vec<u8>> {
+        let (w, h) = clamp_thumbnail_box(max_width, max_height);
+        match self.enumerator.window_thumbnail(&id, w, h).await {
+            Ok(bytes) => Ok(bytes),
+            Err(ferricast::SourceError::Unsupported(_)) => Err(zbus::fdo::Error::NotSupported(
+                format!(
+                    "backend `{}` has no thumbnail capability",
+                    self.enumerator.backend_name()
+                ),
+            )),
+            Err(ferricast::SourceError::NotFound(_)) => Err(zbus::fdo::Error::InvalidArgs(
+                format!("no window with id {id:?}"),
+            )),
+            Err(e) => {
+                tracing::warn!(%e, id, "window thumbnail failed; returning empty");
+                Ok(Vec::new())
+            }
+        }
     }
 
     #[zbus(signal)]

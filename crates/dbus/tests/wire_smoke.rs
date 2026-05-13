@@ -70,6 +70,22 @@ impl Stub {
     async fn list_windows(&self) -> zbus::fdo::Result<Vec<WindowInfoDto>> {
         Ok(Vec::new())
     }
+    async fn get_monitor_thumbnail(
+        &self,
+        _id: String,
+        _max_w: u32,
+        _max_h: u32,
+    ) -> zbus::fdo::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+    async fn get_window_thumbnail(
+        &self,
+        _id: String,
+        _max_w: u32,
+        _max_h: u32,
+    ) -> zbus::fdo::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
 
     #[zbus(property)]
     async fn protocols(&self) -> Vec<String> {
@@ -171,6 +187,8 @@ async fn _client_shape() -> zbus::Result<()> {
     let _: Vec<MonitorInfoDto> = proxy.list_monitors().await?;
     let _: Vec<WindowInfoDto> = proxy.list_windows().await?;
     let _: Vec<String> = proxy.enumeration_capabilities().await?;
+    let _: Vec<u8> = proxy.get_monitor_thumbnail("HDMI-1", 320, 180).await?;
+    let _: Vec<u8> = proxy.get_window_thumbnail("12345", 320, 180).await?;
 
     let mut added = proxy.receive_device_added().await?;
     if let Some(sig) = added.next().await {

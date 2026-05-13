@@ -29,6 +29,12 @@ async-trait = { workspace = true }
 
 libc = "0.2.183"
 
+# Image encoding for thumbnails. `default-features = false` strips
+# every codec except PNG, which is the only one the daemon hands
+# back over D-Bus. Keeps capture's compile time + binary size in
+# check on builds that don't want jpeg/webp/avif support.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 # x11 backend — `randr` is used by the source enumerator for output
 # geometry; the existing capture path only needs `shm`.
 xcb = { version = "1.7.0", features = ["shm", "randr"], optional = true }

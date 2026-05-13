@@ -26,7 +26,7 @@ use ferricast_core::{
 };
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
-use xcb::{x, randr, Xid};
+use xcb::{x, randr, Xid, XidNew};
 
 /// Atom names we need to read window metadata. Cached per-connection
 /// because intern is cheap (one round-trip) but a list-of-200-windows
@@ -131,6 +131,30 @@ impl SourceEnumerator for X11SourceEnumerator {
 
     async fn list_windows(&self) -> Result<Vec<WindowInfo>, SourceError> {
         tokio::task::spawn_blocking(query_windows)
+            .await
+            .map_err(|e| SourceError::Backend(format!("join: {e}")))?
+    }
+
+    async fn monitor_thumbnail(
+        &self,
+        id: &str,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Vec<u8>, SourceError> {
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || monitor_png(&id, max_width, max_height))
+            .await
+            .map_err(|e| SourceError::Backend(format!("join: {e}")))?
+    }
+
+    async fn window_thumbnail(
+        &self,
+        id: &str,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Vec<u8>, SourceError> {
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || window_png(&id, max_width, max_height))
             .await
             .map_err(|e| SourceError::Backend(format!("join: {e}")))?
     }
@@ -407,4 +431,152 @@ fn event_loop(tx: broadcast::Sender<SourceChange>) -> Result<(), SourceError> {
         }
     }
 }
+
+// ── Thumbnails ────────────────────────────────────────────────────
+//
+// X11 makes this easy: `GetImage` on a drawable returns ZPixmap
+// data we can hand straight to `image::RgbaImage` after a BGRA→RGBA
+// swizzle. Both paths open a fresh connection because they run on
+// the tokio blocking pool (separate threads from the event loop),
+// and `xcb::Connection` is `Send` but not `Sync` — a per-call
+// connection is simpler than synchronising one.
+//
+// We cap fan-out the same way the rest of the crate does: any
+// failure becomes `SourceError::Backend(..)` with the X-level
+// reason. The caller (daemon) maps that to a D-Bus error.
+
+fn monitor_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceError> {
+    let (conn, screen_num) = xcb::Connection::connect(None)
+        .map_err(|e| SourceError::Backend(format!("connect: {e}")))?;
+    let setup = conn.get_setup();
+    let screen = setup
+        .roots()
+        .nth(screen_num as usize)
+        .ok_or_else(|| SourceError::Backend("no screen".into()))?;
+    let root = screen.root();
+
+    let cookie = conn.send_request(&randr::GetMonitors {
+        window: root,
+        get_active: true,
+    });
+    let reply = conn
+        .wait_for_reply(cookie)
+        .map_err(|e| SourceError::Backend(format!("GetMonitors: {e}")))?;
+
+    let mut rect = None;
+    for m in reply.monitors() {
+        let name_cookie = conn.send_request(&x::GetAtomName { atom: m.name() });
+        let Ok(name_reply) = conn.wait_for_reply(name_cookie) else {
+            continue;
+        };
+        let name = String::from_utf8_lossy(name_reply.name().to_utf8().as_bytes()).into_owned();
+        if name == id {
+            rect = Some((m.x(), m.y(), m.width(), m.height()));
+            break;
+        }
+    }
+    let (x, y, w, h) = rect.ok_or_else(|| SourceError::NotFound(id.to_owned()))?;
+
+    encode_drawable_png(&conn, x::Drawable::Window(root), x, y, w, h, max_w, max_h)
+}
+
+fn window_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceError> {
+    let xid: u32 = id
+        .parse()
+        .map_err(|_| SourceError::NotFound(id.to_owned()))?;
+    // `XidNew::new` is the documented constructor for owned ids
+    // that came from outside (e.g. picker round-trip through D-Bus
+    // and back). It's the same call `Connection::generate_id` uses
+    // internally; it's safe at the Rust level — passing a stale id
+    // just produces an X-level BadWindow we surface as NotFound.
+    let window: x::Window = <x::Window as XidNew>::new(xid);
+
+    let (conn, _) = xcb::Connection::connect(None)
+        .map_err(|e| SourceError::Backend(format!("connect: {e}")))?;
+
+    let geom_cookie = conn.send_request(&x::GetGeometry {
+        drawable: x::Drawable::Window(window),
+    });
+    let geom = conn
+        .wait_for_reply(geom_cookie)
+        .map_err(|_| SourceError::NotFound(id.to_owned()))?;
+
+    encode_drawable_png(
+        &conn,
+        x::Drawable::Window(window),
+        0,
+        0,
+        geom.width(),
+        geom.height(),
+        max_w,
+        max_h,
+    )
+}
+
+/// Read pixels out of `drawable` at `(x,y,w,h)` and return a PNG
+/// downscaled to `max_w × max_h` (aspect-preserving). Centralised
+/// so monitor + window paths stay short.
+fn encode_drawable_png(
+    conn: &xcb::Connection,
+    drawable: x::Drawable,
+    x: i16,
+    y: i16,
+    w: u16,
+    h: u16,
+    max_w: u32,
+    max_h: u32,
+) -> Result<Vec<u8>, SourceError> {
+    let cookie = conn.send_request(&x::GetImage {
+        format: x::ImageFormat::ZPixmap,
+        drawable,
+        x,
+        y,
+        width: w,
+        height: h,
+        plane_mask: !0,
+    });
+    let reply = conn
+        .wait_for_reply(cookie)
+        .map_err(|e| SourceError::Backend(format!("GetImage: {e}")))?;
+
+    let depth = reply.depth();
+    if !(depth == 24 || depth == 32) {
+        return Err(SourceError::Backend(format!(
+            "unsupported visual depth {depth} for thumbnail"
+        )));
+    }
+
+    // X11 ZPixmap at depth 24/32 on a little-endian server (every
+    // mainstream desktop today) is BGRA. Swizzle to RGBA so the
+    // PNG encoder + every consumer Just Works.
+    let mut rgba = reply.data().to_vec();
+    if rgba.len() != (w as usize) * (h as usize) * 4 {
+        return Err(SourceError::Backend(format!(
+            "unexpected GetImage byte length {} for {w}x{h}",
+            rgba.len()
+        )));
+    }
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2);
+        if depth == 24 {
+            // Force alpha = 0xFF — the X-side "X" byte is undefined.
+            px[3] = 0xFF;
+        }
+    }
+
+    let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+        .ok_or_else(|| SourceError::Backend("rgba from_raw failed".into()))?;
+    let (tw, th) = crate::fit_box(w as u32, h as u32, max_w, max_h);
+    let thumb = image::imageops::thumbnail(&img, tw, th);
+
+    let mut out = Vec::with_capacity(8 * 1024);
+    thumb
+        .write_to(
+            &mut std::io::Cursor::new(&mut out),
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| SourceError::Backend(format!("png encode: {e}")))?;
+    Ok(out)
+}
+
 

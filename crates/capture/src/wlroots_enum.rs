@@ -387,6 +387,30 @@ impl SourceEnumerator for WaylandSourceEnumerator {
         Ok(self.snapshot.lock().unwrap().windows.clone())
     }
 
+    async fn monitor_thumbnail(
+        &self,
+        id: &str,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Vec<u8>, SourceError> {
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || crate::wayland_thumb::monitor_png(&id, max_width, max_height))
+            .await
+            .map_err(|e| SourceError::Backend(format!("join: {e}")))?
+    }
+
+    async fn window_thumbnail(
+        &self,
+        id: &str,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Vec<u8>, SourceError> {
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || crate::wayland_thumb::window_png(&id, max_width, max_height))
+            .await
+            .map_err(|e| SourceError::Backend(format!("join: {e}")))?
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<SourceChange> {
         self.change_tx.subscribe()
     }

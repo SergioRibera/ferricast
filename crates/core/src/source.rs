@@ -133,6 +133,8 @@ impl EnumerationCapability {
 pub enum SourceError {
     #[error("backend does not support enumerating {0:?}")]
     Unsupported(EnumerationCapability),
+    #[error("no source with id {0:?}")]
+    NotFound(String),
     #[error("backend transport disconnected: {0}")]
     Disconnected(String),
     #[error("backend error: {0}")]
@@ -160,6 +162,35 @@ pub trait SourceEnumerator: Send + Sync {
 
     async fn list_monitors(&self) -> Result<Vec<MonitorInfo>, SourceError>;
     async fn list_windows(&self) -> Result<Vec<WindowInfo>, SourceError>;
+
+    /// Capture a one-shot RGBA frame of the monitor with id `id`,
+    /// downscaled to fit in `max_width × max_height`, and return it
+    /// as a PNG byte stream. Aspect ratio is preserved.
+    ///
+    /// Default impl returns [`SourceError::Unsupported`] so backends
+    /// can opt in piecewise (X11 first, wayland on per-protocol
+    /// availability).
+    async fn monitor_thumbnail(
+        &self,
+        _id: &str,
+        _max_width: u32,
+        _max_height: u32,
+    ) -> Result<Vec<u8>, SourceError> {
+        Err(SourceError::Unsupported(EnumerationCapability::Monitors))
+    }
+
+    /// Same as [`SourceEnumerator::monitor_thumbnail`] but for a
+    /// specific window. On Wayland this requires
+    /// `ext-image-copy-capture-v1`; on X11 we use the window
+    /// drawable directly which works for any visible window.
+    async fn window_thumbnail(
+        &self,
+        _id: &str,
+        _max_width: u32,
+        _max_height: u32,
+    ) -> Result<Vec<u8>, SourceError> {
+        Err(SourceError::Unsupported(EnumerationCapability::Windows))
+    }
 
     /// Coarse change stream. The returned receiver is independent
     /// per call — multiple consumers can subscribe; lagging

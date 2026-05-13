@@ -171,6 +171,13 @@ async fn run_client(cmd: Command) -> anyhow::Result<()> {
         Command::Stop { device } => client::stop(device).await,
         Command::Monitors { watch } => client::monitors(watch).await,
         Command::Windows { watch } => client::windows(watch).await,
+        Command::Thumb {
+            kind,
+            id,
+            max_width,
+            max_height,
+            output,
+        } => client::thumb(kind, id, max_width, max_height, output).await,
         Command::Introspect => {
             client::introspect();
             Ok(())
