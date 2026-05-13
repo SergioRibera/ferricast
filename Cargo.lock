@@ -1497,6 +1497,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ashpd",
+ "async-trait",
  "bytes",
  "ferricast-core",
  "libc",
@@ -1505,6 +1506,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
  "xcb",
 ]
 
@@ -1534,6 +1538,7 @@ dependencies = [
 name = "ferricast-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "thiserror 2.0.18",
  "tokio",

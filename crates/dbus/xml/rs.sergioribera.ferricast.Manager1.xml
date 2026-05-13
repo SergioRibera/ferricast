@@ -15,6 +15,15 @@
     DeviceDto       (s s s s s a{sv})  id, name, protocol, model, host, capabilities
     SourceDto       (s a{sv})          kind, args
     ActiveStreamDto (s s)              device_id, device_name
+    MonitorInfoDto  (s s s s i i u u d u b a{sv})
+                    id, name, make, model, x, y, width, height,
+                    scale, refresh_mhz, primary, extra
+                    (empty strings / refresh_mhz==0 mean "unknown")
+    WindowInfoDto   (s s s u b i i u u s a{sv})
+                    id, title, app_id, pid, has_geometry,
+                    x, y, width, height, on_monitor, extra
+                    (has_geometry=false → x/y/w/h are meaningless;
+                     empty strings / pid==0 mean "unknown")
 -->
 <node>
   <interface name="rs.sergioribera.ferricast.Manager1">
@@ -48,6 +57,25 @@
     <!-- Receiver protocols compiled into the running daemon. -->
     <property name="Protocols" type="as" access="read"/>
 
+    <!--
+      Source enumeration: lets in-process pickers / status widgets
+      render their own list of monitors and windows before handing a
+      chosen one to StartStream. On backends that cannot enumerate
+      (Wayland on GNOME/KDE without extensions), List* fails with
+      org.freedesktop.DBus.Error.NotSupported and EnumerationCapabilities
+      is empty — fall back to the OS portal picker in that case.
+    -->
+    <method name="ListMonitors">
+      <arg name="monitors" type="a(ssssiiuuduba{sv})" direction="out"/>
+    </method>
+
+    <method name="ListWindows">
+      <arg name="windows" type="a(sssubiiuusa{sv})" direction="out"/>
+    </method>
+
+    <!-- "monitors", "windows" or empty. -->
+    <property name="EnumerationCapabilities" type="as" access="read"/>
+
     <signal name="DeviceAdded">
       <arg name="device" type="(sssssa{sv})"/>
     </signal>
@@ -80,6 +108,10 @@
       <arg name="protocol" type="s"/>
       <arg name="message"  type="s"/>
     </signal>
+
+    <!-- Coarse change notifications; clients re-call List* on receipt. -->
+    <signal name="MonitorsChanged"/>
+    <signal name="WindowsChanged"/>
 
   </interface>
 </node>

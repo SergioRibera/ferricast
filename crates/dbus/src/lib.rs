@@ -105,6 +105,56 @@ pub struct ActiveStreamDto {
     pub device_name: String,
 }
 
+/// Monitor entry on the wire.
+///
+/// `Option<T>` fields are flattened with sentinel values so the
+/// signature stays a plain struct (`gdbus-codegen`-friendly) and we
+/// don't pay the cost of D-Bus `maybe` types:
+///
+/// - `make` / `model` / `on_monitor` empty string → unknown.
+/// - `refresh_mhz == 0` → unknown.
+///
+/// `extra` is an `a{sv}` tail so backends can publish backend-specific
+/// fields (e.g. transform, EDID hash, HDR support) without a wire
+/// break.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct MonitorInfoDto {
+    pub id: String,
+    pub name: String,
+    pub make: String,
+    pub model: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub scale: f64,
+    pub refresh_mhz: u32,
+    pub primary: bool,
+    pub extra: HashMap<String, OwnedValue>,
+}
+
+/// Window entry on the wire. Same flattening conventions as
+/// [`MonitorInfoDto`].
+///
+/// `has_geometry` exists because some backends (wlroots) only report
+/// window geometry once the window enters an output; we want to keep
+/// the window in the list even before that point. When `false`, the
+/// x/y/width/height fields are meaningless.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct WindowInfoDto {
+    pub id: String,
+    pub title: String,
+    pub app_id: String,
+    pub pid: u32,
+    pub has_geometry: bool,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub on_monitor: String,
+    pub extra: HashMap<String, OwnedValue>,
+}
+
 /// Strongly-typed proxy for the daemon's manager interface.
 ///
 /// ```no_run
@@ -142,6 +192,25 @@ pub trait Manager {
     #[zbus(property)]
     fn protocols(&self) -> zbus::Result<Vec<String>>;
 
+    /// Snapshot of every monitor the local session can stream. Fails
+    /// with `org.freedesktop.DBus.Error.NotSupported` when the daemon
+    /// is running on a backend that cannot enumerate monitors
+    /// (typically: Wayland on GNOME/KDE without extensions). Use
+    /// [`Manager::enumeration_capabilities`] to detect that up-front
+    /// and present the right UI.
+    fn list_monitors(&self) -> zbus::Result<Vec<MonitorInfoDto>>;
+
+    /// Snapshot of every streamable top-level window in the local
+    /// session. Same NotSupported semantics as `ListMonitors`.
+    fn list_windows(&self) -> zbus::Result<Vec<WindowInfoDto>>;
+
+    /// What the daemon's enumerator can publish. Each entry is one
+    /// of `"monitors"` / `"windows"`. An empty list means the daemon
+    /// is on a backend that supports neither — clients should fall
+    /// back to the OS portal picker for source selection.
+    #[zbus(property)]
+    fn enumeration_capabilities(&self) -> zbus::Result<Vec<String>>;
+
     #[zbus(signal)]
     fn device_added(&self, device: DeviceDto) -> zbus::Result<()>;
 
@@ -167,4 +236,17 @@ pub trait Manager {
 
     #[zbus(signal)]
     fn discovery_error(&self, protocol: String, message: String) -> zbus::Result<()>;
+
+    /// Fired when at least one monitor was added, removed, moved or
+    /// rescaled. Coarse on purpose: re-call [`Manager::list_monitors`]
+    /// to get a fresh snapshot. Same contract as the wlroots /
+    /// portal protocols this backend mirrors.
+    #[zbus(signal)]
+    fn monitors_changed(&self) -> zbus::Result<()>;
+
+    /// Fired when at least one window was added, removed, retitled
+    /// or moved between outputs. Re-call [`Manager::list_windows`]
+    /// to resync.
+    #[zbus(signal)]
+    fn windows_changed(&self) -> zbus::Result<()>;
 }

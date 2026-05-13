@@ -40,11 +40,21 @@ async fn main() -> anyhow::Result<()> {
         .build_with_events();
     let manager = Arc::new(Mutex::new(manager));
 
+    // Source enumerator: picks wlroots → x11 → stub at runtime. The
+    // daemon doesn't need to know which backend it is — the trait
+    // hides everything. Capability discovery happens over D-Bus.
+    let enumerator = ferricast::capture::auto_enumerator();
+    tracing::info!(
+        backend = enumerator.backend_name(),
+        capabilities = ?enumerator.capabilities(),
+        "source enumerator selected"
+    );
+
     // Fan-out: the daemon owns the original receiver and forwards a
     // clone of each event into `ui_rx` so the in-process window sees
     // the same stream the bus does, in the same order.
     let (ui_tx, ui_rx) = mpsc::channel::<ManagerEvent>(256);
-    let _conn = daemon::start(manager.clone(), manager_events, Some(ui_tx))
+    let _conn = daemon::start(manager.clone(), enumerator, manager_events, Some(ui_tx))
         .await
         .map_err(|e| anyhow::anyhow!("failed to publish D-Bus service: {e}"))?;
     tracing::info!(
@@ -204,6 +214,8 @@ async fn run_client(cmd: Command) -> anyhow::Result<()> {
         Command::List { watch } => client::list(watch).await,
         Command::Stream { device, source } => client::stream(device, source).await,
         Command::Stop { device } => client::stop(device).await,
+        Command::Monitors { watch } => client::monitors(watch).await,
+        Command::Windows { watch } => client::windows(watch).await,
         Command::Introspect => {
             client::introspect();
             Ok(())

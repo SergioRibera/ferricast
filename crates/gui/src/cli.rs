@@ -90,6 +90,23 @@ pub enum Command {
         device: String,
     },
 
+    /// List monitors visible to the daemon. Fails with a clear
+    /// message on backends that can't enumerate (GNOME/KDE Wayland);
+    /// pickers should fall back to the OS portal in that case.
+    Monitors {
+        /// Stream `MonitorsChanged` events instead of exiting.
+        #[arg(long)]
+        watch: bool,
+    },
+
+    /// List top-level windows visible to the daemon. Same caveats
+    /// as `monitors`.
+    Windows {
+        /// Stream `WindowsChanged` events instead of exiting.
+        #[arg(long)]
+        watch: bool,
+    },
+
     /// Print the D-Bus introspection XML for the daemon's
     /// `Manager1` interface — feed it into `gdbus-codegen`, `pydbus`,
     /// etc.

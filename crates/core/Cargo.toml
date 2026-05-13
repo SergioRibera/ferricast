@@ -10,3 +10,4 @@ tracing.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 uuid.workspace = true
+async-trait = { workspace = true }

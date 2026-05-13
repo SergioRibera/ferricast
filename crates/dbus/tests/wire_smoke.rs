@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ferricast_dbus::{
-    ActiveStreamDto, DeviceDto, ManagerProxy, SourceDto, BUS_NAME, INTERFACE, INTROSPECTION_XML,
-    OBJECT_PATH,
+    ActiveStreamDto, DeviceDto, ManagerProxy, MonitorInfoDto, SourceDto, WindowInfoDto, BUS_NAME,
+    INTERFACE, INTROSPECTION_XML, OBJECT_PATH,
 };
 use tokio::sync::Mutex;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
@@ -52,8 +52,19 @@ impl Stub {
         Ok(())
     }
 
+    async fn list_monitors(&self) -> zbus::fdo::Result<Vec<MonitorInfoDto>> {
+        Ok(Vec::new())
+    }
+    async fn list_windows(&self) -> zbus::fdo::Result<Vec<WindowInfoDto>> {
+        Ok(Vec::new())
+    }
+
     #[zbus(property)]
     async fn protocols(&self) -> Vec<String> {
+        Vec::new()
+    }
+    #[zbus(property)]
+    async fn enumeration_capabilities(&self) -> Vec<String> {
         Vec::new()
     }
 
@@ -88,6 +99,10 @@ impl Stub {
         protocol: String,
         message: String,
     ) -> zbus::Result<()>;
+    #[zbus(signal)]
+    async fn monitors_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+    #[zbus(signal)]
+    async fn windows_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
 /// Type-level confirmation: the patterns the daemon uses to wire up
@@ -123,6 +138,8 @@ async fn _daemon_shape() -> zbus::Result<()> {
     Stub::stream_reconnecting(emitter, "id".into(), 1, "why".into()).await?;
     Stub::stream_error(emitter, "id".into(), "msg".into()).await?;
     Stub::discovery_error(emitter, "proto".into(), "msg".into()).await?;
+    Stub::monitors_changed(emitter).await?;
+    Stub::windows_changed(emitter).await?;
     Ok(())
 }
 
@@ -139,6 +156,9 @@ async fn _client_shape() -> zbus::Result<()> {
     proxy.start_stream("x", SourceDto::screen()).await?;
     proxy.stop_stream("x").await?;
     let _: Vec<String> = proxy.protocols().await?;
+    let _: Vec<MonitorInfoDto> = proxy.list_monitors().await?;
+    let _: Vec<WindowInfoDto> = proxy.list_windows().await?;
+    let _: Vec<String> = proxy.enumeration_capabilities().await?;
 
     let mut added = proxy.receive_device_added().await?;
     if let Some(sig) = added.next().await {
@@ -150,5 +170,12 @@ async fn _client_shape() -> zbus::Result<()> {
         let args = sig.args()?;
         let _id: &str = args.device_id();
     }
+    // The argument-less change signals don't carry args, so we just
+    // confirm the receiver future compiles and yields the right
+    // signal message type.
+    let mut mc = proxy.receive_monitors_changed().await?;
+    let _ = mc.next().await;
+    let mut wc = proxy.receive_windows_changed().await?;
+    let _ = wc.next().await;
     Ok(())
 }

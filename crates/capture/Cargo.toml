@@ -9,9 +9,17 @@ description = "PipeWire and X11 screen capture for ferricast"
 # crate. Downstream callers that ship to a single environment (e.g.
 # a Wayland-only desktop appliance) can opt out via
 # `default-features = false` + the backend they want.
-default = ["pipewire", "x11"]
+default = ["pipewire", "x11", "wlroots"]
 pipewire = ["dep:ashpd", "dep:pipewire", "dep:libspa", "dep:ash"]
 x11 = ["dep:xcb"]
+# Source enumeration on wlroots-based Wayland compositors (Hyprland,
+# sway, river, Wayfire). Pure-Rust wayland client; no extra C deps
+# beyond `libwayland-client.so` which any Wayland install already
+# ships. Orthogonal to `pipewire`: that one is for *capture*, this
+# is for *picking the source to capture*. On non-wlroots compositors
+# (GNOME, KDE, Mutter) the enumerator binds nothing and reports no
+# capabilities at runtime.
+wlroots = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr"]
 
 [dependencies]
 ferricast-core.workspace = true
@@ -19,11 +27,18 @@ tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
+async-trait = { workspace = true }
 
 libc = "0.2.183"
 
-# x11 backend
-xcb = { version = "1.7.0", features = ["shm"], optional = true }
+# x11 backend — `randr` is used by the source enumerator for output
+# geometry; the existing capture path only needs `shm`.
+xcb = { version = "1.7.0", features = ["shm", "randr"], optional = true }
+
+# wlroots enumerator backend
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
+wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
 
 # pipewire backend
 ashpd = { version = "0.10", features = ["tokio"], optional = true }

@@ -98,3 +98,82 @@ pub async fn stop(device: String) -> anyhow::Result<()> {
 pub fn introspect() {
     print!("{}", ferricast_dbus::INTROSPECTION_XML);
 }
+
+pub async fn monitors(watch: bool) -> anyhow::Result<()> {
+    let p = proxy().await?;
+    print_monitors(&p).await?;
+    if !watch {
+        return Ok(());
+    }
+    let mut stream = p.receive_monitors_changed().await.map_err(rewrap)?;
+    eprintln!("# watching MonitorsChanged (Ctrl-C to stop)");
+    while stream.next().await.is_some() {
+        println!("---");
+        print_monitors(&p).await?;
+    }
+    Ok(())
+}
+
+async fn print_monitors(p: &ManagerProxy<'_>) -> anyhow::Result<()> {
+    let mons = p.list_monitors().await.map_err(rewrap)?;
+    for m in mons {
+        let make_model = match (m.make.as_str(), m.model.as_str()) {
+            ("", "") => "-".to_string(),
+            (mk, "") => mk.to_string(),
+            ("", md) => md.to_string(),
+            (mk, md) => format!("{mk} {md}"),
+        };
+        let refresh = if m.refresh_mhz > 0 {
+            format!("{:.3}Hz", m.refresh_mhz as f64 / 1000.0)
+        } else {
+            "-".into()
+        };
+        let primary = if m.primary { " *" } else { "" };
+        println!(
+            "{id}\t{name}\t{make_model}\t{w}x{h}+{x},{y}@{scale:.2}\t{refresh}{primary}",
+            id = m.id,
+            name = m.name,
+            w = m.width,
+            h = m.height,
+            x = m.x,
+            y = m.y,
+            scale = m.scale,
+        );
+    }
+    Ok(())
+}
+
+pub async fn windows(watch: bool) -> anyhow::Result<()> {
+    let p = proxy().await?;
+    print_windows(&p).await?;
+    if !watch {
+        return Ok(());
+    }
+    let mut stream = p.receive_windows_changed().await.map_err(rewrap)?;
+    eprintln!("# watching WindowsChanged (Ctrl-C to stop)");
+    while stream.next().await.is_some() {
+        println!("---");
+        print_windows(&p).await?;
+    }
+    Ok(())
+}
+
+async fn print_windows(p: &ManagerProxy<'_>) -> anyhow::Result<()> {
+    let ws = p.list_windows().await.map_err(rewrap)?;
+    for w in ws {
+        let app = if w.app_id.is_empty() { "-".into() } else { w.app_id };
+        let pid = if w.pid == 0 { "-".into() } else { w.pid.to_string() };
+        let geo = if w.has_geometry {
+            format!("{}x{}+{},{}", w.width, w.height, w.x, w.y)
+        } else {
+            "-".into()
+        };
+        let mon = if w.on_monitor.is_empty() { "-".into() } else { w.on_monitor };
+        println!(
+            "{id}\t{app}\t{pid}\t{geo}\t{mon}\t{title}",
+            id = w.id,
+            title = w.title,
+        );
+    }
+    Ok(())
+}
