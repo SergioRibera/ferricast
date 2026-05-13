@@ -222,25 +222,25 @@ impl VideoEncoder for NvencH264Encoder {
 
     fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
         // NVENC accepts BGRA/RGBA directly via `BufferFormat::Argb`/
-        // `::Abgr`. For `Gpu` frames we still need CPU bytes —
-        // `shiguredo_nvcodec`'s `encode()` does its own host→device
-        // copy via `cuMemcpyHtoD`.
+        // `::Abgr`, but only as host-side bytes today: shiguredo's
+        // `encode()` does its own `cuMemcpyHtoD` from the buffer
+        // we hand it.
         //
-        // TODO(zero-copy): replace this with the
-        // `cuImportExternalMemory(OPAQUE_FD)` →
+        // `CapturedFrame::Gpu` is still accepted — `into_cpu()`
+        // triggers the Vulkan readback via the importer, same as
+        // the x264 path. The only thing we lose vs. VA-API today is
+        // the in-driver colour-conversion + zero-copy ingest. The
+        // upstream `shiguredo_nvcodec` crate is the blocker:
+        // `register_input_resource` is `pub(crate)` so we can't
+        // call `NvEncRegisterResource` from outside the crate.
+        //
+        // Path to zero-copy NVENC: vendor / fork the crate, expose
+        // `register_external_dmabuf(fd, modifier, plane)` that
+        // chains `cuImportExternalMemory(OPAQUE_FD)` →
         // `cuExternalMemoryGetMappedBuffer` →
-        // `NvEncRegisterResource(CUDADEVICEPTR)` chain so the
-        // PipeWire dmabuf goes straight into NVENC. shiguredo
-        // doesn't expose the registration step (its
-        // `register_input_resource` is `pub(crate)`); when the
-        // perf gap matters we vendor the crate or fork it the
-        // same way we did with cros-libva, mirror its
-        // `CudaLibrary` with the two extra `cu*ExternalMemory*`
-        // function pointers, and add a `register_external_dmabuf`
-        // method on `Encoder`. ~200 lines once we commit. The
-        // current readback path costs ~5 ms / frame at 1080p
-        // (Vulkan blit + memcpy + libcuda host->device); a future
-        // commit eliminates it entirely.
+        // `NvEncRegisterResource(CUDADEVICEPTR)` and stores the
+        // registered handle; on encode use it instead of
+        // `cuMemcpyHtoD`. Estimated ~200 lines, tracked separately.
         let raw = frame.into_cpu()?;
 
         let expected = (self.cfg.width as usize)

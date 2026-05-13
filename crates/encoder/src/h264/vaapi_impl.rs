@@ -27,6 +27,7 @@
 //! `cros_libva::bindings::*` call documented in the libva headers.
 
 use std::cell::RefCell;
+use std::os::fd::RawFd;
 use std::os::raw::c_void;
 use std::path::Path;
 use std::rc::Rc;
@@ -34,10 +35,10 @@ use std::rc::Rc;
 use bytes::Bytes;
 use cros_libva::*;
 use ferricast_core::{
-    CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, PixelFormat, Result,
-    VideoEncoder,
+    CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, GpuFrame, PixelFormat,
+    Result, VideoEncoder,
 };
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use super::headers::{self, FrameCrop, PpsParams, SpsParams, VuiParams, profile};
 use super::yuv;
@@ -51,8 +52,23 @@ const RENDER_NODES: &[&str] = &[
 /// Standard NV12 V4L2 / DRM fourcc reused across libva.
 const VA_FOURCC_NV12: u32 = 0x3231564E; // 'N','V','1','2'
 
-/// `VA_RT_FORMAT_YUV420` per `va.h`.
+/// VA-API fourccs for the BGRA / RGBA input layouts we accept on
+/// the DMA-BUF import path. These name the **byte order in memory**
+/// (byte 0 = B for BGRA, etc.). Mapped to DRM fourccs via
+/// [`pixel_format_to_drm`].
+const VA_FOURCC_BGRA: u32 = 0x41524742; // 'B','G','R','A'
+const VA_FOURCC_RGBA: u32 = 0x41424752; // 'R','G','B','A'
+
+/// DRM fourccs are the inverse of VA's: the four letters describe
+/// the **integer** as little-endian, not the memory order. So
+/// memory B,G,R,A == integer ARGB == `DRM_FORMAT_ARGB8888`.
+const DRM_FORMAT_ARGB8888: u32 = 0x34325241; // 'A','R','2','4'
+const DRM_FORMAT_ABGR8888: u32 = 0x34324241; // 'A','B','2','4'
+
+/// `VA_RT_FORMAT_*` per `va.h`. `RGB32` is what the VPP input
+/// surface uses for BGRA / RGBA imports.
 const VA_RT_FORMAT_YUV420: u32 = 0x01;
+const VA_RT_FORMAT_RGB32: u32 = 0x04;
 
 /// Number of reconstruction surfaces. One for the current frame +
 /// one for the previous reference (used by P frames). Two is the
@@ -71,6 +87,15 @@ pub struct VaapiH264Encoder {
     #[allow(dead_code)]
     config: Config,
     context: Rc<Context>,
+
+    /// VPP (`VAEntrypointVideoProc`) plumbing. Used by the GPU
+    /// path to convert imported BGRA/RGBA DMA-BUF surfaces into
+    /// `self.input` (NV12) inside the driver, without any CPU
+    /// readback. `None` means the driver doesn't expose VPP — we
+    /// fall back to the CPU path even for GPU frames in that case
+    /// (which still beats x264 because the encode itself is HW).
+    vpp_config: Option<Config>,
+    vpp_context: Option<Rc<Context>>,
 
     /// One NV12 surface that we re-upload every frame as the
     /// encoder's input.
@@ -297,10 +322,26 @@ impl VaapiH264Encoder {
             transform_8x8_mode_flag: false,
         });
 
+        // VPP config/context. We try to bring it up but treat any
+        // failure as soft: without VPP we lose zero-copy DMA-BUF
+        // input but the rest of the encoder still works (CPU path).
+        let (vpp_config, vpp_context) = match build_vpp(&display, &cfg) {
+            Ok((c, ctx)) => {
+                info!("VA-API VPP up; DMA-BUF input will be zero-copy");
+                (Some(c), Some(ctx))
+            }
+            Err(e) => {
+                warn!(error = %e, "VA-API VPP unavailable; DMA-BUF frames will fall back to CPU path");
+                (None, None)
+            }
+        };
+
         Ok(Self {
             display,
             config: cfg_handle,
             context,
+            vpp_config,
+            vpp_context,
             input,
             recon,
             cfg,
@@ -309,6 +350,29 @@ impl VaapiH264Encoder {
             state: RefCell::new(FrameState::default()),
         })
     }
+}
+
+fn build_vpp(display: &Rc<Display>, cfg: &EncoderCfg) -> Result<(Config, Rc<Context>)> {
+    let config = display
+        .create_config(
+            vec![],
+            VAProfile::VAProfileNone,
+            VAEntrypoint::VAEntrypointVideoProc,
+        )
+        .map_err(|e| FerricastError::Encoder(format!("vaCreateConfig(VPP): {e}")))?;
+    // VPP contexts don't have a render-target list (the dest
+    // surface is passed per-Picture). We pass an empty slice as
+    // `render_targets`, which `Some(&[])` expresses.
+    let context = display
+        .create_context::<()>(
+            &config,
+            cfg.width as u32,
+            cfg.padded_height(),
+            Some(&[]),
+            /* progressive = */ true,
+        )
+        .map_err(|e| FerricastError::Encoder(format!("vaCreateContext(VPP): {e}")))?;
+    Ok((config, context))
 }
 
 fn open_render_node() -> Option<Rc<Display>> {
@@ -410,19 +474,32 @@ impl VideoEncoder for VaapiH264Encoder {
     }
 
     fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
-        // VA-API consumes NV12. The shortest path that always works
-        // is "frame -> CPU bytes -> BGRA→NV12 -> upload". A future
-        // optimisation imports the dmabuf as a BGRA surface and runs
-        // a VPP step in-driver; that's a follow-up.
-        let raw = frame.into_cpu()?;
-        if raw.format != PixelFormat::Bgra {
-            return Err(FerricastError::Encoder(format!(
-                "VA-API: unexpected runtime pixel format {:?}",
-                raw.format
-            )));
+        // Two paths into the encoder's `input` NV12 surface:
+        //
+        // 1. `CapturedFrame::Gpu(g)` + VPP available → import `g`'s
+        //    DMA-BUF as a BGRA/RGBA surface and run `vaProcPipeline`
+        //    to convert it into NV12 directly inside the driver. No
+        //    CPU bytes ever touched.
+        // 2. Otherwise → readback to CPU, run the existing
+        //    BGRA→NV12 conversion + `vaPutImage` upload. Pre-Gpu
+        //    behavior, kept for x264-style callers and as a
+        //    fallback when the driver doesn't expose VPP.
+        let timestamp_us = frame.timestamp_us();
+        match frame {
+            CapturedFrame::Gpu(g) if self.vpp_context.is_some() => {
+                self.upload_dmabuf_via_vpp(&g)?;
+            }
+            other => {
+                let raw = other.into_cpu()?;
+                if !matches!(raw.format, PixelFormat::Bgra | PixelFormat::Rgba) {
+                    return Err(FerricastError::Encoder(format!(
+                        "VA-API: unexpected runtime pixel format {:?}",
+                        raw.format
+                    )));
+                }
+                upload_bgra_to_nv12(&self.input, &self.cfg, &raw.data, raw.stride as usize)?;
+            }
         }
-
-        upload_bgra_to_nv12(&self.input, &self.cfg, &raw.data, raw.stride as usize)?;
 
         let (encoded_bytes, is_keyframe, frame_idx, poc) = {
             let mut state = self.state.borrow_mut();
@@ -432,7 +509,7 @@ impl VideoEncoder for VaapiH264Encoder {
         Ok(EncodedFrame {
             codec: Codec::H264,
             data: Bytes::from(encoded_bytes),
-            timestamp_us: raw.timestamp_us,
+            timestamp_us,
             duration_us: Some(1_000_000 / self.cfg.fps as u64),
             is_keyframe,
             pts_dts: (poc as u64, frame_idx as u64),
@@ -1025,6 +1102,161 @@ fn check_status(status: VAStatus) -> std::result::Result<(), VAStatus> {
         Ok(())
     } else {
         Err(status)
+    }
+}
+
+// ── DMA-BUF input path ────────────────────────────────────────────
+//
+// Zero-copy ingest: import the producer's DMA-BUF as a BGRA/RGBA
+// surface, then run a VPP `vaProcPipeline` step in-driver to copy +
+// colour-convert into `self.input` (NV12). The encoder then proceeds
+// exactly like the CPU path — `self.input` is the same surface
+// either way, just populated differently.
+//
+// The imported surface is **per-frame** because the fd may change
+// every frame (PipeWire rotates buffers in a pool, WaylandDirect
+// allocates fresh per frame). Caching by fd would let us skip
+// re-import when the producer reuses fds; left as a follow-up
+// because the import is cheap (a few `vaCreateSurfaces` calls).
+
+/// Descriptor passed to `Display::create_surfaces` to import a single-
+/// plane DMA-BUF. Only single-plane formats are supported because
+/// every capture path emits BGRA/RGBA (multi-plane formats like
+/// NV12-from-source would need `num_planes = 2`).
+struct DmaBufImport {
+    fd: RawFd,
+    width: u32,
+    height: u32,
+    va_fourcc: u32,
+    drm_fourcc: u32,
+    modifier: u64,
+    offset: u32,
+    stride: u32,
+    size: u32,
+}
+
+impl ExternalBufferDescriptor for DmaBufImport {
+    const MEMORY_TYPE: MemoryType = MemoryType::DrmPrime2;
+    type DescriptorAttribute = bindings::VADRMPRIMESurfaceDescriptor;
+
+    fn va_surface_attribute(&mut self) -> Self::DescriptorAttribute {
+        // `VADRMPRIMESurfaceDescriptor` is a C struct: zeroing then
+        // filling the fields we care about leaves the unused slots
+        // (`objects[1..4]`, `layers[1..4]`) at zero, which the
+        // driver ignores per `num_objects = 1` / `num_layers = 1`.
+        let mut d: bindings::VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
+        d.fourcc = self.va_fourcc;
+        d.width = self.width;
+        d.height = self.height;
+        d.num_objects = 1;
+        d.objects[0].fd = self.fd;
+        d.objects[0].size = self.size;
+        d.objects[0].drm_format_modifier = self.modifier;
+        d.num_layers = 1;
+        d.layers[0].drm_format = self.drm_fourcc;
+        d.layers[0].num_planes = 1;
+        d.layers[0].object_index[0] = 0;
+        d.layers[0].offset[0] = self.offset;
+        d.layers[0].pitch[0] = self.stride;
+        d
+    }
+}
+
+impl VaapiH264Encoder {
+    fn upload_dmabuf_via_vpp(&self, g: &GpuFrame) -> Result<()> {
+        let vpp = self.vpp_context.as_ref().ok_or_else(|| {
+            FerricastError::Encoder("VA-API: VPP not initialised".into())
+        })?;
+
+        let (va_fourcc, drm_fourcc) = match g.format {
+            PixelFormat::Bgra => (VA_FOURCC_BGRA, DRM_FORMAT_ARGB8888),
+            PixelFormat::Rgba => (VA_FOURCC_RGBA, DRM_FORMAT_ABGR8888),
+            other => {
+                return Err(FerricastError::Encoder(format!(
+                    "VA-API VPP: unsupported source pixel format {other:?}"
+                )));
+            }
+        };
+
+        let import = DmaBufImport {
+            fd: g.plane.fd,
+            width: g.width,
+            height: g.height,
+            va_fourcc,
+            drm_fourcc,
+            modifier: g.plane.modifier,
+            offset: g.plane.offset,
+            stride: g.plane.stride,
+            size: g.plane.size,
+        };
+
+        let mut surfaces = self
+            .display
+            .create_surfaces(
+                VA_RT_FORMAT_RGB32,
+                Some(va_fourcc),
+                g.width,
+                g.height,
+                None, // No usage hint — VPP source.
+                vec![import],
+            )
+            .map_err(|e| {
+                FerricastError::Encoder(format!("VA-API: create_surfaces(import DMA-BUF): {e}"))
+            })?;
+        let imported = surfaces.pop().expect("we asked for 1");
+
+        // VAProcPipelineParameterBuffer points at `imported` as the
+        // source; the destination is implicit (the picture target,
+        // = self.input). We pass color standard `None` and let the
+        // driver pick BT.709 — captures from any modern Wayland
+        // compositor are already in sRGB / BT.709.
+        let pipe = ProcPipelineParameterBuffer::new(
+            imported.id(),
+            None, // surface_region = full
+            0_u8, // VAProcColorStandardNone — driver picks BT.601/709.
+            None, // output_region = full
+            0,    // output_background_color
+            0_u8, // VAProcColorStandardNone — driver picks BT.601/709.
+            0, // pipeline_flags
+            0, // filter_flags
+            None,
+            None,
+            None,
+            0, // rotation_state
+            None,
+            0, // mirror_state
+            None,
+            0, // input_surface_flag
+            0, // output_surface_flag
+            ProcColorProperties::default(),
+            ProcColorProperties::default(),
+            0,
+            None,
+        );
+
+        let buffer = vpp
+            .create_buffer(BufferType::ProcPipelineParameter(pipe))
+            .map_err(|e| FerricastError::Encoder(format!("VA-API: vaCreateBuffer(VPP): {e}")))?;
+
+        // Picture lifecycle: New → add buffer → Begin → Render →
+        // End → Sync. After sync, self.input has NV12 data.
+        let mut pic = Picture::new(g.timestamp_us, Rc::clone(vpp), &self.input);
+        pic.add_buffer(buffer);
+        let pic = pic
+            .begin::<()>()
+            .map_err(|e| FerricastError::Encoder(format!("VA-API: vaBeginPicture(VPP): {e}")))?;
+        let pic = pic
+            .render()
+            .map_err(|e| FerricastError::Encoder(format!("VA-API: vaRenderPicture(VPP): {e}")))?;
+        let pic = pic
+            .end()
+            .map_err(|e| FerricastError::Encoder(format!("VA-API: vaEndPicture(VPP): {e}")))?;
+        pic.sync::<()>()
+            .map_err(|(e, _)| FerricastError::Encoder(format!("VA-API: vaSyncSurface(VPP): {e}")))?;
+        // `imported` drops here, freeing the per-frame surface but
+        // the driver has already finished with it.
+        drop(imported);
+        Ok(())
     }
 }
 
