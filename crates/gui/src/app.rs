@@ -1,14 +1,9 @@
-use ferricast_encoder::h264::H264Encoder;
+use ferricast::prelude::*;
 use freya::{prelude::*, radio::*};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
-
-use ferricast_capture::NativeCapture;
-use ferricast_core::{CaptureSource, Device, StreamConfig};
-
-use crate::manager::StreamManager;
 
 #[derive(Default)]
 pub struct AppState {

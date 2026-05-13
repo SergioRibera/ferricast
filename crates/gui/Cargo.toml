@@ -1,0 +1,29 @@
+[package]
+name = "ferricast-gui"
+version = "0.1.0"
+edition = "2024"
+description = "Freya-based desktop GUI for ferricast"
+
+[[bin]]
+name = "ferricast-gui"
+path = "src/main.rs"
+
+[features]
+# Forward the lib's backend/protocol features so packagers can build
+# the binary with only the surface they actually ship (e.g. Wayland-
+# only image: `--no-default-features --features pipewire,chromecast`).
+default = ["chromecast", "pipewire", "x11"]
+chromecast = ["ferricast/chromecast"]
+pipewire = ["ferricast/pipewire"]
+x11 = ["ferricast/x11"]
+
+[dependencies]
+ferricast.workspace = true
+
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid.workspace = true
+
+freya = { version = "0.4.0-rc.11", features = ["icons", "router", "radio"] }
+rustls = { version = "0.23", features = ["ring"] }

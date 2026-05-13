@@ -7,12 +7,18 @@ members = [
     "crates/chromecast",
     "crates/dial",
     "crates/airplay",
-    "crates/miracast", "crates/encoder", "crates/m3u8", "crates/muxer", "crates/hls"
+    "crates/miracast",
+    "crates/encoder",
+    "crates/m3u8",
+    "crates/muxer",
+    "crates/hls",
+    "crates/gui",
 ]
 
 [workspace.dependencies]
+ferricast = { path = ".", default-features = false }
 ferricast-core = { path = "crates/core" }
-ferricast-capture = { path = "crates/capture" }
+ferricast-capture = { path = "crates/capture", default-features = false }
 ferricast-chromecast = { path = "crates/chromecast" }
 ferricast-dial = { path = "crates/dial" }
 ferricast-airplay = { path = "crates/airplay" }
@@ -32,23 +38,40 @@ uuid = { version = "1", features = ["v4"] }
 name = "ferricast"
 version = "0.1.0"
 edition = "2024"
-description = "Unified screen and video streaming for Linux"
+description = "Unified screen and video streaming library for Linux"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["chromecast", "pipewire", "x11"]
+chromecast = ["dep:ferricast-chromecast"]
+# Capture backends — re-exported from `ferricast-capture`. At least
+# one MUST be enabled; the capture crate emits a `compile_error!` if
+# both are turned off.
+pipewire = ["ferricast-capture/pipewire"]
+x11 = ["ferricast-capture/x11"]
+# Reserved for upcoming protocol crates; toggling on requires
+# uncommenting the matching workspace member + dep below.
+# dial = ["dep:ferricast-dial"]
+# airplay = ["dep:ferricast-airplay"]
+# miracast = ["dep:ferricast-miracast"]
 
 [dependencies]
 ferricast-core.workspace = true
+# Capture's default features are turned off at the workspace level
+# so the root's `pipewire`/`x11` features fully control which backends
+# get compiled in. Otherwise turning off the root features wouldn't
+# actually disable them — capture's own defaults would still pull
+# them through.
 ferricast-capture.workspace = true
-ferricast-chromecast.workspace = true
-# ferricast-dial.workspace = true
-# ferricast-airplay.workspace = true
-# ferricast-miracast.workspace = true
 ferricast-encoder.workspace = true
 ferricast-hls.workspace = true
-freya = { version = "0.4.0-rc.11", features = ["icons", "router", "radio"] }
+ferricast-chromecast = { workspace = true, optional = true }
+# ferricast-dial = { workspace = true, optional = true }
+# ferricast-airplay = { workspace = true, optional = true }
+# ferricast-miracast = { workspace = true, optional = true }
 
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rustls = { version = "0.23", features = ["ring"] }
 uuid.workspace = true
-rust_cast = { version = "0.21.0", features = ["thread_safe"] }
-libc = "0.2.186"

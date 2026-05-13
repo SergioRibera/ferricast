@@ -2,7 +2,16 @@
 name = "ferricast-capture"
 version = "0.1.0"
 edition = "2024"
-description = "PipeWire screen capture for ferricast"
+description = "PipeWire and X11 screen capture for ferricast"
+
+[features]
+# Both backends on by default — match the historical behavior of the
+# crate. Downstream callers that ship to a single environment (e.g.
+# a Wayland-only desktop appliance) can opt out via
+# `default-features = false` + the backend they want.
+default = ["pipewire", "x11"]
+pipewire = ["dep:ashpd", "dep:pipewire", "dep:libspa", "dep:ash"]
+x11 = ["dep:xcb"]
 
 [dependencies]
 ferricast-core.workspace = true
@@ -11,17 +20,20 @@ tracing.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 
-ashpd = { version = "0.10", features = ["tokio"] }
-xcb = { version = "1.7.0", features = ["shm"] }
 libc = "0.2.183"
 
-pipewire = { version = "0.8", features = ["v0_3_77"] }
+# x11 backend
+xcb = { version = "1.7.0", features = ["shm"], optional = true }
+
+# pipewire backend
+ashpd = { version = "0.10", features = ["tokio"], optional = true }
+pipewire = { version = "0.8", features = ["v0_3_77"], optional = true }
 # `MODIFIER_FIXATION_REQUIRED` is gated behind libspa's own `v0_3_75`
 # feature, which the `pipewire` crate doesn't pass through directly.
-libspa = { version = "0.8", features = ["v0_3_75"] }
+libspa = { version = "0.8", features = ["v0_3_75"], optional = true }
 
 # Vulkan loader — used to import dmabuf frames from PipeWire and read
 # them back to CPU memory. Optional at runtime: if `ash::Entry::load()`
 # fails (no Vulkan loader / driver) the capture path falls back to
 # SHM-only EnumFormat advertising.
-ash = "0.38"
+ash = { version = "0.38", optional = true }

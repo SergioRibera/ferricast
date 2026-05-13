@@ -1,16 +1,13 @@
-mod manager;
-
 use std::sync::Arc;
 
+use ferricast::prelude::*;
 use freya::{prelude::*, radio::*};
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-use crate::manager::*;
+mod app;
 
 use crate::app::*;
-
-mod app;
 
 #[tokio::main]
 async fn main() {
@@ -28,27 +25,19 @@ async fn main() {
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
 
-    let mut stream_manager = StreamManager::default();
-    stream_manager.register::<ferricast_chromecast::ChromecastHandler>();
-    // stream_manager.register::<ferricast_dial::DialHandler>();
-    // stream_manager.register::<ferricast_airplay::AirPlayHandler>();
-    // stream_manager.register::<ferricast_miracast::MiracastHandler>();
-
-    let mut event_rx = stream_manager
-        .take_event_rx()
-        .expect("event_rx already taken");
+    let (stream_manager, mut event_rx) = StreamManager::builder()
+        .with_chromecast()
+        .build_with_events();
 
     let stream_manager = Arc::new(Mutex::new(stream_manager));
 
     let radio_station = RadioStation::create_global(AppState::default());
 
-    // Clon para el future de eventos
     let mut radio_events = radio_station.clone();
     let sm_discovery = Arc::clone(&stream_manager);
 
     launch(
         LaunchConfig::new()
-            // Discovery
             .with_future(move |_| async move {
                 if let Err(e) = sm_discovery.lock().await.start_discovery().await {
                     tracing::error!(%e, "Failed to start discovery");
@@ -56,7 +45,6 @@ async fn main() {
                     tracing::info!("Discovery started for all protocols");
                 }
             })
-            // Loop de eventos del manager -> actualiza RadioStation
             .with_future(move |_| async move {
                 loop {
                     match event_rx.recv().await {

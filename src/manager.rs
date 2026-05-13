@@ -792,3 +792,65 @@ fn bump_timestamp(frame: &mut CapturedFrame, delta_us: u64) {
         CapturedFrame::Gpu(g) => g.timestamp_us = g.timestamp_us.saturating_add(delta_us),
     }
 }
+
+impl StreamManager {
+    /// Start a builder for ergonomic construction.
+    ///
+    /// ```no_run
+    /// use ferricast::StreamManager;
+    /// let (manager, events) = StreamManager::builder()
+    ///     .with_chromecast()
+    ///     .build_with_events();
+    /// # drop((manager, events));
+    /// ```
+    pub fn builder() -> StreamManagerBuilder {
+        StreamManagerBuilder::default()
+    }
+}
+
+/// Fluent builder for [`StreamManager`].
+///
+/// Each `with_*` helper registers a protocol handler. The generic
+/// [`Self::register`] method takes any [`ProtocolHandler`] for
+/// protocols that aren't exposed as a first-class convenience yet
+/// (or that live outside the workspace).
+#[derive(Default)]
+pub struct StreamManagerBuilder {
+    manager: StreamManager,
+}
+
+impl StreamManagerBuilder {
+    /// Register an arbitrary protocol handler.
+    pub fn register<H>(mut self) -> Self
+    where
+        H: ProtocolHandler + Clone + Default + 'static,
+    {
+        self.manager.register::<H>();
+        self
+    }
+
+    /// Register the Chromecast (CASTv2) handler.
+    #[cfg(feature = "chromecast")]
+    pub fn with_chromecast(self) -> Self {
+        self.register::<ferricast_chromecast::ChromecastHandler>()
+    }
+
+    /// Finalize the builder and return the manager. The event
+    /// receiver stays inside the manager; call
+    /// [`StreamManager::take_event_rx`] when you need it.
+    pub fn build(self) -> StreamManager {
+        self.manager
+    }
+
+    /// Finalize and split out the event receiver in one step — the
+    /// common shape for apps that wrap the manager in `Arc<Mutex<_>>`
+    /// and need the rx accessible from a separate task.
+    pub fn build_with_events(mut self) -> (StreamManager, tokio::sync::mpsc::Receiver<ManagerEvent>)
+    {
+        let rx = self
+            .manager
+            .take_event_rx()
+            .expect("freshly built manager always has its event_rx");
+        (self.manager, rx)
+    }
+}

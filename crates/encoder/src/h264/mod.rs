@@ -42,8 +42,6 @@ pub use nvenc_impl::NvencH264Encoder;
 pub use vaapi_impl::VaapiH264Encoder;
 pub use x264_impl::X264H264Encoder;
 
-const H264_BACKEND_VAR: &'static str = "FERRICAST_H264_BACKEND";
-
 /// Backend-agnostic H.264 encoder. Internal enum picks a backend in
 /// `configure()`.
 pub enum H264Encoder {
@@ -76,12 +74,6 @@ impl VideoEncoder for H264Encoder {
     fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
         match self {
             H264Encoder::Pending => {
-                let var = std::env::var(H264_BACKEND_VAR).unwrap_or_default();
-
-                if !var.is_empty() && !matches!(var.as_str(), "nvenc" | "va-api" | "x264") {
-                    return Err(FerricastError::Encoder(format!("invalid value of {}, {} is not a valid encoder", H264_BACKEND_VAR, var)))
-                }
-
                 // Try NVENC first; if that fails (no NVIDIA, libs
                 // missing) try VA-API; if that fails fall back to
                 // x264. NVENC takes priority over VA-API because
@@ -91,59 +83,45 @@ impl VideoEncoder for H264Encoder {
                 // every frame across PCIe twice — capture on NVIDIA
                 // → readback to CPU → upload to AMD VA-API. NVENC
                 // keeps the entire pipeline on the discrete GPU.
-                //
-
-                if var.is_empty() || var == "nvenc" {
-                    match NvencH264Encoder::probe_with(config.clone()) {
-                        Ok(enc) => {
-                            info!(
-                                width = config.width,
-                                height = config.height,
-                                fps = config.fps,
-                                "H.264 encoder backend: NVENC"
-                            );
-                            *self = H264Encoder::Nvenc(enc);
-                            return Ok(());
-                        }
-                        Err(e) => info!(
-                            error = %e,
-                            "NVENC unavailable, trying VA-API. \
-                            If you expected NVENC, ensure libcuda.so.1 + \
-                             libnvidia-encode.so.1 are on LD_LIBRARY_PATH \
-                             (NixOS: /run/opengl-driver/lib)."
-                        ),
+                match NvencH264Encoder::probe_with(config.clone()) {
+                    Ok(enc) => {
+                        info!(
+                            width = config.width,
+                            height = config.height,
+                            fps = config.fps,
+                            "H.264 encoder backend: NVENC"
+                        );
+                        *self = H264Encoder::Nvenc(enc);
+                        return Ok(());
                     }
+                    Err(e) => info!(
+                        error = %e,
+                        "NVENC unavailable, trying VA-API. \
+                         If you expected NVENC, ensure libcuda.so.1 + \
+                         libnvidia-encode.so.1 are on LD_LIBRARY_PATH \
+                         (NixOS: /run/opengl-driver/lib)."
+                    ),
                 }
 
-                if var.is_empty() || var == "va-api" {
-                    match VaapiH264Encoder::probe_with(config.clone()) {
-                        Ok(enc) => {
-                            info!(
-                                width = config.width,
-                                height = config.height,
-                                fps = config.fps,
-                                "H.264 encoder backend: VA-API"
-                            );
-                            *self = H264Encoder::Vaapi(enc);
-                            return Ok(());
-                        }
-                        Err(e) => info!(error = %e, "VA-API unavailable, falling back to x264"),
+                match VaapiH264Encoder::probe_with(config.clone()) {
+                    Ok(enc) => {
+                        info!(
+                            width = config.width,
+                            height = config.height,
+                            fps = config.fps,
+                            "H.264 encoder backend: VA-API"
+                        );
+                        *self = H264Encoder::Vaapi(enc);
+                        return Ok(());
                     }
+                    Err(e) => info!(error = %e, "VA-API unavailable, falling back to x264"),
                 }
 
-               
-                if var.is_empty() || var == "x264" {
-                     let mut x = X264H264Encoder::default();
-                     x.configure(config)?;
-                     *self = H264Encoder::X264(x);
-                    
-                     info!("H.264 encoder backend: x264 (software)");
-
-                    return Ok(());
-                }
-
-            
-                Err(FerricastError::Encoder(format!("{} unavailable, failed to init the encoder", var)))
+                info!("H.264 encoder backend: x264 (software)");
+                let mut x = X264H264Encoder::default();
+                x.configure(config)?;
+                *self = H264Encoder::X264(x);
+                Ok(())
             }
             H264Encoder::Vaapi(e) => match e.configure(config) {
                 Ok(()) => Ok(()),
