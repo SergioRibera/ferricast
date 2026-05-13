@@ -32,21 +32,12 @@ use std::path::Path;
 use std::rc::Rc;
 
 use bytes::Bytes;
-use cros_libva::bindings::{self, VA_INVALID_ID, VABufferID, VAStatus};
-use cros_libva::buffer::h264::{
-    EncPictureParameterBufferH264, EncSequenceParameterBufferH264, EncSliceParameterBufferH264,
-    H264EncFrameCropOffsets, H264EncPicFields, H264EncSeqFields, H264VuiFields, PictureH264,
-};
-use cros_libva::{
-    Buffer, Config, Context, Display, EncMiscParameter, EncMiscParameterFrameRate,
-    EncMiscParameterHRD, EncMiscParameterRateControl, EncPictureParameter, EncSequenceParameter,
-    EncSliceParameter, Image, MappedCodedBuffer, RcFlags, Surface, UsageHint,
-};
+use cros_libva::*;
 use ferricast_core::{
     CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, PixelFormat, Result,
     VideoEncoder,
 };
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 use super::headers::{self, FrameCrop, PpsParams, SpsParams, VuiParams, profile};
 use super::yuv;
@@ -105,7 +96,7 @@ pub struct VaapiH264Encoder {
 
 #[derive(Clone)]
 struct EncoderCfg {
-    profile: bindings::VAProfile::Type,
+    profile: VAProfile::Type,
     profile_idc: u8,
     /// `constraint_set0..5` packed in the high byte (see SPS
     /// emission).
@@ -187,26 +178,19 @@ impl VaapiH264Encoder {
             .map_err(|e| FerricastError::Encoder(format!("query_config_profiles: {e}")))?;
 
         let (profile, profile_idc, constraint_flags, cabac) = if supported
-            .contains(&bindings::VAProfile::VAProfileH264ConstrainedBaseline)
-            && profile_has_enc_slice(
-                &display,
-                bindings::VAProfile::VAProfileH264ConstrainedBaseline,
-            ) {
+            .contains(&VAProfile::VAProfileH264ConstrainedBaseline)
+            && profile_has_enc_slice(&display, VAProfile::VAProfileH264ConstrainedBaseline)
+        {
             (
-                bindings::VAProfile::VAProfileH264ConstrainedBaseline,
+                VAProfile::VAProfileH264ConstrainedBaseline,
                 profile::BASELINE,
                 0b0100_0000_u8, // constraint_set1_flag = 1 (Constrained Baseline)
                 false,
             )
-        } else if supported.contains(&bindings::VAProfile::VAProfileH264Main)
-            && profile_has_enc_slice(&display, bindings::VAProfile::VAProfileH264Main)
+        } else if supported.contains(&VAProfile::VAProfileH264Main)
+            && profile_has_enc_slice(&display, VAProfile::VAProfileH264Main)
         {
-            (
-                bindings::VAProfile::VAProfileH264Main,
-                profile::MAIN,
-                0_u8,
-                true,
-            )
+            (VAProfile::VAProfileH264Main, profile::MAIN, 0_u8, true)
         } else {
             return Err(FerricastError::Encoder(
                 "VA-API: no supported H.264 encode profile (need ConstrainedBaseline or Main)"
@@ -221,17 +205,17 @@ impl VaapiH264Encoder {
         let cfg_handle = display
             .create_config(
                 vec![
-                    bindings::VAConfigAttrib {
-                        type_: bindings::VAConfigAttribType::VAConfigAttribRTFormat,
+                    VAConfigAttrib {
+                        type_: VAConfigAttribType::VAConfigAttribRTFormat,
                         value: VA_RT_FORMAT_YUV420,
                     },
-                    bindings::VAConfigAttrib {
-                        type_: bindings::VAConfigAttribType::VAConfigAttribRateControl,
-                        value: bindings::VA_RC_CBR,
+                    VAConfigAttrib {
+                        type_: VAConfigAttribType::VAConfigAttribRateControl,
+                        value: VA_RC_CBR,
                     },
                 ],
                 profile,
-                bindings::VAEntrypoint::VAEntrypointEncSlice,
+                VAEntrypoint::VAEntrypointEncSlice,
             )
             .map_err(|e| FerricastError::Encoder(format!("vaCreateConfig: {e}")))?;
 
@@ -344,11 +328,9 @@ fn open_render_node() -> Option<Rc<Display>> {
     Display::open()
 }
 
-fn profile_has_enc_slice(display: &Display, profile: bindings::VAProfile::Type) -> bool {
+fn profile_has_enc_slice(display: &Display, profile: VAProfile::Type) -> bool {
     match display.query_config_entrypoints(profile) {
-        Ok(eps) => eps
-            .iter()
-            .any(|e| *e == bindings::VAEntrypoint::VAEntrypointEncSlice),
+        Ok(eps) => eps.iter().any(|e| *e == VAEntrypoint::VAEntrypointEncSlice),
         Err(_) => false,
     }
 }
@@ -362,7 +344,7 @@ impl EncoderCfg {
 }
 
 fn build_encoder_cfg(
-    profile: bindings::VAProfile::Type,
+    profile: VAProfile::Type,
     profile_idc: u8,
     constraint_flags: u8,
     cabac: bool,
@@ -500,9 +482,9 @@ fn upload_bgra_to_nv12(
         Err(_e) => {
             // Driver doesn't allow derive on this format. Allocate
             // an NV12 image and pay the put-image cost on drop.
-            let format = bindings::VAImageFormat {
+            let format = VAImageFormat {
                 fourcc: VA_FOURCC_NV12,
-                byte_order: bindings::VA_LSB_FIRST,
+                byte_order: VA_LSB_FIRST,
                 bits_per_pixel: 12,
                 ..Default::default()
             };
@@ -606,7 +588,7 @@ fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>
             picture_h264(
                 enc.recon[prev_idx].id(),
                 state.prev_frame_num,
-                bindings::VA_PICTURE_H264_SHORT_TERM_REFERENCE,
+                VA_PICTURE_H264_SHORT_TERM_REFERENCE,
                 state.prev_poc as i32,
             )
         })
@@ -689,20 +671,12 @@ fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>
     // get destroyed at the end of the frame.
     if is_idr {
         let (sp, sd) = unsafe {
-            create_packed_header(
-                &enc.context,
-                bindings::VAEncPackedHeaderType::VAEncPackedHeaderSequence,
-                &enc.sps_nal,
-            )?
+            create_packed_header(&enc.context, EncPackedHeaderType::Sequence, &enc.sps_nal)?
         };
         packed_buffer_ids.push(sp);
         packed_buffer_ids.push(sd);
         let (pp, pd) = unsafe {
-            create_packed_header(
-                &enc.context,
-                bindings::VAEncPackedHeaderType::VAEncPackedHeaderPicture,
-                &enc.pps_nal,
-            )?
+            create_packed_header(&enc.context, EncPackedHeaderType::Picture, &enc.pps_nal)?
         };
         packed_buffer_ids.push(pp);
         packed_buffer_ids.push(pd);
@@ -731,23 +705,23 @@ fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         let ctx = enc.context.id();
         let target = enc.recon[cur_recon_idx].id();
 
-        check_status(bindings::vaBeginPicture(dpy, ctx, target))
+        check_status(vaBeginPicture(dpy, ctx, target))
             .map_err(|s| FerricastError::Encoder(format!("vaBeginPicture: {s:#x}")))?;
 
         println!("{:?}", all_ids.len());
         let render_status =
-            bindings::vaRenderPicture(dpy, ctx, all_ids.as_ptr() as *mut _, all_ids.len() as i32);
+            vaRenderPicture(dpy, ctx, all_ids.as_ptr() as *mut _, all_ids.len() as i32);
         if let Err(s) = check_status(render_status) {
             // Best-effort cleanup on render failure.
-            let _ = bindings::vaEndPicture(dpy, ctx);
+            let _ = vaEndPicture(dpy, ctx);
             destroy_packed(&enc.display, &packed_buffer_ids);
             return Err(FerricastError::Encoder(format!("vaRenderPicture: {s:#x}")));
         }
 
-        check_status(bindings::vaEndPicture(dpy, ctx))
+        check_status(vaEndPicture(dpy, ctx))
             .map_err(|s| FerricastError::Encoder(format!("vaEndPicture: {s:#x}")))?;
 
-        check_status(bindings::vaSyncSurface(dpy, target))
+        check_status(vaSyncSurface(dpy, target))
             .map_err(|s| FerricastError::Encoder(format!("vaSyncSurface: {s:#x}")))?;
     }
 
@@ -960,17 +934,12 @@ fn build_rate_control(cfg: &EncoderCfg) -> EncMiscParameterRateControl {
     )
 }
 
-fn picture_h264(
-    surface_id: bindings::VASurfaceID,
-    frame_idx: u32,
-    flags: u32,
-    poc: i32,
-) -> PictureH264 {
+fn picture_h264(surface_id: VASurfaceID, frame_idx: u32, flags: u32, poc: i32) -> PictureH264 {
     PictureH264::new(surface_id, frame_idx, flags, poc, poc)
 }
 
 fn invalid_picture_h264() -> PictureH264 {
-    PictureH264::new(VA_INVALID_ID, 0, bindings::VA_PICTURE_H264_INVALID, 0, 0)
+    PictureH264::new(VA_INVALID_ID, 0, VA_PICTURE_H264_INVALID, 0, 0)
 }
 
 /// `PictureH264: !Clone`, but the underlying VAPictureH264 is plain
@@ -991,49 +960,50 @@ fn clone_pic(p: &PictureH264) -> PictureH264 {
     // (`cros-libva 0.0.13` `src/buffer/h264.rs:10`). Cloning the
     // backing FFI type is sound.
     unsafe {
-        let inner: bindings::VAPictureH264 = std::mem::transmute_copy(p);
+        let inner: VAPictureH264 = std::mem::transmute_copy(p);
         std::mem::transmute(inner)
     }
 }
 
 unsafe fn create_packed_header(
     context: &Rc<Context>,
-    htype: bindings::VAEncPackedHeaderType::Type,
+    htype: EncPackedHeaderType,
     bytes: &[u8],
 ) -> Result<(VABufferID, VABufferID)> {
     let dpy = context.display().handle();
     let ctx = context.id();
 
-    let mut params = bindings::VAEncPackedHeaderParameterBuffer {
-        type_: htype,
-        bit_length: (bytes.len() as u32) * 8,
-        has_emulation_bytes: 1, // we ran emulation_prevent in the header builder
-        ..Default::default()
-    };
+    let mut params = EncPackedHeaderParameter::new(htype, (bytes.len() as u32) * 8, true);
     let mut p_id: VABufferID = 0;
-    check_status(bindings::vaCreateBuffer(
-        dpy,
-        ctx,
-        bindings::VABufferType::VAEncPackedHeaderParameterBufferType,
-        std::mem::size_of::<bindings::VAEncPackedHeaderParameterBuffer>() as u32,
-        1,
-        &mut params as *mut _ as *mut c_void,
-        &mut p_id,
-    ))
-    .map_err(|s| FerricastError::Encoder(format!("packed header param: {s:#x}")))?;
+    unsafe {
+        check_status(vaCreateBuffer(
+            dpy,
+            ctx,
+            VABufferType::VAEncPackedHeaderParameterBufferType,
+            std::mem::size_of::<EncPackedHeaderParameter>() as u32,
+            1,
+            &mut params as *mut _ as *mut c_void,
+            &mut p_id,
+        ))
+        .map_err(|s| FerricastError::Encoder(format!("packed header param: {s:#x}")))?;
+    }
 
     let mut d_id: VABufferID = 0;
-    let st = check_status(bindings::vaCreateBuffer(
-        dpy,
-        ctx,
-        bindings::VABufferType::VAEncPackedHeaderDataBufferType,
-        bytes.len() as u32,
-        1,
-        bytes.as_ptr() as *mut c_void,
-        &mut d_id,
-    ));
+    let st = unsafe {
+        check_status(vaCreateBuffer(
+            dpy,
+            ctx,
+            VABufferType::VAEncPackedHeaderDataBufferType,
+            bytes.len() as u32,
+            1,
+            bytes.as_ptr() as *mut c_void,
+            &mut d_id,
+        ))
+    };
     if let Err(s) = st {
-        bindings::vaDestroyBuffer(dpy, p_id);
+        unsafe {
+            vaDestroyBuffer(dpy, p_id);
+        }
         return Err(FerricastError::Encoder(format!(
             "packed header data: {s:#x}"
         )));
@@ -1044,7 +1014,7 @@ unsafe fn create_packed_header(
 fn destroy_packed(display: &Rc<Display>, ids: &[VABufferID]) {
     for id in ids {
         unsafe {
-            let _ = bindings::vaDestroyBuffer(display.handle(), *id);
+            let _ = vaDestroyBuffer(display.handle(), *id);
         }
     }
 }

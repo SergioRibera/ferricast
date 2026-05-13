@@ -11,24 +11,12 @@ tracing.workspace = true
 # VA-API binding without ffmpeg. Used to encode H.264 directly on
 # the GPU when the system has a VA-API driver. Loaded at runtime;
 # missing `libva.so` makes the encoder gracefully fall back to x264.
-#
-# Vendored copy of cros-libva 0.0.13 with two private methods
-# exposed (`Display::handle`, `Context::id`) so we can drop into
-# raw FFI for the packed-header buffer types the upstream crate
-# doesn't yet wrap. See `vendor/cros-libva/README-fork.md` (TODO).
-cros-libva = { path = "../../vendor/cros-libva" }
+cros-libva = { git = "https://github.com/SergioRibera/cros-libva", rev = "3eb6e6e0e3085c8376124b75bf638ce6982b7b33" }
 
 # NVENC (NVIDIA hardware H.264 encode). Higher-level Rust binding
 # that wraps the Video Codec SDK headers — no SDK install needed at
 # build time, the libraries (libcuda.so, libnvidia-encode.so) are
 # dlopen'd at runtime. Missing libs cause `Encoder::new` to error
 # and the factory falls back through VA-API / x264.
-#
-# Vendored copy of shiguredo_nvcodec 2026.1.0 with the per-frame
-# `cu_mem_alloc` / `nvEncRegisterResource` / `nvEncCreateBitstreamBuffer`
-# pattern replaced by persistent allocations. Upstream's
-# `register_input_resource` is `pub(crate)` so we couldn't add this
-# from outside; the patch lives next to its callers in
-# `vendor/shiguredo_nvcodec/src/encode.rs` (search "ferricast patch").
-shiguredo_nvcodec = { path = "../../vendor/shiguredo_nvcodec" }
+shiguredo_nvcodec = "2026.1.0"
 openh264 = "0.9.3"
