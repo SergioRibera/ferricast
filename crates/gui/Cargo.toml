@@ -12,10 +12,15 @@ path = "src/main.rs"
 # Forward the lib's backend/protocol features so packagers can build
 # the binary with only the surface they actually ship (e.g. Wayland-
 # only image: `--no-default-features --features pipewire,chromecast`).
-default = ["chromecast", "pipewire", "x11"]
+default = ["chromecast", "pipewire", "x11", "wlroots"]
 chromecast = ["ferricast/chromecast"]
 pipewire = ["ferricast/pipewire"]
 x11 = ["ferricast/x11"]
+# Wayland source enumeration. Defaults on so `ferricast-gui windows`
+# works out of the box on every modern compositor that exposes
+# foreign-toplevel (wlroots, niri, KDE Plasma 6); falls through to
+# the portal silently on GNOME / Mutter.
+wlroots = ["ferricast/wlroots"]
 
 [dependencies]
 ferricast.workspace = true

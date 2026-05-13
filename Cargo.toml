@@ -50,13 +50,19 @@ description = "Unified screen and video streaming library for Linux"
 path = "src/lib.rs"
 
 [features]
-default = ["chromecast", "pipewire", "x11"]
+default = ["chromecast", "pipewire", "x11", "wlroots"]
 chromecast = ["dep:ferricast-chromecast"]
 # Capture backends — re-exported from `ferricast-capture`. At least
 # one MUST be enabled; the capture crate emits a `compile_error!` if
 # both are turned off.
 pipewire = ["ferricast-capture/pipewire"]
 x11 = ["ferricast-capture/x11"]
+# Wayland source enumeration (foreign-toplevel + xdg-output).
+# Orthogonal to `pipewire`: that's for *capture* on Wayland; this is
+# for *picking the source to capture* via an in-process picker
+# instead of the portal dialog. Covers wlroots + niri + KDE Plasma 6
+# under one feature flag (historical name retained for compat).
+wlroots = ["ferricast-capture/wlroots"]
 # Reserved for upcoming protocol crates; toggling on requires
 # uncommenting the matching workspace member + dep below.
 # dial = ["dep:ferricast-dial"]
