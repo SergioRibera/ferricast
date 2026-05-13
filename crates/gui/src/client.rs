@@ -27,7 +27,7 @@ fn rewrap(err: zbus::Error) -> anyhow::Error {
     anyhow::Error::new(err)
 }
 
-async fn proxy() -> anyhow::Result<ManagerProxy<'static>> {
+pub(crate) async fn proxy() -> anyhow::Result<ManagerProxy<'static>> {
     let conn = zbus::Connection::session().await.map_err(rewrap)?;
     ManagerProxy::new(&conn).await.map_err(rewrap)
 }

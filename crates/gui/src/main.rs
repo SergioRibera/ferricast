@@ -11,6 +11,7 @@ mod app;
 mod cli;
 mod client;
 mod daemon;
+mod picker;
 
 use crate::app::*;
 use crate::cli::{Cli, Command};

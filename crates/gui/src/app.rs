@@ -1,20 +1,38 @@
 use ferricast::prelude::*;
+use ferricast::WindowIdentifier;
+use ferricast_dbus::SourceDto;
 use freya::{prelude::*, radio::*};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::picker::SourcePicker;
+
 #[derive(Default)]
 pub struct AppState {
     pub devices: HashMap<Uuid, Device>,
     pub streaming: Vec<Uuid>,
+    /// Set when a device card requests source selection. The
+    /// top-level `App` mounts the `SourcePicker` popup over the
+    /// device list while this is `Some`.
+    pub picker: Option<PickerRequest>,
+}
+
+/// Open-picker request. Carries everything the picker needs to
+/// route the selection back to the right stream — currently just
+/// the device id, but kept as a struct so adding `kind` /
+/// `prefer_window: bool` later doesn't shift state shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickerRequest {
+    pub device_id: Uuid,
 }
 
 #[derive(PartialEq, Eq, Clone, Debug, Copy, Hash)]
 pub enum AppChannel {
     Devices,
     Streaming,
+    Picker,
 }
 
 impl RadioChannel<AppState> for AppChannel {}
@@ -31,10 +49,12 @@ impl App for FerricastApp {
 
         let devices_radio = use_radio::<AppState, AppChannel>(AppChannel::Devices);
         let streaming_radio = use_radio::<AppState, AppChannel>(AppChannel::Streaming);
+        let picker_radio = use_radio::<AppState, AppChannel>(AppChannel::Picker);
         let binding = devices_radio.read();
 
-        rect().expanded().background((18, 18, 24)).vertical().child(
-            // Body
+        let pending_picker = picker_radio.read().picker.clone();
+
+        let body = rect().expanded().background((18, 18, 24)).vertical().child(
             rect()
                 .expanded()
                 .padding(24.)
@@ -58,38 +78,107 @@ impl App for FerricastApp {
                                 let is_streaming =
                                     streaming_radio.read().streaming.contains(&device_id);
                                 DeviceCard {
-                        device: device.clone(),
-                        is_streaming,
-                        on_click: Arc::new({
-                            let sm = Arc::clone(&stream_manager);
-                            move |source| {
-                                let sm = sm.clone();
-                                spawn(async move {
-                                    let sm = sm.lock().await;
-                                    if is_streaming {
-                                        sm.stop_stream(device_id)
-                                            .await
-                                            .expect("Cannot stop stream");
-                                        return;
-                                    }
-                                    let capture = NativeCapture::new();
-                                    let encoder = H264Encoder::default();
-                                    let config = StreamConfig::default();
-                                    if let Err(e) = sm
-                                        .start_stream(device_id, source, capture, encoder, config)
-                                        .await
-                                    {
-                                        tracing::error!(%e, ?device_id, "Failed to start stream");
-                                    }
-                                });
-                            }
-                        }),
-                    }
-                    .into()
+                                    device: device.clone(),
+                                    is_streaming,
+                                    on_request_picker: Arc::new({
+                                        let mut picker_radio = picker_radio.clone();
+                                        move || {
+                                            picker_radio
+                                                .write_channel(AppChannel::Picker)
+                                                .picker = Some(PickerRequest { device_id });
+                                        }
+                                    }),
+                                    on_stop: Arc::new({
+                                        let sm = Arc::clone(&stream_manager);
+                                        move || {
+                                            let sm = sm.clone();
+                                            spawn(async move {
+                                                let sm = sm.lock().await;
+                                                if let Err(e) = sm.stop_stream(device_id).await {
+                                                    tracing::error!(%e, ?device_id, "stop_stream");
+                                                }
+                                            });
+                                        }
+                                    }),
+                                }
+                                .into()
                             })),
                     )
                 }),
-        )
+        );
+
+        body.maybe_child(pending_picker.map(|req| {
+            let stream_manager = stream_manager.clone();
+            let device_id = req.device_id;
+            let mut picker_radio = picker_radio.clone();
+            SourcePicker {
+                on_select: Arc::new(move |source: SourceDto| {
+                    // Clear the picker request first so the popup
+                    // dismisses synchronously — the stream start
+                    // happens on the spawned task and shouldn't
+                    // block the UI thread.
+                    picker_radio.write_channel(AppChannel::Picker).picker = None;
+                    let sm = stream_manager.clone();
+                    spawn(async move {
+                        if let Err(e) = start_stream_with_dto(sm, device_id, source).await {
+                            tracing::error!(%e, ?device_id, "start_stream");
+                        }
+                    });
+                }),
+                on_cancel: Arc::new({
+                    let mut picker_radio = picker_radio.clone();
+                    move || {
+                        picker_radio.write_channel(AppChannel::Picker).picker = None;
+                    }
+                }),
+            }
+        }))
+    }
+}
+
+/// Start a stream by translating a wire-shape `SourceDto` into the
+/// in-process `CaptureSource` and dispatching through the local
+/// `StreamManager`. Mirrors what the daemon does over D-Bus, but
+/// stays in-process so the picker selection avoids a bus round-trip.
+async fn start_stream_with_dto(
+    stream_manager: Arc<Mutex<StreamManager>>,
+    device_id: Uuid,
+    source: SourceDto,
+) -> Result<()> {
+    let cap_source = dto_to_capture_source(&source);
+    let sm = stream_manager.lock().await;
+    let capture = NativeCapture::new();
+    let encoder = H264Encoder::default();
+    let config = StreamConfig::default();
+    sm.start_stream(device_id, cap_source, capture, encoder, config)
+        .await
+}
+
+fn dto_to_capture_source(s: &SourceDto) -> CaptureSource {
+    fn str_arg(s: &SourceDto, key: &str) -> Option<String> {
+        let v = s.args.get(key)?;
+        v.downcast_ref::<&str>().ok().map(|s| s.to_string())
+    }
+    match s.kind.as_str() {
+        "monitor" | "screen" => CaptureSource::FullScreen {
+            monitor: str_arg(s, "id").or_else(|| str_arg(s, "monitor")),
+        },
+        "window" => {
+            let id = str_arg(s, "id");
+            if let Some(id) = id {
+                let identifier = id
+                    .parse::<u64>()
+                    .map(WindowIdentifier::Id)
+                    .unwrap_or_else(|_| WindowIdentifier::Title(id));
+                return CaptureSource::Window {
+                    identifier: Some(identifier),
+                };
+            }
+            CaptureSource::Window {
+                identifier: str_arg(s, "title").map(WindowIdentifier::Title),
+            }
+        }
+        _ => CaptureSource::FullScreen { monitor: None },
     }
 }
 
@@ -99,7 +188,11 @@ impl App for FerricastApp {
 struct DeviceCard {
     device: Device,
     is_streaming: bool,
-    on_click: Arc<dyn Fn(CaptureSource) + Send + Sync>,
+    /// Open the picker for this device. Wired to "share screen" /
+    /// "share window" instead of starting the stream blindly so the
+    /// user picks from real monitors/windows the daemon enumerated.
+    on_request_picker: Arc<dyn Fn() + Send + Sync>,
+    on_stop: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl PartialEq for DeviceCard {
@@ -112,7 +205,8 @@ impl Component for DeviceCard {
     fn render(&self) -> impl IntoElement {
         let device = self.device.clone();
         let is_streaming = self.is_streaming;
-        let on_click = self.on_click.clone();
+        let on_request_picker = self.on_request_picker.clone();
+        let on_stop = self.on_stop.clone();
 
         let bg = if is_streaming {
             (30, 60, 40)
@@ -123,6 +217,20 @@ impl Component for DeviceCard {
             (80, 200, 120)
         } else {
             (50, 50, 65)
+        };
+
+        let primary_btn = if is_streaming {
+            // Already streaming — the share button stops it.
+            TooltipContainer::new(Tooltip::new("Stop stream")).child(
+                share_btn(include_bytes!("../assets/screen.svg"))
+                    .on_press(move |_| (on_stop)()),
+            )
+        } else {
+            // Not streaming — open the picker.
+            TooltipContainer::new(Tooltip::new("Pick a source to share")).child(
+                share_btn(include_bytes!("../assets/screen.svg"))
+                    .on_press(move |_| (on_request_picker)()),
+            )
         };
 
         rect()
@@ -136,7 +244,6 @@ impl Component for DeviceCard {
             .horizontal()
             .spacing(12.)
             .child(
-                // Icono de protocolo (círculo de color)
                 rect()
                     .center()
                     .maybe_child((device.protocol == "chromecast").then(|| {
@@ -153,7 +260,6 @@ impl Component for DeviceCard {
                     })),
             )
             .child(
-                // Info del dispositivo
                 rect()
                     .width(Size::fill())
                     .vertical()
@@ -169,17 +275,7 @@ impl Component for DeviceCard {
                             .width(Size::fill())
                             .horizontal()
                             .spacing(5.)
-                            .child(TooltipContainer::new(Tooltip::new("Share screen")).child(
-                                share_btn(include_bytes!("../assets/screen.svg")).on_press({
-                                    let on_click = on_click.clone();
-                                    move |_| (on_click)(CaptureSource::FullScreen { monitor: None })
-                                }),
-                            ))
-                            .child(TooltipContainer::new(Tooltip::new("Share app")).child(
-                                share_btn(include_bytes!("../assets/app.svg")).on_press(
-                                    move |_| (on_click)(CaptureSource::Window { identifier: None }),
-                                ),
-                            )),
+                            .child(primary_btn),
                     ),
             )
     }
