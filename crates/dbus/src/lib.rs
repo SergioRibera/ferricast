@@ -22,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use zbus::zvariant::{OwnedValue, Type};
+use zbus::zvariant::{self, OwnedValue, Type};
 
 /// Well-known session-bus name owned by the daemon while it's running.
 pub const BUS_NAME: &str = "rs.sergioribera.ferricast";
@@ -63,13 +63,18 @@ pub struct DeviceDto {
 /// arguments as `a{sv}` so each backend can grow new options
 /// without a wire break.
 ///
-/// | kind       | args                          | meaning                                   |
-/// |------------|-------------------------------|-------------------------------------------|
-/// | `""`       | (empty)                       | Let the daemon pick: PipeWire portal on   |
-/// |            |                               | Wayland; on X11 a picker dialog (TODO).   |
-/// | `"screen"` | `monitor: s?`                 | Full-screen capture, optional monitor id. |
-/// | `"window"` | `identifier: s?`              | Window capture; identifier is portal-     |
-/// |            |                               | specific.                                 |
+/// | kind        | args                          | meaning                                       |
+/// |-------------|-------------------------------|-----------------------------------------------|
+/// | `""`        | (empty)                       | Let the daemon pick: PipeWire portal on       |
+/// |             |                               | Wayland; on X11 a picker dialog (TODO).       |
+/// | `"screen"`  | `monitor: s?`                 | Full-screen capture. `monitor` is a string id |
+/// |             |                               | matching `MonitorInfoDto.id`. Legacy alias    |
+/// |             |                               | for `"monitor"` — prefer the latter.          |
+/// | `"monitor"` | `id: s`                       | Capture the monitor whose id matches.         |
+/// | `"window"`  | `id: s` *or* `title: s`       | Capture a specific window. `id` is the id     |
+/// |             |                               | the daemon previously returned in             |
+/// |             |                               | `ListWindows`; `title` is a fallback for      |
+/// |             |                               | callers without access to the enumerator.     |
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 pub struct SourceDto {
     pub kind: String,
@@ -83,6 +88,7 @@ impl SourceDto {
         Self::default()
     }
 
+    /// Full-screen, daemon-chosen monitor.
     pub fn screen() -> Self {
         Self {
             kind: "screen".into(),
@@ -90,10 +96,55 @@ impl SourceDto {
         }
     }
 
+    /// Capture the monitor whose [`MonitorInfoDto::id`] equals `id`.
+    /// The daemon validates the id against its enumerator before
+    /// dispatching to the capture backend, so passing a stale id
+    /// produces a clean `InvalidArgs` error instead of a generic
+    /// capture failure.
+    pub fn monitor(id: impl Into<String>) -> Self {
+        let mut args = HashMap::new();
+        if let Ok(v) = OwnedValue::try_from(zvariant::Value::from(id.into())) {
+            args.insert("id".into(), v);
+        }
+        Self {
+            kind: "monitor".into(),
+            args,
+        }
+    }
+
+    /// Empty `kind="window"` — daemon picks (portal flow).
     pub fn window() -> Self {
         Self {
             kind: "window".into(),
             args: HashMap::new(),
+        }
+    }
+
+    /// Capture the window whose [`WindowInfoDto::id`] equals `id`.
+    /// Same resolution + validation flow as [`SourceDto::monitor`].
+    pub fn window_by_id(id: impl Into<String>) -> Self {
+        let mut args = HashMap::new();
+        if let Ok(v) = OwnedValue::try_from(zvariant::Value::from(id.into())) {
+            args.insert("id".into(), v);
+        }
+        Self {
+            kind: "window".into(),
+            args,
+        }
+    }
+
+    /// Capture the first window whose title matches. Used by clients
+    /// that don't (or can't) talk to the enumerator — e.g. quick
+    /// shell scripts. Less precise than `window_by_id` because two
+    /// windows can share a title.
+    pub fn window_by_title(title: impl Into<String>) -> Self {
+        let mut args = HashMap::new();
+        if let Ok(v) = OwnedValue::try_from(zvariant::Value::from(title.into())) {
+            args.insert("title".into(), v);
+        }
+        Self {
+            kind: "window".into(),
+            args,
         }
     }
 }

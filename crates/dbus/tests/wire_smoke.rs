@@ -29,6 +29,18 @@ fn source_helpers() {
     assert_eq!(SourceDto::auto().kind, "");
     assert_eq!(SourceDto::screen().kind, "screen");
     assert_eq!(SourceDto::window().kind, "window");
+
+    let m = SourceDto::monitor("HDMI-1");
+    assert_eq!(m.kind, "monitor");
+    assert!(m.args.contains_key("id"));
+
+    let w = SourceDto::window_by_id("12345");
+    assert_eq!(w.kind, "window");
+    assert!(w.args.contains_key("id"));
+
+    let w = SourceDto::window_by_title("Firefox");
+    assert_eq!(w.kind, "window");
+    assert!(w.args.contains_key("title"));
 }
 
 /// Replica of the daemon-side interface object. We don't need the

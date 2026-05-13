@@ -66,21 +66,111 @@ fn str_arg(s: &SourceDto, key: &str) -> Option<String> {
     v.downcast_ref::<&str>().ok().map(|s| s.to_owned())
 }
 
-/// Translate a wire [`SourceDto`] into a [`CaptureSource`]. Empty
-/// `kind` means "let the daemon decide", which today is PipeWire's
-/// full-screen path on both Wayland and X11 (the bespoke X11 picker
-/// dialog is still a TODO).
-fn dto_to_source(s: &SourceDto) -> CaptureSource {
+/// Translate a wire [`SourceDto`] into a [`CaptureSource`], resolving
+/// any picker-issued ids against the live enumerator first. The
+/// kinds we accept:
+///
+/// - `""` → full-screen, daemon-chosen monitor.
+/// - `"screen"` with optional `monitor: s` (legacy) → full-screen,
+///   that monitor.
+/// - `"monitor"` with `id: s` (preferred) → full-screen, monitor
+///   with the given id. Errors `InvalidArgs` if no such monitor
+///   exists *and* the enumerator can actually enumerate (stub
+///   backends fall through to "let the capture backend try its
+///   own picker").
+/// - `"window"` with `id: s` → look the window up in the enumerator,
+///   prefer `WindowIdentifier::Id` when the id parses as a u64
+///   (X11 case), fall back to its current title (wlroots case
+///   where ids are wayland protocol_ids and don't survive a fresh
+///   wl_display connection — title is the only handle the capture
+///   backend can re-resolve).
+/// - `"window"` with `title: s` → exact title; no enumerator lookup.
+///
+/// Returning `zbus::fdo::Error` so unknown ids surface as proper bus
+/// errors, not a generic capture failure later.
+async fn resolve_source(
+    enumerator: &dyn SourceEnumerator,
+    s: &SourceDto,
+) -> zbus::fdo::Result<CaptureSource> {
     match s.kind.as_str() {
-        "window" => CaptureSource::Window {
-            identifier: str_arg(s, "identifier").map(ferricast::WindowIdentifier::Title),
-        },
-        "screen" | "" => CaptureSource::FullScreen {
-            monitor: str_arg(s, "monitor"),
-        },
+        "" | "screen" => Ok(CaptureSource::FullScreen {
+            monitor: str_arg(s, "monitor").or_else(|| str_arg(s, "id")),
+        }),
+        "monitor" => {
+            let Some(id) = str_arg(s, "id") else {
+                return Err(zbus::fdo::Error::InvalidArgs(
+                    "`monitor` source requires args.id".into(),
+                ));
+            };
+            // Validate against the enumerator only when it actually
+            // supports monitor enumeration — otherwise we'd reject
+            // legitimate ids the capture backend would have accepted
+            // on its own (e.g. a portal-issued id).
+            if enumerator
+                .capabilities()
+                .contains(&ferricast::EnumerationCapability::Monitors)
+            {
+                let mons = enumerator
+                    .list_monitors()
+                    .await
+                    .map_err(|e| zbus::fdo::Error::Failed(format!("list_monitors: {e}")))?;
+                if !mons.iter().any(|m| m.id == id) {
+                    return Err(zbus::fdo::Error::InvalidArgs(format!(
+                        "no monitor with id {id:?} (try ListMonitors to see current ids)"
+                    )));
+                }
+            }
+            Ok(CaptureSource::FullScreen { monitor: Some(id) })
+        }
+        "window" => {
+            if let Some(id) = str_arg(s, "id") {
+                let supports = enumerator
+                    .capabilities()
+                    .contains(&ferricast::EnumerationCapability::Windows);
+                if supports {
+                    let ws = enumerator
+                        .list_windows()
+                        .await
+                        .map_err(|e| zbus::fdo::Error::Failed(format!("list_windows: {e}")))?;
+                    let Some(w) = ws.into_iter().find(|w| w.id == id) else {
+                        return Err(zbus::fdo::Error::InvalidArgs(format!(
+                            "no window with id {id:?} (try ListWindows to see current ids)"
+                        )));
+                    };
+                    // X11 ids are decimal XIDs — pass them through as
+                    // numeric so the capture backend doesn't have to
+                    // re-parse. Anything that doesn't parse (wlroots
+                    // wayland protocol_id) falls back to the current
+                    // title; the capture backend will re-resolve.
+                    let identifier = if let Ok(num) = w.id.parse::<u64>() {
+                        ferricast::WindowIdentifier::Id(num)
+                    } else {
+                        ferricast::WindowIdentifier::Title(w.title)
+                    };
+                    return Ok(CaptureSource::Window {
+                        identifier: Some(identifier),
+                    });
+                }
+                // No enumerator → trust the caller, treat the id as
+                // a literal numeric XID or pass it as a title if it
+                // doesn't parse.
+                let identifier = id
+                    .parse::<u64>()
+                    .map(ferricast::WindowIdentifier::Id)
+                    .unwrap_or(ferricast::WindowIdentifier::Title(id));
+                return Ok(CaptureSource::Window {
+                    identifier: Some(identifier),
+                });
+            }
+            Ok(CaptureSource::Window {
+                identifier: str_arg(s, "title")
+                    .or_else(|| str_arg(s, "identifier"))
+                    .map(ferricast::WindowIdentifier::Title),
+            })
+        }
         other => {
             tracing::warn!(kind = other, "unknown source kind, defaulting to full-screen");
-            CaptureSource::FullScreen { monitor: None }
+            Ok(CaptureSource::FullScreen { monitor: None })
         }
     }
 }
@@ -172,7 +262,10 @@ impl ManagerService {
 
     async fn start_stream(&self, device_id: String, source: SourceDto) -> zbus::fdo::Result<()> {
         let id = self.resolve(&device_id).await?;
-        let cap_source = dto_to_source(&source);
+        // Resolve the source *before* taking the manager lock: id
+        // lookup hits the enumerator and we don't want capture-side
+        // contention to back up behind a slow enumerator call.
+        let cap_source = resolve_source(self.enumerator.as_ref(), &source).await?;
         let m = self.manager.lock().await;
         let capture = NativeCapture::new();
         let encoder = H264Encoder::default();
