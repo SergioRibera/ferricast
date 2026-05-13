@@ -2,7 +2,7 @@
 name = "ferricast-gui"
 version = "0.1.0"
 edition = "2024"
-description = "Freya-based desktop GUI for ferricast"
+description = "Freya-based desktop GUI + ferricast D-Bus daemon"
 
 [[bin]]
 name = "ferricast-gui"
@@ -19,11 +19,16 @@ x11 = ["ferricast/x11"]
 
 [dependencies]
 ferricast.workspace = true
+ferricast-dbus.workspace = true
 
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid.workspace = true
+zbus.workspace = true
+clap.workspace = true
+futures-util.workspace = true
 
 freya = { version = "0.4.0-rc.11", features = ["icons", "router", "radio"] }
 rustls = { version = "0.23", features = ["ring"] }
+anyhow = "1"
