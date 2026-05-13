@@ -20,8 +20,19 @@ async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
 
     if args.background && args.command.is_some() {
-        return Err(anyhow::Error::msg(
-            "Any command has conflicts with --background",
+        // The two modes serve opposite roles — `--background` runs
+        // the daemon side that owns the bus name; a subcommand is a
+        // client that talks to a daemon that's already up. Trying
+        // to combine them would either race the well-known name or
+        // pointlessly stand up a second daemon. Bail with a hint
+        // pointing at the workflow we actually expect.
+        return Err(anyhow::anyhow!(
+            "--background and subcommands are mutually exclusive: \
+             `--background` starts the headless daemon (and owns the \
+             D-Bus name), while subcommands like `list` / `stream` / \
+             `monitors` are clients of an already-running daemon. \
+             Start the daemon in one terminal with `ferricast-gui \
+             --background`, then run the subcommand in another."
         ));
     }
 

@@ -271,11 +271,29 @@ impl WlrootsSourceEnumerator {
 }
 
 fn run_loop(_conn: Connection, mut queue: wayland_client::EventQueue<State>, mut state: State) {
+    // wayland-client's Dispatch trait panics by default on
+    // unhandled object-creating events (see the explanation around
+    // `event_created_child!` above). If a panic ever escapes
+    // dispatch the thread would die silently and the daemon would
+    // keep advertising "wlroots" with stale snapshots — wrap each
+    // tick in `catch_unwind` so we log it loudly instead.
+    use std::panic::AssertUnwindSafe;
+
     loop {
-        match queue.blocking_dispatch(&mut state) {
-            Ok(_) => state.recompute(),
-            Err(e) => {
-                warn!(%e, "wlroots event loop exited");
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| queue.blocking_dispatch(&mut state)));
+        match result {
+            Ok(Ok(_)) => state.recompute(),
+            Ok(Err(e)) => {
+                warn!(%e, "wlroots event loop exited cleanly with error");
+                return;
+            }
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&'static str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "<non-string panic>".into());
+                warn!(%msg, "wlroots dispatch panicked — exiting enumerator thread");
                 return;
             }
         }
@@ -459,9 +477,11 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
         match event {
             Event::Toplevel { toplevel } => {
                 let id = toplevel.id().protocol_id();
+                debug!(handle_id = id, "wlroots: new toplevel announced");
                 state
                     .toplevels
                     .insert(id, (toplevel, ToplevelData::default()));
+                state.windows_dirty = true;
             }
             Event::Finished => {
                 debug!("foreign-toplevel manager finished; pickers should re-list");
@@ -470,6 +490,19 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
             _ => {}
         }
     }
+
+    // The `toplevel` event creates a new `zwlr_foreign_toplevel_handle_v1`
+    // server-side. wayland-client's default `event_created_child` panics
+    // — silently killing the event-loop thread — unless we tell it which
+    // dispatch user-data to attach. Opcode `0` is the `toplevel` event:
+    // it's the first event declared in the protocol XML, and wayland
+    // assigns event opcodes in declaration order. Without this override
+    // the daemon comes up, advertises the wlroots backend, but the
+    // first incoming `toplevel` aborts the thread — exactly the "no
+    // windows ever appear" symptom.
+    wayland_client::event_created_child!(State, ZwlrForeignToplevelManagerV1, [
+        0 => (ZwlrForeignToplevelHandleV1, ()),
+    ]);
 }
 
 impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
