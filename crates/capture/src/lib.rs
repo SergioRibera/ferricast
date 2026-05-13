@@ -32,7 +32,7 @@ pub use x11::X11Capture;
 #[cfg(feature = "x11")]
 pub use x11_enum::X11SourceEnumerator;
 #[cfg(feature = "wlroots")]
-pub use wlroots_enum::WlrootsSourceEnumerator;
+pub use wlroots_enum::WaylandSourceEnumerator;
 
 use std::sync::Arc;
 
@@ -43,8 +43,9 @@ use ferricast_core::SourceEnumerator;
 /// Resolution order:
 ///
 /// 1. `XDG_SESSION_TYPE=wayland` (or `WAYLAND_DISPLAY` set) →
-///    [`WlrootsSourceEnumerator`]. Falls through if the compositor
-///    doesn't advertise `zwlr_foreign_toplevel_manager_v1`.
+///    [`WaylandSourceEnumerator`]. Falls through if the compositor
+///    advertises neither `zwlr_foreign_toplevel_management_v1` nor
+///    `ext_foreign_toplevel_list_v1`.
 /// 2. `DISPLAY` set → [`X11SourceEnumerator`]. Falls through on
 ///    connection failure.
 /// 3. Otherwise → `ferricast_core::StubEnumerator` (reports no
@@ -61,11 +62,11 @@ pub fn auto_enumerator() -> Arc<dyn SourceEnumerator> {
                 .map(|v| v.eq_ignore_ascii_case("wayland"))
                 .unwrap_or(false);
         if is_wayland {
-            match WlrootsSourceEnumerator::try_new() {
+            match WaylandSourceEnumerator::try_new() {
                 Ok(e) => return Arc::new(e),
                 Err(e) => tracing::info!(
                     %e,
-                    "wlroots enumerator unavailable, falling through (compositor probably doesn't expose wlr-foreign-toplevel-management)"
+                    "wayland enumerator unavailable, falling through (compositor exposes neither zwlr_foreign_toplevel_management_v1 nor ext_foreign_toplevel_list_v1)"
                 ),
             }
         }

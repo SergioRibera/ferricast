@@ -12,13 +12,11 @@ description = "PipeWire and X11 screen capture for ferricast"
 default = ["pipewire", "x11", "wlroots"]
 pipewire = ["dep:ashpd", "dep:pipewire", "dep:libspa", "dep:ash"]
 x11 = ["dep:xcb"]
-# Source enumeration on wlroots-based Wayland compositors (Hyprland,
-# sway, river, Wayfire). Pure-Rust wayland client; no extra C deps
-# beyond `libwayland-client.so` which any Wayland install already
-# ships. Orthogonal to `pipewire`: that one is for *capture*, this
-# is for *picking the source to capture*. On non-wlroots compositors
-# (GNOME, KDE, Mutter) the enumerator binds nothing and reports no
-# capabilities at runtime.
+# wayland (window/monitor enumeration). "wlroots" is the historical
+# name and stays for backward compat, but the backend now also
+# supports the standard `ext-foreign-toplevel-list-v1` protocol —
+# which means it works on niri, KDE Plasma 6, and any other modern
+# compositor, not just wlr-protocols implementers.
 wlroots = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr"]
 
 [dependencies]
@@ -37,7 +35,7 @@ xcb = { version = "1.7.0", features = ["shm", "randr"], optional = true }
 
 # wlroots enumerator backend
 wayland-client = { version = "0.31", optional = true }
-wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
+wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"], optional = true }
 wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
 
 # pipewire backend

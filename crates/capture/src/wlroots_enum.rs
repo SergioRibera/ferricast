@@ -1,19 +1,23 @@
-//! Source enumeration on **wlroots-based Wayland compositors**
-//! (Hyprland, sway, river, Wayfire, labwc, …).
+//! Source enumeration on **Wayland**. Supports any compositor that
+//! exposes at least one of two foreign-toplevel protocols, which in
+//! practice covers everything except GNOME / Mutter:
 //!
-//! Uses two protocols that wlroots compositors expose but GNOME's
-//! Mutter and KDE's KWin currently don't:
+//! - `zwlr_foreign_toplevel_management_v1` (wlroots family: Hyprland,
+//!   sway, river, Wayfire, labwc, …). Richer — has `output_enter` /
+//!   `output_leave` / window state.
+//! - `ext_foreign_toplevel_list_v1` (niri, KDE Plasma 6, future
+//!   wlroots). Standard upstream protocol, intentionally minimal:
+//!   title / app_id / a globally-stable identifier and nothing else.
 //!
-//! - `zwlr_foreign_toplevel_management_v1` — every top-level window,
-//!   with `title` / `app_id` / `output_enter` / `state` events.
-//! - `zxdg_output_manager_v1` — stable output name + logical
-//!   position/size (post-scale, post-transform), which is what a
-//!   picker actually wants to show.
+//! `try_new` tries them in that order — wlr first because the extra
+//! metadata is genuinely useful for pickers — and falls back to the
+//! ext variant when the wlr binding fails. Monitor geometry uses
+//! `zxdg_output_manager_v1` either way.
 //!
-//! When binding fails (`zwlr_foreign_toplevel_management_v1` absent),
-//! [`WlrootsSourceEnumerator::try_new`] reports an error and the
+//! On compositors that expose neither (today: GNOME / Mutter),
+//! [`WaylandSourceEnumerator::try_new`] reports an error and the
 //! upper layer falls back to the stub. That's the intended detection
-//! mechanism for "this is GNOME/KDE, use the portal picker instead".
+//! mechanism for "use the OS portal picker instead".
 //!
 //! Threading model: a dedicated `std::thread` owns the wayland
 //! `EventQueue` and a `Mutex<Snapshot>` of the current world. The
@@ -38,6 +42,10 @@ use wayland_client::{
         wl_registry::WlRegistry,
     },
     Connection, Dispatch, Proxy, QueueHandle,
+};
+use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
+    ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
+    ext_foreign_toplevel_list_v1::{self, ExtForeignToplevelListV1},
 };
 use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_manager_v1::ZxdgOutputManagerV1,
@@ -75,7 +83,19 @@ struct OutputData {
 struct ToplevelData {
     title: String,
     app_id: Option<String>,
+    /// wl_output protocol_ids this toplevel is currently on. Empty
+    /// on the `ext-foreign-toplevel-list-v1` backend because that
+    /// protocol intentionally omits output tracking — clients are
+    /// expected to compose it with `ext-foreign-toplevel-state-v1`
+    /// (still draft) or query the compositor IPC.
     outputs: HashSet<u32>,
+    /// Stable string id from `ext_foreign_toplevel_handle_v1.identifier`.
+    /// Only populated on the ext backend; wlr toplevels fall back to
+    /// the wayland protocol_id stringified. We prefer this when
+    /// publishing because the ext spec guarantees it's a globally
+    /// unique, compositor-stable id, while protocol_id is per-
+    /// connection.
+    identifier: Option<String>,
     closed: bool,
     ready: bool,
 }
@@ -93,14 +113,24 @@ struct State {
     /// events without juggling proxy lifetimes.
     outputs: HashMap<u32, (WlOutput, OutputData)>,
     xdg_outputs: HashMap<u32, ZxdgOutputV1>,
-    toplevels: HashMap<u32, (ZwlrForeignToplevelHandleV1, ToplevelData)>,
+    /// Toplevels announced via `zwlr_foreign_toplevel_management_v1`
+    /// (wlroots / Hyprland / sway / Wayfire / …). Richer than the
+    /// ext variant — has output tracking + state.
+    wlr_toplevels: HashMap<u32, (ZwlrForeignToplevelHandleV1, ToplevelData)>,
+    /// Toplevels announced via the standard `ext-foreign-toplevel-list-v1`
+    /// (niri, KDE Plasma 6, future wlroots). Less metadata but
+    /// universally supported across modern compositors.
+    ext_toplevels: HashMap<u32, (ExtForeignToplevelHandleV1, ToplevelData)>,
 
     xdg_output_manager: Option<ZxdgOutputManagerV1>,
-    /// Held for its side effect: dropping the manager proxy makes
-    /// the compositor stop sending `toplevel` events. Not read
-    /// directly anywhere.
+    /// Held for their side effect: dropping the manager proxy makes
+    /// the compositor stop sending `toplevel` events. Only one of
+    /// the two is `Some` at any time — try_new picks wlr first
+    /// (richer info) and falls back to ext.
     #[allow(dead_code)]
     foreign_manager: Option<ZwlrForeignToplevelManagerV1>,
+    #[allow(dead_code)]
+    ext_manager: Option<ExtForeignToplevelListV1>,
 
     snapshot: Arc<Mutex<Snapshot>>,
     change_tx: broadcast::Sender<SourceChange>,
@@ -148,23 +178,35 @@ impl State {
                 primary: false,
             });
         }
-        for (handle_id, (_, t)) in &self.toplevels {
+        let publish = |snap: &mut Snapshot,
+                       handle_id: u32,
+                       t: &ToplevelData,
+                       outputs: &HashMap<u32, (WlOutput, OutputData)>| {
             if !t.ready || t.closed {
-                continue;
+                return;
             }
-            let on_monitor = t.outputs.iter().next().and_then(|wl_id| {
-                self.outputs
-                    .get(wl_id)
-                    .and_then(|(_, o)| o.name.clone())
-            });
+            let on_monitor = t
+                .outputs
+                .iter()
+                .next()
+                .and_then(|wl_id| outputs.get(wl_id).and_then(|(_, o)| o.name.clone()));
             snap.windows.push(WindowInfo {
-                id: handle_id.to_string(),
+                id: t
+                    .identifier
+                    .clone()
+                    .unwrap_or_else(|| handle_id.to_string()),
                 title: t.title.clone(),
                 app_id: t.app_id.clone(),
                 pid: None,
                 geometry: None,
                 on_monitor,
             });
+        };
+        for (id, (_, t)) in &self.wlr_toplevels {
+            publish(&mut snap, *id, t, &self.outputs);
+        }
+        for (id, (_, t)) in &self.ext_toplevels {
+            publish(&mut snap, *id, t, &self.outputs);
         }
         *self.snapshot.lock().unwrap() = snap;
 
@@ -179,24 +221,27 @@ impl State {
     }
 }
 
-pub struct WlrootsSourceEnumerator {
+pub struct WaylandSourceEnumerator {
     snapshot: Arc<Mutex<Snapshot>>,
     change_tx: broadcast::Sender<SourceChange>,
 }
 
-impl WlrootsSourceEnumerator {
+impl WaylandSourceEnumerator {
     /// Connect to the running Wayland compositor and bind the
-    /// foreign-toplevel + xdg-output globals. Returns an error if:
+    /// available foreign-toplevel + xdg-output globals. Returns an
+    /// error if:
     ///
-    /// - `WAYLAND_DISPLAY` isn't set / can't connect
-    /// - the compositor doesn't expose
-    ///   `zwlr_foreign_toplevel_management_v1` (i.e. it's GNOME or
-    ///   KDE). xdg-output is optional but every modern wlroots
-    ///   compositor has it.
+    /// - `WAYLAND_DISPLAY` isn't set / can't connect, or
+    /// - the compositor exposes **neither**
+    ///   `zwlr_foreign_toplevel_management_v1` (wlroots family) nor
+    ///   `ext_foreign_toplevel_list_v1` (niri / KDE Plasma 6 /
+    ///   modern compositors). In that case the caller falls back to
+    ///   the stub and the picker should defer to the OS portal.
     ///
-    /// The check is the whole point of this backend: a successful
-    /// `try_new` means we can enumerate; failure means the caller
-    /// should drop us and use a stub.
+    /// Binding precedence is wlr first because it carries strictly
+    /// more information (per-output presence + window state). The
+    /// ext fallback is intentionally minimal: title / app_id /
+    /// stable identifier and nothing else.
     pub fn try_new() -> Result<Self, SourceError> {
         let conn = Connection::connect_to_env()
             .map_err(|e| SourceError::Backend(format!("wayland connect: {e}")))?;
@@ -206,18 +251,34 @@ impl WlrootsSourceEnumerator {
 
         let foreign_manager = globals
             .bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ())
-            .map_err(|e| {
-                SourceError::Backend(format!(
-                    "zwlr_foreign_toplevel_management_v1 missing — not a wlroots compositor: {e}"
-                ))
-            })?;
+            .ok();
+        let ext_manager = if foreign_manager.is_none() {
+            globals
+                .bind::<ExtForeignToplevelListV1, _, _>(&qh, 1..=1, ())
+                .ok()
+        } else {
+            None
+        };
+        if foreign_manager.is_none() && ext_manager.is_none() {
+            return Err(SourceError::Backend(
+                "neither zwlr_foreign_toplevel_management_v1 nor \
+                 ext_foreign_toplevel_list_v1 is available — compositor \
+                 is GNOME / Mutter or an older stack; use the portal picker"
+                    .into(),
+            ));
+        }
+        tracing::info!(
+            wlr = foreign_manager.is_some(),
+            ext = ext_manager.is_some(),
+            "wayland enumerator: bound foreign-toplevel protocol"
+        );
         let xdg_output_manager = globals
             .bind::<ZxdgOutputManagerV1, _, _>(&qh, 2..=3, ())
             .ok();
         if xdg_output_manager.is_none() {
             warn!(
-                "wlroots: xdg-output missing; monitor geometry will be 0×0. \
-                 (compositor is wlroots-ish but unusually old.)"
+                "wayland enumerator: xdg-output missing; monitor geometry will be 0×0. \
+                 (unusually old compositor — every modern wlroots / niri / KWin ships it.)"
             );
         }
 
@@ -242,9 +303,11 @@ impl WlrootsSourceEnumerator {
         let mut state = State {
             outputs: HashMap::new(),
             xdg_outputs: HashMap::new(),
-            toplevels: HashMap::new(),
+            wlr_toplevels: HashMap::new(),
+            ext_toplevels: HashMap::new(),
             xdg_output_manager,
-            foreign_manager: Some(foreign_manager),
+            foreign_manager,
+            ext_manager,
             snapshot: snapshot.clone(),
             change_tx: change_tx.clone(),
             monitors_dirty: false,
@@ -301,9 +364,13 @@ fn run_loop(_conn: Connection, mut queue: wayland_client::EventQueue<State>, mut
 }
 
 #[async_trait]
-impl SourceEnumerator for WlrootsSourceEnumerator {
+impl SourceEnumerator for WaylandSourceEnumerator {
     fn backend_name(&self) -> &'static str {
-        "wlroots"
+        // Historically "wlroots"; broadened to cover any compositor
+        // that exposes either foreign-toplevel protocol — niri,
+        // KDE Plasma 6, etc. — so the name now reflects the
+        // protocol family rather than a specific compositor stack.
+        "wayland"
     }
 
     fn capabilities(&self) -> Vec<EnumerationCapability> {
@@ -477,14 +544,14 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
         match event {
             Event::Toplevel { toplevel } => {
                 let id = toplevel.id().protocol_id();
-                debug!(handle_id = id, "wlroots: new toplevel announced");
+                debug!(handle_id = id, "wlr: new toplevel announced");
                 state
-                    .toplevels
+                    .wlr_toplevels
                     .insert(id, (toplevel, ToplevelData::default()));
                 state.windows_dirty = true;
             }
             Event::Finished => {
-                debug!("foreign-toplevel manager finished; pickers should re-list");
+                debug!("wlr foreign-toplevel manager finished; pickers should re-list");
                 state.windows_dirty = true;
             }
             _ => {}
@@ -515,7 +582,7 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         let id = proxy.id().protocol_id();
-        let Some((_, data)) = state.toplevels.get_mut(&id) else {
+        let Some((_, data)) = state.wlr_toplevels.get_mut(&id) else {
             return;
         };
         use zwlr_foreign_toplevel_handle_v1::Event;
@@ -543,7 +610,90 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
             }
             Event::Closed => {
                 data.closed = true;
-                state.toplevels.remove(&id);
+                state.wlr_toplevels.remove(&id);
+                state.windows_dirty = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── ext-foreign-toplevel-list-v1 ──────────────────────────────────
+//
+// Minimal upstream alternative to the wlr protocol. Fired by niri,
+// KDE Plasma 6, and (eventually) every modern compositor. Carries
+// title / app_id / a stable identifier but no output presence or
+// state — clients that need those have to compose this with other
+// protocols (or the compositor's IPC).
+
+impl Dispatch<ExtForeignToplevelListV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &ExtForeignToplevelListV1,
+        event: <ExtForeignToplevelListV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use ext_foreign_toplevel_list_v1::Event;
+        match event {
+            Event::Toplevel { toplevel } => {
+                let id = toplevel.id().protocol_id();
+                debug!(handle_id = id, "ext: new toplevel announced");
+                state
+                    .ext_toplevels
+                    .insert(id, (toplevel, ToplevelData::default()));
+                state.windows_dirty = true;
+            }
+            Event::Finished => {
+                debug!("ext foreign-toplevel list finished; pickers should re-list");
+                state.windows_dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    // Same panic-by-default reasoning as the wlr manager — opcode 0
+    // is `toplevel` per the protocol declaration order.
+    wayland_client::event_created_child!(State, ExtForeignToplevelListV1, [
+        0 => (ExtForeignToplevelHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<ExtForeignToplevelHandleV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &ExtForeignToplevelHandleV1,
+        event: <ExtForeignToplevelHandleV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let id = proxy.id().protocol_id();
+        let Some((_, data)) = state.ext_toplevels.get_mut(&id) else {
+            return;
+        };
+        use ext_foreign_toplevel_handle_v1::Event;
+        match event {
+            Event::Title { title } => {
+                data.title = title;
+                state.windows_dirty = true;
+            }
+            Event::AppId { app_id } => {
+                data.app_id = Some(app_id);
+                state.windows_dirty = true;
+            }
+            Event::Identifier { identifier } => {
+                data.identifier = Some(identifier);
+                state.windows_dirty = true;
+            }
+            Event::Done => {
+                data.ready = true;
+                state.windows_dirty = true;
+            }
+            Event::Closed => {
+                data.closed = true;
+                state.ext_toplevels.remove(&id);
                 state.windows_dirty = true;
             }
             _ => {}
