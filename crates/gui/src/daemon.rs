@@ -14,12 +14,12 @@ use std::sync::Arc;
 use ferricast::prelude::*;
 use ferricast::{ManagerEvent, SourceChange, SourceEnumerator};
 use ferricast_dbus::{
-    ActiveStreamDto, DeviceDto, MonitorInfoDto, SourceDto, WindowInfoDto, BUS_NAME, OBJECT_PATH,
+    ActiveStreamDto, BUS_NAME, DeviceDto, MonitorInfoDto, OBJECT_PATH, SourceDto, WindowInfoDto,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::OwnedValue;
+use zbus::zvariant::{OwnedValue, Value};
 
 /// Build a [`DeviceDto`] from a core [`Device`]. The `protocol_icon`
 /// is dropped — sending raw bytes over D-Bus for every signal is
@@ -28,23 +28,17 @@ use zbus::zvariant::OwnedValue;
 fn device_to_dto(d: &Device) -> DeviceDto {
     let mut caps: HashMap<String, OwnedValue> = HashMap::new();
     if let Some(v) = d.capabilities.max_fps {
-        if let Ok(v) = OwnedValue::try_from(v) {
-            caps.insert("max_fps".into(), v);
-        }
+        caps.insert("max_fps".into(), OwnedValue::from(v));
     }
     if let Some(v) = d.capabilities.max_bitrate_kbps {
-        if let Ok(v) = OwnedValue::try_from(v) {
-            caps.insert("max_bitrate_kbps".into(), v);
-        }
+        caps.insert("max_bitrate_kbps".into(), OwnedValue::from(v));
     }
     if let Some(p) = d.capabilities.max_h264_profile {
-        if let Ok(v) = OwnedValue::try_from(format!("{p:?}")) {
+        if let Ok(v) = Value::Str(format!("{p:?}").into()).try_to_owned() {
             caps.insert("max_h264_profile".into(), v);
         }
     }
-    if let Ok(v) = OwnedValue::try_from(d.capabilities.requires_audio) {
-        caps.insert("requires_audio".into(), v);
-    }
+    caps.insert("requires_audio".into(), OwnedValue::from(d.capabilities.requires_audio));
 
     DeviceDto {
         id: d.id.to_string(),
@@ -169,7 +163,10 @@ async fn resolve_source(
             })
         }
         other => {
-            tracing::warn!(kind = other, "unknown source kind, defaulting to full-screen");
+            tracing::warn!(
+                kind = other,
+                "unknown source kind, defaulting to full-screen"
+            );
             Ok(CaptureSource::FullScreen { monitor: None })
         }
     }
@@ -297,12 +294,12 @@ impl ManagerService {
     async fn list_monitors(&self) -> zbus::fdo::Result<Vec<MonitorInfoDto>> {
         match self.enumerator.list_monitors().await {
             Ok(mons) => Ok(mons.into_iter().map(monitor_to_dto).collect()),
-            Err(ferricast::SourceError::Unsupported(_)) => Err(zbus::fdo::Error::NotSupported(
-                format!(
+            Err(ferricast::SourceError::Unsupported(_)) => {
+                Err(zbus::fdo::Error::NotSupported(format!(
                     "backend `{}` cannot enumerate monitors — use the OS portal picker",
                     self.enumerator.backend_name()
-                ),
-            )),
+                )))
+            }
             Err(e) => Err(zbus::fdo::Error::Failed(e.to_string())),
         }
     }
@@ -310,12 +307,12 @@ impl ManagerService {
     async fn list_windows(&self) -> zbus::fdo::Result<Vec<WindowInfoDto>> {
         match self.enumerator.list_windows().await {
             Ok(ws) => Ok(ws.into_iter().map(window_to_dto).collect()),
-            Err(ferricast::SourceError::Unsupported(_)) => Err(zbus::fdo::Error::NotSupported(
-                format!(
+            Err(ferricast::SourceError::Unsupported(_)) => {
+                Err(zbus::fdo::Error::NotSupported(format!(
                     "backend `{}` cannot enumerate windows — use the OS portal picker",
                     self.enumerator.backend_name()
-                ),
-            )),
+                )))
+            }
             Err(e) => Err(zbus::fdo::Error::Failed(e.to_string())),
         }
     }
@@ -442,16 +439,12 @@ async fn source_signal_loop(
     loop {
         match source_rx.recv().await {
             Ok(SourceChange::Monitors) => {
-                if let Err(e) =
-                    ManagerService::monitors_changed(iface_ref.signal_emitter()).await
-                {
+                if let Err(e) = ManagerService::monitors_changed(iface_ref.signal_emitter()).await {
                     tracing::warn!(%e, "failed to emit MonitorsChanged");
                 }
             }
             Ok(SourceChange::Windows) => {
-                if let Err(e) =
-                    ManagerService::windows_changed(iface_ref.signal_emitter()).await
-                {
+                if let Err(e) = ManagerService::windows_changed(iface_ref.signal_emitter()).await {
                     tracing::warn!(%e, "failed to emit WindowsChanged");
                 }
             }
@@ -521,13 +514,8 @@ async fn signal_loop(
                 attempt,
                 reason,
             } => {
-                ManagerService::stream_reconnecting(
-                    emitter,
-                    device_id.to_string(),
-                    attempt,
-                    reason,
-                )
-                .await
+                ManagerService::stream_reconnecting(emitter, device_id.to_string(), attempt, reason)
+                    .await
             }
             ManagerEvent::StreamError { device_id, message } => {
                 ManagerService::stream_error(emitter, device_id.to_string(), message).await

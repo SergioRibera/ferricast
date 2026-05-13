@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use ferricast::prelude::*;
 use ferricast::ManagerEvent;
+use ferricast::prelude::*;
 use freya::{prelude::*, radio::*};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing_subscriber::EnvFilter;
-use uuid::Uuid;
 
 mod app;
 mod cli;
@@ -19,6 +18,12 @@ use crate::cli::{Cli, Command};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
+
+    if args.background && args.command.is_some() {
+        return Err(anyhow::Error::msg(
+            "Any command has conflicts with --background",
+        ));
+    }
 
     // Client subcommands don't need the heavy init that the daemon
     // does (no tls, no rustls provider, no stream-manager build) —
@@ -71,18 +76,6 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!(%e, "Failed to start discovery");
             } else {
                 tracing::info!("Discovery started for all protocols");
-            }
-        });
-    }
-
-    // Optional `--device` auto-start: watch for the matching device
-    // and fire a stream once it shows up.
-    if let Some(device_arg) = args.device.clone() {
-        let sm = manager.clone();
-        let source = args.source;
-        tokio::spawn(async move {
-            if let Err(e) = auto_stream(sm, device_arg, source).await {
-                tracing::error!(%e, "auto-stream failed");
             }
         });
     }
@@ -160,55 +153,6 @@ fn run_window(stream_manager: Arc<Mutex<StreamManager>>, mut ui_rx: mpsc::Receiv
     );
 }
 
-/// Resolve `--device` (UUID or case-insensitive name) and start a
-/// stream as soon as the matching device is discovered. Times out
-/// after 30s of not seeing it — gives slow mDNS / SSDP discoveries
-/// time to settle without hanging the daemon forever.
-async fn auto_stream(
-    manager: Arc<Mutex<StreamManager>>,
-    ident: String,
-    source: Option<cli::SourceKind>,
-) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    let id = loop {
-        if let Some(uuid) = match_device(&manager, &ident).await {
-            break uuid;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("no device matching {ident:?} appeared within 30s");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    };
-
-    let cap_source = match source {
-        Some(cli::SourceKind::Screen) | None => CaptureSource::FullScreen { monitor: None },
-        Some(cli::SourceKind::Window) => CaptureSource::Window { identifier: None },
-    };
-
-    let m = manager.lock().await;
-    let capture = NativeCapture::new();
-    let encoder = H264Encoder::default();
-    let config = StreamConfig::default();
-    m.start_stream(id, cap_source, capture, encoder, config)
-        .await?;
-    tracing::info!(device = %ident, "auto-stream started");
-    Ok(())
-}
-
-async fn match_device(manager: &Arc<Mutex<StreamManager>>, ident: &str) -> Option<Uuid> {
-    if let Ok(uuid) = Uuid::parse_str(ident) {
-        return Some(uuid);
-    }
-    let needle = ident.to_lowercase();
-    let m = manager.lock().await;
-    for d in m.devices().await {
-        if d.name.to_lowercase() == needle {
-            return Some(d.id);
-        }
-    }
-    None
-}
-
 async fn run_client(cmd: Command) -> anyhow::Result<()> {
     match cmd {
         Command::List { watch } => client::list(watch).await,
@@ -238,6 +182,8 @@ fn init_tracing_for_client() {
     // Quieter default — a CLI client shouldn't paint the terminal
     // green by default. Users can still bump it with RUST_LOG.
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error")),
+        )
         .init();
 }

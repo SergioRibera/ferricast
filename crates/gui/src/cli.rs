@@ -25,21 +25,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 )]
 pub struct Cli {
     /// Run as a headless daemon without opening the desktop window.
-    #[arg(long, conflicts_with = "command")]
+    #[arg(long)]
     pub background: bool,
-
-    /// Auto-start a stream on this device once it appears in discovery.
-    /// Accepts a UUID or a (case-insensitive) device name.
-    ///
-    /// Only meaningful in daemon modes (`--background` or windowed).
-    #[arg(long, value_name = "ID_OR_NAME", conflicts_with = "command")]
-    pub device: Option<String>,
-
-    /// What to share when `--device` triggers an auto-start. If
-    /// omitted the daemon picks: PipeWire portal on Wayland; an
-    /// X11 picker dialog (TODO) on X11.
-    #[arg(long, value_enum, conflicts_with = "command")]
-    pub source: Option<SourceKind>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -51,15 +38,6 @@ pub enum SourceKind {
     Screen,
     /// Window capture (portal picks the window on Wayland).
     Window,
-}
-
-impl SourceKind {
-    pub fn as_kind_str(self) -> &'static str {
-        match self {
-            Self::Screen => "screen",
-            Self::Window => "window",
-        }
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -90,9 +68,7 @@ pub enum Command {
         device: String,
     },
 
-    /// List monitors visible to the daemon. Fails with a clear
-    /// message on backends that can't enumerate (GNOME/KDE Wayland);
-    /// pickers should fall back to the OS portal in that case.
+    /// List monitors visible to the daemon.
     Monitors {
         /// Stream `MonitorsChanged` events instead of exiting.
         #[arg(long)]
