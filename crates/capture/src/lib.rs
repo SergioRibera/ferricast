@@ -23,6 +23,8 @@ mod x11_enum;
 mod wlroots_enum;
 #[cfg(feature = "wlroots")]
 mod wayland_thumb;
+#[cfg(feature = "wayland-direct")]
+mod wayland_direct;
 
 /// Largest `(w, h)` that fits inside `(max_w, max_h)` while keeping
 /// the aspect ratio of `(src_w, src_h)`. Both dimensions are
@@ -54,6 +56,8 @@ pub use x11::X11Capture;
 pub use x11_enum::X11SourceEnumerator;
 #[cfg(feature = "wlroots")]
 pub use wlroots_enum::WaylandSourceEnumerator;
+#[cfg(feature = "wayland-direct")]
+pub use wayland_direct::WaylandDirectCapture;
 
 use std::sync::Arc;
 
