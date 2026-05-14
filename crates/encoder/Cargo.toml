@@ -4,6 +4,30 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+# Encoder backends, each gated behind its own feature so a build
+# can opt out of any combination. At least one backend MUST be
+# enabled — `lib.rs` emits a `compile_error!` when all three are
+# off, since the H.264 facade has nothing to dispatch to.
+#
+# - `openh264` — software fallback, always available at runtime.
+#             The only path with no system-library coupling that
+#             fails outside its compatible version window.
+# - `vaapi` — Intel iGPU / AMD Mesa hardware encode via cros-libva.
+#             cros-libva pins to a specific libva ABI; bump the
+#             fork rev when libva moves and bindgen output diverges.
+# - `nvenc` — NVIDIA hardware encode via shiguredo_nvcodec.
+#             Loads libcuda + libnvidia-encode at runtime; missing
+#             libraries make `probe()` fall through to the next
+#             backend at runtime.
+#
+# Disable any one you can't build on a particular host. Typical
+# fix for cros-libva ABI mismatches:
+#   ferricast = { default-features = false, features = ["openh264", "nvenc"] }
+default = ["openh264", "vaapi", "nvenc"]
+openh264 = ["dep:openh264"]
+vaapi = ["dep:cros-libva"]
+nvenc = ["dep:shiguredo_nvcodec"]
+
 # Zero-copy DMA-BUF input on NVENC. Requires a forked
 # `shiguredo_nvcodec` that exposes `Encoder::register_external_dmabuf`
 # + `Encoder::encode_external` (the upstream crate keeps those
@@ -13,25 +37,32 @@ edition = "2024"
 #
 # Toggle on with `--features nvenc-zero-copy` once `Cargo.toml`
 # points `shiguredo_nvcodec` at a fork that publishes the two
-# methods. The NVENC encoder file picks the right code path at
-# compile time via `#[cfg(feature = "nvenc-zero-copy")]`.
-default = []
-nvenc-zero-copy = []
+# methods.
+nvenc-zero-copy = ["nvenc"]
 
 [dependencies]
 ferricast-core.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 
+# Software encoder — pure-Rust binding around openh264.
+openh264 = { version = "0.9.3", optional = true }
+
 # VA-API binding without ffmpeg. Used to encode H.264 directly on
 # the GPU when the system has a VA-API driver. Loaded at runtime;
-# missing `libva.so` makes the encoder gracefully fall back to x264.
-cros-libva = { git = "https://github.com/SergioRibera/cros-libva", rev = "3eb6e6e0e3085c8376124b75bf638ce6982b7b33" }
+# missing `libva.so` makes the encoder gracefully fall back to openh264.
+#
+# The fork is pinned to a specific rev because cros-libva regenerates
+# bindings from libva headers — newer libva versions add fields that
+# the pinned bindgen output doesn't know about, breaking compile on
+# rolling-release distros. Bump the rev when libva on your target
+# distro moves; until then `--no-default-features --features "openh264,nvenc"`
+# is the escape hatch.
+cros-libva = { git = "https://github.com/SergioRibera/cros-libva", rev = "3eb6e6e0e3085c8376124b75bf638ce6982b7b33", optional = true }
 
 # NVENC (NVIDIA hardware H.264 encode). Higher-level Rust binding
 # that wraps the Video Codec SDK headers — no SDK install needed at
 # build time, the libraries (libcuda.so, libnvidia-encode.so) are
 # dlopen'd at runtime. Missing libs cause `Encoder::new` to error
-# and the factory falls back through VA-API / x264.
-shiguredo_nvcodec = "2026.1.0"
-openh264 = "0.9.3"
+# and the factory falls back through VA-API / openh264.
+shiguredo_nvcodec = { version = "2026.1.0", optional = true }

@@ -24,7 +24,7 @@ ferricast-chromecast = { path = "crates/chromecast" }
 ferricast-dial = { path = "crates/dial" }
 ferricast-airplay = { path = "crates/airplay" }
 ferricast-miracast = { path = "crates/miracast" }
-ferricast-encoder = { path = "crates/encoder" }
+ferricast-encoder = { path = "crates/encoder", default-features = false }
 ferricast-m3u8 = { path = "crates/m3u8" }
 ferricast-muxer = { path = "crates/muxer" }
 ferricast-hls = { path = "crates/hls" }
@@ -50,13 +50,33 @@ description = "Unified screen and video streaming library for Linux"
 path = "src/lib.rs"
 
 [features]
-default = ["chromecast", "pipewire", "x11", "wlroots", "wayland-direct"]
+default = [
+    "chromecast",
+    "pipewire",
+    "x11",
+    "wlroots",
+    "wayland-direct",
+    "x264",
+    "vaapi",
+    "nvenc",
+]
 chromecast = ["dep:ferricast-chromecast"]
 # Capture backends — re-exported from `ferricast-capture`. At least
 # one MUST be enabled; the capture crate emits a `compile_error!` if
 # both are turned off.
 pipewire = ["ferricast-capture/pipewire"]
 x11 = ["ferricast-capture/x11"]
+# Encoder backends — re-exported from `ferricast-encoder`. At least
+# one MUST be enabled (the encoder crate emits a `compile_error!`
+# when all three are off). Typical escape hatch when cros-libva's
+# pinned libva ABI doesn't match the host:
+#     ferricast = { default-features = false,
+#                   features = ["chromecast", "x11", "pipewire",
+#                               "x264", "nvenc"] }
+x264 = ["ferricast-encoder/x264"]
+vaapi = ["ferricast-encoder/vaapi"]
+nvenc = ["ferricast-encoder/nvenc"]
+nvenc-zero-copy = ["ferricast-encoder/nvenc-zero-copy", "nvenc"]
 # Wayland source enumeration (foreign-toplevel + xdg-output).
 # Orthogonal to `pipewire`: that's for *capture* on Wayland; this is
 # for *picking the source to capture* via an in-process picker
