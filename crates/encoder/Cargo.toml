@@ -3,6 +3,21 @@ name = "ferricast-encoder"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Zero-copy DMA-BUF input on NVENC. Requires a forked
+# `shiguredo_nvcodec` that exposes `Encoder::register_external_dmabuf`
+# + `Encoder::encode_external` (the upstream crate keeps those
+# `pub(crate)`). Without the fork, NVENC stays on the CPU path
+# (Vulkan readback + libcuda HtoD) which still works on every
+# NVIDIA GPU — just not zero-copy.
+#
+# Toggle on with `--features nvenc-zero-copy` once `Cargo.toml`
+# points `shiguredo_nvcodec` at a fork that publishes the two
+# methods. The NVENC encoder file picks the right code path at
+# compile time via `#[cfg(feature = "nvenc-zero-copy")]`.
+default = []
+nvenc-zero-copy = []
+
 [dependencies]
 ferricast-core.workspace = true
 bytes.workspace = true

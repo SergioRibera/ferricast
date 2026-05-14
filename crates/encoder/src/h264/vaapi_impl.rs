@@ -94,6 +94,12 @@ pub struct VaapiH264Encoder {
     /// readback. `None` means the driver doesn't expose VPP — we
     /// fall back to the CPU path even for GPU frames in that case
     /// (which still beats x264 because the encode itself is HW).
+    ///
+    /// `vpp_config` is held purely to keep the FFI handle alive
+    /// for the lifetime of `vpp_context` — cros-libva drops the
+    /// config before the context, which would invalidate the
+    /// context. Never read directly.
+    #[allow(dead_code)]
     vpp_config: Option<Config>,
     vpp_context: Option<Rc<Context>>,
 
@@ -361,14 +367,15 @@ fn build_vpp(display: &Rc<Display>, cfg: &EncoderCfg) -> Result<(Config, Rc<Cont
         )
         .map_err(|e| FerricastError::Encoder(format!("vaCreateConfig(VPP): {e}")))?;
     // VPP contexts don't have a render-target list (the dest
-    // surface is passed per-Picture). We pass an empty slice as
-    // `render_targets`, which `Some(&[])` expresses.
+    // surface is passed per-Picture). `create_context` accepts
+    // `Option<&Vec<Surface<D>>>`, so we hand it `None` rather than
+    // synthesising an empty Vec just to satisfy the API shape.
     let context = display
         .create_context::<()>(
             &config,
-            cfg.width as u32,
+            cfg.width,
             cfg.padded_height(),
-            Some(&[]),
+            None,
             /* progressive = */ true,
         )
         .map_err(|e| FerricastError::Encoder(format!("vaCreateContext(VPP): {e}")))?;
@@ -1137,14 +1144,14 @@ struct DmaBufImport {
 
 impl ExternalBufferDescriptor for DmaBufImport {
     const MEMORY_TYPE: MemoryType = MemoryType::DrmPrime2;
-    type DescriptorAttribute = bindings::VADRMPRIMESurfaceDescriptor;
+    type DescriptorAttribute = VADRMPRIMESurfaceDescriptor;
 
     fn va_surface_attribute(&mut self) -> Self::DescriptorAttribute {
         // `VADRMPRIMESurfaceDescriptor` is a C struct: zeroing then
         // filling the fields we care about leaves the unused slots
         // (`objects[1..4]`, `layers[1..4]`) at zero, which the
         // driver ignores per `num_objects = 1` / `num_layers = 1`.
-        let mut d: bindings::VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
+        let mut d: VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
         d.fourcc = self.va_fourcc;
         d.width = self.width;
         d.height = self.height;

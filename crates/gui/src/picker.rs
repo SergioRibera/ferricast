@@ -1,42 +1,191 @@
-//! In-process source picker shown as a Freya `Popup` overlay on
-//! the main window.
+//! Out-of-process source picker — runs in its own OS-level window.
 //!
-//! When a `DeviceCard` requests a stream, the app pushes a
-//! [`PickerRequest`] into shared state and the top-level `App`
-//! mounts a `SourcePicker` over the device list. The picker:
+//! Why a separate window (vs an in-app `Popup` overlay): the user
+//! wants the picker reachable even when the main Ferricast window is
+//! minimised / backgrounded. A `Popup` is just a child element of
+//! the host window — when that window isn't on screen, the popup
+//! isn't either. A standalone window has its own surface and the
+//! compositor / window manager treats it independently.
 //!
-//! 1. Calls `ListMonitors` + `ListWindows` against the running
-//!    daemon (via the same `client::proxy()` helper the CLI uses).
-//! 2. Renders a tabbed grid: Monitors / Windows. Each entry is a
-//!    card with a lazy thumbnail (PNG bytes from the daemon's
-//!    `GetMonitorThumbnail` / `GetWindowThumbnail`).
-//! 3. On click, builds a [`SourceDto`] (`monitor` + `id` /
-//!    `window_by_id`) and fires the `on_select` callback. The app
-//!    clears the picker request and starts the stream.
-//! 4. Escape / backdrop tap → `on_cancel`.
+//! Stay-on-top: we request `WindowLevel::AlwaysOnTop` via winit's
+//! `WindowAttributes`. On X11 / Windows / macOS that's honoured;
+//! on Wayland the protocol doesn't expose "always on top" to apps,
+//! so it's a best-effort soft-request that the compositor may
+//! ignore. The window is still independent (top-level), reachable
+//! through Alt-Tab and the compositor's task switcher.
 //!
-//! Same component will be reusable from any future "pick a source"
-//! flow inside the app.
+//! ## Wiring
+//!
+//! [`open_picker`] is the entry point used by [`crate::app`]:
+//!
+//! 1. Allocates a `tokio::sync::oneshot::channel`.
+//! 2. Builds a [`PickerWindowApp`] holding the sender, then calls
+//!    `Platform::launch_window` to spawn the window asynchronously.
+//! 3. Awaits the user's selection on the receiver.
+//! 4. Closes the window via `Platform::close_window` and dispatches
+//!    the chosen [`SourceDto`] (or no-op on cancel).
+//!
+//! The picker UI itself is the [`SourcePicker`] component — same
+//! component the prior in-window popup used. Now it lives at the
+//! root of [`PickerWindowApp::render`] instead of inside a `Popup`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use ferricast::prelude::*;
+use ferricast::WindowIdentifier;
 use ferricast_dbus::{MonitorInfoDto, SourceDto, WindowInfoDto};
 use freya::prelude::*;
-use freya_engine::prelude::{SkData, SkImage};
+use freya::winit::window::WindowLevel;
+use tokio::sync::{oneshot, Mutex};
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::client;
 
-// ── Public component ──────────────────────────────────────────────
+// ── Entry point used by the main app ──────────────────────────────
 
-/// Callbacks from the picker run synchronously on the Freya UI
-/// thread (button press / Escape key), so they don't need
-/// `Send + Sync` — keeping them as plain `Fn` lets the caller
-/// capture non-Send handles (Radio writers, Rc<...>, etc.) without
-/// jumping through extra channels.
+/// Launch the picker in a new top-level window and start the
+/// chosen stream when the user selects something.
+///
+/// Returns immediately — the actual window lifecycle runs on a
+/// freya-local task spawned here. Multiple concurrent calls open
+/// independent windows; cancelling one doesn't affect the others.
+pub fn open_picker(
+    platform: Platform,
+    stream_manager: Arc<Mutex<StreamManager>>,
+    device_id: Uuid,
+) {
+    spawn(async move {
+        let (tx, rx) = oneshot::channel::<Option<SourceDto>>();
+        let app = PickerWindowApp {
+            sender: Rc::new(RefCell::new(Some(tx))),
+        };
+
+        let config = WindowConfig::new_app(app)
+            .with_title("Choose what to share")
+            .with_size(820., 580.)
+            .with_background((20, 20, 28))
+            // Always-on-top: honoured on X11 / Windows / macOS. On
+            // Wayland the protocol doesn't expose this knob; the
+            // compositor will ignore the request and the window
+            // will behave like any other top-level (still reachable
+            // via Alt-Tab, just not pinned above).
+            .with_window_attributes(|attrs, _| attrs.with_window_level(WindowLevel::AlwaysOnTop));
+
+        let wid = platform.launch_window(config).await;
+        // Focus on creation so the user sees it on top even when
+        // AlwaysOnTop is a no-op. Wayland still respects activation
+        // when it comes from a user gesture (the share-button click
+        // that triggered this).
+        platform.focus_window(Some(wid));
+
+        match rx.await {
+            Ok(Some(dto)) => {
+                platform.close_window(wid);
+                if let Err(e) = start_stream_with_dto(stream_manager, device_id, dto).await {
+                    tracing::error!(%e, ?device_id, "start_stream");
+                }
+            }
+            // Cancel button, escape, or window dismissed: close
+            // the window if it's still alive (it might already be
+            // gone if the user clicked the close button).
+            Ok(None) | Err(_) => platform.close_window(wid),
+        }
+    });
+}
+
+/// Translate the wire-shape `SourceDto` chosen in the picker into
+/// the in-process `CaptureSource`. Mirrors what
+/// `daemon::resolve_source` does over D-Bus but stays in-process
+/// since we already hold the `StreamManager`.
+async fn start_stream_with_dto(
+    stream_manager: Arc<Mutex<StreamManager>>,
+    device_id: Uuid,
+    source: SourceDto,
+) -> Result<()> {
+    let cap_source = dto_to_capture_source(&source);
+    let sm = stream_manager.lock().await;
+    let capture = NativeCapture::new();
+    let encoder = H264Encoder::default();
+    let config = StreamConfig::default();
+    sm.start_stream(device_id, cap_source, capture, encoder, config)
+        .await
+}
+
+fn dto_to_capture_source(s: &SourceDto) -> CaptureSource {
+    fn str_arg(s: &SourceDto, key: &str) -> Option<String> {
+        let v = s.args.get(key)?;
+        v.downcast_ref::<&str>().ok().map(|s| s.to_string())
+    }
+    match s.kind.as_str() {
+        "monitor" | "screen" => CaptureSource::FullScreen {
+            monitor: str_arg(s, "id").or_else(|| str_arg(s, "monitor")),
+        },
+        "window" => {
+            let id = str_arg(s, "id");
+            if let Some(id) = id {
+                let identifier = id
+                    .parse::<u64>()
+                    .map(WindowIdentifier::Id)
+                    .unwrap_or_else(|_| WindowIdentifier::Title(id));
+                return CaptureSource::Window {
+                    identifier: Some(identifier),
+                };
+            }
+            CaptureSource::Window {
+                identifier: str_arg(s, "title").map(WindowIdentifier::Title),
+            }
+        }
+        _ => CaptureSource::FullScreen { monitor: None },
+    }
+}
+
+// ── PickerWindowApp ───────────────────────────────────────────────
+
+/// The freya `App` that runs inside the picker window. Holds a
+/// one-shot sender that the picker's select/cancel callbacks fire
+/// to communicate the user's choice back to [`open_picker`].
+pub struct PickerWindowApp {
+    /// `RefCell<Option<_>>` because `oneshot::Sender::send` takes
+    /// `self`, but `App::render` only sees `&self`. Wrapped in
+    /// `Rc` so both `on_select` and `on_cancel` can hold a clone;
+    /// whichever fires first `.take()`s the sender and the other
+    /// becomes a no-op.
+    sender: Rc<RefCell<Option<oneshot::Sender<Option<SourceDto>>>>>,
+}
+
+impl App for PickerWindowApp {
+    fn render(&self) -> impl IntoElement {
+        let sender_select = self.sender.clone();
+        let sender_cancel = self.sender.clone();
+
+        let on_select: Arc<dyn Fn(SourceDto)> = Arc::new(move |dto: SourceDto| {
+            if let Some(tx) = sender_select.borrow_mut().take() {
+                let _ = tx.send(Some(dto));
+            }
+        });
+        let on_cancel: Arc<dyn Fn()> = Arc::new(move || {
+            if let Some(tx) = sender_cancel.borrow_mut().take() {
+                let _ = tx.send(None);
+            }
+        });
+
+        SourcePicker {
+            on_select,
+            on_cancel,
+        }
+    }
+}
+
+// ── SourcePicker (UI body, no Popup wrapper) ──────────────────────
+
+/// Picker UI. Used as the root of the standalone picker window;
+/// also reusable from any other surface that wants the same
+/// "choose what to share" flow (just instantiate it with the
+/// appropriate callbacks).
 #[derive(Clone)]
 pub struct SourcePicker {
     pub on_select: Arc<dyn Fn(SourceDto)>,
@@ -57,30 +206,29 @@ enum Tab {
     Windows,
 }
 
-#[derive(Default, Clone, PartialEq)]
+#[derive(Default, Clone)]
 struct Entries {
     monitors: Vec<MonitorInfoDto>,
     windows: Vec<WindowInfoDto>,
     loaded: bool,
-    /// `Err` when the daemon refused either list with NotSupported
-    /// (e.g. GNOME / Mutter where the picker can't enumerate).
-    /// We render the message instead of an empty grid.
+    /// `Some` when the daemon refused enumeration with a hard
+    /// error. We render the message instead of an empty grid.
     error: Option<String>,
 }
 
 impl Component for SourcePicker {
     fn render(&self) -> impl IntoElement {
         let on_select = self.on_select.clone();
-        let on_cancel_top = self.on_cancel.clone();
+        let on_cancel = self.on_cancel.clone();
 
-        let mut tab = use_state::<Tab>(Default::default);
-        let mut entries = use_state::<Entries>(Default::default);
+        let tab = use_state::<Tab>(Default::default);
+        let entries = use_state::<Entries>(Default::default);
 
-        // One-shot fetch on mount.
-        use_side_effect_with_deps((), {
-            let entries = entries.clone();
-            move |_| {
-                let mut entries = entries.clone();
+        // One-shot fetch when the picker mounts.
+        use_side_effect_with_deps(&(), {
+            let entries = entries;
+            move |_: &()| {
+                let mut entries = entries;
                 spawn(async move {
                     let loaded = load_entries().await;
                     entries.set(loaded);
@@ -91,47 +239,70 @@ impl Component for SourcePicker {
         let snapshot = entries.read().clone();
         let current_tab = *tab.read();
 
-        Popup::new()
-            .width(Size::px(720.))
-            .on_close_request({
-                let cancel = on_cancel_top.clone();
-                move |_| (cancel)()
-            })
-            .child(PopupTitle::new("Choose what to share".to_string()))
-            .child(
-                PopupContent::new().child(
-                    rect()
-                        .vertical()
-                        .spacing(12.)
-                        .child(tabs_row(current_tab, tab.clone()))
-                        .child(grid(
-                            current_tab,
-                            snapshot,
-                            on_select.clone(),
-                            on_cancel_top.clone(),
-                        )),
-                ),
-            )
-            .child(
-                PopupButtons::new().child(
-                    Button::new()
-                        .child("Cancel")
-                        .on_press(move |_| (on_cancel_top)()),
-                ),
-            )
+        rect()
+            .expanded()
+            .vertical()
+            .background((20, 20, 28))
+            .padding(16.)
+            .spacing(12.)
+            .child(header(on_cancel.clone()))
+            .child(tabs_row(current_tab, tab.clone()))
+            .child(grid(current_tab, snapshot, on_select.clone()))
+            .child(footer(on_cancel))
     }
 }
 
-// ── Tabs row ──────────────────────────────────────────────────────
+fn header(on_cancel: Arc<dyn Fn()>) -> Rect {
+    rect()
+        .width(Size::fill())
+        .horizontal()
+        .cross_align(Alignment::center())
+        .child(
+            label()
+                .text("Choose what to share")
+                .font_size(16.)
+                .color((230, 230, 240)),
+        )
+        .child(rect().width(Size::fill()))
+        .child(
+            rect()
+                .padding(Gaps::new(4., 10., 4., 10.))
+                .corner_radius(6.)
+                .background((50, 50, 65))
+                .on_press(move |_| (on_cancel)())
+                .child(label().text("✕").color((230, 230, 240)).font_size(13.)),
+        )
+}
 
-fn tabs_row(current: Tab, mut tab_state: State<Tab>) -> Rect {
-    let monitor_btn = tab_button("Monitors", current == Tab::Monitors, {
-        let mut t = tab_state.clone();
-        move |_| t.set(Tab::Monitors)
+fn footer(on_cancel: Arc<dyn Fn()>) -> Rect {
+    rect()
+        .width(Size::fill())
+        .horizontal()
+        .main_align(Alignment::end())
+        .child(
+            rect()
+                .padding(Gaps::new(6., 14., 6., 14.))
+                .corner_radius(8.)
+                .background((50, 50, 65))
+                .on_press(move |_| (on_cancel)())
+                .child(label().text("Cancel").color((230, 230, 240)).font_size(13.)),
+        )
+}
+
+// ── Tabs ──────────────────────────────────────────────────────────
+
+fn tabs_row(current: Tab, tab_state: State<Tab>) -> Rect {
+    // `State<T>` is `Copy` (it's a handle into the global signal
+    // store), so we capture by-value into the closure and re-bind
+    // as `mut` inside the body — Fn closures can't mutably borrow
+    // a captured variable directly, but they can shadow it.
+    let monitor_btn = tab_button("Monitors", current == Tab::Monitors, move |_| {
+        let mut t = tab_state;
+        t.set(Tab::Monitors);
     });
-    let window_btn = tab_button("Windows", current == Tab::Windows, {
-        let mut t = tab_state.clone();
-        move |_| t.set(Tab::Windows)
+    let window_btn = tab_button("Windows", current == Tab::Windows, move |_| {
+        let mut t = tab_state;
+        t.set(Tab::Windows);
     });
     rect()
         .horizontal()
@@ -157,15 +328,10 @@ fn tab_button(
 
 // ── Grid ──────────────────────────────────────────────────────────
 
-fn grid(
-    current: Tab,
-    entries: Entries,
-    on_select: Arc<dyn Fn(SourceDto) + Send + Sync>,
-    on_cancel: Arc<dyn Fn() + Send + Sync>,
-) -> Rect {
+fn grid(current: Tab, entries: Entries, on_select: Arc<dyn Fn(SourceDto)>) -> Rect {
     let body = rect()
         .width(Size::fill())
-        .height(Size::px(420.))
+        .height(Size::fill())
         .background((22, 22, 30))
         .corner_radius(10.)
         .padding(8.);
@@ -191,7 +357,7 @@ fn grid(
         Tab::Monitors => {
             if entries.monitors.is_empty() {
                 return body.center().child(empty_msg(
-                    "No monitors enumerable on this compositor — falling back to portal at stream time.",
+                    "No monitors enumerable on this compositor — picker will fall back to the portal at stream time.",
                 ));
             }
             let cards = entries.monitors.into_iter().map(move |m| {
@@ -202,25 +368,21 @@ fn grid(
                 .into()
             });
             body.child(
-                ScrollView::new()
-                    .expanded()
-                    .direction(Direction::Vertical)
-                    .child(
-                        rect()
-                            .horizontal()
-                            .spacing(8.)
-                            .content(Content::wrap_spacing(8.))
-                            .children(cards),
-                    ),
+                ScrollView::new().expanded().direction(Direction::Vertical).child(
+                    rect()
+                        .horizontal()
+                        .spacing(8.)
+                        .content(Content::wrap_spacing(8.))
+                        .children(cards),
+                ),
             )
         }
         Tab::Windows => {
             if entries.windows.is_empty() {
                 return body.center().child(empty_msg(
-                    "No windows enumerable on this compositor — fall back to portal or X11 source.",
+                    "No windows enumerable on this compositor — pick a monitor or fall back to the portal.",
                 ));
             }
-            let _cancel = on_cancel; // reserved for future per-card actions
             let cards = entries.windows.into_iter().map(move |w| {
                 WindowCard {
                     info: w,
@@ -229,16 +391,13 @@ fn grid(
                 .into()
             });
             body.child(
-                ScrollView::new()
-                    .expanded()
-                    .direction(Direction::Vertical)
-                    .child(
-                        rect()
-                            .horizontal()
-                            .spacing(8.)
-                            .content(Content::wrap_spacing(8.))
-                            .children(cards),
-                    ),
+                ScrollView::new().expanded().direction(Direction::Vertical).child(
+                    rect()
+                        .horizontal()
+                        .spacing(8.)
+                        .content(Content::wrap_spacing(8.))
+                        .children(cards),
+                ),
             )
         }
     }
@@ -259,7 +418,7 @@ const THUMB_H: f32 = 124.;
 #[derive(Clone)]
 struct MonitorCard {
     info: MonitorInfoDto,
-    on_select: Arc<dyn Fn(SourceDto) + Send + Sync>,
+    on_select: Arc<dyn Fn(SourceDto)>,
 }
 
 impl PartialEq for MonitorCard {
@@ -281,18 +440,23 @@ impl Component for MonitorCard {
         let geom = format!("{}×{}", self.info.width, self.info.height);
         let on_select = self.on_select.clone();
         let id_for_select = id.clone();
-        let id_for_thumb = id.clone();
 
-        card_shell(label_text, geom, id, "monitor", THUMB_W as u32, THUMB_H as u32, move |_| {
-            (on_select)(SourceDto::monitor(id_for_select.clone()))
-        }, id_for_thumb)
+        card_shell(
+            label_text,
+            geom,
+            id.clone(),
+            "monitor",
+            THUMB_W as u32,
+            THUMB_H as u32,
+            move |_| (on_select)(SourceDto::monitor(id_for_select.clone())),
+        )
     }
 }
 
 #[derive(Clone)]
 struct WindowCard {
     info: WindowInfoDto,
-    on_select: Arc<dyn Fn(SourceDto) + Send + Sync>,
+    on_select: Arc<dyn Fn(SourceDto)>,
 }
 
 impl PartialEq for WindowCard {
@@ -316,16 +480,26 @@ impl Component for WindowCard {
         };
         let on_select = self.on_select.clone();
         let id_for_select = id.clone();
-        let id_for_thumb = id.clone();
 
-        card_shell(title, app_id, id, "window", THUMB_W as u32, THUMB_H as u32, move |_| {
-            (on_select)(SourceDto::window_by_id(id_for_select.clone()))
-        }, id_for_thumb)
+        card_shell(
+            title,
+            app_id,
+            id,
+            "window",
+            THUMB_W as u32,
+            THUMB_H as u32,
+            move |_| (on_select)(SourceDto::window_by_id(id_for_select.clone())),
+        )
     }
 }
 
 /// Shared visual shell for monitor + window cards. Holds the lazy
 /// thumbnail fetch so the layout code stays close to the data.
+///
+/// The thumbnail is fed into `ImageViewer` which handles async PNG
+/// decoding via Freya's asset cache — same path Freya itself uses
+/// for any byte-blob image source. Re-renders that re-fetch the same
+/// `(cache_key, bytes)` tuple deduplicate via the asset cache.
 fn card_shell(
     title: String,
     subtitle: String,
@@ -334,43 +508,38 @@ fn card_shell(
     thumb_w: u32,
     thumb_h: u32,
     on_press: impl Fn(Event<PressEventData>) + 'static,
-    thumb_id: String,
 ) -> Rect {
-    let mut thumb = use_state::<Option<ImageHolder>>(|| None);
-    use_side_effect_with_deps(cache_key.clone(), {
-        let thumb = thumb.clone();
-        move |key| {
-            let mut thumb = thumb.clone();
-            let k = key.clone();
-            spawn(async move {
-                if let Some(holder) = fetch_thumbnail(kind, &k, thumb_w, thumb_h).await {
-                    thumb.set(Some(holder));
-                }
-            });
-        }
+    let thumb = use_state::<Option<Bytes>>(|| None);
+    let cache_key_for_effect = cache_key.clone();
+    use_side_effect_with_deps(&cache_key_for_effect, move |key: &String| {
+        let mut thumb = thumb;
+        let k = key.clone();
+        spawn(async move {
+            if let Some(bytes) = fetch_thumbnail_bytes(kind, &k, thumb_w, thumb_h).await {
+                thumb.set(Some(bytes));
+            }
+        });
     });
 
-    let _ = thumb_id; // documented above; debug-only
-
-    let preview = match thumb.read().clone() {
-        Some(h) => image(h)
-            .width(Size::px(thumb_w as f32))
-            .height(Size::px(thumb_h as f32))
-            .corner_radius(6.)
-            .into_element(),
+    let preview: Element = match thumb.read().clone() {
+        Some(bytes) => {
+            // Stable id = (kind, cache_key) so the asset cache
+            // dedupes when the same card re-renders.
+            let source: ImageSource = ((kind, cache_key.clone()), bytes).into();
+            ImageViewer::new(source)
+                .width(Size::px(thumb_w as f32))
+                .height(Size::px(thumb_h as f32))
+                .corner_radius(6.)
+                .into()
+        }
         None => rect()
             .width(Size::px(thumb_w as f32))
             .height(Size::px(thumb_h as f32))
             .corner_radius(6.)
             .background((35, 35, 48))
             .center()
-            .child(
-                label()
-                    .text("…")
-                    .color((120, 120, 135))
-                    .font_size(18.),
-            )
-            .into_element(),
+            .child(label().text("…").color((120, 120, 135)).font_size(18.))
+            .into(),
     };
 
     rect()
@@ -431,7 +600,12 @@ async fn load_entries() -> Entries {
     }
 }
 
-async fn fetch_thumbnail(kind: &str, id: &str, max_w: u32, max_h: u32) -> Option<ImageHolder> {
+async fn fetch_thumbnail_bytes(
+    kind: &str,
+    id: &str,
+    max_w: u32,
+    max_h: u32,
+) -> Option<Bytes> {
     let proxy = client::proxy().await.ok()?;
     let bytes = match kind {
         "monitor" => proxy.get_monitor_thumbnail(id, max_w, max_h).await.ok()?,
@@ -440,22 +614,8 @@ async fn fetch_thumbnail(kind: &str, id: &str, max_w: u32, max_h: u32) -> Option
     };
     if bytes.is_empty() {
         // Daemon returned `[]` → backend can't preview this item.
-        // Card stays on the placeholder shimmer.
+        // Card stays on the placeholder.
         return None;
     }
-    decode_png(Bytes::from(bytes))
-}
-
-fn decode_png(bytes: Bytes) -> Option<ImageHolder> {
-    // SAFETY: `SkData::new_bytes` borrows the slice for the
-    // lifetime of the returned `SkData`. We hand the SkData into
-    // `from_encoded`, which copies the decoded image into a new
-    // `SkImage` — the SkData (and its borrow) drops at the end of
-    // this expression. The Bytes itself we keep around in the
-    // ImageHolder so the asset cache can dedupe by content.
-    let image = unsafe { SkImage::from_encoded(SkData::new_bytes(&bytes)) }?;
-    Some(ImageHolder {
-        bytes,
-        image: Rc::new(RefCell::new(image)),
-    })
+    Some(Bytes::from(bytes))
 }

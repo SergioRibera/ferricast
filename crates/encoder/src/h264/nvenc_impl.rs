@@ -39,20 +39,28 @@
 //!   the host→device copy and the colour conversion lives in
 //!   NVENC's hardware path.
 
-use std::collections::HashMap;
-use std::os::fd::RawFd;
-
 use bytes::Bytes;
 use ferricast_core::{
-    CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, GpuFrame, PixelFormat,
-    Result, VideoEncoder,
+    CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, PixelFormat, Result,
+    VideoEncoder,
 };
 use shiguredo_nvcodec::{
     BufferFormat, CodecConfig, EncodeOptions, Encoder as NvEncoder, EncoderCodec,
     EncoderConfig as NvCfg, H264EncoderConfig, H264Profile, PictureType, Preset, RateControlMode,
-    ReconfigureParams, RegisteredResource, TuningInfo,
+    ReconfigureParams, TuningInfo,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
+
+#[cfg(feature = "nvenc-zero-copy")]
+use std::collections::HashMap;
+#[cfg(feature = "nvenc-zero-copy")]
+use std::os::fd::RawFd;
+#[cfg(feature = "nvenc-zero-copy")]
+use ferricast_core::GpuFrame;
+#[cfg(feature = "nvenc-zero-copy")]
+use shiguredo_nvcodec::RegisteredResource;
+#[cfg(feature = "nvenc-zero-copy")]
+use tracing::warn;
 
 pub struct NvencH264Encoder {
     encoder: NvEncoder,
@@ -72,10 +80,14 @@ pub struct NvencH264Encoder {
     /// the steady-state hit rate is ~100% — only the first frame
     /// after each pool slot pays the registration cost.
     ///
-    /// Eviction: on `configure()` (dimension change), on `set_bitrate_kbps`
-    /// reconfigure (no, that doesn't invalidate), and implicitly when
-    /// the upstream closes the fd (we'd see a registration failure
-    /// next time and fall through to readback).
+    /// Eviction: on `configure()` (dimension change). Stale fds
+    /// fail registration on next encode and we drop the entry
+    /// implicitly via the soft-fallback path.
+    ///
+    /// Only present when the `nvenc-zero-copy` feature is on —
+    /// requires a forked `shiguredo_nvcodec` that exposes the
+    /// registration methods upstream keeps `pub(crate)`.
+    #[cfg(feature = "nvenc-zero-copy")]
     dmabuf_cache: HashMap<DmabufKey, RegisteredResource>,
 }
 
@@ -91,6 +103,7 @@ struct NvencCfg {
 /// `(fd, modifier)` rather than `fd` alone because some compositors
 /// recycle fd numbers after `close(2)` and a stale `RegisteredResource`
 /// would happily encode garbage.
+#[cfg(feature = "nvenc-zero-copy")]
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct DmabufKey {
     fd: RawFd,
@@ -232,6 +245,7 @@ impl NvencH264Encoder {
             },
             frame_count: 0,
             pending_keyframe: false,
+            #[cfg(feature = "nvenc-zero-copy")]
             dmabuf_cache: HashMap::new(),
         })
     }
@@ -255,6 +269,7 @@ impl NvencH264Encoder {
     /// Registers the DMA-BUF (or hits the per-fd cache) and tells
     /// the encoder to use that resource as the input surface for
     /// this frame. No CPU bytes touched.
+    #[cfg(feature = "nvenc-zero-copy")]
     fn encode_dmabuf(&mut self, g: &GpuFrame, options: &EncodeOptions) -> Result<()> {
         let format = match g.format {
             PixelFormat::Bgra => BufferFormat::Argb,
@@ -322,6 +337,7 @@ impl VideoEncoder for NvencH264Encoder {
         // cached `RegisteredResource` from a previous size is junk
         // even if the fd happens to match. The cache will refill
         // organically on the first encode at the new size.
+        #[cfg(feature = "nvenc-zero-copy")]
         self.dmabuf_cache.clear();
         Ok(())
     }
@@ -359,21 +375,34 @@ impl VideoEncoder for NvencH264Encoder {
         };
 
         let timestamp_us = frame.timestamp_us();
-        match frame {
-            CapturedFrame::Gpu(g) => {
-                if let Err(e) = self.encode_dmabuf(&g, &options) {
-                    // Soft fall-back: log and try the CPU path on the
-                    // same frame. Costs one Vulkan readback for this
-                    // frame; subsequent frames will retry the GPU
-                    // path (single-frame failures shouldn't sticky).
-                    warn!(%e, "NVENC dmabuf path failed; falling back to CPU readback for this frame");
-                    let raw = CapturedFrame::Gpu(g).into_cpu()?;
+        #[cfg(feature = "nvenc-zero-copy")]
+        {
+            match frame {
+                CapturedFrame::Gpu(g) => {
+                    if let Err(e) = self.encode_dmabuf(&g, &options) {
+                        // Soft fall-back: log and try the CPU path
+                        // on the same frame. Costs one Vulkan readback
+                        // for this frame; subsequent frames retry
+                        // the GPU path so single-frame failures don't
+                        // sticky.
+                        warn!(%e, "NVENC dmabuf path failed; falling back to CPU readback for this frame");
+                        let raw = CapturedFrame::Gpu(g).into_cpu()?;
+                        self.encode_cpu(&raw.data, &options)?;
+                    }
+                }
+                CapturedFrame::Cpu(raw) => {
                     self.encode_cpu(&raw.data, &options)?;
                 }
             }
-            CapturedFrame::Cpu(raw) => {
-                self.encode_cpu(&raw.data, &options)?;
-            }
+        }
+        // Without the `nvenc-zero-copy` feature the encode body is
+        // the old "readback then upload" path — `into_cpu()` is a
+        // no-op for `Cpu` frames and triggers Vulkan readback for
+        // `Gpu`. Same code shape as before the zero-copy commit.
+        #[cfg(not(feature = "nvenc-zero-copy"))]
+        {
+            let raw = frame.into_cpu()?;
+            self.encode_cpu(&raw.data, &options)?;
         }
 
         // shiguredo's encoder buffers encoded frames internally
