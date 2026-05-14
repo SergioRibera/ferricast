@@ -115,27 +115,36 @@ pub fn monitor_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceEr
         outputs: Vec::new(),
         buffer: None,
         status: FrameStatus::Pending,
+        frame_flags: 0,
+        target_transform: WlTransform::Normal,
     };
     for g in globals.contents().clone_list() {
         if g.interface == "wl_output" {
             let out = globals
                 .registry()
                 .bind::<WlOutput, _, _>(g.name, g.version.min(4), &qh, ());
-            state.outputs.push((out, None));
+            state.outputs.push(OutputEntry {
+                proxy: out,
+                name: None,
+                transform: WlTransform::Normal,
+            });
         }
     }
     // First roundtrip: wait for every wl_output to emit `name` /
-    // `done`. Without it we can't match the picker id to a proxy.
+    // `geometry` / `done`. We need both `name` (to match the picker
+    // id) and `transform` (so the captured framebuffer is rotated /
+    // flipped to match what the user sees) before screen-capturing.
     queue
         .roundtrip(&mut state)
         .map_err(|e| SourceError::Backend(format!("output roundtrip: {e}")))?;
 
-    let output = state
+    let entry = state
         .outputs
         .iter()
-        .find(|(_, n)| n.as_deref() == Some(id))
-        .map(|(o, _)| o.clone())
+        .find(|e| e.name.as_deref() == Some(id))
         .ok_or_else(|| SourceError::NotFound(id.to_owned()))?;
+    let output = entry.proxy.clone();
+    state.target_transform = entry.transform;
 
     let frame = screencopy.capture_output(0, &output, &qh, ());
     // Wait for the `buffer` event so we know which shm format to
@@ -172,7 +181,16 @@ pub fn monitor_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceEr
         ));
     }
 
-    let png = encode_png(info, mmap, max_w, max_h)?;
+    let png = encode_png(
+        info,
+        mmap,
+        max_w,
+        max_h,
+        Orientation {
+            transform: state.target_transform,
+            y_invert: state.frame_flags & 1 != 0,
+        },
+    )?;
     // Explicit cleanup: drop wayland objects + buffer first so the
     // server can release its end before we close the fd.
     buffer.destroy();
@@ -181,12 +199,49 @@ pub fn monitor_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceEr
     Ok(png)
 }
 
-#[derive(Default)]
+// `wl_output::Transform` doesn't impl `Default` upstream — derive
+// our own constructor so the auto-`#[derive(Default)]` on
+// `MonitorState` would have to chain a manual init anyway. Cleaner
+// to just write `Default` ourselves.
 struct MonitorState {
-    outputs: Vec<(WlOutput, Option<String>)>,
+    outputs: Vec<OutputEntry>,
     buffer: Option<BufferInfo>,
     status: FrameStatus,
+    /// Bit 0 = `Y_INVERT`. Set from the screencopy `flags` event;
+    /// applied as a vertical flip on the captured buffer before
+    /// the output transform.
+    frame_flags: u32,
+    /// The wl_output transform of the chosen target. Captured pixels
+    /// are in the framebuffer's pre-transform orientation; we apply
+    /// this transform on the way out so the thumbnail matches what
+    /// the user sees on the monitor (rotated displays come out
+    /// upright, not sideways).
+    target_transform: WlTransform,
 }
+
+impl Default for MonitorState {
+    fn default() -> Self {
+        Self {
+            outputs: Vec::new(),
+            buffer: None,
+            status: FrameStatus::default(),
+            frame_flags: 0,
+            target_transform: WlTransform::Normal,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct OutputEntry {
+    proxy: WlOutput,
+    name: Option<String>,
+    transform: WlTransform,
+}
+
+/// Re-export so the `encode_png` orientation arg has a stable type
+/// even though wayland-client's `WEnum<Transform>` is `!Copy`. Keeps
+/// the per-orientation match arms in one place too.
+type WlTransform = wl_output::Transform;
 
 impl Default for FrameStatus {
     fn default() -> Self {
@@ -207,13 +262,32 @@ impl Dispatch<WlOutput, ()> for MonitorState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Name { name } = event {
-            for (out, slot) in &mut state.outputs {
-                if out == proxy {
-                    *slot = Some(name.clone());
-                    break;
+        match event {
+            wl_output::Event::Name { name } => {
+                for entry in &mut state.outputs {
+                    if &entry.proxy == proxy {
+                        entry.name = Some(name);
+                        break;
+                    }
                 }
             }
+            wl_output::Event::Geometry { transform, .. } => {
+                // `WEnum::Value(t)` has the variant; `Unknown(_)`
+                // is something the protocol added we don't know
+                // about — fall back to Normal which is a safe
+                // no-op orientation.
+                let t = match transform {
+                    WEnum::Value(v) => v,
+                    WEnum::Unknown(_) => WlTransform::Normal,
+                };
+                for entry in &mut state.outputs {
+                    if &entry.proxy == proxy {
+                        entry.transform = t;
+                        break;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -258,6 +332,15 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for MonitorState {
                     height,
                     stride,
                 });
+            }
+            Event::Flags { flags } => {
+                // Bitfield with `y_invert = 1`. We surface the raw
+                // bits so the encoder can apply the flip uniformly
+                // even if future protocol versions add more flags.
+                state.frame_flags = match flags {
+                    WEnum::Value(v) => v.bits(),
+                    WEnum::Unknown(v) => v,
+                };
             }
             Event::Ready { .. } => state.status = FrameStatus::Ready,
             Event::Failed => state.status = FrameStatus::Failed,
@@ -352,7 +435,12 @@ pub fn window_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceErr
         ));
     }
 
-    let png = encode_png(info, mmap, max_w, max_h)?;
+    // Window thumbnails come from `ext-image-copy-capture-v1`, which
+    // delivers pixels in the standard top-down framebuffer order
+    // and doesn't expose `Y_INVERT`. Output transforms don't apply
+    // either — the source is a toplevel surface, not an output.
+    // So `Orientation::default()` (Normal, no flip) is correct.
+    let png = encode_png(info, mmap, max_w, max_h, Orientation::default())?;
     frame.destroy();
     session.destroy();
     source.destroy();
@@ -597,11 +685,32 @@ fn wl_shm_format(raw: u32) -> Result<wl_shm::Format, SourceError> {
     }
 }
 
+/// Orientation hints for [`encode_png`]. `transform` is the wl_output
+/// transform of the captured monitor (rotated displays come out
+/// sideways from the framebuffer otherwise); `y_invert` is the
+/// `Y_INVERT` bit from the screencopy `flags` event (some
+/// compositors emit pixels bottom-up).
+#[derive(Clone, Copy)]
+struct Orientation {
+    transform: wl_output::Transform,
+    y_invert: bool,
+}
+
+impl Default for Orientation {
+    fn default() -> Self {
+        Orientation {
+            transform: wl_output::Transform::Normal,
+            y_invert: false,
+        }
+    }
+}
+
 fn encode_png(
     info: BufferInfo,
     mmap: MmapRegion,
     max_w: u32,
     max_h: u32,
+    orientation: Orientation,
 ) -> Result<Vec<u8>, SourceError> {
     let src = mmap.as_slice();
     if src.len() < info.size() {
@@ -631,9 +740,22 @@ fn encode_png(
     }
     drop(mmap);
 
-    let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+    let mut img = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
         .ok_or_else(|| SourceError::Backend("rgba from_raw failed".into()))?;
-    let (tw, th) = crate::fit_box(w as u32, h as u32, max_w, max_h);
+
+    // Apply Y_INVERT first (it's defined on the buffer's framebuffer
+    // axis), then the wl_output transform — which is the
+    // composition the compositor would apply before scanning out to
+    // the user's eye. Doing them in the same order the spec describes
+    // means rotated + inverted captures (some VR / mobile-ish
+    // displays) come out the way the user sees them.
+    if orientation.y_invert {
+        img = image::imageops::flip_vertical(&img);
+    }
+    img = apply_wl_transform(img, orientation.transform);
+
+    let (final_w, final_h) = (img.width(), img.height());
+    let (tw, th) = crate::fit_box(final_w, final_h, max_w, max_h);
     let thumb = image::imageops::thumbnail(&img, tw, th);
 
     let mut out = Vec::with_capacity(8 * 1024);
@@ -643,8 +765,41 @@ fn encode_png(
             image::ImageFormat::Png,
         )
         .map_err(|e| SourceError::Backend(format!("png encode: {e}")))?;
-    debug!(w = tw, h = th, bytes = out.len(), "wayland thumbnail encoded");
+    debug!(
+        w = tw,
+        h = th,
+        bytes = out.len(),
+        transform = ?orientation.transform,
+        y_invert = orientation.y_invert,
+        "wayland thumbnail encoded"
+    );
     Ok(out)
+}
+
+/// Apply the wl_output transform to a captured framebuffer so the
+/// thumbnail matches what the user sees on the monitor. The
+/// `Flipped*` variants are "flip horizontal then rotate by N"
+/// per the wayland spec — same operation order as wlroots' renderer.
+fn apply_wl_transform(
+    img: image::RgbaImage,
+    transform: wl_output::Transform,
+) -> image::RgbaImage {
+    use image::imageops as ops;
+    use wl_output::Transform::*;
+    match transform {
+        Normal => img,
+        _90 => ops::rotate90(&img),
+        _180 => ops::rotate180(&img),
+        _270 => ops::rotate270(&img),
+        Flipped => ops::flip_horizontal(&img),
+        Flipped90 => ops::rotate90(&ops::flip_horizontal(&img)),
+        Flipped180 => ops::rotate180(&ops::flip_horizontal(&img)),
+        Flipped270 => ops::rotate270(&ops::flip_horizontal(&img)),
+        // Future-proof: an unknown variant lands here. Treat as
+        // Normal so the thumbnail is still readable, just at the
+        // wrong orientation — better than dropping the frame.
+        _ => img,
+    }
 }
 
 /// Byte offsets within a 4-byte wl_shm pixel for `(R, G, B, A)`,
