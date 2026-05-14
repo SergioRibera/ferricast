@@ -69,10 +69,7 @@ use crate::client;
 ///
 /// `None` on the reply channel means "user cancelled / closed the
 /// window"; `Some(dto)` is the picked source.
-pub fn open_picker_for_dto(
-    platform: Platform,
-    reply_tx: oneshot::Sender<Option<SourceDto>>,
-) {
+pub fn open_picker_for_dto(platform: Platform, reply_tx: oneshot::Sender<Option<SourceDto>>) {
     spawn(async move {
         let (tx, rx) = oneshot::channel::<Option<SourceDto>>();
         let app = PickerWindowApp {
@@ -81,9 +78,16 @@ pub fn open_picker_for_dto(
 
         let config = WindowConfig::new_app(app)
             .with_title("Choose what to share")
-            .with_size(820., 580.)
+            .with_size(522., 530.)
             .with_background((20, 20, 28))
-            .with_window_attributes(|attrs, _| attrs.with_window_level(WindowLevel::AlwaysOnTop));
+            .with_transparency(true)
+            .with_decorations(false)
+            .with_app_id("rs.sergioribera.ferricast.Picker")
+            .with_window_attributes(|attrs, _| {
+                attrs
+                    .with_window_level(WindowLevel::AlwaysOnTop)
+                    .with_blur(true)
+            });
 
         let wid = platform.launch_window(config).await;
         platform.focus_window(Some(wid));
@@ -306,7 +310,6 @@ impl Component for SourcePicker {
         rect()
             .expanded()
             .vertical()
-            .background((20, 20, 28))
             .padding(16.)
             .spacing(12.)
             .content(Content::Flex)
@@ -349,7 +352,11 @@ fn footer(on_cancel: Arc<dyn Fn()>, audio_state: State<bool>) -> Rect {
     // Click target: the whole row toggles. Box-shaped indicator on
     // the left mirrors the state so the affordance reads "checkbox".
     let toggle_row = {
-        let bg_indicator = if audio_on { (60, 90, 160) } else { (40, 40, 55) };
+        let bg_indicator = if audio_on {
+            (60, 90, 160)
+        } else {
+            (40, 40, 55)
+        };
         let fg_indicator = if audio_on {
             (245, 245, 250)
         } else {
@@ -373,9 +380,9 @@ fn footer(on_cancel: Arc<dyn Fn()>, audio_state: State<bool>) -> Rect {
                     .border(Border::new().fill((90, 90, 105)).width(1.))
                     .center()
                     // U+2713 (check). Renders only when on.
-                    .maybe_child(audio_on.then(|| {
-                        label().text("✓").color(fg_indicator).font_size(13.)
-                    })),
+                    .maybe_child(
+                        audio_on.then(|| label().text("✓").color(fg_indicator).font_size(13.)),
+                    ),
             )
             .child(
                 label()
@@ -513,6 +520,7 @@ fn grid(current: Tab, entries: Entries, on_select: Arc<dyn Fn(SourceDto)>) -> Re
                         rect()
                             .horizontal()
                             .spacing(8.)
+                            .max_width(Size::fill())
                             .content(Content::wrap_spacing(8.))
                             .children(cards),
                     ),
@@ -539,6 +547,7 @@ fn grid(current: Tab, entries: Entries, on_select: Arc<dyn Fn(SourceDto)>) -> Re
                         rect()
                             .horizontal()
                             .spacing(8.)
+                            .max_width(Size::fill())
                             .content(Content::wrap_spacing(8.))
                             .children(cards),
                     ),
