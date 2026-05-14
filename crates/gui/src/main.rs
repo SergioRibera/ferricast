@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -6,6 +8,8 @@ use ferricast::prelude::*;
 use freya::{prelude::*, radio::*};
 use tokio::sync::{Mutex, mpsc};
 use tracing_subscriber::EnvFilter;
+
+use crate::daemon::PickerRequest;
 
 mod app;
 mod cli;
@@ -71,9 +75,23 @@ async fn main() -> anyhow::Result<()> {
     // clone of each event into `ui_rx` so the in-process window sees
     // the same stream the bus does, in the same order.
     let (ui_tx, ui_rx) = mpsc::channel::<ManagerEvent>(256);
-    let _conn = daemon::start(manager.clone(), enumerator, manager_events, Some(ui_tx))
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to publish D-Bus service: {e}"))?;
+
+    // Picker delegation channel: the daemon's `StartStream` handler
+    // pushes a request here when the D-Bus caller didn't pick a
+    // concrete source, and the Freya app drains it to open the
+    // picker window. Capacity 4 because requests are user-driven —
+    // bursts higher than that mean a buggy client.
+    let (picker_tx, picker_rx) = mpsc::channel::<PickerRequest>(4);
+
+    let _conn = daemon::start(
+        manager.clone(),
+        enumerator,
+        manager_events,
+        Some(ui_tx),
+        Some(picker_tx),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to publish D-Bus service: {e}"))?;
     tracing::info!(
         bus = ferricast_dbus::BUS_NAME,
         path = ferricast_dbus::OBJECT_PATH,
@@ -92,76 +110,109 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Both modes mount the Freya runtime so the picker window can
+    // be opened on demand from the D-Bus path. `--background` just
+    // hides the main window — the user only sees Ferricast UI when
+    // the picker pops, which is what they want for headless
+    // workflows that drive the daemon over the bus.
     if args.background {
-        // Headless: stay alive until SIGINT/SIGTERM. The daemon's
-        // signal-loop task and discovery already run in the
-        // background; we just need to keep the process up.
-        tracing::info!("running headless — Ctrl-C to exit");
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutdown requested");
-        let mut m = manager.lock().await;
-        if let Err(e) = m.shutdown().await {
-            tracing::warn!(%e, "shutdown error");
-        }
-        return Ok(());
+        tracing::info!(
+            "running with hidden main window — Freya alive to host the picker; \
+             Ctrl-C to exit"
+        );
     }
-
-    // Windowed mode: feed the in-process Freya app from `ui_rx`.
-    run_window(manager, ui_rx);
+    run_window(manager, ui_rx, picker_rx, args.background);
     Ok(())
 }
 
-fn run_window(stream_manager: Arc<Mutex<StreamManager>>, mut ui_rx: mpsc::Receiver<ManagerEvent>) {
+fn run_window(
+    stream_manager: Arc<Mutex<StreamManager>>,
+    mut ui_rx: mpsc::Receiver<ManagerEvent>,
+    picker_rx: mpsc::Receiver<PickerRequest>,
+    hidden: bool,
+) {
     let radio_station = RadioStation::create_global(AppState::default());
     let mut radio_events = radio_station.clone();
 
+    let mut window_config = WindowConfig::new_app(FerricastApp {
+        stream_manager,
+        radio_station,
+        // `Rc<RefCell<Option<_>>>` because the receiver isn't
+        // `Clone` and `App::render` takes `&self`. The first render
+        // `take()`s it from inside `use_hook` and starts the
+        // listener; subsequent renders see `None` and skip.
+        picker_req_rx: Rc::new(RefCell::new(Some(picker_rx))),
+    })
+    .with_title("Ferricast")
+    .with_size(800., 600.);
+    if hidden {
+        // `--background`: open the main window invisible. winit
+        // accepts `with_visible(false)` at creation; the surface
+        // never appears in the user's task switcher / task bar.
+        // Picker windows opened via `Platform::launch_window` are
+        // separate top-levels and DO appear normally — that's the
+        // whole point of this mode.
+        window_config = window_config.with_window_attributes(|attrs, _| attrs.with_visible(false));
+    }
+
     launch(
         LaunchConfig::new()
-            .with_future(move |_| async move {
-                loop {
-                    match ui_rx.recv().await {
-                        Some(ManagerEvent::DeviceFound(device)) => {
-                            radio_events
-                                .write_channel(AppChannel::Devices)
-                                .devices
-                                .entry(device.id)
-                                .insert_entry(device);
-                        }
-                        Some(ManagerEvent::DeviceLost(id)) => {
-                            radio_events
-                                .write_channel(AppChannel::Devices)
-                                .devices
-                                .remove(&id);
-                            radio_events
-                                .write_channel(AppChannel::Streaming)
-                                .streaming
-                                .retain(|&s| s != id);
-                        }
-                        Some(ManagerEvent::StreamStarted { device_id, .. }) => {
-                            let mut state = radio_events.write_channel(AppChannel::Streaming);
-                            if !state.streaming.contains(&device_id) {
-                                state.streaming.push(device_id);
+            .with_future(move |proxy| async move {
+                // Two concurrent jobs on the Freya local runtime:
+                // - drain the manager-events channel into the radio
+                //   station so the device list updates live;
+                // - listen for Ctrl-C and request a clean exit so
+                //   `--background` (hidden main window) can still
+                //   be terminated from the launching terminal.
+                let ctrl_c = async {
+                    let _ = tokio::signal::ctrl_c().await;
+                    tracing::info!("Ctrl-C received, exiting");
+                    let _ = proxy
+                        .post_callback(|ctx| {
+                            ctx.exit();
+                        })
+                        .await;
+                };
+                let pump = async {
+                    loop {
+                        match ui_rx.recv().await {
+                            Some(ManagerEvent::DeviceFound(device)) => {
+                                radio_events
+                                    .write_channel(AppChannel::Devices)
+                                    .devices
+                                    .entry(device.id)
+                                    .insert_entry(device);
                             }
+                            Some(ManagerEvent::DeviceLost(id)) => {
+                                radio_events
+                                    .write_channel(AppChannel::Devices)
+                                    .devices
+                                    .remove(&id);
+                                radio_events
+                                    .write_channel(AppChannel::Streaming)
+                                    .streaming
+                                    .retain(|&s| s != id);
+                            }
+                            Some(ManagerEvent::StreamStarted { device_id, .. }) => {
+                                let mut state = radio_events.write_channel(AppChannel::Streaming);
+                                if !state.streaming.contains(&device_id) {
+                                    state.streaming.push(device_id);
+                                }
+                            }
+                            Some(ManagerEvent::StreamStopped { device_id }) => {
+                                radio_events
+                                    .write_channel(AppChannel::Streaming)
+                                    .streaming
+                                    .retain(|&s| s != device_id);
+                            }
+                            None => break,
+                            _ => {}
                         }
-                        Some(ManagerEvent::StreamStopped { device_id }) => {
-                            radio_events
-                                .write_channel(AppChannel::Streaming)
-                                .streaming
-                                .retain(|&s| s != device_id);
-                        }
-                        None => break,
-                        _ => {}
                     }
-                }
+                };
+                tokio::join!(ctrl_c, pump);
             })
-            .with_window(
-                WindowConfig::new_app(FerricastApp {
-                    stream_manager,
-                    radio_station,
-                })
-                .with_title("Ferricast")
-                .with_size(800., 600.),
-            ),
+            .with_window(window_config),
     );
 }
 

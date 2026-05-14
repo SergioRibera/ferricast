@@ -1,10 +1,13 @@
 use ferricast::prelude::*;
 use freya::{prelude::*, radio::*};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::daemon::PickerRequest;
 use crate::picker;
 
 #[derive(Default)]
@@ -24,6 +27,13 @@ impl RadioChannel<AppState> for AppChannel {}
 pub struct FerricastApp {
     pub stream_manager: Arc<Mutex<StreamManager>>,
     pub radio_station: RadioStation<AppState, AppChannel>,
+    /// Receiver for picker requests coming from the daemon's
+    /// D-Bus path (e.g. `--background` mode where there's no
+    /// in-process share button to trigger the picker). Wrapped in
+    /// `Rc<RefCell<Option<_>>>` because `App::render` only sees
+    /// `&self` and the receiver isn't `Clone` — the first render
+    /// `.take()`s it and starts the listener task.
+    pub picker_req_rx: Rc<RefCell<Option<tokio::sync::mpsc::Receiver<PickerRequest>>>>,
 }
 
 impl App for FerricastApp {
@@ -40,6 +50,35 @@ impl App for FerricastApp {
         // context that's only valid from inside a component body —
         // calling it inside the share-button closure would panic.
         let platform = Platform::get();
+
+        // Picker-request listener: drive the daemon→freya channel
+        // exactly once, on first mount. `use_hook` runs its init
+        // closure a single time per component instance, so the
+        // `take()` is safe and the spawned future lives for the
+        // lifetime of the app.
+        //
+        // For each request that arrives (D-Bus `StartStream` with
+        // an abstract source), we open the picker and forward the
+        // user's choice back through the embedded oneshot. The
+        // daemon's request handler awaits the oneshot, then runs
+        // `StreamManager::start_stream` itself.
+        let picker_req_rx_init = self.picker_req_rx.clone();
+        use_hook(|| {
+            if let Some(mut rx) = picker_req_rx_init.borrow_mut().take() {
+                let platform = platform.clone();
+                spawn(async move {
+                    while let Some(req) = rx.recv().await {
+                        tracing::debug!(
+                            device_id = ?req.device_id,
+                            "daemon picker request — opening picker window"
+                        );
+                        let (dto_tx, dto_rx) = tokio::sync::oneshot::channel();
+                        picker::open_picker_for_dto(platform.clone(), dto_tx);
+                        let _ = req.reply.send(dto_rx.await.ok().flatten());
+                    }
+                });
+            }
+        });
 
         rect().expanded().background((18, 18, 24)).vertical().child(
             rect()

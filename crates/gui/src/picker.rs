@@ -53,7 +53,26 @@ use crate::client;
 /// Returns immediately — the actual window lifecycle runs on a
 /// freya-local task spawned here. Multiple concurrent calls open
 /// independent windows; cancelling one doesn't affect the others.
-pub fn open_picker(platform: Platform, stream_manager: Arc<Mutex<StreamManager>>, device_id: Uuid) {
+/// Launch the picker in a new top-level window, await the user's
+/// selection, and return the chosen `SourceDto` via the supplied
+/// `oneshot::Sender`. Returns immediately — the actual window
+/// lifecycle runs on a freya-local task spawned here.
+///
+/// The caller decides what to do with the picked source:
+///
+/// - In-process flow (main app share button): see [`open_picker`]
+///   which wraps this and dispatches `start_stream_with_dto`
+///   directly through the local `StreamManager`.
+/// - Daemon-driven flow (D-Bus `StartStream` with empty source):
+///   the daemon calls this with a oneshot it awaits in its own
+///   request handler, then runs `start_stream` itself.
+///
+/// `None` on the reply channel means "user cancelled / closed the
+/// window"; `Some(dto)` is the picked source.
+pub fn open_picker_for_dto(
+    platform: Platform,
+    reply_tx: oneshot::Sender<Option<SourceDto>>,
+) {
     spawn(async move {
         let (tx, rx) = oneshot::channel::<Option<SourceDto>>();
         let app = PickerWindowApp {
@@ -64,31 +83,35 @@ pub fn open_picker(platform: Platform, stream_manager: Arc<Mutex<StreamManager>>
             .with_title("Choose what to share")
             .with_size(820., 580.)
             .with_background((20, 20, 28))
-            // Always-on-top: honoured on X11 / Windows / macOS. On
-            // Wayland the protocol doesn't expose this knob; the
-            // compositor will ignore the request and the window
-            // will behave like any other top-level (still reachable
-            // via Alt-Tab, just not pinned above).
             .with_window_attributes(|attrs, _| attrs.with_window_level(WindowLevel::AlwaysOnTop));
 
         let wid = platform.launch_window(config).await;
-        // Focus on creation so the user sees it on top even when
-        // AlwaysOnTop is a no-op. Wayland still respects activation
-        // when it comes from a user gesture (the share-button click
-        // that triggered this).
         platform.focus_window(Some(wid));
 
-        match rx.await {
-            Ok(Some(dto)) => {
-                platform.close_window(wid);
-                if let Err(e) = start_stream_with_dto(stream_manager, device_id, dto).await {
-                    tracing::error!(%e, ?device_id, "start_stream");
-                }
-            }
-            // Cancel button, escape, or window dismissed: close
-            // the window if it's still alive (it might already be
-            // gone if the user clicked the close button).
-            Ok(None) | Err(_) => platform.close_window(wid),
+        let picked = match rx.await {
+            Ok(Some(dto)) => Some(dto),
+            Ok(None) | Err(_) => None,
+        };
+        platform.close_window(wid);
+        // Best-effort: the caller might have lost interest (e.g.
+        // dropped its receiver because of a timeout) — that's fine,
+        // we just discard the dto.
+        let _ = reply_tx.send(picked);
+    });
+}
+
+/// Launch the picker and start the stream in-process when the user
+/// confirms. Convenience wrapper used by the main app's share
+/// buttons. The daemon path uses [`open_picker_for_dto`] directly
+/// because it does the start_stream work itself.
+pub fn open_picker(platform: Platform, stream_manager: Arc<Mutex<StreamManager>>, device_id: Uuid) {
+    let (tx, rx) = oneshot::channel::<Option<SourceDto>>();
+    open_picker_for_dto(platform, tx);
+    spawn(async move {
+        if let Ok(Some(dto)) = rx.await
+            && let Err(e) = start_stream_with_dto(stream_manager, device_id, dto).await
+        {
+            tracing::error!(%e, ?device_id, "start_stream");
         }
     });
 }

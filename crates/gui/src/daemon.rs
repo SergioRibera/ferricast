@@ -218,16 +218,83 @@ fn window_to_dto(w: ferricast::WindowInfo) -> WindowInfoDto {
     }
 }
 
+/// A picker-pop request issued by the daemon when a D-Bus client
+/// calls `StartStream` with no concrete source. The Freya app side
+/// listens on the corresponding `mpsc::Receiver`, opens the picker
+/// window, and replies through the embedded oneshot. `None` reply
+/// means the user cancelled.
+pub struct PickerRequest {
+    pub device_id: Uuid,
+    pub reply: tokio::sync::oneshot::Sender<Option<SourceDto>>,
+}
+
 /// Object exported on the bus. The manager is shared with the rest
 /// of the app (the Freya window holds the same `Arc`), which is why
 /// it's behind a mutex. The enumerator is read-only — its own
 /// internal locking handles concurrent access.
+///
+/// `picker_req_tx` is only `Some` when the binary was launched in
+/// a mode that has a Freya runtime alive (the foreground GUI or
+/// `--background` with a hidden main window). When it's `None` —
+/// no Freya at all — `StartStream` calls with empty source fail
+/// fast instead of hanging waiting for a picker that can never
+/// open.
 pub struct ManagerService {
     pub manager: Arc<Mutex<StreamManager>>,
     pub enumerator: Arc<dyn SourceEnumerator>,
+    pub picker_req_tx: Option<tokio::sync::mpsc::Sender<PickerRequest>>,
+}
+
+/// Heuristic: a `SourceDto` is "abstract" — caller wants help —
+/// when its kind is empty, or when it's a `screen` / `monitor` /
+/// `window` shape with no concrete id/title to dispatch on. The
+/// daemon delegates abstract requests to the in-app picker so the
+/// user gets to choose interactively.
+fn needs_picker(s: &SourceDto) -> bool {
+    fn has_str(s: &SourceDto, key: &str) -> bool {
+        s.args
+            .get(key)
+            .and_then(|v| v.downcast_ref::<&str>().ok())
+            .is_some()
+    }
+    match s.kind.as_str() {
+        "" => true,
+        "screen" => !has_str(s, "monitor") && !has_str(s, "id"),
+        "monitor" => !has_str(s, "id"),
+        "window" => !has_str(s, "id") && !has_str(s, "title") && !has_str(s, "identifier"),
+        _ => false,
+    }
 }
 
 impl ManagerService {
+    /// Send a picker request to the Freya app and await the reply.
+    /// Returns the chosen `SourceDto` or a `zbus::fdo::Error` when
+    /// the user cancelled / the picker channel collapsed.
+    async fn run_picker(
+        &self,
+        tx: tokio::sync::mpsc::Sender<PickerRequest>,
+        device_id: Uuid,
+    ) -> zbus::fdo::Result<SourceDto> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<Option<SourceDto>>();
+        tx.send(PickerRequest {
+            device_id,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| {
+            zbus::fdo::Error::Failed(
+                "picker channel closed — Freya app is not listening for requests".into(),
+            )
+        })?;
+        match reply_rx.await {
+            Ok(Some(dto)) => Ok(dto),
+            Ok(None) => Err(zbus::fdo::Error::Failed("picker cancelled by user".into())),
+            Err(_) => Err(zbus::fdo::Error::Failed(
+                "picker oneshot dropped without reply".into(),
+            )),
+        }
+    }
+
     /// Resolve a `device_id` argument coming from D-Bus. Accepts
     /// either the canonical UUID or a case-insensitive device name.
     /// Returning `zbus::fdo::Error` so the message goes back to the
@@ -268,6 +335,29 @@ impl ManagerService {
 
     async fn start_stream(&self, device_id: String, source: SourceDto) -> zbus::fdo::Result<()> {
         let id = self.resolve(&device_id).await?;
+
+        // Empty source = "user wants help picking". Pop the
+        // in-process picker via the Freya app and use its reply.
+        // Without picker support (no Freya runtime) the call fails
+        // explicitly so the caller knows it has to supply a source
+        // itself instead of waiting on a window that won't open.
+        let source = if needs_picker(&source) {
+            match self.picker_req_tx.as_ref() {
+                Some(tx) => self.run_picker(tx.clone(), id).await?,
+                None => {
+                    return Err(zbus::fdo::Error::Failed(
+                        "StartStream needs a concrete source: no Freya runtime is up to host \
+                         the picker (start the daemon with `ferricast-gui` or \
+                         `ferricast-gui --background`, then call StartStream with \
+                         SourceDto::monitor(...) or window_by_id(...))"
+                            .into(),
+                    ));
+                }
+            }
+        } else {
+            source
+        };
+
         // Resolve the source *before* taking the manager lock: id
         // lookup hits the enumerator and we don't want capture-side
         // contention to back up behind a slow enumerator call.
@@ -476,6 +566,7 @@ pub async fn start(
     enumerator: Arc<dyn SourceEnumerator>,
     event_rx: mpsc::Receiver<ManagerEvent>,
     forward_tx: Option<mpsc::Sender<ManagerEvent>>,
+    picker_req_tx: Option<tokio::sync::mpsc::Sender<PickerRequest>>,
 ) -> zbus::Result<zbus::Connection> {
     // Subscribe BEFORE serve_at so we can't lose initial events.
     // Re-subscribing inside the spawned task would race the
@@ -490,6 +581,7 @@ pub async fn start(
             ManagerService {
                 manager,
                 enumerator,
+                picker_req_tx,
             },
         )?
         .build()
