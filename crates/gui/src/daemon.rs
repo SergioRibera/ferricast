@@ -445,6 +445,38 @@ impl ManagerService {
             .collect()
     }
 
+    /// Reports which kinds of sources the *capture* path can actually
+    /// stream end-to-end without falling back to the
+    /// xdg-desktop-portal picker. Used by the in-app picker to grey
+    /// out tabs whose selection wouldn't actually be honoured.
+    ///
+    /// Resolution rules (no probe — derived from session type):
+    ///
+    /// - `XDG_SESSION_TYPE=x11`     → `["monitor", "window"]`
+    ///   (X11Capture supports both via XID + XRandR rect)
+    /// - `WAYLAND_DISPLAY` set      → `["monitor"]` only.
+    ///   WaylandDirect can stream a chosen monitor via wlr-screencopy
+    ///   but doesn't capture toplevels yet — needs
+    ///   `ext_foreign_toplevel_image_capture_source_manager_v1` which
+    ///   no major compositor exposes today.
+    /// - Otherwise (no session info) → `[]`.
+    ///
+    /// Once a Wayland compositor adds the toplevel image-capture
+    /// protocol, this method gains a real probe (try-bind from the
+    /// auto_capture path) and returns `"window"` accordingly without
+    /// any picker change needed on the client side.
+    #[zbus(property)]
+    async fn capture_capabilities(&self) -> Vec<String> {
+        let on_x11 = std::env::var_os("DISPLAY").is_some()
+            && std::env::var_os("WAYLAND_DISPLAY").is_none();
+        let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        match (on_x11, on_wayland) {
+            (true, _) => vec!["monitor".into(), "window".into()],
+            (_, true) => vec!["monitor".into()],
+            _ => Vec::new(),
+        }
+    }
+
     /// Capture a one-shot PNG preview of the monitor `id`. See the
     /// proxy doc for the empty-vs-NotSupported convention.
     async fn get_monitor_thumbnail(

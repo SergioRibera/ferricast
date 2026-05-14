@@ -241,6 +241,12 @@ struct Entries {
     monitors: Vec<MonitorInfoDto>,
     windows: Vec<WindowInfoDto>,
     loaded: bool,
+    /// Whether the streaming side can actually honour a window
+    /// pick. When `false` the picker hides the Windows tab — there
+    /// would be no point in selecting a window the capture path
+    /// would just fall back to portal-asking-again on. Driven by
+    /// the daemon's `CaptureCapabilities` property.
+    can_capture_window: bool,
     /// `Some` when the daemon refused enumeration with a hard
     /// error. We render the message instead of an empty grid.
     error: Option<String>,
@@ -285,6 +291,18 @@ impl Component for SourcePicker {
             })
         };
 
+        // Clamp the visible tab: if the user picked "Windows"
+        // before the capability snapshot loaded — or the daemon
+        // reported window capture as unavailable — render the
+        // Monitors tab instead. The state stays as-is; the next
+        // capability change re-renders with the real tab if the
+        // user's pick becomes available.
+        let effective_tab = if !snapshot.can_capture_window && current_tab == Tab::Windows {
+            Tab::Monitors
+        } else {
+            current_tab
+        };
+
         rect()
             .expanded()
             .vertical()
@@ -293,8 +311,12 @@ impl Component for SourcePicker {
             .spacing(12.)
             .content(Content::Flex)
             .child(header(on_cancel.clone()))
-            .child(tabs_row(current_tab, tab.clone()))
-            .child(grid(current_tab, snapshot, on_select_with_audio))
+            .child(tabs_row(
+                effective_tab,
+                tab.clone(),
+                snapshot.can_capture_window,
+            ))
+            .child(grid(effective_tab, snapshot, on_select_with_audio))
             .child(footer(on_cancel, audio.clone()))
     }
 }
@@ -383,19 +405,30 @@ fn footer(on_cancel: Arc<dyn Fn()>, audio_state: State<bool>) -> Rect {
 
 // ── Tabs ──────────────────────────────────────────────────────────
 
-fn tabs_row(current: Tab, tab_state: State<Tab>) -> Rect {
+fn tabs_row(current: Tab, tab_state: State<Tab>, can_capture_window: bool) -> Rect {
     // `State<T>` is `Copy` (it's a handle into the global signal
     // store), so we capture by-value into the closure and re-bind
     // as `mut` inside the body — Fn closures can't mutably borrow
     // a captured variable directly, but they can shadow it.
-    let monitor_btn = tab_button("Monitors", current == Tab::Monitors, move |_| {
+    let monitor_btn = tab_button("Monitors", current == Tab::Monitors, true, move |_| {
         let mut t = tab_state;
         t.set(Tab::Monitors);
     });
-    let window_btn = tab_button("Windows", current == Tab::Windows, move |_| {
-        let mut t = tab_state;
-        t.set(Tab::Windows);
-    });
+    let window_btn = tab_button(
+        "Windows",
+        current == Tab::Windows,
+        // Disabled tab: still rendered so the user knows the choice
+        // exists (and the layout doesn't shift across compositors),
+        // but the press handler is a no-op when the streaming side
+        // can't honour a window pick.
+        can_capture_window,
+        move |_| {
+            if can_capture_window {
+                let mut t = tab_state;
+                t.set(Tab::Windows);
+            }
+        },
+    );
     rect()
         .horizontal()
         .spacing(6.)
@@ -406,10 +439,19 @@ fn tabs_row(current: Tab, tab_state: State<Tab>) -> Rect {
 fn tab_button(
     text: &'static str,
     active: bool,
+    enabled: bool,
     on_press: impl Fn(Event<PressEventData>) + 'static,
 ) -> Rect {
-    let bg = if active { (60, 90, 160) } else { (40, 40, 55) };
-    let fg = if active {
+    let bg = if !enabled {
+        (28, 28, 38)
+    } else if active {
+        (60, 90, 160)
+    } else {
+        (40, 40, 55)
+    };
+    let fg = if !enabled {
+        (110, 110, 120)
+    } else if active {
         (245, 245, 250)
     } else {
         (200, 200, 210)
@@ -735,6 +777,7 @@ async fn load_entries() -> Entries {
                 monitors: Vec::new(),
                 windows: Vec::new(),
                 loaded: true,
+                can_capture_window: false,
                 error: Some(format!("can't reach daemon: {e}")),
             };
         }
@@ -747,10 +790,23 @@ async fn load_entries() -> Entries {
         warn!(%e, "list_windows failed");
         Vec::new()
     });
+    // Probe whether the daemon's capture path can actually stream a
+    // window selection. On Wayland today this is `false` because no
+    // compositor exposes ext-foreign-toplevel-image-capture-source
+    // — the picker hides the Windows tab in that case to stop the
+    // user from picking a source the streaming side would silently
+    // fall back to a portal dialog on. The property is missing on
+    // very old daemons; we treat absence as "no" to fail safe.
+    let can_capture_window = proxy
+        .capture_capabilities()
+        .await
+        .map(|caps| caps.iter().any(|s| s == "window"))
+        .unwrap_or(false);
     Entries {
         monitors,
         windows,
         loaded: true,
+        can_capture_window,
         error: None,
     }
 }

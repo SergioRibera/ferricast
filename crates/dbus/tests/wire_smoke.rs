@@ -95,6 +95,10 @@ impl Stub {
     async fn enumeration_capabilities(&self) -> Vec<String> {
         Vec::new()
     }
+    #[zbus(property)]
+    async fn capture_capabilities(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     #[zbus(signal)]
     async fn device_added(emitter: &SignalEmitter<'_>, device: DeviceDto) -> zbus::Result<()>;
@@ -187,6 +191,7 @@ async fn _client_shape() -> zbus::Result<()> {
     let _: Vec<MonitorInfoDto> = proxy.list_monitors().await?;
     let _: Vec<WindowInfoDto> = proxy.list_windows().await?;
     let _: Vec<String> = proxy.enumeration_capabilities().await?;
+    let _: Vec<String> = proxy.capture_capabilities().await?;
     let _: Vec<u8> = proxy.get_monitor_thumbnail("HDMI-1", 320, 180).await?;
     let _: Vec<u8> = proxy.get_window_thumbnail("12345", 320, 180).await?;
 

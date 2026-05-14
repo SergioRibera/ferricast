@@ -286,6 +286,22 @@ pub trait Manager {
     #[zbus(property)]
     fn enumeration_capabilities(&self) -> zbus::Result<Vec<String>>;
 
+    /// What the daemon can actually *capture* end-to-end without
+    /// re-asking the user via xdg-desktop-portal. Each entry is one
+    /// of `"monitor"` / `"window"`. Pickers should use this to
+    /// disable tabs whose selection wouldn't be honoured by the
+    /// streaming path — e.g. on niri today this returns `["monitor"]`
+    /// because window streaming requires
+    /// `ext_foreign_toplevel_image_capture_source_manager_v1` which
+    /// the compositor doesn't expose yet.
+    ///
+    /// `enumeration_capabilities` and `capture_capabilities` are
+    /// independent: a backend can enumerate windows it can't stream
+    /// (the picker can show them as informational, but selecting
+    /// one would have to fall back to the portal).
+    #[zbus(property)]
+    fn capture_capabilities(&self) -> zbus::Result<Vec<String>>;
+
     /// Capture a one-shot preview of the monitor `id`, downscaled
     /// to fit in `max_width × max_height` (aspect-preserving), and
     /// return it as PNG bytes ready to feed into an image widget.
