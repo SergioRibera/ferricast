@@ -147,6 +147,30 @@ impl SourceDto {
             args,
         }
     }
+
+    /// Set the `audio` flag in `args`. The daemon reads this when
+    /// starting the stream to decide whether to mux a captured
+    /// audio track alongside the video. Callable on any source
+    /// (`SourceDto::monitor("DP-1").with_audio(true)` etc.) —
+    /// chains fluently with the constructors above.
+    ///
+    /// Defaults to absent → daemon treats it as `false` (no audio).
+    pub fn with_audio(mut self, audio: bool) -> Self {
+        if let Ok(v) = OwnedValue::try_from(zvariant::Value::from(audio)) {
+            self.args.insert("audio".into(), v);
+        }
+        self
+    }
+
+    /// Read the `audio` flag previously set with `with_audio`. Used
+    /// by the daemon to decide whether to wire an audio capture
+    /// pipeline alongside video. Defaults to `false` when absent.
+    pub fn audio(&self) -> bool {
+        self.args
+            .get("audio")
+            .and_then(|v| v.downcast_ref::<bool>().ok())
+            .unwrap_or(false)
+    }
 }
 
 /// Summary entry from `ListActiveStreams`.

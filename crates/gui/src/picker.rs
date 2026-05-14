@@ -103,6 +103,17 @@ async fn start_stream_with_dto(
     source: SourceDto,
 ) -> Result<()> {
     let cap_source = dto_to_capture_source(&source);
+    let audio = source.audio();
+    if audio {
+        // The picker collected an audio preference, but the
+        // `StreamManager` doesn't have an audio-capture path wired
+        // through yet — log it loudly so the user can see the flag
+        // arrived end-to-end and we don't quietly drop the choice.
+        tracing::info!(
+            ?device_id,
+            "picker requested audio, but StreamManager has no audio pipeline yet — flag stored, no audio captured"
+        );
+    }
     let sm = stream_manager.lock().await;
     let capture = NativeCapture::new();
     let encoder = H264Encoder::default();
@@ -219,6 +230,11 @@ impl Component for SourcePicker {
 
         let tab = use_state::<Tab>(Default::default);
         let entries = use_state::<Entries>(Default::default);
+        // Audio toggle. Default off — audio capture isn't wired
+        // through StreamManager yet, but the choice rides in
+        // `SourceDto.args["audio"]` so the daemon can pick it up
+        // once the audio pipeline lands.
+        let audio = use_state::<bool>(|| false);
 
         // One-shot fetch when the picker mounts.
         use_side_effect_with_deps(&(), {
@@ -235,6 +251,17 @@ impl Component for SourcePicker {
         let snapshot = entries.read().clone();
         let current_tab = *tab.read();
 
+        // Wrap `on_select` so every emission carries the current
+        // audio choice — the grid cards stay oblivious to it.
+        let on_select_with_audio: Arc<dyn Fn(SourceDto)> = {
+            let on_select = on_select.clone();
+            let audio = audio;
+            Arc::new(move |dto: SourceDto| {
+                let dto = dto.with_audio(*audio.peek_state());
+                (on_select)(dto);
+            })
+        };
+
         rect()
             .expanded()
             .vertical()
@@ -244,8 +271,8 @@ impl Component for SourcePicker {
             .content(Content::Flex)
             .child(header(on_cancel.clone()))
             .child(tabs_row(current_tab, tab.clone()))
-            .child(grid(current_tab, snapshot, on_select.clone()))
-            .child(footer(on_cancel))
+            .child(grid(current_tab, snapshot, on_select_with_audio))
+            .child(footer(on_cancel, audio.clone()))
     }
 }
 
@@ -272,11 +299,55 @@ fn header(on_cancel: Arc<dyn Fn()>) -> Rect {
         )
 }
 
-fn footer(on_cancel: Arc<dyn Fn()>) -> Rect {
+fn footer(on_cancel: Arc<dyn Fn()>, audio_state: State<bool>) -> Rect {
+    let audio_on = *audio_state.read();
+    // Click target: the whole row toggles. Box-shaped indicator on
+    // the left mirrors the state so the affordance reads "checkbox".
+    let toggle_row = {
+        let bg_indicator = if audio_on { (60, 90, 160) } else { (40, 40, 55) };
+        let fg_indicator = if audio_on {
+            (245, 245, 250)
+        } else {
+            (90, 90, 105)
+        };
+        rect()
+            .horizontal()
+            .spacing(10.)
+            .cross_align(Alignment::center())
+            .on_press(move |_| {
+                let mut s = audio_state;
+                let cur = *s.peek_state();
+                s.set(!cur);
+            })
+            .child(
+                rect()
+                    .width(Size::px(18.))
+                    .height(Size::px(18.))
+                    .corner_radius(4.)
+                    .background(bg_indicator)
+                    .border(Border::new().fill((90, 90, 105)).width(1.))
+                    .center()
+                    // U+2713 (check). Renders only when on.
+                    .maybe_child(audio_on.then(|| {
+                        label().text("✓").color(fg_indicator).font_size(13.)
+                    })),
+            )
+            .child(
+                label()
+                    .text("Include audio")
+                    .color((220, 220, 230))
+                    .font_size(13.),
+            )
+    };
+
     rect()
         .width(Size::fill())
         .horizontal()
-        .main_align(Alignment::end())
+        .cross_align(Alignment::center())
+        .content(Content::Flex)
+        .child(toggle_row)
+        // Filler pushes the cancel button to the far right.
+        .child(rect().width(Size::flex(1.)))
         .child(
             rect()
                 .padding(Gaps::new(6., 14., 6., 14.))
@@ -529,29 +600,82 @@ fn card_shell(
         });
     });
 
-    let preview: Element = match thumb.read().clone() {
-        Some(bytes) => {
-            // Stable id = (kind, cache_key) so the asset cache
-            // dedupes when the same card re-renders.
-            let source: ImageSource = ((kind, cache_key.clone()), bytes).into();
-            ImageViewer::new(source)
-                .width(Size::px(thumb_w as f32))
-                .height(Size::px(thumb_h as f32))
-                .corner_radius(6.)
-                .into()
-        }
-        None => rect()
-            .width(Size::px(thumb_w as f32))
-            .height(Size::px(thumb_h as f32))
-            .corner_radius(6.)
-            .background((35, 35, 48))
-            .center()
-            .child(label().text("…").color((120, 120, 135)).font_size(18.))
-            .into(),
-    };
+    // Outer thumb frame: always exactly `thumb_w × thumb_h` so the
+    // grid stays uniform regardless of what came back from the
+    // daemon. The ImageViewer / placeholder lives inside, centered.
+    //
+    // `AspectRatio::Min` + `ImageCover::Center` make the image
+    // scale uniformly until it fills the smaller dimension, then
+    // letterbox / pillarbox along the other. Portrait monitors
+    // become a centered vertical strip inside the landscape card
+    // frame instead of being stretched horizontally; landscape
+    // monitors fill the frame; square monitors land in the middle.
+    let preview_frame = rect()
+        .width(Size::px(thumb_w as f32))
+        .height(Size::px(thumb_h as f32))
+        .corner_radius(6.)
+        .background((10, 10, 16))
+        .center()
+        .overflow(Overflow::Clip)
+        .child(match thumb.read().clone() {
+            Some(bytes) => {
+                let source: ImageSource = ((kind, cache_key.clone()), bytes).into();
+                let viewer: Element = ImageViewer::new(source)
+                    .width(Size::px(thumb_w as f32))
+                    .height(Size::px(thumb_h as f32))
+                    .aspect_ratio(AspectRatio::Min)
+                    .image_cover(ImageCover::Center)
+                    .into();
+                viewer
+            }
+            None => {
+                // No thumbnail bytes. Reasons:
+                //   - Card just mounted, fetch in flight → animated
+                //     placeholder reads "loading".
+                //   - Daemon returned empty bytes → compositor /
+                //     backend doesn't expose the capture path for
+                //     this item (e.g. niri without
+                //     ext_foreign_toplevel_image_capture_source_manager_v1
+                //     for window thumbs). For windows we surface
+                //     the subtitle (app_id) prominently as a
+                //     fallback identifier; for monitors we show
+                //     the id text.
+                let big = if kind == "window" && subtitle != "—" {
+                    subtitle.clone()
+                } else {
+                    cache_key.clone()
+                };
+                rect()
+                    .expanded()
+                    .center()
+                    .vertical()
+                    .spacing(4.)
+                    .child(
+                        label()
+                            .text(big)
+                            .color((180, 180, 195))
+                            .font_size(18.)
+                            .max_lines(1)
+                            .text_overflow(TextOverflow::Ellipsis),
+                    )
+                    .child(
+                        label()
+                            .text("no preview")
+                            .color((110, 110, 125))
+                            .font_size(11.),
+                    )
+                    .into()
+            }
+        });
 
+    // Card frame: fixed width = thumb width + 2*padding; height is
+    // auto-sized to thumb + subtitle/title rows. Using Size::px (not
+    // Size::fill / flex) on width is what stops the wrap-grid from
+    // stretching cards when the window resizes — every card stays
+    // at the same width and the row reflows by reflowing whole
+    // cards, not by resizing them.
     rect()
-        .min_width(Size::px(thumb_w as f32))
+        .width(Size::px(thumb_w as f32 + 12.))
         .background((28, 28, 38))
         .corner_radius(10.)
         .padding(6.)
@@ -559,7 +683,7 @@ fn card_shell(
         .spacing(4.)
         .border(Border::new().fill((50, 50, 65)).width(1.))
         .on_press(on_press)
-        .child(preview)
+        .child(preview_frame)
         .child(
             label()
                 .text(title)
