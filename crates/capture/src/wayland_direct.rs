@@ -117,19 +117,78 @@ impl DmabufAllocator {
         height: u32,
         fourcc: drm_fourcc::DrmFourcc,
     ) -> Result<AllocatedBuffer> {
+        // Allocation strategy: cascade through three increasingly
+        // permissive paths because GBM backends — NVIDIA's in
+        // particular — return EINVAL on combinations that other
+        // drivers accept without complaint.
+        //
+        //   1. `with_modifiers([Linear])` — modifier-driven API,
+        //      no usage flags. Mesa picks sensible internal flags.
+        //      The cleanest path; works on Intel/AMD universally.
+        //   2. `with_modifiers([Invalid])` — driver-picked
+        //      modifier. INVALID is a valid wire value for
+        //      `zwp_linux_buffer_params_v1`, and the compositor
+        //      accepts whatever the driver gave us.
+        //   3. Legacy `BufferObjectFlags::LINEAR` (no RENDERING).
+        //      NVIDIA's gbm sometimes refuses RENDERING + LINEAR
+        //      for the format the compositor offered, so we drop
+        //      RENDERING in the last attempt.
+        //
+        // Whichever succeeds defines the modifier we'll forward
+        // to `params.add` so the compositor knows what layout it's
+        // looking at.
+        use gbm::{BufferObjectFlags, Modifier};
+
+        tracing::debug!(
+            ?fourcc,
+            width,
+            height,
+            "gbm: attempting dmabuf alloc"
+        );
+
         let bo = self
             .device
-            .create_buffer_object::<()>(
+            .create_buffer_object_with_modifiers::<()>(
                 width,
                 height,
                 fourcc,
-                gbm::BufferObjectFlags::LINEAR | gbm::BufferObjectFlags::RENDERING,
+                [Modifier::Linear].into_iter(),
             )
-            .map_err(|e| FerricastError::Capture(format!("gbm alloc: {e}")))?;
-        // FOURCC modifier for LINEAR — universally accepted as
-        // either `DRM_FORMAT_MOD_LINEAR (0)` or `INVALID
-        // (0xff_ff_ff_ff_ff_ff_ff_ff)`. We pass LINEAR explicitly so
-        // the compositor accepts the negotiation.
+            .inspect(|_| tracing::debug!(?fourcc, "gbm: allocated with Modifier::Linear"))
+            .or_else(|e1| {
+                tracing::debug!(
+                    %e1, ?fourcc,
+                    "gbm: with_modifiers([Linear]) rejected; trying [Invalid]"
+                );
+                self.device
+                    .create_buffer_object_with_modifiers::<()>(
+                        width,
+                        height,
+                        fourcc,
+                        [Modifier::Invalid].into_iter(),
+                    )
+                    .inspect(|_| tracing::debug!(?fourcc, "gbm: allocated with Modifier::Invalid"))
+                    .or_else(|e2| {
+                        tracing::debug!(
+                            %e2, ?fourcc,
+                            "gbm: with_modifiers([Invalid]) rejected; trying legacy LINEAR flag"
+                        );
+                        self.device
+                            .create_buffer_object::<()>(
+                                width,
+                                height,
+                                fourcc,
+                                BufferObjectFlags::LINEAR,
+                            )
+                            .inspect(|_| tracing::debug!(?fourcc, "gbm: allocated with legacy LINEAR flag"))
+                    })
+            })
+            .map_err(|e| {
+                FerricastError::Capture(format!(
+                    "gbm alloc (fourcc={fourcc:?}, {width}x{height}): {e}"
+                ))
+            })?;
+
         let modifier = u64::from(bo.modifier());
         let stride = bo.stride() as u32;
         let fd: OwnedFd = bo
@@ -813,6 +872,19 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for WorkerState {
                 width,
                 height,
             } => {
+                // Decode the DRM fourcc so the log line is greppable
+                // ("ARGB8888" / "XRGB8888" / "ABGR8888" / …) rather
+                // than a bare hex word. Useful when an allocation
+                // fails — `fourcc=Some(Argb8888)` immediately
+                // localises the problem to a known format the GBM
+                // backend should support.
+                tracing::trace!(
+                    raw = format!("0x{format:08x}"),
+                    decoded = ?drm_fourcc::DrmFourcc::try_from(format).ok(),
+                    width,
+                    height,
+                    "wlr-screencopy: linux_dmabuf offer"
+                );
                 let entry = state.frame_info.get_or_insert(FrameInfo {
                     width,
                     height,
