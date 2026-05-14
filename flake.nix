@@ -40,6 +40,17 @@
 
           wayland
 
+          # gbm + libdrm: DMA-BUF allocation for the wayland-direct
+          # capture backend. `libgbm` is mesa's general-purpose
+          # buffer manager — present on every desktop Linux except
+          # systems with *only* the proprietary NVIDIA driver
+          # installed (NixOS hosts always have it because mesa is
+          # used for software fallback / Xwayland regardless of GPU).
+          # Newer nixpkgs split it out of `mesa` into its own
+          # `libgbm` attribute; older ones still expose it via mesa.
+          libgbm
+          libdrm
+
           vulkan-loader
 	  vulkan-validation-layers
 
