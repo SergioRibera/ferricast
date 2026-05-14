@@ -34,12 +34,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ferricast::prelude::*;
 use ferricast::WindowIdentifier;
+use ferricast::prelude::*;
 use ferricast_dbus::{MonitorInfoDto, SourceDto, WindowInfoDto};
 use freya::prelude::*;
 use freya::winit::window::WindowLevel;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -53,11 +53,7 @@ use crate::client;
 /// Returns immediately — the actual window lifecycle runs on a
 /// freya-local task spawned here. Multiple concurrent calls open
 /// independent windows; cancelling one doesn't affect the others.
-pub fn open_picker(
-    platform: Platform,
-    stream_manager: Arc<Mutex<StreamManager>>,
-    device_id: Uuid,
-) {
+pub fn open_picker(platform: Platform, stream_manager: Arc<Mutex<StreamManager>>, device_id: Uuid) {
     spawn(async move {
         let (tx, rx) = oneshot::channel::<Option<SourceDto>>();
         let app = PickerWindowApp {
@@ -245,6 +241,7 @@ impl Component for SourcePicker {
             .background((20, 20, 28))
             .padding(16.)
             .spacing(12.)
+            .content(Content::Flex)
             .child(header(on_cancel.clone()))
             .child(tabs_row(current_tab, tab.clone()))
             .child(grid(current_tab, snapshot, on_select.clone()))
@@ -257,13 +254,14 @@ fn header(on_cancel: Arc<dyn Fn()>) -> Rect {
         .width(Size::fill())
         .horizontal()
         .cross_align(Alignment::center())
+        .content(Content::Flex)
         .child(
             label()
                 .text("Choose what to share")
                 .font_size(16.)
                 .color((230, 230, 240)),
         )
-        .child(rect().width(Size::fill()))
+        .child(rect().width(Size::flex(1.)))
         .child(
             rect()
                 .padding(Gaps::new(4., 10., 4., 10.))
@@ -317,7 +315,11 @@ fn tab_button(
     on_press: impl Fn(Event<PressEventData>) + 'static,
 ) -> Rect {
     let bg = if active { (60, 90, 160) } else { (40, 40, 55) };
-    let fg = if active { (245, 245, 250) } else { (200, 200, 210) };
+    let fg = if active {
+        (245, 245, 250)
+    } else {
+        (200, 200, 210)
+    };
     rect()
         .padding(Gaps::new(6., 14., 6., 14.))
         .corner_radius(8.)
@@ -331,7 +333,7 @@ fn tab_button(
 fn grid(current: Tab, entries: Entries, on_select: Arc<dyn Fn(SourceDto)>) -> Rect {
     let body = rect()
         .width(Size::fill())
-        .height(Size::fill())
+        .height(Size::flex(1.))
         .background((22, 22, 30))
         .corner_radius(10.)
         .padding(8.);
@@ -368,13 +370,16 @@ fn grid(current: Tab, entries: Entries, on_select: Arc<dyn Fn(SourceDto)>) -> Re
                 .into()
             });
             body.child(
-                ScrollView::new().expanded().direction(Direction::Vertical).child(
-                    rect()
-                        .horizontal()
-                        .spacing(8.)
-                        .content(Content::wrap_spacing(8.))
-                        .children(cards),
-                ),
+                ScrollView::new()
+                    .expanded()
+                    .direction(Direction::Vertical)
+                    .child(
+                        rect()
+                            .horizontal()
+                            .spacing(8.)
+                            .content(Content::wrap_spacing(8.))
+                            .children(cards),
+                    ),
             )
         }
         Tab::Windows => {
@@ -391,13 +396,16 @@ fn grid(current: Tab, entries: Entries, on_select: Arc<dyn Fn(SourceDto)>) -> Re
                 .into()
             });
             body.child(
-                ScrollView::new().expanded().direction(Direction::Vertical).child(
-                    rect()
-                        .horizontal()
-                        .spacing(8.)
-                        .content(Content::wrap_spacing(8.))
-                        .children(cards),
-                ),
+                ScrollView::new()
+                    .expanded()
+                    .direction(Direction::Vertical)
+                    .child(
+                        rect()
+                            .horizontal()
+                            .spacing(8.)
+                            .content(Content::wrap_spacing(8.))
+                            .children(cards),
+                    ),
             )
         }
     }
@@ -543,7 +551,7 @@ fn card_shell(
     };
 
     rect()
-        .width(Size::px(thumb_w as f32))
+        .min_width(Size::px(thumb_w as f32))
         .background((28, 28, 38))
         .corner_radius(10.)
         .padding(6.)
@@ -600,12 +608,7 @@ async fn load_entries() -> Entries {
     }
 }
 
-async fn fetch_thumbnail_bytes(
-    kind: &str,
-    id: &str,
-    max_w: u32,
-    max_h: u32,
-) -> Option<Bytes> {
+async fn fetch_thumbnail_bytes(kind: &str, id: &str, max_w: u32, max_h: u32) -> Option<Bytes> {
     let proxy = client::proxy().await.ok()?;
     let bytes = match kind {
         "monitor" => proxy.get_monitor_thumbnail(id, max_w, max_h).await.ok()?,

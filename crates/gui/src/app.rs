@@ -144,18 +144,6 @@ impl Component for DeviceCard {
             (50, 50, 65)
         };
 
-        let primary_btn = if is_streaming {
-            TooltipContainer::new(Tooltip::new("Stop stream")).child(
-                share_btn(include_bytes!("../assets/screen.svg"))
-                    .on_press(move |_| (on_stop)()),
-            )
-        } else {
-            TooltipContainer::new(Tooltip::new("Pick a source to share")).child(
-                share_btn(include_bytes!("../assets/screen.svg"))
-                    .on_press(move |_| (on_request_picker)()),
-            )
-        };
-
         rect()
             .width(Size::fill())
             .height(Size::px(72.))
@@ -166,6 +154,8 @@ impl Component for DeviceCard {
             .cross_align(Alignment::center())
             .horizontal()
             .spacing(12.)
+            .maybe(is_streaming, |r| r.on_press(move |_| (on_stop)()))
+            .maybe(!is_streaming, |r| r.on_press(move |_| (on_request_picker)()))
             .child(
                 rect()
                     .center()
@@ -194,11 +184,10 @@ impl Component for DeviceCard {
                             .color((230, 230, 240)),
                     )
                     .child(
-                        rect()
-                            .width(Size::fill())
-                            .horizontal()
-                            .spacing(5.)
-                            .child(primary_btn),
+                        label()
+                            .text(device.protocol.clone())
+                            .font_size(12.)
+                            .color((230, 230, 240)),
                     ),
             )
     }
