@@ -49,6 +49,7 @@ where
     // SPS+PPS in Annex B form. Captured once and injected at every
     // keyframe access unit so any segment is self-describing.
     let parameter_sets = encoder.get_headers()?;
+
     if parameter_sets.is_empty() {
         return Err(FerricastError::Encoder(
             "encoder produced empty H.264 parameter sets; refusing to start segmenter".into(),

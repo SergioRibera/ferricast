@@ -32,3 +32,4 @@ cros-libva = { path = "../../vendor/cros-libva" }
 # from outside; the patch lives next to its callers in
 # `vendor/shiguredo_nvcodec/src/encode.rs` (search "ferricast patch").
 shiguredo_nvcodec = { path = "../../vendor/shiguredo_nvcodec" }
+openh264 = "0.9.3"
