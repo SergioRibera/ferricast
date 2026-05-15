@@ -295,17 +295,16 @@ impl Component for SourcePicker {
             })
         };
 
-        // Clamp the visible tab: if the user picked "Windows"
-        // before the capability snapshot loaded — or the daemon
-        // reported window capture as unavailable — render the
-        // Monitors tab instead. The state stays as-is; the next
-        // capability change re-renders with the real tab if the
-        // user's pick becomes available.
-        let effective_tab = if !snapshot.can_capture_window && current_tab == Tab::Windows {
-            Tab::Monitors
-        } else {
-            current_tab
-        };
+        // Compact-mode rendering is decided by `snapshot.can_capture_window`:
+        // - true  → grid with thumbnail cards (the rich view).
+        // - false → bare name list (compositor doesn't expose
+        //   ext-foreign-toplevel-image-capture-source, so previews
+        //   would be empty placeholders anyway — show the data we
+        //   *do* have instead of pretending).
+        // Selection paths through start_stream as usual; if the
+        // streaming side can't honour the pick either it falls
+        // back to the portal flow.
+        let compact_windows = !snapshot.can_capture_window;
 
         rect()
             .expanded()
@@ -314,12 +313,13 @@ impl Component for SourcePicker {
             .spacing(12.)
             .content(Content::Flex)
             .child(header(on_cancel.clone()))
-            .child(tabs_row(
-                effective_tab,
-                tab.clone(),
-                snapshot.can_capture_window,
+            .child(tabs_row(current_tab, tab.clone()))
+            .child(grid(
+                current_tab,
+                snapshot,
+                on_select_with_audio,
+                compact_windows,
             ))
-            .child(grid(effective_tab, snapshot, on_select_with_audio))
             .child(footer(on_cancel, audio.clone()))
     }
 }
@@ -412,30 +412,19 @@ fn footer(on_cancel: Arc<dyn Fn()>, audio_state: State<bool>) -> Rect {
 
 // ── Tabs ──────────────────────────────────────────────────────────
 
-fn tabs_row(current: Tab, tab_state: State<Tab>, can_capture_window: bool) -> Rect {
+fn tabs_row(current: Tab, tab_state: State<Tab>) -> Rect {
     // `State<T>` is `Copy` (it's a handle into the global signal
     // store), so we capture by-value into the closure and re-bind
     // as `mut` inside the body — Fn closures can't mutably borrow
     // a captured variable directly, but they can shadow it.
-    let monitor_btn = tab_button("Monitors", current == Tab::Monitors, true, move |_| {
+    let monitor_btn = tab_button("Monitors", current == Tab::Monitors, move |_| {
         let mut t = tab_state;
         t.set(Tab::Monitors);
     });
-    let window_btn = tab_button(
-        "Windows",
-        current == Tab::Windows,
-        // Disabled tab: still rendered so the user knows the choice
-        // exists (and the layout doesn't shift across compositors),
-        // but the press handler is a no-op when the streaming side
-        // can't honour a window pick.
-        can_capture_window,
-        move |_| {
-            if can_capture_window {
-                let mut t = tab_state;
-                t.set(Tab::Windows);
-            }
-        },
-    );
+    let window_btn = tab_button("Windows", current == Tab::Windows, move |_| {
+        let mut t = tab_state;
+        t.set(Tab::Windows);
+    });
     rect()
         .horizontal()
         .spacing(6.)
@@ -446,19 +435,10 @@ fn tabs_row(current: Tab, tab_state: State<Tab>, can_capture_window: bool) -> Re
 fn tab_button(
     text: &'static str,
     active: bool,
-    enabled: bool,
     on_press: impl Fn(Event<PressEventData>) + 'static,
 ) -> Rect {
-    let bg = if !enabled {
-        (28, 28, 38)
-    } else if active {
-        (60, 90, 160)
-    } else {
-        (40, 40, 55)
-    };
-    let fg = if !enabled {
-        (110, 110, 120)
-    } else if active {
+    let bg = if active { (60, 90, 160) } else { (40, 40, 55) };
+    let fg = if active {
         (245, 245, 250)
     } else {
         (200, 200, 210)
@@ -473,7 +453,12 @@ fn tab_button(
 
 // ── Grid ──────────────────────────────────────────────────────────
 
-fn grid(current: Tab, entries: Entries, on_select: Arc<dyn Fn(SourceDto)>) -> Rect {
+fn grid(
+    current: Tab,
+    entries: Entries,
+    on_select: Arc<dyn Fn(SourceDto)>,
+    compact_windows: bool,
+) -> Rect {
     let body = rect()
         .width(Size::fill())
         .height(Size::flex(1.))
@@ -532,26 +517,59 @@ fn grid(current: Tab, entries: Entries, on_select: Arc<dyn Fn(SourceDto)>) -> Re
                     "No windows enumerable on this compositor — pick a monitor or fall back to the portal.",
                 ));
             }
-            let cards = entries.windows.into_iter().map(move |w| {
-                WindowCard {
-                    info: w,
-                    on_select: on_select.clone(),
-                }
-                .into()
-            });
-            body.child(
-                ScrollView::new()
-                    .expanded()
-                    .direction(Direction::Vertical)
-                    .child(
-                        rect()
-                            .horizontal()
-                            .spacing(8.)
-                            .max_width(Size::fill())
-                            .content(Content::wrap_spacing(8.))
-                            .children(cards),
-                    ),
-            )
+            // Two layouts for the Windows tab, picked on whether
+            // the daemon told us window previews are reachable:
+            //
+            //   - rich: same thumbnail-card grid as Monitors. Each
+            //     card lazy-loads `GetWindowThumbnail`.
+            //   - compact: vertical list of name + app_id rows, no
+            //     preview area. Used when the compositor doesn't
+            //     expose `ext_foreign_toplevel_image_capture_source_manager_v1`
+            //     — we'd just be rendering placeholder boxes
+            //     otherwise. The list is denser, scrolls naturally,
+            //     and reads as "this is by design", not "I'm broken".
+            if compact_windows {
+                let rows = entries.windows.into_iter().map(move |w| {
+                    WindowRow {
+                        info: w,
+                        on_select: on_select.clone(),
+                    }
+                    .into()
+                });
+                body.child(
+                    ScrollView::new()
+                        .expanded()
+                        .direction(Direction::Vertical)
+                        .child(
+                            rect()
+                                .vertical()
+                                .spacing(4.)
+                                .width(Size::fill())
+                                .children(rows),
+                        ),
+                )
+            } else {
+                let cards = entries.windows.into_iter().map(move |w| {
+                    WindowCard {
+                        info: w,
+                        on_select: on_select.clone(),
+                    }
+                    .into()
+                });
+                body.child(
+                    ScrollView::new()
+                        .expanded()
+                        .direction(Direction::Vertical)
+                        .child(
+                            rect()
+                                .horizontal()
+                                .spacing(8.)
+                                .max_width(Size::fill())
+                                .content(Content::wrap_spacing(8.))
+                                .children(cards),
+                        ),
+                )
+            }
         }
     }
 }
@@ -643,6 +661,74 @@ impl Component for WindowCard {
             THUMB_H as u32,
             move |_| (on_select)(SourceDto::window_by_id(id_for_select.clone())),
         )
+    }
+}
+
+/// Compact list-row variant of `WindowCard` used when the daemon
+/// reports no window-preview capability. No thumbnail, just a row
+/// of text the user can scan and click. Selection routes through
+/// the same `SourceDto::window_by_id` as the card path, so click
+/// behavior is identical — only the visual is different.
+#[derive(Clone)]
+struct WindowRow {
+    info: WindowInfoDto,
+    on_select: Arc<dyn Fn(SourceDto)>,
+}
+
+impl PartialEq for WindowRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.info.id == other.info.id && self.info.title == other.info.title
+    }
+}
+
+impl Component for WindowRow {
+    fn render(&self) -> impl IntoElement {
+        let id = self.info.id.clone();
+        let title = if self.info.title.is_empty() {
+            "(untitled)".to_string()
+        } else {
+            self.info.title.clone()
+        };
+        let app_id = if self.info.app_id.is_empty() {
+            "—".to_string()
+        } else {
+            self.info.app_id.clone()
+        };
+        let on_select = self.on_select.clone();
+        let id_for_select = id.clone();
+
+        rect()
+            .width(Size::fill())
+            .background((28, 28, 38))
+            .corner_radius(8.)
+            .border(Border::new().fill((50, 50, 65)).width(1.))
+            .padding(Gaps::new(8., 12., 8., 12.))
+            .horizontal()
+            .cross_align(Alignment::center())
+            .spacing(12.)
+            .on_press(move |_| (on_select)(SourceDto::window_by_id(id_for_select.clone())))
+            .child(
+                rect()
+                    .vertical()
+                    .width(Size::flex(1.))
+                    .spacing(2.)
+                    .child(
+                        label()
+                            .text(title)
+                            .color((230, 230, 240))
+                            .font_size(14.)
+                            .max_lines(1)
+                            .text_overflow(TextOverflow::Ellipsis),
+                    )
+                    .child(
+                        label()
+                            .text(app_id)
+                            .color((140, 140, 160))
+                            .font_size(11.)
+                            .max_lines(1)
+                            .text_overflow(TextOverflow::Ellipsis),
+                    ),
+            )
     }
 }
 
