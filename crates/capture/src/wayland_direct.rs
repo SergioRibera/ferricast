@@ -246,7 +246,36 @@ impl DmabufAllocator {
         // flags; v2 needs libgbm ≥ 22.2 which is present on every
         // distro shipping a recent Wayland stack.
         let usage = BufferObjectFlags::RENDERING;
+        // Important: this loop ONLY tries LINEAR (modifier == 0).
+        // After-capture we hand the bytes to the encoder via
+        // `mmap` + the kernel's dma-buf sync ioctl. That mmap
+        // assumes row-major BGRA layout — which is what LINEAR
+        // gives. Vendor-tiled modifiers like NVIDIA's
+        // `BLOCK_LINEAR_2D` (0x0300_0000_0060_6011) write pixels
+        // in a tile pattern; mmap'ing those returns bytes that
+        // *look* like BGRA per row but are actually scrambled.
+        // The encoder happily compresses the scramble and the
+        // chromecast plays unrecognisable garbage — symptom the
+        // user hit on NVIDIA when LINEAR+RENDERING got rejected
+        // and the cascade fell through to the next advertised
+        // modifier.
+        //
+        // For non-LINEAR modifiers we'd need a Vulkan blit step
+        // (tiled→linear on the GPU) followed by readback. That's
+        // what `VulkanImporter` from `pipewire/vulkan/` does;
+        // hoisting it out of the pipewire submodule is the next
+        // step to support GBM allocations that have to be tiled.
+        // Until then: if LINEAR+RENDERING can't allocate, fail
+        // the dmabuf path so sticky-disable promotes us to shm.
+        let linear = u64::from(Modifier::Linear);
         for modifier_u64 in &wanted {
+            if *modifier_u64 != linear {
+                tracing::trace!(
+                    modifier = format!("0x{modifier_u64:016x}"),
+                    "gbm: skipping non-LINEAR modifier (mmap-readback requires row-major layout)"
+                );
+                continue;
+            }
             let modifier: Modifier = (*modifier_u64).into();
             match self.device.create_buffer_object_with_modifiers2::<()>(
                 width,
