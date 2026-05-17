@@ -310,7 +310,7 @@ impl DmabufAllocator {
             .fd()
             .map_err(|e| FerricastError::Capture(format!("gbm fd: {e}")))?;
         Ok(AllocatedBuffer {
-            _bo: bo,
+            bo,
             fd,
             width,
             height,
@@ -325,7 +325,11 @@ impl DmabufAllocator {
 /// (drop releases the memory) and exposes the fd for wl_buffer
 /// wrapping + downstream consumption.
 struct AllocatedBuffer {
-    _bo: gbm::BufferObject<()>,
+    /// Held to keep the buffer alive while the wl_buffer + the
+    /// downstream `CapturedFrame` reference it. Also used as the
+    /// handle for `gbm_bo_map` when we have to read the bytes
+    /// back for a CPU encoder.
+    bo: gbm::BufferObject<()>,
     fd: OwnedFd,
     width: u32,
     height: u32,
@@ -702,21 +706,61 @@ fn run_worker(
             dmabuf_consecutive_failures = 0;
         }
         let captured = match transport {
-            Transport::Dmabuf(alloc) => CapturedFrame::Gpu(GpuFrame {
-                width: alloc.width,
-                height: alloc.height,
-                stride: alloc.stride,
-                format: alloc.pixel_format(),
-                timestamp_us: now_us(),
-                plane: DmaBufPlane {
-                    fd: alloc.fd.as_raw_fd(),
-                    offset: 0,
-                    stride: alloc.stride,
-                    modifier: alloc.modifier,
-                    size: alloc.stride.saturating_mul(alloc.height),
-                },
-                importer: importer.clone(),
-            }),
+            Transport::Dmabuf(alloc) => {
+                // Two cases for what we hand the encoder:
+                //
+                //   1. Vulkan importer present → emit `Gpu` with
+                //      the fd attached. GPU encoders (VA-API VPP,
+                //      future NVENC zero-copy) consume the fd
+                //      directly; CPU encoders trigger
+                //      `into_cpu()` which routes through the
+                //      importer's Vulkan readback.
+                //   2. No importer → `CapturedFrame::Gpu` with
+                //      `importer: None` would just blow up at the
+                //      encoder's `into_cpu()` call (the user's
+                //      most recent bug: "GpuFrame has no DmaBuf
+                //      importer attached"). So we mmap the bo via
+                //      gbm here and emit `Cpu` straight away.
+                //      `gbm_bo_map(READ)` is allowed on LINEAR
+                //      bos including ones flagged RENDERING; the
+                //      driver may return a staging copy on
+                //      non-coherent hosts, but the bytes are the
+                //      same. We pay one CPU memcpy that the
+                //      encoder would have paid anyway via Vulkan
+                //      readback — net the same end-to-end cost,
+                //      and it gets the path working today on
+                //      hosts where we haven't hoisted the Vulkan
+                //      importer out of the pipewire submodule yet.
+                if let Some(importer) = importer.clone() {
+                    CapturedFrame::Gpu(GpuFrame {
+                        width: alloc.width,
+                        height: alloc.height,
+                        stride: alloc.stride,
+                        format: alloc.pixel_format(),
+                        timestamp_us: now_us(),
+                        plane: DmaBufPlane {
+                            fd: alloc.fd.as_raw_fd(),
+                            offset: 0,
+                            stride: alloc.stride,
+                            modifier: alloc.modifier,
+                            size: alloc.stride.saturating_mul(alloc.height),
+                        },
+                        importer: Some(importer),
+                    })
+                } else {
+                    match mmap_bo_to_raw(&alloc) {
+                        Ok(raw) => CapturedFrame::Cpu(raw),
+                        Err(e) => {
+                            warn!(
+                                %e,
+                                "wayland-direct: gbm_bo_map readback failed — dropping frame"
+                            );
+                            buffer.destroy();
+                            continue;
+                        }
+                    }
+                }
+            }
             Transport::Shm(shm_buf) => CapturedFrame::Cpu(RawFrame {
                 width: shm_buf.width,
                 height: shm_buf.height,
@@ -870,6 +914,60 @@ fn now_us() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
+}
+
+/// Read a freshly-captured dmabuf back to host bytes via
+/// `gbm_bo_map(READ)`. Used when no Vulkan importer is available
+/// to attach to a `CapturedFrame::Gpu` — without an importer the
+/// encoder's `into_cpu()` call would fail at the wire, and the
+/// failure mode is worse than just paying for one mmap copy.
+///
+/// Returns a `RawFrame` whose `data` is a tightly-packed copy of
+/// the bo's pixel region: if `gbm_bo_map` returns a staging
+/// buffer with a stride wider than `width * 4` (driver-side
+/// alignment), we strip the padding so downstream encoders can
+/// treat the bytes as `width * 4 * height` without surprise.
+fn mmap_bo_to_raw(alloc: &AllocatedBuffer) -> std::result::Result<RawFrame, FerricastError> {
+    let w = alloc.width;
+    let h = alloc.height;
+    let format = alloc.pixel_format();
+    alloc
+        .bo
+        .map(0, 0, w, h, |mapped| {
+            let map_stride = mapped.stride();
+            let src = mapped.buffer();
+            // Re-pack into `width * 4` so callers don't have to
+            // know about the underlying alignment. The cost is
+            // one row-wise memcpy on top of what gbm already did.
+            let dst_stride = (w as usize) * 4;
+            if (map_stride as usize) == dst_stride {
+                RawFrame {
+                    width: w,
+                    height: h,
+                    stride: dst_stride as u32,
+                    format,
+                    data: Bytes::copy_from_slice(src),
+                    timestamp_us: now_us(),
+                }
+            } else {
+                let mut data = vec![0u8; dst_stride * (h as usize)];
+                for y in 0..h as usize {
+                    let src_off = y * (map_stride as usize);
+                    let dst_off = y * dst_stride;
+                    data[dst_off..dst_off + dst_stride]
+                        .copy_from_slice(&src[src_off..src_off + dst_stride]);
+                }
+                RawFrame {
+                    width: w,
+                    height: h,
+                    stride: dst_stride as u32,
+                    format,
+                    data: Bytes::from(data),
+                    timestamp_us: now_us(),
+                }
+            }
+        })
+        .map_err(|e| FerricastError::Capture(format!("gbm_bo_map: {e}")))
 }
 
 /// `/dev/dri/renderD128..D192`, in numerical order. We probe in
