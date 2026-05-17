@@ -439,6 +439,20 @@ fn run_worker(
 
     let frame_period = Duration::from_micros(1_000_000 / fps as u64);
     let mut next_capture = Instant::now();
+    // Sticky-disable knob for the dmabuf path. The compositor can
+    // accept a `params.add` with `create_immed` (no synchronous
+    // error there) and only reject the buffer at `copy()` time via
+    // the `failed` event — so even when allocation looks fine we
+    // can end up dropping every frame. After a small handful of
+    // consecutive `Failed`s we stop trying dmabuf and stream via
+    // wl_shm for the rest of the session. The threshold is small
+    // (3) because the failure mode is systemic, not transient —
+    // either the compositor's renderer can read our modifier or
+    // it can't.
+    let mut dmabuf_disabled = false;
+    let mut dmabuf_consecutive_failures: u32 = 0;
+    const DMABUF_FAILURE_THRESHOLD: u32 = 3;
+
     loop {
         // Cooperative stop — check between frames.
         if stop_rx.try_recv().is_ok() {
@@ -476,10 +490,14 @@ fn run_worker(
             state.size_emitted = true;
         }
 
-        // Pick the transport: dmabuf if both the compositor offered
-        // it on this frame AND we have an allocator + a known
-        // modifier; otherwise wl_shm fallback.
-        let dmabuf_offer = info.dmabuf.as_ref().filter(|_| allocator.is_some());
+        // Pick the transport: dmabuf if (a) the compositor offered
+        // it on this frame, (b) we have an allocator, and (c) the
+        // sticky-disable hasn't kicked in yet. Otherwise wl_shm
+        // fallback.
+        let dmabuf_offer = info
+            .dmabuf
+            .as_ref()
+            .filter(|_| allocator.is_some() && !dmabuf_disabled);
         let (buffer, transport) = if let (Some(offer), Some(alloc), Some(dmabuf_proxy)) =
             (dmabuf_offer, allocator.as_ref(), dmabuf.as_ref())
         {
@@ -495,6 +513,7 @@ fn run_worker(
             let (buf, tx) = make_shm_buffer(&shm, &qh, &info)?;
             (buf, Transport::Shm(tx))
         };
+        let attempted_dmabuf = matches!(transport, Transport::Dmabuf(_));
 
         frame.copy(&buffer);
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -504,9 +523,34 @@ fn run_worker(
                 .map_err(|e| FerricastError::Capture(format!("frame wait: {e}")))?;
         }
         if state.status != FrameStatus::Ready {
+            // Record per-transport consecutive failures so the
+            // sticky-disable above only fires when the *dmabuf*
+            // path is the one rejecting frames. shm failures are
+            // a different problem (compositor bug, OOM) and don't
+            // benefit from flipping the dmabuf knob.
+            if attempted_dmabuf {
+                dmabuf_consecutive_failures = dmabuf_consecutive_failures.saturating_add(1);
+                if dmabuf_consecutive_failures >= DMABUF_FAILURE_THRESHOLD && !dmabuf_disabled {
+                    dmabuf_disabled = true;
+                    warn!(
+                        consecutive = dmabuf_consecutive_failures,
+                        "compositor rejected {DMABUF_FAILURE_THRESHOLD} dmabuf frames in a row \
+                         — switching this session to wl_shm transport. \
+                         Set RUST_LOG=ferricast_capture=debug to see the negotiated \
+                         modifier / stride / format that the compositor refused."
+                    );
+                }
+            }
             warn!(?state.status, "frame not ready — dropping");
             buffer.destroy();
             continue;
+        }
+        // Successful frame: a dmabuf success means the path is
+        // healthy, so wipe the consecutive-failure counter. (One
+        // bad frame followed by good ones shouldn't escalate to
+        // sticky-disable.)
+        if attempted_dmabuf {
+            dmabuf_consecutive_failures = 0;
         }
         let captured = match transport {
             Transport::Dmabuf(alloc) => CapturedFrame::Gpu(GpuFrame {
@@ -567,6 +611,22 @@ fn make_dmabuf_buffer(
         FerricastError::Capture(format!("unknown DRM fourcc 0x{:08x}", offer.format))
     })?;
     let buf = alloc.alloc(offer.width, offer.height, fourcc)?;
+    // The compositor only finds out about a bad params combo at
+    // `copy()` time (it emits `failed` on the frame), so logging
+    // what we negotiated here is the only way to diagnose
+    // "compositor rejected the buffer" failures after the fact.
+    // The modifier is the most common culprit: gbm sometimes
+    // returns INVALID (`u64::MAX`) for what's really a linear
+    // allocation, and not every compositor's renderer is willing
+    // to import INVALID-modifier buffers via screencopy.
+    tracing::debug!(
+        format = ?fourcc,
+        width = buf.width,
+        height = buf.height,
+        stride = buf.stride,
+        modifier = format!("0x{:016x}", buf.modifier),
+        "wayland-direct: zwp_linux_buffer_params_v1.add()"
+    );
     let params: ZwpLinuxBufferParamsV1 = dmabuf.create_params(qh, ());
     params.add(
         buf.fd.as_fd(),
