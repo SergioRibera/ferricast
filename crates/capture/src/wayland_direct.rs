@@ -916,58 +916,121 @@ fn now_us() -> u64 {
         .unwrap_or(0)
 }
 
-/// Read a freshly-captured dmabuf back to host bytes via
-/// `gbm_bo_map(READ)`. Used when no Vulkan importer is available
-/// to attach to a `CapturedFrame::Gpu` — without an importer the
-/// encoder's `into_cpu()` call would fail at the wire, and the
-/// failure mode is worse than just paying for one mmap copy.
+/// Read a freshly-captured dmabuf back to host bytes. Used when no
+/// Vulkan importer is available to attach to a `CapturedFrame::Gpu`
+/// — without an importer the encoder's `into_cpu()` call would fail
+/// at the wire, and the failure mode is worse than paying for one
+/// mmap copy.
 ///
-/// Returns a `RawFrame` whose `data` is a tightly-packed copy of
-/// the bo's pixel region: if `gbm_bo_map` returns a staging
-/// buffer with a stride wider than `width * 4` (driver-side
-/// alignment), we strip the padding so downstream encoders can
-/// treat the bytes as `width * 4 * height` without surprise.
+/// We *don't* go through `gbm_bo_map` here. That call has been
+/// observed to return `EAGAIN` ("Resource temporarily unavailable")
+/// on dmabufs the compositor just finished writing into, even after
+/// the screencopy `Ready` event — mesa's gbm path doesn't do the
+/// cross-process CPU-coherence sync internally. Instead we do the
+/// kernel-documented dance:
+///
+///   1. `DMA_BUF_IOCTL_SYNC(START | READ)` — blocks until the GPU
+///      releases the buffer to the CPU. Maps internally to the
+///      driver's `dma_buf_attach`-style fencing.
+///   2. `mmap(PROT_READ)` of the fd. LINEAR-modifier buffers are
+///      laid out row-major at `alloc.stride` bytes per row.
+///   3. Row-wise copy into a tightly-packed `width * 4 * height`
+///      buffer (the alignment padding upstream encoders don't
+///      want to know about).
+///   4. `munmap` + `DMA_BUF_IOCTL_SYNC(END | READ)` — releases
+///      CPU access back to the GPU side.
+///
+/// Returns a `RawFrame` whose `data` is the tightly-packed bytes.
 fn mmap_bo_to_raw(alloc: &AllocatedBuffer) -> std::result::Result<RawFrame, FerricastError> {
-    let w = alloc.width;
-    let h = alloc.height;
+    let fd = alloc.fd.as_raw_fd();
+    let map_stride = alloc.stride as usize;
+    let w = alloc.width as usize;
+    let h = alloc.height as usize;
+    let dst_stride = w * 4;
+    let size = map_stride * h;
     let format = alloc.pixel_format();
-    alloc
-        .bo
-        .map(0, 0, w, h, |mapped| {
-            let map_stride = mapped.stride();
-            let src = mapped.buffer();
-            // Re-pack into `width * 4` so callers don't have to
-            // know about the underlying alignment. The cost is
-            // one row-wise memcpy on top of what gbm already did.
-            let dst_stride = (w as usize) * 4;
-            if (map_stride as usize) == dst_stride {
-                RawFrame {
-                    width: w,
-                    height: h,
-                    stride: dst_stride as u32,
-                    format,
-                    data: Bytes::copy_from_slice(src),
-                    timestamp_us: now_us(),
-                }
-            } else {
-                let mut data = vec![0u8; dst_stride * (h as usize)];
-                for y in 0..h as usize {
-                    let src_off = y * (map_stride as usize);
-                    let dst_off = y * dst_stride;
-                    data[dst_off..dst_off + dst_stride]
-                        .copy_from_slice(&src[src_off..src_off + dst_stride]);
-                }
-                RawFrame {
-                    width: w,
-                    height: h,
-                    stride: dst_stride as u32,
-                    format,
-                    data: Bytes::from(data),
-                    timestamp_us: now_us(),
-                }
-            }
-        })
-        .map_err(|e| FerricastError::Capture(format!("gbm_bo_map: {e}")))
+
+    dma_buf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ)
+        .map_err(|e| FerricastError::Capture(format!("dma_buf_sync(START|READ): {e}")))?;
+
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        let err = std::io::Error::last_os_error();
+        // Best-effort release before returning; we can't read but
+        // the kernel still needs to know we're done with the
+        // acquire side.
+        let _ = dma_buf_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+        return Err(FerricastError::Capture(format!("mmap(dmabuf): {err}")));
+    }
+    let src = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
+
+    // Re-pack into `width * 4` so callers see tightly-packed bytes
+    // regardless of what alignment the driver picked. The cost is
+    // one row-wise memcpy and matches what the Vulkan-importer
+    // readback path produces.
+    let data = if map_stride == dst_stride {
+        Bytes::copy_from_slice(src)
+    } else {
+        let mut buf = vec![0u8; dst_stride * h];
+        for y in 0..h {
+            let src_off = y * map_stride;
+            let dst_off = y * dst_stride;
+            buf[dst_off..dst_off + dst_stride]
+                .copy_from_slice(&src[src_off..src_off + dst_stride]);
+        }
+        Bytes::from(buf)
+    };
+
+    unsafe {
+        libc::munmap(ptr, size);
+    }
+    let _ = dma_buf_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+
+    Ok(RawFrame {
+        width: alloc.width,
+        height: alloc.height,
+        stride: dst_stride as u32,
+        format,
+        data,
+        timestamp_us: now_us(),
+    })
+}
+
+// `linux/dma-buf.h` constants. Hardcoded because `libc` doesn't
+// expose them and adding a `nix` dep for one ioctl is overkill.
+const DMA_BUF_SYNC_READ: u64 = 1 << 0;
+#[allow(dead_code)]
+const DMA_BUF_SYNC_WRITE: u64 = 1 << 1;
+const DMA_BUF_SYNC_START: u64 = 0;
+const DMA_BUF_SYNC_END: u64 = 1 << 2;
+// `_IOW('b', 0, struct dma_buf_sync)` = 0x40086200 on every Linux
+// arch we target. struct size = 8 bytes, dir = WRITE (userspace
+// writes the request struct), type = 'b' = 0x62, nr = 0. The
+// ioctl value is ABI-stable across kernel versions.
+const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
+
+fn dma_buf_sync(fd: std::os::fd::RawFd, flags: u64) -> std::io::Result<()> {
+    #[repr(C)]
+    struct DmaBufSync {
+        flags: u64,
+    }
+    let req = DmaBufSync { flags };
+    let res =
+        unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &req as *const DmaBufSync as *const _) };
+    if res < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// `/dev/dri/renderD128..D192`, in numerical order. We probe in
