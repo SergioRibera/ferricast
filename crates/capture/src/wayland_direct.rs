@@ -235,19 +235,32 @@ impl DmabufAllocator {
 
         let mut last_err: Option<std::io::Error> = None;
         let mut bo_opt: Option<gbm::BufferObject<()>> = None;
+        // Crucial knob: pass `RENDERING` so the compositor's GLES
+        // renderer can bind the buffer as a render *target* via
+        // EGL. The plain `create_buffer_object_with_modifiers`
+        // (v1, no flags) variant lets mesa pick defaults — which
+        // on many drivers means SCANOUT-ish flags that EGL refuses
+        // to bind for rendering. niri's screencopy backend does
+        // `renderer.bind(&mut dmabuf)` and that's where it fails
+        // without RENDERING. We use the v2 API to force the right
+        // flags; v2 needs libgbm ≥ 22.2 which is present on every
+        // distro shipping a recent Wayland stack.
+        let usage = BufferObjectFlags::RENDERING;
         for modifier_u64 in &wanted {
             let modifier: Modifier = (*modifier_u64).into();
-            match self.device.create_buffer_object_with_modifiers::<()>(
+            match self.device.create_buffer_object_with_modifiers2::<()>(
                 width,
                 height,
                 fourcc,
                 [modifier].into_iter(),
+                usage,
             ) {
                 Ok(bo) => {
                     tracing::debug!(
                         ?fourcc,
                         modifier = format!("0x{modifier_u64:016x}"),
-                        "gbm: allocated with advertised modifier"
+                        flags = format!("{usage:?}"),
+                        "gbm: allocated with advertised modifier + RENDERING"
                     );
                     bo_opt = Some(bo);
                     break;
@@ -264,16 +277,17 @@ impl DmabufAllocator {
         }
         // Final legacy-flag fallback for the no-feedback case —
         // some drivers (NVIDIA's GBM in particular) only do LINEAR
-        // via the flag API, not the modifier API.
+        // via the flag API, not the modifier API. Same RENDERING
+        // requirement, just expressed as flag bits.
         if bo_opt.is_none() {
             match self.device.create_buffer_object::<()>(
                 width,
                 height,
                 fourcc,
-                BufferObjectFlags::LINEAR,
+                BufferObjectFlags::LINEAR | BufferObjectFlags::RENDERING,
             ) {
                 Ok(bo) => {
-                    tracing::debug!(?fourcc, "gbm: allocated with legacy LINEAR flag");
+                    tracing::debug!(?fourcc, "gbm: allocated with legacy LINEAR+RENDERING flags");
                     bo_opt = Some(bo);
                 }
                 Err(e) => {
