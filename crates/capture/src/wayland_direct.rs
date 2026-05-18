@@ -686,7 +686,31 @@ fn run_worker(
             match make_dmabuf_buffer(alloc, dmabuf_proxy, &qh, offer) {
                 Ok((buf, tx)) => (buf, Transport::Dmabuf(tx)),
                 Err(e) => {
-                    warn!(%e, "dmabuf allocation failed, falling back to shm for this frame");
+                    // Alloc-time failure (gbm rejected our format /
+                    // modifier / RENDERING combo). Increment the
+                    // sticky-disable counter from this side too —
+                    // otherwise the per-frame "trying dmabuf,
+                    // falling back to shm" cycle just keeps
+                    // spamming logs while doing wasted work. Once
+                    // we've failed N allocs in a row, flip
+                    // dmabuf_disabled and stop trying.
+                    dmabuf_consecutive_failures =
+                        dmabuf_consecutive_failures.saturating_add(1);
+                    if dmabuf_consecutive_failures >= DMABUF_FAILURE_THRESHOLD
+                        && !dmabuf_disabled
+                    {
+                        dmabuf_disabled = true;
+                        warn!(
+                            %e,
+                            consecutive = dmabuf_consecutive_failures,
+                            "gbm refused {DMABUF_FAILURE_THRESHOLD} dmabuf allocs in a row \
+                             (typical on NVIDIA where LINEAR+RENDERING is rejected and the \
+                             driver only offers vendor-tiled modifiers we can't mmap) — \
+                             switching this session to wl_shm transport."
+                        );
+                    } else {
+                        warn!(%e, "dmabuf allocation failed, falling back to shm for this frame");
+                    }
                     let (buf, tx) = make_shm_buffer(&shm, &qh, &info)?;
                     (buf, Transport::Shm(tx))
                 }
