@@ -203,7 +203,7 @@ impl HlsServer {
             }
         });
 
-        ring::wait_for_first_segment(&ring).await;
+       ring::wait_for_first_segment(&ring).await;
 
         info!(
             listen = %local,
@@ -254,6 +254,7 @@ impl HlsServer {
                     let ring = self.ring.clone();
                     let adaptive = self.adaptive.clone();
                     let stats = self.stats.clone();
+              
                     tokio::spawn(async move {
                         if let Err(e) = http::handle(socket, ring, adaptive, stats).await {
                             trace!(peer = %peer, error = %e, "HLS connection ended");

@@ -26,12 +26,29 @@ impl VideoEncoder for OpenH264Encoder {
             H264Profile::Main => Profile::Main,
             H264Profile::High => Profile::High,
          };
+    
         
          let encoder_config = EncoderConfig::new()
              .profile(profile)
-             .num_threads(1)
+             .skip_frames(false)
+             .usage_type(openh264::encoder::UsageType::CameraVideoRealTime)
+             
              .bitrate(BitRate::from_bps(config.bitrate_kbps * 1000));
-        let encoder = Encoder::with_api_config(api, encoder_config).map_err(|e| FerricastError::Encoder(format!("Cannot create openh264 encoder {:?}", e)))?;        
+        let mut encoder = Encoder::with_api_config(api, encoder_config).map_err(|e| FerricastError::Encoder(format!("Cannot create openh264 encoder {:?}", e)))?;
+        
+        let empty_frame = YUVBuffer::new(config.width as usize, config.height as usize);
+        let encoded = encoder.encode(&empty_frame).map_err(|_| FerricastError::Encoding("Cannot encode empty frame".to_string()))?;
+        let data = encoded.to_vec();
+
+        let sps_pps = extract_sps_pps(&data);
+        if sps_pps.is_empty() {
+            return Err(FerricastError::Encoding("Sps/pps not found in first keyframe".to_string()));
+        }
+
+
+        tracing::info!("SPS/PPS found!");
+        self.sps_pps = sps_pps;
+
 
         self.fps = config.fps as usize;
         self.encoder = Some(encoder);
@@ -59,21 +76,8 @@ impl VideoEncoder for OpenH264Encoder {
             _ => unimplemented!(),
         };
 
-    
-  
         let encoded = encoder.encode(&yuv_buffer).map_err(|_| FerricastError::Encoding("Cannot encode frame".to_string()))?;
         let data = encoded.to_vec();
-
-        if self.sps_pps.is_empty() && encoded.frame_type() == FrameType::IDR {
-            let sps_pps = extract_sps_pps(&data);
-   
-            if sps_pps.is_empty() {
-                return Err(FerricastError::Encoding("Sps/pps not found in first keyframe".to_string()));
-            }
-
-            tracing::info!("SPS/PPS found!");
-            self.sps_pps = sps_pps;
-        }
 
         let pts = (self.frame_count * 1000) / self.fps;
         self.frame_count += 1;

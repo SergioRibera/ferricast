@@ -55,6 +55,8 @@ where
             "encoder produced empty H.264 parameter sets; refusing to start segmenter".into(),
         ));
     }
+    
+
     let target = Duration::from_secs_f32(config.segment_target_secs);
     let frame_period = Duration::from_secs_f64(1.0 / (config.target_fps.max(1) as f64));
     let frame_period_us = frame_period.as_micros() as u64;
@@ -94,7 +96,10 @@ where
     // state must persist or ffmpeg's MPEG-TS demuxer flags every
     // boundary as a packet error.
     let mut muxer = MpegTs::default().with_silent_audio(config.inject_silent_audio);
+
     muxer.config(parameter_sets.clone())?;
+
+
 
     // Inter-frame dt for diagnosing capture-side throughput. At 60 fps
     // we expect ~16-17 ms; values closer to 50-60 ms point at the
