@@ -2,7 +2,7 @@
 //!
 //! The HLS segmenter wants SPS + PPS (NAL types 7 and 8) prefixed
 //! with start codes so it can inject them at every segment boundary.
-//! Most encoders we wrap (VA-API, NVENC) emit them inline at every
+//! Most encoders we wrap (VA-API, NVENC, OPENH264) emit them inline at every
 //! IDR, so we recover them by scanning the first keyframe payload.
 
 /// Walk an Annex B bitstream and return the concatenation of every

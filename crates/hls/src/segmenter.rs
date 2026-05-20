@@ -386,6 +386,7 @@ pub async fn run_from_frames(
             },
         };
 
+
         let started = Instant::now();
         let mut frames_in_segment: u64 = 0;
         push_frame(&mut muxer, &first, pts_us)?;

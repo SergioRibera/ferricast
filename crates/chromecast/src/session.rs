@@ -902,6 +902,7 @@ fn try_extract_app(msg: &CastMessage, app_id: &str) -> ExtractApp {
 /// Background heartbeat ticker. Stops as soon as the read loop
 /// flips `alive` to `false` or a ping write fails.
 async fn heartbeat_loop(writer: SharedWriter, alive: Arc<AtomicBool>) {
+    
     let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
     // First tick fires immediately; skip it so we don't ping before
     // launch settles.

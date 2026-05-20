@@ -10,6 +10,7 @@ pub struct OpenH264Encoder {
     pub encoder: Option<Encoder>,
     pub frame_count: usize,
     pub fps: usize,
+    pub sps_pps: Vec<u8>
 }
 
 
@@ -57,11 +58,24 @@ impl VideoEncoder for OpenH264Encoder {
             },
             _ => unimplemented!(),
         };
+
+    
   
         let encoded = encoder.encode(&yuv_buffer).map_err(|_| FerricastError::Encoding("Cannot encode frame".to_string()))?;
         let data = encoded.to_vec();
 
-        let pts = (self.frame_count * self.fps) / self.fps;
+        if self.sps_pps.is_empty() && encoded.frame_type() == FrameType::IDR {
+            let sps_pps = extract_sps_pps(&data);
+   
+            if sps_pps.is_empty() {
+                return Err(FerricastError::Encoding("Sps/pps not found in first keyframe".to_string()));
+            }
+
+            tracing::info!("SPS/PPS found!");
+            self.sps_pps = sps_pps;
+        }
+
+        let pts = (self.frame_count * 1000) / self.fps;
         self.frame_count += 1;
 
 
@@ -79,8 +93,10 @@ impl VideoEncoder for OpenH264Encoder {
         Ok(vec![])
     }
     fn get_headers(&mut self) -> ferricast_core::Result<Vec<u8>> {
-        // TODO!
-        Ok(vec![]) 
+        if self.sps_pps.is_empty() {
+            tracing::warn!("No keyframe has been generated to obtain the sps/pps, resulting in an empty Vec");
+        }
+        Ok(self.sps_pps.clone()) 
     }
     fn request_keyframe(&mut self) {
         let encoder = self.encoder.as_mut().expect("Ferricast(Openh264) bug: use of an encoder that has not been configured");
@@ -88,3 +104,52 @@ impl VideoEncoder for OpenH264Encoder {
         encoder.force_intra_frame();
     }
 }
+
+pub fn extract_sps_pps(annex_b: &[u8]) -> Vec<u8> {
+    let positions = find_start_codes(annex_b);
+    if positions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for (i, &(start, sc_len)) in positions.iter().enumerate() {
+        let nal_start = start + sc_len;
+        if nal_start >= annex_b.len() {
+            continue;
+        }
+        let nal_type = annex_b[nal_start] & 0x1f;
+        if nal_type != 7 && nal_type != 8 {
+            continue;
+        }
+        let nal_end = positions
+            .get(i + 1)
+            .map(|(s, _)| *s)
+            .unwrap_or(annex_b.len());
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&annex_b[nal_start..nal_end]);
+    }
+    out
+}
+
+fn find_start_codes(buf: &[u8]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 3 <= buf.len() {
+        if buf[i] == 0 && buf[i + 1] == 0 {
+            if buf[i + 2] == 1 {
+                out.push((i, 3));
+                i += 3;
+                continue;
+            }
+            if i + 4 <= buf.len() && buf[i + 2] == 0 && buf[i + 3] == 1 {
+                out.push((i, 4));
+                i += 4;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+
