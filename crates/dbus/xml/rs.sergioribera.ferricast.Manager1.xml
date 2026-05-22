@@ -1,0 +1,137 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!--
+  ferricast — Manager1 introspection.
+
+  Bus name : rs.sergioribera.ferricast (session bus)
+  Path     : /rs/sergioribera/ferricast
+  Interface: rs.sergioribera.ferricast.Manager1
+
+  Wire types follow the Rust DTOs in `crates/dbus/src/lib.rs` — if you
+  edit one, edit the other. A `gdbus-codegen` / `pydbus` consumer needs
+  only this file.
+
+  Struct layouts:
+    DeviceDto       (s s s s s a{sv})  id, name, protocol, model, host, capabilities
+    SourceDto       (s a{sv})          kind, args
+    ActiveStreamDto (s s)              device_id, device_name
+    MonitorInfoDto  (s s s s i i u u d u b a{sv})
+                    id, name, make, model, x, y, width, height,
+                    scale, refresh_mhz, primary, extra
+                    (empty strings / refresh_mhz==0 mean "unknown")
+    WindowInfoDto   (s s s u b i i u u s a{sv})
+                    id, title, app_id, pid, has_geometry,
+                    x, y, width, height, on_monitor, extra
+                    (has_geometry=false → x/y/w/h are meaningless;
+                     empty strings / pid==0 mean "unknown")
+-->
+<node>
+  <interface name="rs.sergioribera.ferricast.Manager1">
+
+    <!-- All devices currently known to the daemon. -->
+    <method name="ListDevices">
+      <arg name="devices" type="a(sssssa{sv})" direction="out"/>
+    </method>
+
+    <!-- Devices that currently have an active stream. -->
+    <method name="ListActiveStreams">
+      <arg name="streams" type="a(ss)" direction="out"/>
+    </method>
+
+    <!--
+      Start streaming to `device_id`. `source` is (kind, args):
+        - kind="",       args={}            → daemon-chosen default
+        - kind="screen", args={monitor?}    → full-screen capture
+        - kind="window", args={identifier?} → window capture
+    -->
+    <method name="StartStream">
+      <arg name="device_id" type="s" direction="in"/>
+      <arg name="source"    type="(sa{sv})" direction="in"/>
+    </method>
+
+    <!-- Stop the active stream on `device_id`. -->
+    <method name="StopStream">
+      <arg name="device_id" type="s" direction="in"/>
+    </method>
+
+    <!-- Receiver protocols compiled into the running daemon. -->
+    <property name="Protocols" type="as" access="read"/>
+
+    <!--
+      Source enumeration: lets in-process pickers / status widgets
+      render their own list of monitors and windows before handing a
+      chosen one to StartStream. On backends that cannot enumerate
+      (Wayland on GNOME/KDE without extensions), List* fails with
+      org.freedesktop.DBus.Error.NotSupported and EnumerationCapabilities
+      is empty — fall back to the OS portal picker in that case.
+    -->
+    <method name="ListMonitors">
+      <arg name="monitors" type="a(ssssiiuuduba{sv})" direction="out"/>
+    </method>
+
+    <method name="ListWindows">
+      <arg name="windows" type="a(sssubiiuusa{sv})" direction="out"/>
+    </method>
+
+    <!-- "monitors", "windows" or empty. -->
+    <property name="EnumerationCapabilities" type="as" access="read"/>
+
+    <!--
+      Thumbnails. PNG bytes, downscaled to fit the requested box
+      while preserving aspect ratio. Empty `ay` means "backend can't
+      thumbnail *this* item" (render a placeholder); NotSupported
+      means "this backend has no thumbnail capability at all".
+    -->
+    <method name="GetMonitorThumbnail">
+      <arg name="id"         type="s"  direction="in"/>
+      <arg name="max_width"  type="u"  direction="in"/>
+      <arg name="max_height" type="u"  direction="in"/>
+      <arg name="png"        type="ay" direction="out"/>
+    </method>
+
+    <method name="GetWindowThumbnail">
+      <arg name="id"         type="s"  direction="in"/>
+      <arg name="max_width"  type="u"  direction="in"/>
+      <arg name="max_height" type="u"  direction="in"/>
+      <arg name="png"        type="ay" direction="out"/>
+    </method>
+
+    <signal name="DeviceAdded">
+      <arg name="device" type="(sssssa{sv})"/>
+    </signal>
+
+    <signal name="DeviceRemoved">
+      <arg name="device_id" type="s"/>
+    </signal>
+
+    <signal name="StreamStarted">
+      <arg name="device_id"   type="s"/>
+      <arg name="device_name" type="s"/>
+    </signal>
+
+    <signal name="StreamStopped">
+      <arg name="device_id" type="s"/>
+    </signal>
+
+    <signal name="StreamReconnecting">
+      <arg name="device_id" type="s"/>
+      <arg name="attempt"   type="u"/>
+      <arg name="reason"    type="s"/>
+    </signal>
+
+    <signal name="StreamError">
+      <arg name="device_id" type="s"/>
+      <arg name="message"   type="s"/>
+    </signal>
+
+    <signal name="DiscoveryError">
+      <arg name="protocol" type="s"/>
+      <arg name="message"  type="s"/>
+    </signal>
+
+    <!-- Coarse change notifications; clients re-call List* on receipt. -->
+    <signal name="MonitorsChanged"/>
+    <signal name="WindowsChanged"/>
+
+  </interface>
+</node>

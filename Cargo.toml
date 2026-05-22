@@ -12,6 +12,7 @@ members = [
     "crates/m3u8",
     "crates/muxer",
     "crates/hls",
+    "crates/dbus",
     "crates/gui",
 ]
 
@@ -23,16 +24,21 @@ ferricast-chromecast = { path = "crates/chromecast" }
 ferricast-dial = { path = "crates/dial" }
 ferricast-airplay = { path = "crates/airplay" }
 ferricast-miracast = { path = "crates/miracast" }
-ferricast-encoder = { path = "crates/encoder" }
+ferricast-encoder = { path = "crates/encoder", default-features = false }
 ferricast-m3u8 = { path = "crates/m3u8" }
 ferricast-muxer = { path = "crates/muxer" }
 ferricast-hls = { path = "crates/hls" }
+ferricast-dbus = { path = "crates/dbus" }
 
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 thiserror = "2"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
+zbus = "5"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+async-trait = "0.1"
 
 [package]
 name = "ferricast"
@@ -44,13 +50,44 @@ description = "Unified screen and video streaming library for Linux"
 path = "src/lib.rs"
 
 [features]
-default = ["chromecast", "pipewire", "x11"]
+default = [
+    "chromecast",
+    "pipewire",
+    "x11",
+    "wlroots",
+    "wayland-direct",
+    "openh264",
+    "vaapi",
+    "nvenc",
+]
 chromecast = ["dep:ferricast-chromecast"]
 # Capture backends — re-exported from `ferricast-capture`. At least
 # one MUST be enabled; the capture crate emits a `compile_error!` if
 # both are turned off.
 pipewire = ["ferricast-capture/pipewire"]
 x11 = ["ferricast-capture/x11"]
+# Encoder backends — re-exported from `ferricast-encoder`. At least
+# one MUST be enabled (the encoder crate emits a `compile_error!`
+# when all three are off). Typical escape hatch when cros-libva's
+# pinned libva ABI doesn't match the host:
+#     ferricast = { default-features = false,
+#                   features = ["chromecast", "x11", "pipewire",
+#                               "openh264", "nvenc"] }
+openh264 = ["ferricast-encoder/openh264"]
+vaapi = ["ferricast-encoder/vaapi"]
+nvenc = ["ferricast-encoder/nvenc"]
+nvenc-zero-copy = ["ferricast-encoder/nvenc-zero-copy", "nvenc"]
+# Wayland source enumeration (foreign-toplevel + xdg-output).
+# Orthogonal to `pipewire`: that's for *capture* on Wayland; this is
+# for *picking the source to capture* via an in-process picker
+# instead of the portal dialog. Covers wlroots + niri + KDE Plasma 6
+# under one feature flag (historical name retained for compat).
+wlroots = ["ferricast-capture/wlroots"]
+# Wayland direct capture (no xdg-desktop-portal). Streams a
+# resolved monitor via `wlr-screencopy`, allocates DMA-BUFs through
+# gbm for GPU end-to-end. Falls back to PipeWire/portal at runtime
+# if the protocols aren't available.
+wayland-direct = ["ferricast-capture/wayland-direct", "wlroots"]
 # Reserved for upcoming protocol crates; toggling on requires
 # uncommenting the matching workspace member + dep below.
 # dial = ["dep:ferricast-dial"]

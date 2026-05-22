@@ -214,6 +214,7 @@ impl DialDiscovery {
                 max_width: None,
                 max_height: None,
                 supported_codecs: vec![ferricast_core::Codec::H264],
+                ..Default::default()
             },
             metadata,
         }

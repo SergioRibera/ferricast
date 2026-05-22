@@ -8,6 +8,7 @@ pub mod frame;
 pub mod net;
 pub mod protocol;
 pub mod session;
+pub mod source;
 
 pub use adaptive::AdaptiveBitrateState;
 pub use capture::{CaptureConfig, CaptureSource, ScreenCapture, WindowIdentifier};
@@ -22,3 +23,7 @@ pub use frame::{
 pub use net::local_addr_for;
 pub use protocol::{Codec, ProtocolHandler};
 pub use session::{CastSession, StreamConfig};
+pub use source::{
+    EnumerationCapability, Geometry, MonitorInfo, SourceChange, SourceEnumerator, SourceError,
+    StubEnumerator, WindowInfo,
+};

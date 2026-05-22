@@ -33,7 +33,7 @@
 //! ## Modules
 //!
 //! - [`capture`] — screen-capture backends (PipeWire, X11, native picker).
-//! - [`encoder`] — video encoders (x264, VA-API, NVENC) behind a unified trait.
+//! - [`encoder`] — video encoders (openh264, VA-API, NVENC) behind a unified trait.
 //! - [`protocols`] — receiver protocols (Chromecast today; DIAL/AirPlay/Miracast pending).
 //! - [`prelude`] — the everyday types most callers want in scope.
 
@@ -58,7 +58,7 @@ pub mod capture {
 /// Video encoders.
 ///
 /// The default H.264 entry point is [`encoder::h264::H264Encoder`].
-/// At runtime it negotiates NVENC → VA-API → x264 in order, so the
+/// At runtime it negotiates NVENC → VA-API → openh264 in order, so the
 /// same handle works across hardware without any caller changes.
 pub mod encoder {
     pub use ferricast_encoder::*;
