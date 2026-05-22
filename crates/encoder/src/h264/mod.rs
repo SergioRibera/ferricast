@@ -40,7 +40,6 @@ use tracing::{info, warn};
 
 pub use nvenc_impl::NvencH264Encoder;
 pub use vaapi_impl::VaapiH264Encoder;
-pub use x264_impl::X264H264Encoder;
 pub use openh264_impl::OpenH264Encoder;
 
 const H264_BACKEND_VAR: &'static str = "FERRICAST_H264_BACKEND";

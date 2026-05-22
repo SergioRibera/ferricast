@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ferricast::prelude::*;
+use ferricast::{CaptureConfig, ScreenCapture, VideoEncoder, capture::X11Capture, encoder::h264::OpenH264Encoder, hls::{HlsConfig, HlsServer}, prelude::*};
 use freya::{prelude::*, radio::*};
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
@@ -11,7 +11,20 @@ use crate::app::*;
 
 #[tokio::main]
 async fn main() { 
+    let mut capture = X11Capture::new();
+    capture.start(CaptureSource::FullScreen { monitor: None }, CaptureConfig::default()).await.unwrap();
 
+    let mut encoder = OpenH264Encoder::default();
+    let size = capture.get_screen_size();
+    encoder.configure(&ferricast::EncoderConfig {
+        codec: Codec::H264,
+        width: size.0 as u32,
+        height: size.1 as u32,
+        ..Default::default()
+    }).unwrap();
+
+    let server = HlsServer::start("0.0.0.0:8001", capture, encoder, HlsConfig::default()).await.unwrap();
+    server.run().await.unwrap();
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {

@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use ferricast_core::{Codec, EncodedFrame, FerricastError, H264Profile, PixelFormat, VideoEncoder};
-use openh264::{OpenH264API, encoder::{BitRate, Encoder, EncoderConfig, FrameType, Profile}, formats::{BgraSliceU8, RgbaSliceU8, YUVBuffer}};
+use openh264::{OpenH264API, encoder::{BitRate, Encoder, EncoderConfig, FrameType, Profile, QpRange, VuiConfig}, formats::{BgraSliceU8, RgbaSliceU8, YUVBuffer}};
 
 pub const OPEN_H264_THREADS_VAR: &'static str = "FERRICAST_OPEN_H264_THREADS";
 
@@ -30,9 +30,12 @@ impl VideoEncoder for OpenH264Encoder {
         
          let encoder_config = EncoderConfig::new()
              .profile(profile)
-             .skip_frames(false)
-             .usage_type(openh264::encoder::UsageType::CameraVideoRealTime)
-             
+             .qp(QpRange::new(16, 45))
+             .rate_control_mode(openh264::encoder::RateControlMode::Bitrate)
+             .complexity(openh264::encoder::Complexity::Low)
+             .vui(VuiConfig::srgb())              
+             .debug(cfg!(debug_assertions))
+             .usage_type(openh264::encoder::UsageType::ScreenContentRealTime) 
              .bitrate(BitRate::from_bps(config.bitrate_kbps * 1000));
         let mut encoder = Encoder::with_api_config(api, encoder_config).map_err(|e| FerricastError::Encoder(format!("Cannot create openh264 encoder {:?}", e)))?;
         
