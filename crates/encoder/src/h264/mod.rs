@@ -216,3 +216,80 @@ impl VideoEncoder for H264Encoder {
 pub fn vaapi_available(config: &EncoderConfig) -> bool {
     VaapiH264Encoder::probe_with(config.clone()).is_ok()
 }
+
+pub mod utils {
+    pub fn extract_sps_pps(annex_b: &[u8]) -> Vec<u8> {
+        let positions = find_start_codes(annex_b);
+        if positions.is_empty() {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        for (i, &(start, sc_len)) in positions.iter().enumerate() {
+            let nal_start = start + sc_len;
+            if nal_start >= annex_b.len() {
+                continue;
+        }
+        let nal_type = annex_b[nal_start] & 0x1f;
+        if nal_type != 7 && nal_type != 8 {
+            continue;
+        }
+        let nal_end = positions
+            .get(i + 1)
+            .map(|(s, _)| *s)
+            .unwrap_or(annex_b.len());
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&annex_b[nal_start..nal_end]);
+    }
+        out
+    }
+
+    fn find_start_codes(buf: &[u8]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 3 <= buf.len() {
+            if buf[i] == 0 && buf[i + 1] == 0 {
+                if buf[i + 2] == 1 {
+                    out.push((i, 3));
+                    i += 3;
+                    continue;
+                }
+            if i + 4 <= buf.len() && buf[i + 2] == 0 && buf[i + 3] == 1 {
+                out.push((i, 4));
+                i += 4;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+
+}
+#[cfg(test)]
+mod tests {
+    use super::utils::*;
+
+    #[test]
+    fn extracts_sps_pps_from_idr() {
+        // SPS (type 7), PPS (type 8), IDR slice (type 5) — all
+        // prefixed with 4-byte start codes.
+        let stream = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e, // SPS
+            0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, // PPS
+            0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, // IDR
+        ];
+        let out = extract_sps_pps(&stream);
+        let expected = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e, 0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80,
+        ];
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn empty_when_no_params() {
+        let stream = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00];
+        assert!(extract_sps_pps(&stream).is_empty());
+    }
+}

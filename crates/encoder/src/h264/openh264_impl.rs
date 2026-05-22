@@ -40,7 +40,7 @@ impl VideoEncoder for OpenH264Encoder {
         let encoded = encoder.encode(&empty_frame).map_err(|_| FerricastError::Encoding("Cannot encode empty frame".to_string()))?;
         let data = encoded.to_vec();
 
-        let sps_pps = extract_sps_pps(&data);
+        let sps_pps = super::utils::extract_sps_pps(&data);
         if sps_pps.is_empty() {
             return Err(FerricastError::Encoding("Sps/pps not found in first keyframe".to_string()));
         }
@@ -108,52 +108,4 @@ impl VideoEncoder for OpenH264Encoder {
         encoder.force_intra_frame();
     }
 }
-
-pub fn extract_sps_pps(annex_b: &[u8]) -> Vec<u8> {
-    let positions = find_start_codes(annex_b);
-    if positions.is_empty() {
-        return Vec::new();
-    }
-
-    let mut out = Vec::new();
-    for (i, &(start, sc_len)) in positions.iter().enumerate() {
-        let nal_start = start + sc_len;
-        if nal_start >= annex_b.len() {
-            continue;
-        }
-        let nal_type = annex_b[nal_start] & 0x1f;
-        if nal_type != 7 && nal_type != 8 {
-            continue;
-        }
-        let nal_end = positions
-            .get(i + 1)
-            .map(|(s, _)| *s)
-            .unwrap_or(annex_b.len());
-        out.extend_from_slice(&[0, 0, 0, 1]);
-        out.extend_from_slice(&annex_b[nal_start..nal_end]);
-    }
-    out
-}
-
-fn find_start_codes(buf: &[u8]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i + 3 <= buf.len() {
-        if buf[i] == 0 && buf[i + 1] == 0 {
-            if buf[i + 2] == 1 {
-                out.push((i, 3));
-                i += 3;
-                continue;
-            }
-            if i + 4 <= buf.len() && buf[i + 2] == 0 && buf[i + 3] == 1 {
-                out.push((i, 4));
-                i += 4;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out
-}
-
 
