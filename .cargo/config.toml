@@ -21,33 +21,33 @@
 
 [alias]
 # "Minimal but useful" build: every protocol + capture backend
-# the workspace ships, x264 and NVENC encoders, no VA-API. This is
+# the workspace ships, openh264 and NVENC encoders, no VA-API. This is
 # the right command on NixOS + recent libva, or any host where
 # cros-libva refuses to compile against the system headers.
 b-min = [
     "build",
     "--no-default-features",
     "--features",
-    "chromecast,pipewire,x11,wlroots,wayland-direct,x264,nvenc",
+    "chromecast,pipewire,x11,wlroots,wayland-direct,openh264,nvenc",
 ]
 r-min = [
     "run",
     "--no-default-features",
     "--features",
-    "chromecast,pipewire,x11,wlroots,wayland-direct,x264,nvenc",
+    "chromecast,pipewire,x11,wlroots,wayland-direct,openh264,nvenc",
 ]
 c-min = [
     "check",
     "--no-default-features",
     "--features",
-    "chromecast,pipewire,x11,wlroots,wayland-direct,x264,nvenc",
+    "chromecast,pipewire,x11,wlroots,wayland-direct,openh264,nvenc",
 ]
 
-# x264-only fallback. Useful on hosts without any GPU encode
+# openh264-only fallback. Useful on hosts without any GPU encode
 # library at all (CI, minimal containers, Wayland-on-llvmpipe).
 b-soft = [
     "build",
     "--no-default-features",
     "--features",
-    "chromecast,pipewire,x11,wlroots,wayland-direct,x264",
+    "chromecast,pipewire,x11,wlroots,wayland-direct,openh264",
 ]

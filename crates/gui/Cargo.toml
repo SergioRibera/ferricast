@@ -18,7 +18,7 @@ default = [
     "x11",
     "wlroots",
     "wayland-direct",
-    "x264",
+    "openh264",
     "vaapi",
     "nvenc",
 ]
@@ -28,8 +28,8 @@ x11 = ["ferricast/x11"]
 # Encoder backends — forwarded through the umbrella to ferricast-encoder.
 # Drop `vaapi` here when cros-libva can't compile against the host
 # libva version; the runtime backend chain then skips VA-API and
-# uses NVENC / x264.
-x264 = ["ferricast/x264"]
+# uses NVENC / openh264.
+openh264 = ["ferricast/openh264"]
 vaapi = ["ferricast/vaapi"]
 nvenc = ["ferricast/nvenc"]
 nvenc-zero-copy = ["ferricast/nvenc-zero-copy", "nvenc"]

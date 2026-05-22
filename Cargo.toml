@@ -56,7 +56,7 @@ default = [
     "x11",
     "wlroots",
     "wayland-direct",
-    "x264",
+    "openh264",
     "vaapi",
     "nvenc",
 ]
@@ -72,8 +72,8 @@ x11 = ["ferricast-capture/x11"]
 # pinned libva ABI doesn't match the host:
 #     ferricast = { default-features = false,
 #                   features = ["chromecast", "x11", "pipewire",
-#                               "x264", "nvenc"] }
-x264 = ["ferricast-encoder/x264"]
+#                               "openh264", "nvenc"] }
+openh264 = ["ferricast-encoder/openh264"]
 vaapi = ["ferricast-encoder/vaapi"]
 nvenc = ["ferricast-encoder/nvenc"]
 nvenc-zero-copy = ["ferricast-encoder/nvenc-zero-copy", "nvenc"]
