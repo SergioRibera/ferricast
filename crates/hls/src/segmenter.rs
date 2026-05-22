@@ -49,11 +49,14 @@ where
     // SPS+PPS in Annex B form. Captured once and injected at every
     // keyframe access unit so any segment is self-describing.
     let parameter_sets = encoder.get_headers()?;
+
     if parameter_sets.is_empty() {
         return Err(FerricastError::Encoder(
             "encoder produced empty H.264 parameter sets; refusing to start segmenter".into(),
         ));
     }
+    
+
     let target = Duration::from_secs_f32(config.segment_target_secs);
     let frame_period = Duration::from_secs_f64(1.0 / (config.target_fps.max(1) as f64));
     let frame_period_us = frame_period.as_micros() as u64;
@@ -93,7 +96,10 @@ where
     // state must persist or ffmpeg's MPEG-TS demuxer flags every
     // boundary as a packet error.
     let mut muxer = MpegTs::default().with_silent_audio(config.inject_silent_audio);
+
     muxer.config(parameter_sets.clone())?;
+
+
 
     // Inter-frame dt for diagnosing capture-side throughput. At 60 fps
     // we expect ~16-17 ms; values closer to 50-60 ms point at the
@@ -384,6 +390,7 @@ pub async fn run_from_frames(
                 }
             },
         };
+
 
         let started = Instant::now();
         let mut frames_in_segment: u64 = 0;

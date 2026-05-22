@@ -39,7 +39,6 @@ use crate::castv2::{
     connect_message, get_status_message, launch_message, load_media_message, namespace,
     ping_message, pong_message, stop_app_message,
 };
-use crate::h264_params::extract_sps_pps;
 use crate::wire::{self, SharedWriter};
 
 /// Channel depth between the manager-driven `send_frame` and the HLS
@@ -412,7 +411,7 @@ impl ChromecastSession {
             .as_ref()
             .ok_or_else(|| FerricastError::Streaming("setup_stream not called".into()))?;
 
-        let parameter_sets = extract_sps_pps(&first_keyframe.data);
+        let parameter_sets = ferricast_encoder::h264::utils::extract_sps_pps(&first_keyframe.data);
         if parameter_sets.is_empty() {
             return Err(FerricastError::Encoder(
                 "first keyframe carries no SPS/PPS; cannot bootstrap HLS".into(),
@@ -902,6 +901,7 @@ fn try_extract_app(msg: &CastMessage, app_id: &str) -> ExtractApp {
 /// Background heartbeat ticker. Stops as soon as the read loop
 /// flips `alive` to `false` or a ping write fails.
 async fn heartbeat_loop(writer: SharedWriter, alive: Arc<AtomicBool>) {
+    
     let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
     // First tick fires immediately; skip it so we don't ping before
     // launch settles.
