@@ -10,7 +10,7 @@ use std::{
 use tracing::info;
 use xcb::{
     shm::Seg,
-    x::{Format, Pixmap, Screen, ScreenBuf},
+    x::{Format, ScreenBuf},
 };
 
 pub struct X11Capture {
@@ -26,6 +26,7 @@ pub struct X11Capture {
     /// configured value so downstream paces correctly.
     fps: u32,
     buffer_ptr: AtomicPtr<u8>,
+    time: Instant,
 }
 
 impl X11Capture {
@@ -47,7 +48,7 @@ impl X11Capture {
 impl ScreenCapture for X11Capture {
     async fn start(
         &mut self,
-        source: ferricast_core::CaptureSource,
+        _source: ferricast_core::CaptureSource,
         config: ferricast_core::CaptureConfig,
     ) -> ferricast_core::Result<()> {
         info!("Connecting to Xserver");
@@ -112,6 +113,7 @@ impl ScreenCapture for X11Capture {
         self.size = (w, h);
         self.fps = config.fps;
         self.pixmap = Some(pixmap);
+        self.time = Instant::now();
         Ok(())
     }
     async fn stop(&mut self) -> ferricast_core::Result<()> {
@@ -185,7 +187,7 @@ impl ScreenCapture for X11Capture {
                 stride: format.bits_per_pixel() as u32,
                 format: ferricast_core::PixelFormat::Bgra,
                 data: Bytes::from(buffer.to_vec()),
-                timestamp_us: Instant::now().elapsed().as_micros() as u64,
+                timestamp_us: self.time.elapsed().as_micros() as u64,
             },
         ))
     }
