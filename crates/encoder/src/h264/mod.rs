@@ -30,7 +30,6 @@ mod bitstream;
 mod headers;
 mod nvenc_impl;
 mod vaapi_impl;
-mod x264_impl;
 mod yuv;
 mod openh264_impl;
 
