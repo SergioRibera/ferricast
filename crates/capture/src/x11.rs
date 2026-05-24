@@ -40,6 +40,7 @@ impl X11Capture {
             is_running: AtomicBool::new(false),
             size: (0, 0),
             fps: 0,
+            time: Instant::now(),
             buffer_ptr: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -112,8 +113,7 @@ impl ScreenCapture for X11Capture {
         self.is_running = AtomicBool::new(true);
         self.size = (w, h);
         self.fps = config.fps;
-        self.pixmap = Some(pixmap);
-        self.time = Instant::now();
+        self.pixmap = Some(pixmap); 
         Ok(())
     }
     async fn stop(&mut self) -> ferricast_core::Result<()> {

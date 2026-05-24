@@ -11,6 +11,7 @@ use crate::app::*;
 
 #[tokio::main]
 async fn main() { 
+    /*
     let mut capture = X11Capture::new();
     capture.start(CaptureSource::FullScreen { monitor: None }, CaptureConfig::default()).await.unwrap();
 
@@ -25,7 +26,7 @@ async fn main() {
 
     let server = HlsServer::start("0.0.0.0:8001", capture, encoder, HlsConfig::default()).await.unwrap();
     server.run().await.unwrap();
-
+    */
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             EnvFilter::new(
