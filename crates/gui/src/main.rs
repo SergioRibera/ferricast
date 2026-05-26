@@ -19,7 +19,8 @@ async fn main() {
         }))
     .init();
 
-    let mut capture = X11Capture::new();
+   
+    /*let mut capture = X11Capture::new();
     capture.start(CaptureSource::FullScreen { monitor: None }, CaptureConfig::default()).await.unwrap();
 
     let mut encoder = OpenH264Encoder::default();
@@ -33,6 +34,7 @@ async fn main() {
 
     let server = HlsServer::start("0.0.0.0:8001", capture, encoder, HlsConfig::default()).await.unwrap();
     server.run().await.unwrap();
+    */
     
 
 

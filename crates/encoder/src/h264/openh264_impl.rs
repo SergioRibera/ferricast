@@ -62,7 +62,6 @@ impl VideoEncoder for OpenH264Encoder {
              .background_detection(false)
              .vui(VuiConfig::srgb())              
              .num_threads(threads)
-             //.debug(cfg!(debug_assertions))
              .usage_type(openh264::encoder::UsageType::ScreenContentRealTime) 
              .bitrate(BitRate::from_bps(config.bitrate_kbps * 1000));
 
@@ -111,18 +110,10 @@ impl VideoEncoder for OpenH264Encoder {
             _ => unimplemented!(),
         };
 
-        let i1 = std::time::Instant::now();
         let encoded = encoder.encode(&yuv_buffer).map_err(|_| FerricastError::Encoding("Cannot encode frame".to_string()))?;
-        let e1 = i1.elapsed();
-        println!("encode time {} ns {} ms {} s", e1.as_nanos(), e1.as_millis(), e1.as_secs());
-        
-        let i2 = std::time::Instant::now();
+      
         let data = encoded.to_vec();
-        let e2 = i2.elapsed();
-        println!("clone time {} ns {} ms {} s", e2.as_nanos(), e2.as_millis(), e2.as_secs());
-
-        let s = e1 + e2;
-        println!("total: {} ns {} ms {} s", s.as_nanos(), s.as_millis(), s.as_secs());
+ 
   
 
 

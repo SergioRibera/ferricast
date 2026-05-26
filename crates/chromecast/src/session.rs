@@ -25,10 +25,12 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
+use ferricast_capture::X11Capture;
 use ferricast_core::{
-    CastSession, Codec, Device, EncodedFrame, FerricastError, Result, StreamConfig,
+    CaptureConfig, CaptureSource, CastSession, Codec, Device, EncodedFrame, EncoderConfig, FerricastError, Result, ScreenCapture, StreamConfig, VideoEncoder
 };
-use ferricast_hls::{HlsConfig, HlsFrameSink};
+use ferricast_encoder::h264::OpenH264Encoder;
+use ferricast_hls::{HlsConfig, HlsFrameSink, HlsServer};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
@@ -106,7 +108,7 @@ struct StreamState {
     /// HLS endpoint. Owns the TCP listener + segmenter task; held
     /// solely for its Drop side-effect (cleanup) — the wait+LOAD
     /// task gets its own clone of the readiness future.
-    _sink: HlsFrameSink,
+    _sink: JoinHandle<()>,
     /// Background task that waits for the first segment to land and
     /// then sends `LOAD` to the receiver. Spawned because doing it
     /// inline in `send_frame` deadlocks the manager loop — the
@@ -315,6 +317,7 @@ impl CastSession for ChromecastSession {
             .as_mut()
             .ok_or_else(|| FerricastError::Streaming("HLS stream not initialised".into()))?;
 
+        /*
         // try_send avoids stalling the upstream encoder when the
         // segmenter falls behind. Recovery happens at the next IDR.
         match stream.frame_tx.try_send(frame.clone()) {
@@ -328,6 +331,8 @@ impl CastSession for ChromecastSession {
                 ));
             }
         }
+
+        */
 
         Ok(())
     }
@@ -453,25 +458,48 @@ impl ChromecastSession {
             part_target_secs,
             ..Default::default()
         };
-        let sink = HlsFrameSink::start("0.0.0.0:0", frame_rx, parameter_sets, hls_config).await?;
-        let local_addr = sink.local_addr();
-        let media_url = format!("http://{}:{}/index.m3u8", local_ip, local_addr.port());
+        let mut capture = X11Capture::new();
+    
+    capture.start(CaptureSource::FullScreen { monitor: None }, CaptureConfig::default()).await.unwrap();
+
+    let mut encoder = OpenH264Encoder::default();
+    let size = capture.get_screen_size();
+    
+    encoder.configure(&EncoderConfig {
+        codec: Codec::H264,
+        width: size.0 as u32,
+        height: size.1 as u32,
+        ..Default::default()
+    }).unwrap();
+
+
+    let sink = HlsServer::start("0.0.0.0:0", capture, encoder, hls_config).await.unwrap();
+          
+    let local_addr = sink.local_addr()?;
+        let media_url = format!("http://{}:{}/index.html", local_ip, local_addr.port());
         info!(
             url = %media_url,
             "chromecast HLS endpoint ready (open this URL in a player to verify)"
         );
 
-        let ready = sink.first_segment_ready();
         let load_url = media_url.clone();
         let probe_port = local_addr.port();
+
+
+        let hls_run_task = tokio::spawn(async move {
+            tracing::info!("Hls server running"); 
+            sink.run().await.unwrap();
+        });
+
         let load_task = tokio::spawn(async move {
-            ready.await;
+        
 
             // Self-test: try fetching the playlist over loopback
             // before pointing the receiver at it. If we can't reach
             // our own server, neither can the chromecast — and the
             // log makes the failure mode obvious instead of "TV
             // shows black, no errors anywhere".
+            /*
             match self_test_playlist(probe_port).await {
                 Ok(snippet) => info!(
                     bytes = snippet.len(),
@@ -483,6 +511,7 @@ impl ChromecastSession {
                     "HLS self-test FAILED — chromecast almost certainly can't reach the URL either"
                 ),
             }
+             */
 
             let request_id = request_id_counter.fetch_add(1, Ordering::Relaxed);
             let media = MediaInfo {
@@ -519,7 +548,7 @@ impl ChromecastSession {
 
         self.stream = Some(StreamState {
             frame_tx,
-            _sink: sink,
+            _sink: hls_run_task,
             load_task,
         });
         Ok(())

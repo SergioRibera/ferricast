@@ -202,7 +202,7 @@ impl HlsServer {
                 error!(error = %e, "HLS segmenter loop exited");
             }
         });
-
+    
        ring::wait_for_first_segment(&ring).await;
 
         info!(
