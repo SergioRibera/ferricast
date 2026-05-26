@@ -26,21 +26,53 @@ impl VideoEncoder for OpenH264Encoder {
             H264Profile::Main => Profile::Main,
             H264Profile::High => Profile::High,
          };
+
+         let threads = match std::env::var(OPEN_H264_THREADS_VAR).unwrap_or("0".to_string()).as_str() {
+            "0" => { 
+                tracing::info!("OpenH264 Threads: Auto");
+                0 
+            },
+            "1" => {
+                tracing::info!("OpenH264 Threads: Single Threaded");
+                1 
+            },
+            n => {
+                match n.parse::<u16>() {
+                    Ok(num) => {
+                        tracing::info!("OpenH264 Threads: fixed {} threads", num);
+                        num
+                    }
+                    Err(_) => {
+                        tracing::info!("OpenH264 Threads: Unknown Value {}, Fallback to Auto", n);
+                        0
+                    }
+                }
+            }, 
+         };
+         
     
         
          let encoder_config = EncoderConfig::new()
              .profile(profile)
-             .qp(QpRange::new(16, 45))
-             .rate_control_mode(openh264::encoder::RateControlMode::Bitrate)
+             .qp(QpRange::new(28, 28))
+             .rate_control_mode(openh264::encoder::RateControlMode::Off)
              .complexity(openh264::encoder::Complexity::Low)
+             .adaptive_quantization(false)
+             .scene_change_detect(false)
+             .background_detection(false)
              .vui(VuiConfig::srgb())              
-             .debug(cfg!(debug_assertions))
+             .num_threads(threads)
+             //.debug(cfg!(debug_assertions))
              .usage_type(openh264::encoder::UsageType::ScreenContentRealTime) 
              .bitrate(BitRate::from_bps(config.bitrate_kbps * 1000));
+
+
         let mut encoder = Encoder::with_api_config(api, encoder_config).map_err(|e| FerricastError::Encoder(format!("Cannot create openh264 encoder {:?}", e)))?;
         
         let empty_frame = YUVBuffer::new(config.width as usize, config.height as usize);
+
         let encoded = encoder.encode(&empty_frame).map_err(|_| FerricastError::Encoding("Cannot encode empty frame".to_string()))?;
+    
         let data = encoded.to_vec();
 
         let sps_pps = super::utils::extract_sps_pps(&data);
@@ -79,8 +111,20 @@ impl VideoEncoder for OpenH264Encoder {
             _ => unimplemented!(),
         };
 
+        let i1 = std::time::Instant::now();
         let encoded = encoder.encode(&yuv_buffer).map_err(|_| FerricastError::Encoding("Cannot encode frame".to_string()))?;
+        let e1 = i1.elapsed();
+        println!("encode time {} ns {} ms {} s", e1.as_nanos(), e1.as_millis(), e1.as_secs());
+        
+        let i2 = std::time::Instant::now();
         let data = encoded.to_vec();
+        let e2 = i2.elapsed();
+        println!("clone time {} ns {} ms {} s", e2.as_nanos(), e2.as_millis(), e2.as_secs());
+
+        let s = e1 + e2;
+        println!("total: {} ns {} ms {} s", s.as_nanos(), s.as_millis(), s.as_secs());
+  
+
 
         let pts = (self.frame_count * 1000) / self.fps;
         self.frame_count += 1;
