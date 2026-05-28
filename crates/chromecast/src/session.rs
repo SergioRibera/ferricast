@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
-use ferricast_capture::X11Capture;
+use ferricast_capture::NativeCapture;
 use ferricast_core::{
     CaptureConfig, CaptureSource, CastSession, Codec, Device, EncodedFrame, EncoderConfig, FerricastError, Result, ScreenCapture, StreamConfig, VideoEncoder
 };
@@ -458,7 +458,7 @@ impl ChromecastSession {
             part_target_secs,
             ..Default::default()
         };
-        let mut capture = X11Capture::new();
+        let mut capture = NativeCapture::new();
     
     capture.start(CaptureSource::FullScreen { monitor: None }, CaptureConfig::default()).await.unwrap();
 
