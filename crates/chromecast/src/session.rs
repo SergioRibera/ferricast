@@ -29,7 +29,7 @@ use ferricast_capture::NativeCapture;
 use ferricast_core::{
     CaptureConfig, CaptureSource, CastSession, Codec, Device, EncodedFrame, EncoderConfig, FerricastError, Result, ScreenCapture, StreamConfig, VideoEncoder
 };
-use ferricast_encoder::h264::OpenH264Encoder;
+use ferricast_encoder::h264::H264Encoder;
 use ferricast_hls::{HlsConfig, HlsFrameSink, HlsServer};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -462,7 +462,7 @@ impl ChromecastSession {
     
     capture.start(CaptureSource::FullScreen { monitor: None }, CaptureConfig::default()).await.unwrap();
 
-    let mut encoder = OpenH264Encoder::default();
+    let mut encoder = H264Encoder::default();
     let size = capture.get_screen_size();
     
     encoder.configure(&EncoderConfig {
