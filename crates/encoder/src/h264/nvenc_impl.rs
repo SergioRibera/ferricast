@@ -283,9 +283,13 @@ impl VideoEncoder for NvencH264Encoder {
         self.frame_count += 1;
         let is_keyframe = matches!(nv_frame.picture_type(), PictureType::I | PictureType::Idr);
 
+        let encoded_bytes = nv_frame.into_data();
+        
+        println!("{:?}", &encoded_bytes[..4]);
+
         Ok(EncodedFrame {
             codec: Codec::H264,
-            data: Bytes::from(nv_frame.into_data()),
+            data: Bytes::from(encoded_bytes),
             timestamp_us: raw.timestamp_us,
             duration_us: Some(1_000_000 / self.cfg.fps as u64),
             is_keyframe,

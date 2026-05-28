@@ -454,8 +454,6 @@ impl VideoEncoder for VaapiH264Encoder {
             run_encode(self, &mut state)?
         };
 
-        println!("{:?}", &encoded_bytes[..4]);
-
         Ok(EncodedFrame {
             codec: Codec::H264,
             data: Bytes::from(encoded_bytes),

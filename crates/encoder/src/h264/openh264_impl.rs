@@ -125,7 +125,7 @@ impl VideoEncoder for OpenH264Encoder {
             codec: Codec::H264,
             data: Bytes::from(data),
             timestamp_us: 0,
-            is_keyframe: encoded.frame_type() == FrameType::IDR,
+            is_keyframe: matches!(encoded.frame_type(), FrameType::IDR | FrameType::I),
             duration_us: None, 
             pts_dts: (pts as u64, pts as u64)
         })
