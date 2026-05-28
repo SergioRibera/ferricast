@@ -390,6 +390,7 @@ pub async fn run_from_frames(
                 }
             },
         };
+      
 
 
         let started = Instant::now();
@@ -427,6 +428,7 @@ pub async fn run_from_frames(
                 break;
             }
             push_frame(&mut muxer, &encoded, pts_us)?;
+        
             pts_us = pts_us.saturating_add(effective_frame_period_us);
             frames_in_segment += 1;
 

@@ -461,11 +461,12 @@ impl ChromecastSession {
             "chromecast HLS endpoint ready (open this URL in a player to verify)"
         );
 
-        let ready = sink.first_segment_ready();
+        //let ready = sink.first_segment_ready();
         let load_url = media_url.clone();
         let probe_port = local_addr.port();
         let load_task = tokio::spawn(async move {
-            ready.await;
+          //  ready.await;
+            
 
             // Self-test: try fetching the playlist over loopback
             // before pointing the receiver at it. If we can't reach
@@ -486,13 +487,13 @@ impl ChromecastSession {
 
             let request_id = request_id_counter.fetch_add(1, Ordering::Relaxed);
             let media = MediaInfo {
-                content_id: load_url.clone(),
+                content_id: load_url.to_string(),//"https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8".to_string(),
                 // Default Media Receiver accepts the lowercase form
                 // (the spec is case-insensitive but some receiver
                 // versions are picky and the lowercase variant is
                 // what every reference HLS sample uses).
-                content_type: "application/x-mpegurl".to_string(),
-                stream_type: Some("LIVE".to_string()),
+                content_type: "video/mp2t".to_string(),
+                stream_type: Some("LIVE".to_string()), 
                 duration: None,
             };
             let msg = match load_media_message(request_id, &transport_id, media) {
@@ -516,6 +517,8 @@ impl ChromecastSession {
         if let Err(e) = frame_tx.try_send(first_keyframe.clone()) {
             warn!(?e, "could not seed first keyframe (channel full at init)");
         }
+
+ 
 
         self.stream = Some(StreamState {
             frame_tx,
