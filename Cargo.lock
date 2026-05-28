@@ -1417,7 +1417,6 @@ name = "ferricast-chromecast"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "ferricast-capture",
  "ferricast-core",
  "ferricast-encoder",
  "ferricast-hls",
