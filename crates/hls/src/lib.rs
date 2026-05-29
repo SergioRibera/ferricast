@@ -33,6 +33,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
@@ -342,14 +343,43 @@ impl HlsFrameSink {
         let accept = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((socket, peer)) => {
+                    Ok((mut socket, peer)) => {
                         let r = accept_ring.clone();
                         let a = accept_adaptive.clone();
                         let s = accept_stats.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = http::handle(socket, r, a, s).await {
+                            let content = "
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXT-X-TARGETDURATION:11
+#EXTINF:10.000,
+https://test-streams.mux.dev/x36xhzz/url_6/url_846/193039199_mp4_h264_aac_hq_7.ts
+#EXTINF:10.000,
+https://test-streams.mux.dev/x36xhzz/url_6/url_847/193039199_mp4_h264_aac_hq_7.ts
+#EXTINF:10.000,
+https://test-streams.mux.dev/x36xhzz/url_6/url_848/193039199_mp4_h264_aac_hq_7.ts
+#EXTINF:10.000,
+https://test-streams.mux.dev/x36xhzz/url_6/url_849/193039199_mp4_h264_aac_hq_7.ts
+#EXTINF:10.000,
+https://test-streams.mux.dev/x36xhzz/url_6/url_850/193039199_mp4_h264_aac_hq_7.ts
+#EXTINF:10.000,
+https://test-streams.mux.dev/x36xhzz/url_6/url_851/193039199_mp4_h264_aac_hq_7.ts
+#EXTINF:10.000,
+https://test-streams.mux.dev/x36xhzz/url_6/url_852/193039199_mp4_h264_aac_hq_7.ts
+#EXTINF:9.967,
+https://test-streams.mux.dev/x36xhzz/url_6/url_853/193039199_mp4_h264_aac_hq_7.ts
+#EXTINF:10.033,
+https://test-streams.mux.dev/x36xhzz/url_6/url_854/193039199_mp4_h264_aac_hq_7.ts
+#EXT-X-ENDLIST
+                            ";
+
+                            println!("Wrinting http response");
+                            socket.write(format!("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\n\r\n{}", content.len(), content).as_bytes()).await.unwrap();
+                            /* if let Err(e) = http::handle(socket, r, a, s).await {
                                 trace!(peer = %peer, error = %e, "HLS connection ended");
                             }
+                            */
                         });
                     }
                     Err(e) => {

@@ -453,6 +453,7 @@ impl ChromecastSession {
             part_target_secs,
             ..Default::default()
         };
+        
         let sink = HlsFrameSink::start("0.0.0.0:0", frame_rx, parameter_sets, hls_config).await?;
         let local_addr = sink.local_addr();
         let media_url = format!("http://{}:{}/index.m3u8", local_ip, local_addr.port());
@@ -460,6 +461,7 @@ impl ChromecastSession {
             url = %media_url,
             "chromecast HLS endpoint ready (open this URL in a player to verify)"
         );
+        
 
         //let ready = sink.first_segment_ready();
         let load_url = media_url.clone();
@@ -487,7 +489,7 @@ impl ChromecastSession {
 
             let request_id = request_id_counter.fetch_add(1, Ordering::Relaxed);
             let media = MediaInfo {
-                content_id: "https://test-streams.mux.dev/x36xhzz/url_6/193039199_mp4_h264_aac_hq_7.m3u8".to_string(),//"https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8".to_string(),
+                content_id: load_url.to_string(),//"https://test-streams.mux.dev/x36xhzz/url_6/193039199_mp4_h264_aac_hq_7.m3u8".to_string(),//"https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8".to_string(),
                 // Default Media Receiver accepts the lowercase form
                 // (the spec is case-insensitive but some receiver
                 // versions are picky and the lowercase variant is
