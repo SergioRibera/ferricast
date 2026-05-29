@@ -487,12 +487,12 @@ impl ChromecastSession {
 
             let request_id = request_id_counter.fetch_add(1, Ordering::Relaxed);
             let media = MediaInfo {
-                content_id: load_url.to_string(),//"https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8".to_string(),
+                content_id: "https://test-streams.mux.dev/x36xhzz/url_6/193039199_mp4_h264_aac_hq_7.m3u8".to_string(),//"https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8".to_string(),
                 // Default Media Receiver accepts the lowercase form
                 // (the spec is case-insensitive but some receiver
                 // versions are picky and the lowercase variant is
                 // what every reference HLS sample uses).
-                content_type: "video/mp2t".to_string(),
+                content_type: "video/mp4a".to_string(),
                 stream_type: Some("LIVE".to_string()), 
                 duration: None,
             };
