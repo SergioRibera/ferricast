@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use ferricast_core::{Codec, EncodedFrame, FerricastError, H264Profile, PixelFormat, VideoEncoder};
-use openh264::{OpenH264API, encoder::{BitRate, Encoder, EncoderConfig, FrameType, Profile, QpRange, VuiConfig}, formats::{BgraSliceU8, RgbaSliceU8, YUVBuffer}};
+use openh264::{OpenH264API, encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, Profile, QpRange, VuiConfig}, formats::{BgraSliceU8, RgbaSliceU8, YUVBuffer}};
 
 pub const OPEN_H264_THREADS_VAR: &'static str = "FERRICAST_OPEN_H264_THREADS";
 
@@ -60,6 +60,7 @@ impl VideoEncoder for OpenH264Encoder {
              .adaptive_quantization(false)
              .scene_change_detect(false)
              .background_detection(false)
+             .max_frame_rate(FrameRate::from_hz(config.fps as f32))
              .vui(VuiConfig::srgb())              
              .num_threads(threads)
              .usage_type(openh264::encoder::UsageType::ScreenContentRealTime) 
@@ -124,9 +125,9 @@ impl VideoEncoder for OpenH264Encoder {
         Ok(EncodedFrame {  
             codec: Codec::H264,
             data: Bytes::from(data),
-            timestamp_us: 0,
+            timestamp_us: (encoded.raw_info().uiTimeStamp as u64) * 1000,
             is_keyframe: matches!(encoded.frame_type(), FrameType::IDR | FrameType::I),
-            duration_us: None, 
+            duration_us: Some((10000 / self.fps) as u64), 
             pts_dts: (pts as u64, pts as u64)
         })
         

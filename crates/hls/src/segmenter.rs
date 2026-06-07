@@ -389,8 +389,7 @@ pub async fn run_from_frames(
                     None => return Ok(()),
                 }
             },
-        };
-      
+        };      
 
 
         let started = Instant::now();
