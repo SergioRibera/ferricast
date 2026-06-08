@@ -3,6 +3,13 @@ name = "ferricast-hls"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Receiver-side HLS puller. Default-on because the chromecast
+# receiver path depends on it; turn off only when building a sender-
+# only binary that doesn't need to pull foreign streams.
+default = ["pull"]
+pull = ["dep:reqwest", "dep:m3u8-rs", "dep:url"]
+
 [dependencies]
 ferricast-core.workspace = true
 ferricast-m3u8.workspace = true
@@ -10,3 +17,27 @@ ferricast-muxer.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 bytes.workspace = true
+futures-util.workspace = true
+
+# Pull-path deps. Each is pulled in only when the `pull` feature is
+# on (which it is by default) so a sender-only build doesn't pay
+# the compile cost or carry rustls in its closure.
+#
+# - `reqwest` — async HTTP client, rustls-backed so no system OpenSSL
+#   dep. `stream` exposes a `bytes_stream()` adapter we drain segment-
+#   by-segment instead of buffering whole segments in memory.
+# - `m3u8-rs` — pure-Rust HLS playlist parser. Read side only — the
+#   write side stays inside `ferricast-m3u8` because the sender's
+#   needs (LL-HLS parts, server control, custom URIs) don't map onto
+#   m3u8-rs's serializer.
+# - MPEG-TS demux is hand-rolled inline (see `puller/ts.rs`). It's
+#   ~150 lines of well-defined byte-level work — PAT → PMT → PES
+#   reassembly — and avoids dragging in a callback-based crate
+#   whose API surface we'd only use 5% of.
+# - `url` — URL normalisation when a media playlist's segment URIs
+#   are relative to the playlist's own URL (the common case for live
+#   HLS origins).
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "stream", "http2"] }
+m3u8-rs = { version = "6", optional = true }
+mpeg2ts-reader = { version = "0.16", optional = true }
+url = { version = "2", optional = true }

@@ -29,6 +29,12 @@ mod ring;
 mod segmenter;
 mod stats;
 
+#[cfg(feature = "pull")]
+pub mod puller;
+
+#[cfg(feature = "pull")]
+pub use puller::HlsPuller;
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
