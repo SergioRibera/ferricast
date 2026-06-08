@@ -1,5 +1,8 @@
 pub mod adaptive;
+pub mod advertiser;
 pub mod capture;
+pub mod control;
+pub mod decoder;
 pub mod device;
 pub mod discovery;
 pub mod encoder;
@@ -7,11 +10,19 @@ pub mod error;
 pub mod frame;
 pub mod net;
 pub mod protocol;
+pub mod puller;
 pub mod session;
+pub mod sink;
 pub mod source;
 
 pub use adaptive::AdaptiveBitrateState;
+pub use advertiser::{AdvertiseInfo, Advertiser, MdnsAdvertiser};
 pub use capture::{CaptureConfig, CaptureSource, ScreenCapture, WindowIdentifier};
+pub use control::{
+    ControlSession, MediaCommand, PlaybackState, QueueItem, RemoteSender, RepeatMode,
+    TrackSelection,
+};
+pub use decoder::{AudioDecoder, AudioDecoderConfig, DecodedAudio, DecoderConfig, VideoDecoder};
 pub use device::{Device, DeviceCapabilities, DiscoveryEvent, H264Profile};
 pub use discovery::{Discovery, MdnsDiscovery};
 pub use encoder::{EncoderConfig, VideoEncoder};
@@ -22,7 +33,9 @@ pub use frame::{
 };
 pub use net::local_addr_for;
 pub use protocol::{Codec, ProtocolHandler};
+pub use puller::{AudioStreamInfo, MediaInfo, MediaPacket, MediaPuller, PullSpec, VideoStreamInfo};
 pub use session::{CastSession, StreamConfig};
+pub use sink::FrameSink;
 pub use source::{
     EnumerationCapability, Geometry, MonitorInfo, SourceChange, SourceEnumerator, SourceError,
     StubEnumerator, WindowInfo,
