@@ -12,7 +12,14 @@ tracing.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 uuid.workspace = true
-ferricast-encoder.workspace = true
+# chromecast only reaches into `ferricast_encoder::h264::utils` for
+# the Annex-B SPS/PPS extractor — but the encoder facade itself emits
+# a `compile_error!` when zero backends are on, so we pull
+# `openh264` (the smallest, pure-Rust one) just to keep the facade
+# happy when chromecast is checked in isolation. Doesn't pull in
+# any extra runtime cost since the workspace's default-feature
+# `openh264` already had it on for the encoder path.
+ferricast-encoder = { workspace = true, features = ["openh264"] }
 mdns-sd = "0.11"
 tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
@@ -31,3 +38,12 @@ prost-types = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 webpki-roots = "0.26"
+
+# Self-signed cert for the receiver-side TLS server. Modern Cast
+# senders (YouTube, Spotify) require device auth signed by Google's
+# Cast CA — without that, those apps' `LOAD` calls won't reach us,
+# but generic Cast-aware media players (VLC, casttube,
+# BubbleUPnP receivers, the Default Media Receiver simulator)
+# connect fine. The self-signed cert is regenerated per-launch and
+# embedded in the TLS handshake; nothing persists to disk.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

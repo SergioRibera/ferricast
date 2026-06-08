@@ -1520,6 +1520,27 @@ impl StreamManagerBuilder {
         self.register::<ferricast_chromecast::ChromecastHandler>()
     }
 
+    /// Register the Chromecast *receiver* — advertise this process
+    /// as a Cast target and accept LOAD / PLAY / PAUSE / SEEK from
+    /// senders.
+    #[cfg(feature = "chromecast")]
+    pub fn with_chromecast_receiver(self) -> Self {
+        self.register_receiver::<ferricast_chromecast::ChromecastReceiver>()
+    }
+
+    /// Register the bundled H.264 video decoder facade
+    /// ([`ferricast_decoder::H264Decoder`]).
+    pub fn with_h264_decoder(self) -> Self {
+        self.register_video_decoder::<ferricast_decoder::H264Decoder>()
+    }
+
+    /// Register the bundled AAC audio decoder
+    /// ([`ferricast_decoder::AacDecoder`]).
+    #[cfg(feature = "aac")]
+    pub fn with_aac_decoder(self) -> Self {
+        self.register_audio_decoder::<ferricast_decoder::AacDecoder>()
+    }
+
     /// Register a receiver-side protocol handler.
     pub fn register_receiver<P>(mut self) -> Self
     where
