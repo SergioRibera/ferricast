@@ -9,6 +9,17 @@ use uuid::Uuid;
 
 use crate::daemon::PickerRequest;
 use crate::picker;
+use crate::receiver_window;
+
+/// Request to spawn a receiver window for an incoming transmission.
+/// Pumped from `with_future` (which sees the manager events) to the
+/// App's render loop (which holds `Platform`) over a tokio mpsc —
+/// same shape the picker uses to bridge daemon → UI.
+pub struct ReceiverWindowReq {
+    pub remote: ferricast::RemoteSender,
+    pub info: ferricast::MediaInfo,
+    pub counters: Arc<receiver_window::ReceiverCounters>,
+}
 
 #[derive(Default)]
 pub struct AppState {
@@ -34,6 +45,9 @@ pub struct FerricastApp {
     /// `&self` and the receiver isn't `Clone` — the first render
     /// `.take()`s it and starts the listener task.
     pub picker_req_rx: Rc<RefCell<Option<tokio::sync::mpsc::Receiver<PickerRequest>>>>,
+    /// Receiver-window requests from the pump. Same one-shot-take
+    /// pattern as `picker_req_rx`.
+    pub receiver_req_rx: Rc<RefCell<Option<tokio::sync::mpsc::Receiver<ReceiverWindowReq>>>>,
 }
 
 impl App for FerricastApp {
@@ -63,9 +77,10 @@ impl App for FerricastApp {
         // daemon's request handler awaits the oneshot, then runs
         // `StreamManager::start_stream` itself.
         let picker_req_rx_init = self.picker_req_rx.clone();
-        use_hook(|| {
+        let picker_platform = platform.clone();
+        use_hook(move || {
             if let Some(mut rx) = picker_req_rx_init.borrow_mut().take() {
-                let platform = platform.clone();
+                let platform = picker_platform;
                 spawn(async move {
                     while let Some(req) = rx.recv().await {
                         tracing::debug!(
@@ -75,6 +90,34 @@ impl App for FerricastApp {
                         let (dto_tx, dto_rx) = tokio::sync::oneshot::channel();
                         picker::open_picker_for_dto(platform.clone(), dto_tx);
                         let _ = req.reply.send(dto_rx.await.ok().flatten());
+                    }
+                });
+            }
+        });
+
+        // Receiver-window listener — symmetric to the picker one
+        // above. Drains requests off the pump → app channel and
+        // opens a new top-level Freya window per receiver session.
+        let receiver_req_rx_init = self.receiver_req_rx.clone();
+        let receiver_platform = platform.clone();
+        use_hook(move || {
+            if let Some(mut rx) = receiver_req_rx_init.borrow_mut().take() {
+                let platform = receiver_platform;
+                spawn(async move {
+                    while let Some(req) = rx.recv().await {
+                        tracing::info!(
+                            sender = %req.remote.addr,
+                            audio = req.info.audio.is_some(),
+                            video = req.info.video.is_some(),
+                            "opening receiver window"
+                        );
+                        let _wid = receiver_window::open_receiver_window(
+                            platform.clone(),
+                            req.remote,
+                            req.info,
+                            req.counters,
+                        )
+                        .await;
                     }
                 });
             }

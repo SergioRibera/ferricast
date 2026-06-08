@@ -21,6 +21,7 @@ default = [
     "openh264",
     "vaapi",
     "nvenc",
+    "aac",
 ]
 chromecast = ["ferricast/chromecast"]
 pipewire = ["ferricast/pipewire"]
@@ -32,6 +33,7 @@ x11 = ["ferricast/x11"]
 openh264 = ["ferricast/openh264"]
 vaapi = ["ferricast/vaapi"]
 nvenc = ["ferricast/nvenc"]
+aac = ["ferricast/aac"]
 nvenc-zero-copy = ["ferricast/nvenc-zero-copy", "nvenc"]
 # Wayland source enumeration. Defaults on so `ferricast-gui windows`
 # works out of the box on every modern compositor that exposes
@@ -58,3 +60,4 @@ freya = { version = "0.4.0-rc.19", features = ["icons", "router", "radio"] }
 rustls = { version = "0.23", features = ["ring"] }
 anyhow = "1"
 bytes.workspace = true
+async-trait.workspace = true

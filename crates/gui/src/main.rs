@@ -8,7 +8,9 @@ use ferricast::prelude::*;
 use freya::{prelude::*, radio::*};
 use tokio::sync::{Mutex, mpsc};
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
+use crate::app::ReceiverWindowReq;
 use crate::daemon::PickerRequest;
 
 mod app;
@@ -16,6 +18,7 @@ mod cli;
 mod client;
 mod daemon;
 mod picker;
+mod receiver_window;
 
 use crate::app::*;
 use crate::cli::{Cli, Command};
@@ -56,8 +59,51 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
 
+    // Shared frame counters per active receiver — keyed by
+    // receiver_id, populated by the sink_factory below and read by
+    // the receiver windows. `Arc<DashMap>`-shaped via std HashMap +
+    // Mutex because the receiver pipeline runs on tokio while the
+    // window reads on Freya's local thread.
+    let receiver_counters: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<Uuid, Arc<receiver_window::ReceiverCounters>>,
+        >,
+    > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let receiver_counters_factory = receiver_counters.clone();
+
     let (manager, manager_events) = StreamManager::builder()
         .with_chromecast()
+        .with_chromecast_receiver()
+        .with_h264_decoder()
+        .with_aac_decoder()
+        // Pipeline-supplied sink: builds a `LoggingSink` per session.
+        // The counter map is keyed by sender id so we can correlate
+        // with `ReceiverIncoming` events later — `ReceiverIncoming`
+        // carries a `receiver_id` that's distinct from `remote.id`,
+        // so the window opener has to keep its own mapping (see
+        // the pump below).
+        .set_sink_factory(move |remote, info| {
+            let counters = Arc::new(receiver_window::ReceiverCounters::default());
+            let key = remote.id;
+            let counters_for_map = counters.clone();
+            let counters_map = receiver_counters_factory.clone();
+            let label = format!(
+                "{}{}",
+                remote
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| remote.addr.to_string()),
+                if info.video.is_some() { " (video)" } else { " (audio)" },
+            );
+            async move {
+                counters_map
+                    .lock()
+                    .expect("sink_factory counters lock poisoned")
+                    .insert(key, counters_for_map);
+                Ok(Box::new(receiver_window::LoggingSink::new(label, counters))
+                    as Box<dyn ferricast::FrameSink>)
+            }
+        })
         .build_with_events();
     let manager = Arc::new(Mutex::new(manager));
 
@@ -82,6 +128,10 @@ async fn main() -> anyhow::Result<()> {
     // picker window. Capacity 4 because requests are user-driven —
     // bursts higher than that mean a buggy client.
     let (picker_tx, picker_rx) = mpsc::channel::<PickerRequest>(4);
+    // Receiver-window channel: pump → App. App opens windows when
+    // requests come in. Capacity 16 because casts come in bursts on
+    // a busy LAN but don't realistically queue.
+    let (receiver_window_tx, receiver_window_rx) = mpsc::channel::<ReceiverWindowReq>(16);
 
     let _conn = daemon::start(
         manager.clone(),
@@ -110,6 +160,20 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Start receivers (Chromecast advertise + accept). Idempotent;
+    // running on its own task so a slow mDNS bind doesn't block the
+    // window from coming up.
+    {
+        let sm = manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sm.lock().await.start_receivers().await {
+                tracing::error!(%e, "Failed to start receivers");
+            } else {
+                tracing::info!("Receivers advertising on the LAN");
+            }
+        });
+    }
+
     // Both modes mount the Freya runtime so the picker window can
     // be opened on demand from the D-Bus path. `--background` just
     // hides the main window — the user only sees Ferricast UI when
@@ -121,7 +185,15 @@ async fn main() -> anyhow::Result<()> {
              Ctrl-C to exit"
         );
     }
-    run_window(manager, ui_rx, picker_rx, args.background);
+    run_window(
+        manager,
+        ui_rx,
+        picker_rx,
+        receiver_counters,
+        receiver_window_tx,
+        receiver_window_rx,
+        args.background,
+    );
     Ok(())
 }
 
@@ -129,6 +201,13 @@ fn run_window(
     stream_manager: Arc<Mutex<StreamManager>>,
     mut ui_rx: mpsc::Receiver<ManagerEvent>,
     picker_rx: mpsc::Receiver<PickerRequest>,
+    receiver_counters: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<Uuid, Arc<receiver_window::ReceiverCounters>>,
+        >,
+    >,
+    receiver_window_tx: mpsc::Sender<ReceiverWindowReq>,
+    receiver_window_rx: mpsc::Receiver<ReceiverWindowReq>,
     hidden: bool,
 ) {
     let radio_station = RadioStation::create_global(AppState::default());
@@ -142,6 +221,7 @@ fn run_window(
         // `take()`s it from inside `use_hook` and starts the
         // listener; subsequent renders see `None` and skip.
         picker_req_rx: Rc::new(RefCell::new(Some(picker_rx))),
+        receiver_req_rx: Rc::new(RefCell::new(Some(receiver_window_rx))),
     })
     .with_title("Ferricast")
     .with_size(800., 600.);
@@ -204,6 +284,64 @@ fn run_window(
                                     .write_channel(AppChannel::Streaming)
                                     .streaming
                                     .retain(|&s| s != device_id);
+                            }
+                            Some(ManagerEvent::ReceiverIncoming { protocol, remote, .. }) => {
+                                tracing::info!(
+                                    protocol,
+                                    sender = %remote.addr,
+                                    "receiver: sender connected — waiting for LOAD"
+                                );
+                            }
+                            Some(ManagerEvent::ReceiverStarted {
+                                receiver_id,
+                                remote,
+                                info,
+                            }) => {
+                                // Sink_factory has already populated
+                                // `receiver_counters[remote.id]` by
+                                // this point (it ran before
+                                // ReceiverStarted was emitted —
+                                // see manager.rs ordering). Missing
+                                // key = empty counter group; the
+                                // window still opens, indicators
+                                // just stay at zero.
+                                let counters = receiver_counters
+                                    .lock()
+                                    .expect("receiver_counters lock")
+                                    .get(&remote.id)
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        Arc::new(
+                                            receiver_window::ReceiverCounters::default(),
+                                        )
+                                    });
+                                let _ = receiver_id;
+                                let _ = receiver_window_tx
+                                    .send(ReceiverWindowReq {
+                                        remote,
+                                        info,
+                                        counters,
+                                    })
+                                    .await;
+                            }
+                            Some(ManagerEvent::ReceiverStateChanged {
+                                receiver_id,
+                                state,
+                            }) => {
+                                tracing::debug!(?receiver_id, ?state, "receiver state");
+                            }
+                            Some(ManagerEvent::ReceiverStopped { receiver_id })
+                            | Some(ManagerEvent::ReceiverError { receiver_id, .. }) => {
+                                // TODO follow-up: close the
+                                // associated receiver window here.
+                                // Tracking the WindowId requires the
+                                // app listener to bubble it back
+                                // (`launch_window` returns the id
+                                // on the freya local thread only) —
+                                // small wire-up out of scope this
+                                // turn. User closes the window
+                                // manually in the meantime.
+                                let _ = receiver_id;
                             }
                             None => break,
                             _ => {}
