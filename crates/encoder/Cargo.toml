@@ -58,7 +58,7 @@ openh264 = { version = "0.9.3", optional = true }
 # rolling-release distros. Bump the rev when libva on your target
 # distro moves; until then `--no-default-features --features "openh264,nvenc"`
 # is the escape hatch.
-cros-libva = { git = "https://github.com/SergioRibera/cros-libva", rev = "3eb6e6e0e3085c8376124b75bf638ce6982b7b33", optional = true }
+cros-libva = { git = "https://github.com/SergioRibera/cros-libva", branch = "fix/vp9-encpicparam-fields", optional = true }
 
 # NVENC (NVIDIA hardware H.264 encode). Higher-level Rust binding
 # that wraps the Video Codec SDK headers — no SDK install needed at
