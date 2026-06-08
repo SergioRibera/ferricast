@@ -15,10 +15,16 @@ use crate::receiver_window;
 /// Pumped from `with_future` (which sees the manager events) to the
 /// App's render loop (which holds `Platform`) over a tokio mpsc —
 /// same shape the picker uses to bridge daemon → UI.
+///
+/// Carries the `rx` halves of the per-session video / audio
+/// channels: the sink (manager-side) holds the `tx`, the window
+/// (Freya-side) holds the `rx`. One window per session.
 pub struct ReceiverWindowReq {
     pub remote: ferricast::RemoteSender,
     pub info: ferricast::MediaInfo,
     pub counters: Arc<receiver_window::ReceiverCounters>,
+    pub video_rx: tokio::sync::mpsc::Receiver<receiver_window::VideoFrame>,
+    pub audio_rx: tokio::sync::mpsc::Receiver<receiver_window::AudioBuf>,
 }
 
 #[derive(Default)]
@@ -116,6 +122,8 @@ impl App for FerricastApp {
                             req.remote,
                             req.info,
                             req.counters,
+                            req.video_rx,
+                            req.audio_rx,
                         )
                         .await;
                     }

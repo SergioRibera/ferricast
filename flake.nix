@@ -36,6 +36,14 @@
           pipewire.dev
           pipewire
           libva
+
+          # ALSA headers — rodio's audio output goes through cpal,
+          # which on Linux talks to libasound. PipeWire installs an
+          # alsa-emulation layer at runtime so playback still ends
+          # up in the PipeWire graph, but the build-time dep is
+          # alsa-lib regardless.
+          alsa-lib
+          alsa-lib.dev
 	  xorg.libXcursor
 
           wayland

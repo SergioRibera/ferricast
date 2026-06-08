@@ -1,112 +1,179 @@
-//! Receiver window — one top-level Freya window per incoming
-//! transmission.
+//! Receiver window — one Freya top-level window per incoming cast.
 //!
-//! Pattern mirrors [`crate::picker`]: each window is its own OS-level
-//! top-level so users can still reach it when the main Ferricast
-//! window is minimised. Window opens on
-//! [`ferricast::ManagerEvent::ReceiverIncoming`]; closes on
-//! [`ferricast::ManagerEvent::ReceiverStopped`] or
-//! [`ferricast::ManagerEvent::ReceiverError`].
+//! Three subsystems work together:
 //!
-//! UI shape today:
+//! 1. [`WindowSink`] — the [`FrameSink`] the manager pipeline pipes
+//!    decoded frames into. It splits the stream: BGRA video frames
+//!    go to a video mpsc; PCM s16le audio goes to an audio mpsc.
+//! 2. [`ReceiverWindowApp`] — the Freya `App` that owns the audio
+//!    output (rodio `Sink` over PipeWire), the latest video frame
+//!    slot, and a [`canvas`] element that blits the latest decoded
+//!    frame using Skia each render pass.
+//! 3. Window opener ([`open_receiver_window`]) — wires the rx ends
+//!    into the App and calls `Platform::launch_window`.
 //!
-//! - Audio-only (`MediaInfo::video.is_none()`): card view with the
-//!   friendly metadata the sender supplied (title, artist, artwork
-//!   URL when set) plus the sender's address and a stop button.
-//! - Video: same card with a "Video: WIDTHxHEIGHT — codec" stamp.
-//!   Actual frame rendering follows in a separate change — needs
-//!   Freya `Canvas` (Skia surface) integration so we can blit a
-//!   decoded BGRA buffer at fps without PNG-encoding every frame.
+//! Audio output uses rodio because it bundles cpal + symphonia and
+//! gives us a no-fuss `Sink::append(SamplesBuffer)`. We pre-decode
+//! AAC → PCM in the pipeline (`ferricast-decoder::AacDecoder`) and
+//! hand rodio bare PCM, so the `symphonia-aac` feature isn't on
+//! rodio's decode path today — it's there to keep the door open for
+//! a future "skip the decoder, feed rodio ADTS directly" shortcut.
 //!
-//! [`LoggingSink`] is the placeholder sink the manager pipes decoded
-//! frames into. Today it counts frames and forwards counters to the
-//! window for a "received N video / M audio frames" indicator;
-//! real audio playback (cpal → PipeWire) and Skia video rendering
-//! are deferred.
+//! Video render uses Freya's [`canvas`] which exposes a Skia
+//! `SkCanvas` per render. We build a raster `SkImage` wrapping the
+//! latest BGRA buffer and draw it scaled to the canvas area. Skia
+//! does the resampling on whatever backend (Vulkan / OpenGL) the
+//! window happens to be running on.
 
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use bytes::Bytes;
 use ferricast::{
     AudioCodec, CapturedFrame, Codec, DecodedAudio, FerricastError, FrameSink, MediaInfo,
-    RemoteSender, Result,
+    PixelFormat, RemoteSender, Result,
+};
+use freya::engine::prelude::{
+    AlphaType, ColorType, Data, ISize, Image as SkImage, ImageInfo, Paint, SamplingOptions,
 };
 use freya::prelude::*;
 use freya::winit::window::WindowLevel;
+use tokio::sync::mpsc;
 
-/// Frame counters shared between [`LoggingSink`] and the window's
-/// reactive read side. Both writers (the pipeline) and the reader
-/// (the window's render loop) are decoupled — atomic counters keep
-/// the wiring trivial.
+/// Frame counters surfaced to the receiver-side telemetry — kept
+/// public because `main.rs` collects them across active sessions
+/// for a debugging overlay we may add later.
 #[derive(Default, Debug)]
 pub struct ReceiverCounters {
     pub video_frames: AtomicU64,
     pub audio_frames: AtomicU64,
 }
 
-/// Placeholder sink. Counts everything it receives so the window can
-/// show progress. Video frames carry width/height; audio frames
-/// carry sample-rate hints — both are dropped after counting.
-///
-/// When the audio output path (cpal → PipeWire) lands, push the
-/// `DecodedAudio` PCM bytes into the cpal ring buffer here instead
-/// of discarding. When the video render path (Freya Canvas + Skia
-/// image upload) lands, blit `CapturedFrame::Cpu` into the surface
-/// here instead of discarding.
-pub struct LoggingSink {
-    counters: Arc<ReceiverCounters>,
-    label: String,
+/// Cross-thread payload for one decoded video frame. Skia images
+/// can't be `Send` across thread boundaries in all configurations,
+/// so we ship raw bytes + dims and reconstruct the `SkImage` inside
+/// the render closure on the Freya thread.
+#[derive(Clone, Debug)]
+pub struct VideoFrame {
+    pub width: u32,
+    pub height: u32,
+    /// Tightly packed BGRA8888 — what openh264's CPU path emits
+    /// after we swap R↔B in `OpenH264Decoder::decode`. When a GPU
+    /// decoder lands and produces `CapturedFrame::Gpu` (DMA-BUF),
+    /// the sink readbacks here too — the canvas only knows about
+    /// the CPU shape.
+    pub bgra: Bytes,
+    pub stride: u32,
 }
 
-impl LoggingSink {
-    pub fn new(label: impl Into<String>, counters: Arc<ReceiverCounters>) -> Self {
+/// Cross-thread payload for one decoded audio buffer. Already s16le
+/// interleaved as `Vec<i16>` so rodio's [`rodio::buffer::SamplesBuffer`]
+/// can take it without further conversion.
+#[derive(Clone, Debug)]
+pub struct AudioBuf {
+    pub samples: Arc<Vec<i16>>,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// The sink the manager pipeline writes into. Owns the tx ends of
+/// the per-window video / audio channels. When the receiver
+/// disconnects the channels close on drop; the window drains
+/// whatever was pending and quiesces.
+pub struct WindowSink {
+    counters: Arc<ReceiverCounters>,
+    label: String,
+    video_tx: mpsc::Sender<VideoFrame>,
+    audio_tx: mpsc::Sender<AudioBuf>,
+}
+
+impl WindowSink {
+    pub fn new(
+        label: impl Into<String>,
+        counters: Arc<ReceiverCounters>,
+        video_tx: mpsc::Sender<VideoFrame>,
+        audio_tx: mpsc::Sender<AudioBuf>,
+    ) -> Self {
         Self {
             counters,
             label: label.into(),
+            video_tx,
+            audio_tx,
         }
     }
 }
 
 #[async_trait::async_trait]
-impl FrameSink for LoggingSink {
+impl FrameSink for WindowSink {
     async fn push_video(&mut self, frame: CapturedFrame) -> Result<()> {
+        let raw = frame.into_cpu()?;
+        if raw.format != PixelFormat::Bgra {
+            // Future GPU decoders may emit NV12; convert there when
+            // they land. The openh264 path always produces BGRA so
+            // we don't carry a conversion table here yet.
+            return Err(FerricastError::Decode(format!(
+                "WindowSink: expected BGRA frame, got {:?}",
+                raw.format
+            )));
+        }
         let n = self.counters.video_frames.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_multiple_of(60) {
-            tracing::info!(
+        if n.is_multiple_of(120) {
+            tracing::debug!(
                 receiver = %self.label,
                 count = n,
-                width = frame.width(),
-                height = frame.height(),
-                "receiver sink: video frames received"
+                width = raw.width,
+                height = raw.height,
+                "WindowSink: video"
             );
         }
+        let frame = VideoFrame {
+            width: raw.width,
+            height: raw.height,
+            stride: raw.stride,
+            bgra: raw.data,
+        };
+        // try_send drops on backpressure: a frame older than the
+        // newest in flight is useless for display anyway, and
+        // blocking the decoder would back-pressure into the puller
+        // and then into the sender (bad UX — the sender notices a
+        // stuck connection and disconnects). Drop instead.
+        let _ = self.video_tx.try_send(frame);
         Ok(())
     }
 
     async fn push_audio(&mut self, audio: DecodedAudio) -> Result<()> {
         let n = self.counters.audio_frames.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_multiple_of(120) {
-            tracing::info!(
+        if n.is_multiple_of(240) {
+            tracing::debug!(
                 receiver = %self.label,
                 count = n,
                 sample_rate = audio.sample_rate,
                 channels = audio.channels,
-                "receiver sink: audio frames received"
+                "WindowSink: audio"
             );
         }
+        // Pack the s16le bytes into Vec<i16>. We could keep them as
+        // bytes and have the audio task interleave — but rodio's
+        // `SamplesBuffer` constructor wants typed samples, so doing
+        // the cast here keeps the audio task simple.
+        let samples: Vec<i16> = audio
+            .pcm
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let buf = AudioBuf {
+            samples: Arc::new(samples),
+            sample_rate: audio.sample_rate,
+            channels: audio.channels,
+        };
+        // Audio backpressure is real: dropping audio buffers
+        // produces audible glitches. Bound to 64 and `send` rather
+        // than `try_send` so the decoder waits if the playback task
+        // falls behind.
+        let _ = self.audio_tx.send(buf).await;
         Ok(())
     }
-}
-
-/// Construct an error to surface when the sink_factory closure is
-/// invoked before the GUI's reactive infrastructure is ready. Kept
-/// as a free function so call sites read naturally.
-pub fn err_not_ready() -> FerricastError {
-    FerricastError::Receiver(
-        "receiver sink_factory invoked before GUI was ready — \
-         this is a startup ordering bug; report it"
-            .into(),
-    )
 }
 
 #[derive(Clone)]
@@ -114,14 +181,28 @@ pub struct ReceiverWindowApp {
     remote: RemoteSender,
     info: MediaInfo,
     counters: Arc<ReceiverCounters>,
+    /// `Rc<RefCell<Option<_>>>` because the inner receivers aren't
+    /// `Clone` and `App::render` takes `&self`. First mount takes
+    /// them out; subsequent renders find `None` and skip the
+    /// drain-task setup.
+    video_rx: std::rc::Rc<std::cell::RefCell<Option<mpsc::Receiver<VideoFrame>>>>,
+    audio_rx: std::rc::Rc<std::cell::RefCell<Option<mpsc::Receiver<AudioBuf>>>>,
 }
 
 impl ReceiverWindowApp {
-    pub fn new(remote: RemoteSender, info: MediaInfo, counters: Arc<ReceiverCounters>) -> Self {
+    pub fn new(
+        remote: RemoteSender,
+        info: MediaInfo,
+        counters: Arc<ReceiverCounters>,
+        video_rx: mpsc::Receiver<VideoFrame>,
+        audio_rx: mpsc::Receiver<AudioBuf>,
+    ) -> Self {
         Self {
             remote,
             info,
             counters,
+            video_rx: std::rc::Rc::new(std::cell::RefCell::new(Some(video_rx))),
+            audio_rx: std::rc::Rc::new(std::cell::RefCell::new(Some(audio_rx))),
         }
     }
 }
@@ -132,97 +213,246 @@ impl App for ReceiverWindowApp {
         let info = self.info.clone();
         let counters = self.counters.clone();
 
-        // Counter snapshot at render time. Live tick (re-render
-        // every second to reflect new frames) needs a Freya signal
-        // wired through; tracked as follow-up alongside the proper
-        // video render path.
+        // Shared video slot: the drain task writes the most recent
+        // frame, the canvas closure reads it and draws. `StdMutex`
+        // (not tokio) because the canvas closure runs sync on the
+        // Freya render thread and we don't want to wait on a tokio
+        // lock there.
+        let video_slot: Arc<StdMutex<Option<VideoFrame>>> = Arc::new(StdMutex::new(None));
+
+        // Tick signal: drain task increments per video frame. The
+        // render() body reads it so Freya schedules a redraw on
+        // each frame and the canvas closure re-runs.
+        let mut tick = use_state(|| 0u64);
+        let _ = tick.read();
+
+        // Drain video into the slot.
+        let video_rx_take = self.video_rx.clone();
+        let video_slot_for_task = video_slot.clone();
+        use_hook(move || {
+            if let Some(mut rx) = video_rx_take.borrow_mut().take() {
+                let slot = video_slot_for_task;
+                spawn(async move {
+                    while let Some(frame) = rx.recv().await {
+                        if let Ok(mut g) = slot.lock() {
+                            *g = Some(frame);
+                        }
+                        *tick.write() += 1;
+                    }
+                });
+            }
+        });
+
+        // Drain audio into rodio. The `OutputStream` has to live
+        // for the whole window lifetime — drop it and PipeWire
+        // tears the stream down mid-playback. Stash it in a hook
+        // closure so it's owned by the task.
+        let audio_rx_take = self.audio_rx.clone();
+        use_hook(move || {
+            if let Some(mut rx) = audio_rx_take.borrow_mut().take() {
+                spawn(async move {
+                    let (stream, handle) = match rodio::OutputStream::try_default() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(%e, "no rodio default output — receiver window will be silent");
+                            return;
+                        }
+                    };
+                    let sink = match rodio::Sink::try_new(&handle) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(%e, "rodio sink init failed");
+                            return;
+                        }
+                    };
+                    // Keep `stream` alive: drop = device closed.
+                    let _stream_keepalive = stream;
+                    while let Some(buf) = rx.recv().await {
+                        let samples: Vec<i16> = (*buf.samples).clone();
+                        let source = rodio::buffer::SamplesBuffer::new(
+                            buf.channels,
+                            buf.sample_rate,
+                            samples,
+                        );
+                        sink.append(source);
+                    }
+                });
+            }
+        });
+
         let video_n = counters.video_frames.load(Ordering::Relaxed);
         let audio_n = counters.audio_frames.load(Ordering::Relaxed);
 
         let title = receiver_title(&remote, &info);
         let codec_line = codec_line(&info);
-        let video_label = match &info.video {
-            Some(v) => format!(
-                "Video: {} — {} frames decoded",
-                codec_label_video(v.codec),
-                video_n
-            ),
-            None => "No video".to_string(),
-        };
-        let audio_label = match &info.audio {
-            Some(a) => format!(
-                "Audio: {} {}Hz/{}ch — {} frames decoded",
-                codec_label_audio(a.codec),
-                a.sample_rate,
-                a.channels,
-                audio_n
-            ),
-            None => "No audio".to_string(),
-        };
+        let video_meta = info
+            .video
+            .as_ref()
+            .map(|v| {
+                format!(
+                    "{} — {} frames",
+                    codec_label_video(v.codec),
+                    video_n
+                )
+            })
+            .unwrap_or_else(|| "no video".to_string());
+        let audio_meta = info
+            .audio
+            .as_ref()
+            .map(|a| {
+                format!(
+                    "{} {}Hz/{}ch — {} frames",
+                    codec_label_audio(a.codec),
+                    a.sample_rate,
+                    a.channels,
+                    audio_n
+                )
+            })
+            .unwrap_or_else(|| "no audio".to_string());
+
+        let render_slot = video_slot.clone();
+        let on_render = RenderCallback::new(move |ctx| {
+            let Ok(g) = render_slot.lock() else { return };
+            let Some(frame) = g.as_ref() else { return };
+            // Build a raster SkImage that wraps the bytes — Skia
+            // copies into its own surface on draw, so we don't have
+            // to keep the bytes alive past this closure call.
+            let info = ImageInfo::new(
+                ISize::new(frame.width as i32, frame.height as i32),
+                ColorType::BGRA8888,
+                AlphaType::Premul,
+                None,
+            );
+            let data = Data::new_copy(&frame.bgra);
+            let Some(image) = SkImage::from_raster_data(&info, data, frame.stride as usize)
+            else {
+                return;
+            };
+            // Use the visible-area dimensions Freya gave us; the
+            // canvas() layout determines the rect. We scale-to-fit
+            // letterbox-style by computing the largest src→dst
+            // aspect-preserving rectangle.
+            let area = ctx.layout_node.visible_area();
+            let dst = aspect_fit(
+                area.width(),
+                area.height(),
+                frame.width as f32,
+                frame.height as f32,
+            );
+            let paint = Paint::default();
+            ctx.canvas.draw_image_rect_with_sampling_options(
+                &image,
+                None,
+                freya::engine::prelude::SkRect::new(
+                    dst.0,
+                    dst.1,
+                    dst.0 + dst.2,
+                    dst.1 + dst.3,
+                ),
+                SamplingOptions::default(),
+                &paint,
+            );
+        });
 
         rect()
             .expanded()
-            .background((20, 20, 28))
+            .background((10, 10, 14))
             .vertical()
-            .padding(24.)
-            .spacing(12.)
             .child(
-                label()
-                    .text(title)
-                    .font_size(20.)
-                    .color((230, 230, 240)),
-            )
-            .child(
-                label()
-                    .text(codec_line)
-                    .font_size(13.)
-                    .color((180, 180, 200)),
-            )
-            .child(
+                // Video region — fills as much height as possible.
                 rect()
+                    .width(Size::fill())
+                    .height(Size::flex(1.))
+                    .background((0, 0, 0))
+                    .center()
+                    .child(canvas(on_render).expanded()),
+            )
+            .child(
+                // Metadata strip across the bottom.
+                rect()
+                    .width(Size::fill())
+                    .background((18, 18, 24))
+                    .padding(Gaps::new(12., 16., 12., 16.))
                     .vertical()
-                    .spacing(6.)
+                    .spacing(4.)
                     .child(
                         label()
-                            .text(video_label)
-                            .font_size(13.)
-                            .color((200, 200, 220)),
+                            .text(title)
+                            .font_size(16.)
+                            .color((230, 230, 240)),
                     )
                     .child(
                         label()
-                            .text(audio_label)
-                            .font_size(13.)
-                            .color((200, 200, 220)),
+                            .text(codec_line)
+                            .font_size(11.)
+                            .color((160, 160, 180)),
+                    )
+                    .child(
+                        rect()
+                            .horizontal()
+                            .spacing(16.)
+                            .child(
+                                label()
+                                    .text(video_meta)
+                                    .font_size(11.)
+                                    .color((200, 200, 220)),
+                            )
+                            .child(
+                                label()
+                                    .text(audio_meta)
+                                    .font_size(11.)
+                                    .color((200, 200, 220)),
+                            ),
+                    )
+                    .child(
+                        label()
+                            .text(format!("from {}", remote.addr))
+                            .font_size(10.)
+                            .color((130, 130, 150)),
                     ),
-            )
-            .child(
-                label()
-                    .text(format!("from {}", remote.addr))
-                    .font_size(12.)
-                    .color((150, 150, 170)),
             )
     }
 }
 
-/// Launch a new top-level Freya window for an incoming receiver
-/// session. The window persists until the caller closes it via
-/// `Platform::close_window(window_id)` (typically on `ReceiverStopped`).
+/// Aspect-fit `src` into `dst`, return `(x, y, w, h)` of the inset
+/// rectangle. Used by the canvas closure to letterbox the decoded
+/// frame inside the visible-area Freya measured for the canvas.
+fn aspect_fit(
+    dst_w: f32,
+    dst_h: f32,
+    src_w: f32,
+    src_h: f32,
+) -> (f32, f32, f32, f32) {
+    if src_w <= 0.0 || src_h <= 0.0 || dst_w <= 0.0 || dst_h <= 0.0 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    let src_aspect = src_w / src_h;
+    let dst_aspect = dst_w / dst_h;
+    let (w, h) = if src_aspect > dst_aspect {
+        (dst_w, dst_w / src_aspect)
+    } else {
+        (dst_h * src_aspect, dst_h)
+    };
+    let x = (dst_w - w) / 2.0;
+    let y = (dst_h - h) / 2.0;
+    (x, y, w, h)
+}
+
+/// Launch a top-level receiver window. Returns the window id so the
+/// pump can close it when the receiver stops.
 pub async fn open_receiver_window(
     platform: Platform,
     remote: RemoteSender,
     info: MediaInfo,
     counters: Arc<ReceiverCounters>,
+    video_rx: mpsc::Receiver<VideoFrame>,
+    audio_rx: mpsc::Receiver<AudioBuf>,
 ) -> freya::winit::window::WindowId {
     let title = receiver_title(&remote, &info);
-    let app = ReceiverWindowApp::new(remote, info, counters);
+    let app = ReceiverWindowApp::new(remote, info, counters, video_rx, audio_rx);
     let config = WindowConfig::new_app(app)
-        // `WindowConfig::with_title` takes a `&'static str`, which
-        // can't carry the dynamic sender name. The winit attribute
-        // builder accepts an owned String, so we set the title there
-        // and skip the static-only API. `with_app_id` keeps the
-        // desktop-entry / wmclass stable across sessions.
-        .with_size(480., 280.)
-        .with_background((20, 20, 28))
+        .with_size(720., 480.)
+        .with_background((10, 10, 14))
         .with_app_id("rs.sergioribera.ferricast.Receiver")
         .with_window_attributes(move |attrs, _| {
             attrs

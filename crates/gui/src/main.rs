@@ -59,34 +59,25 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
 
-    // Shared frame counters per active receiver — keyed by
-    // receiver_id, populated by the sink_factory below and read by
-    // the receiver windows. `Arc<DashMap>`-shaped via std HashMap +
-    // Mutex because the receiver pipeline runs on tokio while the
-    // window reads on Freya's local thread.
-    let receiver_counters: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<Uuid, Arc<receiver_window::ReceiverCounters>>,
-        >,
-    > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let receiver_counters_factory = receiver_counters.clone();
+    // Receiver-window channel: pump → App. App opens windows when
+    // requests come in. Capacity 16 because casts come in bursts on
+    // a busy LAN but don't realistically queue.
+    let (receiver_window_tx, receiver_window_rx) = mpsc::channel::<ReceiverWindowReq>(16);
+    let receiver_window_tx_factory = receiver_window_tx.clone();
 
     let (manager, manager_events) = StreamManager::builder()
         .with_chromecast()
         .with_chromecast_receiver()
         .with_h264_decoder()
         .with_aac_decoder()
-        // Pipeline-supplied sink: builds a `LoggingSink` per session.
-        // The counter map is keyed by sender id so we can correlate
-        // with `ReceiverIncoming` events later — `ReceiverIncoming`
-        // carries a `receiver_id` that's distinct from `remote.id`,
-        // so the window opener has to keep its own mapping (see
-        // the pump below).
+        // Sink factory: per-session, allocate video+audio channels
+        // and immediately request a window via
+        // `receiver_window_tx`. Returns a `WindowSink` that the
+        // pipeline pumps into. Pairing the channel allocation with
+        // the window open here (instead of via ReceiverStarted
+        // event) keeps the rx halves on a single ownership path —
+        // sink owns tx, window owns rx, no shared registry.
         .set_sink_factory(move |remote, info| {
-            let counters = Arc::new(receiver_window::ReceiverCounters::default());
-            let key = remote.id;
-            let counters_for_map = counters.clone();
-            let counters_map = receiver_counters_factory.clone();
             let label = format!(
                 "{}{}",
                 remote
@@ -95,13 +86,28 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| remote.addr.to_string()),
                 if info.video.is_some() { " (video)" } else { " (audio)" },
             );
+            let counters = Arc::new(receiver_window::ReceiverCounters::default());
+            let (video_tx, video_rx) = mpsc::channel::<receiver_window::VideoFrame>(2);
+            let (audio_tx, audio_rx) = mpsc::channel::<receiver_window::AudioBuf>(64);
+            let req = ReceiverWindowReq {
+                remote: remote.clone(),
+                info: info.clone(),
+                counters: counters.clone(),
+                video_rx,
+                audio_rx,
+            };
+            let tx = receiver_window_tx_factory.clone();
             async move {
-                counters_map
-                    .lock()
-                    .expect("sink_factory counters lock poisoned")
-                    .insert(key, counters_for_map);
-                Ok(Box::new(receiver_window::LoggingSink::new(label, counters))
-                    as Box<dyn ferricast::FrameSink>)
+                if tx.send(req).await.is_err() {
+                    tracing::warn!(
+                        receiver = %label,
+                        "sink_factory: window request channel closed — \
+                         pipeline will run without a window"
+                    );
+                }
+                Ok(Box::new(receiver_window::WindowSink::new(
+                    label, counters, video_tx, audio_tx,
+                )) as Box<dyn ferricast::FrameSink>)
             }
         })
         .build_with_events();
@@ -128,10 +134,6 @@ async fn main() -> anyhow::Result<()> {
     // picker window. Capacity 4 because requests are user-driven —
     // bursts higher than that mean a buggy client.
     let (picker_tx, picker_rx) = mpsc::channel::<PickerRequest>(4);
-    // Receiver-window channel: pump → App. App opens windows when
-    // requests come in. Capacity 16 because casts come in bursts on
-    // a busy LAN but don't realistically queue.
-    let (receiver_window_tx, receiver_window_rx) = mpsc::channel::<ReceiverWindowReq>(16);
 
     let _conn = daemon::start(
         manager.clone(),
@@ -189,8 +191,6 @@ async fn main() -> anyhow::Result<()> {
         manager,
         ui_rx,
         picker_rx,
-        receiver_counters,
-        receiver_window_tx,
         receiver_window_rx,
         args.background,
     );
@@ -201,12 +201,6 @@ fn run_window(
     stream_manager: Arc<Mutex<StreamManager>>,
     mut ui_rx: mpsc::Receiver<ManagerEvent>,
     picker_rx: mpsc::Receiver<PickerRequest>,
-    receiver_counters: Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<Uuid, Arc<receiver_window::ReceiverCounters>>,
-        >,
-    >,
-    receiver_window_tx: mpsc::Sender<ReceiverWindowReq>,
     receiver_window_rx: mpsc::Receiver<ReceiverWindowReq>,
     hidden: bool,
 ) {
@@ -292,37 +286,16 @@ fn run_window(
                                     "receiver: sender connected — waiting for LOAD"
                                 );
                             }
-                            Some(ManagerEvent::ReceiverStarted {
-                                receiver_id,
-                                remote,
-                                info,
-                            }) => {
-                                // Sink_factory has already populated
-                                // `receiver_counters[remote.id]` by
-                                // this point (it ran before
-                                // ReceiverStarted was emitted —
-                                // see manager.rs ordering). Missing
-                                // key = empty counter group; the
-                                // window still opens, indicators
-                                // just stay at zero.
-                                let counters = receiver_counters
-                                    .lock()
-                                    .expect("receiver_counters lock")
-                                    .get(&remote.id)
-                                    .cloned()
-                                    .unwrap_or_else(|| {
-                                        Arc::new(
-                                            receiver_window::ReceiverCounters::default(),
-                                        )
-                                    });
-                                let _ = receiver_id;
-                                let _ = receiver_window_tx
-                                    .send(ReceiverWindowReq {
-                                        remote,
-                                        info,
-                                        counters,
-                                    })
-                                    .await;
+                            Some(ManagerEvent::ReceiverStarted { remote, info, .. }) => {
+                                // Window has already been requested
+                                // from `sink_factory`; this event is
+                                // diagnostic only.
+                                tracing::info!(
+                                    sender = %remote.addr,
+                                    audio = info.audio.is_some(),
+                                    video = info.video.is_some(),
+                                    "receiver: LOAD acknowledged, pipeline running"
+                                );
                             }
                             Some(ManagerEvent::ReceiverStateChanged {
                                 receiver_id,

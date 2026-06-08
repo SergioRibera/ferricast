@@ -56,8 +56,15 @@ zbus.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 
-freya = { version = "0.4.0-rc.19", features = ["icons", "router", "radio"] }
+freya = { version = "0.4.0-rc.19", features = ["icons", "router", "radio", "engine"] }
 rustls = { version = "0.23", features = ["ring"] }
 anyhow = "1"
 bytes.workspace = true
 async-trait.workspace = true
+
+# Audio output for receiver windows. `rodio` bundles `OutputStream`
+# + `Sink` over `cpal` (which uses PipeWire on modern Linux), and
+# the `symphonia-aac` feature lets us swap to direct-from-ADTS
+# decoding later if we want — for now the receiver pipeline
+# pre-decodes via `ferricast-decoder::AacDecoder` and we push PCM.
+rodio = { version = "0.20", default-features = false, features = ["symphonia-aac"] }
