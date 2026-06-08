@@ -701,6 +701,12 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
 name = "bitstream-io"
+version = "1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e445576659fd04a57b44cbd00aa37aaa815ebefa0aa3cb677a6b5e63d883074f"
+
+[[package]]
+name = "bitstream-io"
 version = "4.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60d4bd9d1db2c6bdf285e223a7fa369d5ce98ec767dec949c6ca62863ce61757"
@@ -1821,7 +1827,9 @@ name = "ferricast-decoder"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "cros-libva",
  "ferricast-core",
+ "h264-reader",
  "openh264",
  "symphonia",
  "tracing",
@@ -2028,6 +2036,12 @@ checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
 ]
+
+[[package]]
+name = "four-cc"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3958af68a31b1d1384d3f39b6aa33eb14b6009065b5ca305ddd9712a4237124f"
 
 [[package]]
 name = "four-cc"
@@ -2635,6 +2649,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "h264-reader"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd118dcc322cc71cfc33254a19ebece92cfaaf6d4b4793fec3f7f44fbc4150df"
+dependencies = [
+ "bitstream-io 1.10.0",
+ "hex-slice",
+ "log",
+ "memchr",
+ "rfc6381-codec",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2680,6 +2707,12 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hex-slice"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5491a308e0214554f07a81d8944abe45f552871c12e3c3c6e7e5d354039a6c4c"
 
 [[package]]
 name = "hotpath"
@@ -3434,6 +3467,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mp4ra-rust"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be9daf03b43bf3842962947c62ba40f411e46a58774c60838038f04a67d17626"
+dependencies = [
+ "four-cc 0.1.0",
+]
+
+[[package]]
 name = "mpeg2ts-reader"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3444,6 +3486,12 @@ dependencies = [
  "log",
  "smptera-format-identifiers-rust",
 ]
+
+[[package]]
+name = "mpeg4-audio-const"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96a1fe2275b68991faded2c80aa4a33dba398b77d276038b8f50701a22e55918"
 
 [[package]]
 name = "nasm-rs"
@@ -4716,7 +4764,7 @@ dependencies = [
  "arrayvec",
  "av-scenechange",
  "av1-grain",
- "bitstream-io",
+ "bitstream-io 4.9.0",
  "built",
  "cfg-if",
  "interpolate_name",
@@ -4901,6 +4949,17 @@ dependencies = [
  "wasm-streams",
  "web-sys",
  "webpki-roots 1.0.6",
+]
+
+[[package]]
+name = "rfc6381-codec"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4395f46a67f0d57c57f6a5361f3a9a0c0183a19cab3998892ecdc003de6d8037"
+dependencies = [
+ "four-cc 0.1.0",
+ "mp4ra-rust",
+ "mpeg4-audio-const",
 ]
 
 [[package]]
@@ -5388,7 +5447,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b79962555faf3a7892357f69d0306269cb1b265007957252c843953804884750"
 dependencies = [
- "four-cc",
+ "four-cc 0.3.0",
 ]
 
 [[package]]

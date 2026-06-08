@@ -17,6 +17,13 @@ description = "Receiver-side decoders for ferricast (CPU H.264 + AAC; GPU paths 
 default = ["openh264-decode", "aac"]
 openh264-decode = ["dep:openh264"]
 aac = ["dep:symphonia"]
+# Hardware H.264 decode via VA-API. Opt-in (not in defaults) until
+# the slice-submission path is fully verified against a real
+# bitstream test rig — until then `FERRICAST_H264_DECODE_BACKEND=vaapi`
+# is the runtime escape hatch to engage it. Default-off keeps every
+# build that turns this feature on at compile time from accidentally
+# using a half-validated decode path.
+vaapi-decode = ["dep:cros-libva", "dep:h264-reader"]
 
 [dependencies]
 ferricast-core.workspace = true
@@ -25,3 +32,12 @@ tracing.workspace = true
 
 openh264 = { version = "0.9.3", optional = true }
 symphonia = { version = "0.5", optional = true, default-features = false, features = ["aac"] }
+
+# VA-API decode (opt-in). Same fork pin as the encoder so a single
+# libva ABI version is in play across the workspace.
+cros-libva = { git = "https://github.com/SergioRibera/cros-libva", branch = "fix/vp9-encpicparam-fields", optional = true }
+
+# H.264 bitstream parser. Pure-Rust, no system deps. Used by the
+# VA-API backend to decode SPS / PPS so the VA buffer construction
+# has the bitstream-derived parameters it needs.
+h264-reader = { version = "0.7", optional = true }
