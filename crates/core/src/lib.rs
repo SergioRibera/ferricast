@@ -32,7 +32,7 @@ pub use frame::{
     PixelFormat, RawFrame,
 };
 pub use net::local_addr_for;
-pub use protocol::{Codec, ProtocolHandler};
+pub use protocol::{Codec, ProtocolHandler, ReceiverProtocol};
 pub use puller::{AudioStreamInfo, MediaInfo, MediaPacket, MediaPuller, PullSpec, VideoStreamInfo};
 pub use session::{CastSession, StreamConfig};
 pub use sink::FrameSink;

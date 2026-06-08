@@ -1158,7 +1158,7 @@ dependencies = [
 [[package]]
 name = "cros-libva"
 version = "0.0.13"
-source = "git+https://github.com/SergioRibera/cros-libva?rev=3eb6e6e0e3085c8376124b75bf638ce6982b7b33#3eb6e6e0e3085c8376124b75bf638ce6982b7b33"
+source = "git+https://github.com/SergioRibera/cros-libva?branch=fix%2Fvp9-encpicparam-fields#627695c5a145e5d3d9d0ba78f37bfb3db0178cba"
 dependencies = [
  "bindgen 0.70.1",
  "bitflags 2.11.0",

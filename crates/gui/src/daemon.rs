@@ -735,6 +735,15 @@ async fn signal_loop(
             ManagerEvent::DiscoveryError { protocol, message } => {
                 ManagerService::discovery_error(emitter, protocol.to_string(), message).await
             }
+            // Receiver-side events are consumed by the in-process
+            // window listener (`forward_tx` above). D-Bus signals
+            // for these will be added when external clients need
+            // them; for now the daemon just logs.
+            ManagerEvent::ReceiverIncoming { .. }
+            | ManagerEvent::ReceiverStarted { .. }
+            | ManagerEvent::ReceiverStateChanged { .. }
+            | ManagerEvent::ReceiverStopped { .. }
+            | ManagerEvent::ReceiverError { .. } => Ok(()),
         };
         if let Err(e) = r {
             tracing::warn!(%e, "failed to emit D-Bus signal");
