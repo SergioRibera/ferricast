@@ -9,6 +9,7 @@ members = [
     "crates/airplay",
     "crates/miracast",
     "crates/encoder",
+    "crates/decoder",
     "crates/m3u8",
     "crates/muxer",
     "crates/hls",
@@ -25,6 +26,7 @@ ferricast-dial = { path = "crates/dial" }
 ferricast-airplay = { path = "crates/airplay" }
 ferricast-miracast = { path = "crates/miracast" }
 ferricast-encoder = { path = "crates/encoder", default-features = false }
+ferricast-decoder = { path = "crates/decoder", default-features = false }
 ferricast-m3u8 = { path = "crates/m3u8" }
 ferricast-muxer = { path = "crates/muxer" }
 ferricast-hls = { path = "crates/hls" }
@@ -59,6 +61,7 @@ default = [
     "openh264",
     "vaapi",
     "nvenc",
+    "aac",
 ]
 chromecast = ["dep:ferricast-chromecast"]
 # Capture backends — re-exported from `ferricast-capture`. At least
@@ -73,10 +76,14 @@ x11 = ["ferricast-capture/x11"]
 #     ferricast = { default-features = false,
 #                   features = ["chromecast", "x11", "pipewire",
 #                               "openh264", "nvenc"] }
-openh264 = ["ferricast-encoder/openh264"]
+openh264 = ["ferricast-encoder/openh264", "ferricast-decoder/openh264-decode"]
 vaapi = ["ferricast-encoder/vaapi"]
 nvenc = ["ferricast-encoder/nvenc"]
 nvenc-zero-copy = ["ferricast-encoder/nvenc-zero-copy", "nvenc"]
+# Pure-Rust AAC decode for receivers. CPU only (no consumer driver
+# does hardware AAC); plenty fast for one stream. Default on so
+# `ferricast = "*"` builds with both H.264 and AAC decode wired up.
+aac = ["ferricast-decoder/aac"]
 # Wayland source enumeration (foreign-toplevel + xdg-output).
 # Orthogonal to `pipewire`: that's for *capture* on Wayland; this is
 # for *picking the source to capture* via an in-process picker
@@ -103,6 +110,7 @@ ferricast-core.workspace = true
 # them through.
 ferricast-capture.workspace = true
 ferricast-encoder.workspace = true
+ferricast-decoder.workspace = true
 ferricast-hls.workspace = true
 ferricast-chromecast = { workspace = true, optional = true }
 # ferricast-dial = { workspace = true, optional = true }

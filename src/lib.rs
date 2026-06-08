@@ -64,6 +64,16 @@ pub mod encoder {
     pub use ferricast_encoder::*;
 }
 
+/// Receiver-side decoders.
+///
+/// Today's facade exposes a CPU H.264 path via openh264 and an AAC-LC
+/// audio path via symphonia. The facade type ([`decoder::H264Decoder`])
+/// is shaped to absorb VA-API + NVDEC variants once those land
+/// without changing the call sites.
+pub mod decoder {
+    pub use ferricast_decoder::*;
+}
+
 /// HLS server primitives — exposed mainly so protocols outside this
 /// workspace can reuse the segmenter / adaptive controller. End
 /// users typically don't touch this module directly.

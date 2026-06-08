@@ -1,0 +1,27 @@
+[package]
+name = "ferricast-decoder"
+version = "0.1.0"
+edition = "2024"
+description = "Receiver-side decoders for ferricast (CPU H.264 + AAC; GPU paths follow)"
+
+[features]
+# Decoder backends.
+#
+# - `openh264-decode` — software H.264 decode. CPU only, always
+#   works when compiled in. Today's only video backend; GPU paths
+#   (`vaapi-decode`, `nvdec-decode`) are slotted into the facade's
+#   auto-select chain in a follow-up — the shape is already there.
+# - `aac` — pure-Rust AAC-LC decoder via symphonia. Audio decode is
+#   CPU-bound across the board (no consumer driver exposes hardware
+#   AAC decode), so one backend covers the receiver pipeline.
+default = ["openh264-decode", "aac"]
+openh264-decode = ["dep:openh264"]
+aac = ["dep:symphonia"]
+
+[dependencies]
+ferricast-core.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+
+openh264 = { version = "0.9.3", optional = true }
+symphonia = { version = "0.5", optional = true, default-features = false, features = ["aac"] }
