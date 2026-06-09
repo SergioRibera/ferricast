@@ -447,15 +447,30 @@ impl ChromecastSession {
         } else {
             None
         };
+        // Self-signed TLS for the per-session HLS server. CAF 1.56+
+        // (post-2023) rejects plain `http://` URLs on some firmware
+        // even on the LAN; serving HTTPS unconditionally sidesteps
+        // that without breaking older devices, which accept either.
+        // SAN list includes the LAN-side IP we observed during TLS
+        // connect — receivers don't validate but rcgen wants a SAN.
+        let tls = match ferricast_hls::build_self_signed_server_config(&[local_ip]) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                tracing::warn!(%e, "HLS TLS material failed; falling back to plain HTTP");
+                None
+            }
+        };
         let hls_config = HlsConfig {
             inject_silent_audio: requires_audio,
             adaptive: adaptive_for_hls,
             part_target_secs,
+            tls,
             ..Default::default()
         };
         let sink = HlsFrameSink::start("0.0.0.0:0", frame_rx, parameter_sets, hls_config).await?;
         let local_addr = sink.local_addr();
-        let media_url = format!("http://{}:{}/index.m3u8", local_ip, local_addr.port());
+        let scheme = sink.scheme();
+        let media_url = format!("{scheme}://{}:{}/index.m3u8", local_ip, local_addr.port());
         info!(
             url = %media_url,
             "chromecast HLS endpoint ready (open this URL in a player to verify)"
@@ -464,6 +479,7 @@ impl ChromecastSession {
         let ready = sink.first_segment_ready();
         let load_url = media_url.clone();
         let probe_port = local_addr.port();
+        let probe_scheme = scheme;
         let load_task = tokio::spawn(async move {
             ready.await;
 
@@ -472,16 +488,29 @@ impl ChromecastSession {
             // our own server, neither can the chromecast — and the
             // log makes the failure mode obvious instead of "TV
             // shows black, no errors anywhere".
-            match self_test_playlist(probe_port).await {
-                Ok(snippet) => info!(
-                    bytes = snippet.len(),
-                    body_head = %snippet,
-                    "HLS self-test OK; sending LOAD"
-                ),
-                Err(e) => tracing::error!(
-                    error = %e,
-                    "HLS self-test FAILED — chromecast almost certainly can't reach the URL either"
-                ),
+            //
+            // Skipped under HTTPS: the raw-TCP probe doesn't speak
+            // TLS, and adding a TLS client just for this diagnostic
+            // would pull rustls/webpki into the chromecast crate.
+            // The HLS server itself logs every accept, so a wedged
+            // listener still shows up downstream.
+            if probe_scheme == "http" {
+                match self_test_playlist(probe_port).await {
+                    Ok(snippet) => info!(
+                        bytes = snippet.len(),
+                        body_head = %snippet,
+                        "HLS self-test OK; sending LOAD"
+                    ),
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "HLS self-test FAILED — chromecast almost certainly can't reach the URL either"
+                    ),
+                }
+            } else {
+                info!(
+                    scheme = probe_scheme,
+                    "HLS self-test skipped under TLS (raw-TCP probe doesn't speak TLS)"
+                );
             }
 
             let request_id = request_id_counter.fetch_add(1, Ordering::Relaxed);

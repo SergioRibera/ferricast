@@ -28,6 +28,7 @@ mod http;
 mod ring;
 mod segmenter;
 mod stats;
+pub mod tls;
 
 #[cfg(feature = "pull")]
 pub mod puller;
@@ -39,14 +40,16 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::net::{TcpListener, ToSocketAddrs};
+use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, trace};
 
 use ferricast_core::{EncodedFrame, FerricastError, Result, ScreenCapture, VideoEncoder};
 
 pub use ring::SegmentRing;
+pub use tls::build_self_signed_server_config;
 
 /// Number of initial segment GETs the HLS server averages before
 /// feeding the adaptive controller a one-shot bandwidth probe. Re-
@@ -120,6 +123,19 @@ pub struct HlsConfig {
     /// doesn't have a live encoder it can downshift).
     pub adaptive: Option<Arc<ferricast_core::AdaptiveBitrateState>>,
 
+    /// HTTPS opt-in. When `Some(config)`, the accept loop wraps
+    /// each connection with `tokio_rustls::TlsAcceptor` before
+    /// dispatching to the HTTP handler. The URL the sink emits in
+    /// [`HlsFrameSink::scheme`] flips to `https` in this case.
+    ///
+    /// Cast Application Framework 1.56+ rejects plain `http://` URLs
+    /// on some firmwares even on the LAN. The chromecast handler
+    /// turns this on with a per-session self-signed cert (see
+    /// [`build_self_signed_server_config`]); the puller side
+    /// (`HlsPuller`) accepts invalid certs unconditionally so
+    /// cast-to-self still works end-to-end.
+    pub tls: Option<Arc<rustls::ServerConfig>>,
+
     /// Low-Latency HLS opt-in. When `Some(seconds)`, the segmenter
     /// flushes a "part" every `secs` of accumulated wall time
     /// inside each segment, the ring publishes them immediately so
@@ -153,6 +169,7 @@ impl Default for HlsConfig {
             target_fps: 60,
             inject_silent_audio: false,
             adaptive: None,
+            tls: None,
             part_target_secs: None,
         }
     }
@@ -166,6 +183,7 @@ pub struct HlsServer {
     ring: Arc<RwLock<SegmentRing>>,
     adaptive: Option<Arc<ferricast_core::AdaptiveBitrateState>>,
     stats: Arc<stats::SessionStats>,
+    tls: Option<TlsAcceptor>,
     /// Cancels the capture loop when the server is dropped.
     _segmenter: JoinHandle<()>,
 }
@@ -219,11 +237,13 @@ impl HlsServer {
             "HLS server ready"
         );
 
+        let tls = config.tls.clone().map(TlsAcceptor::from);
         Ok(Self {
             listener,
             ring,
             adaptive: config.adaptive.clone(),
             stats: Arc::new(stats::SessionStats::new()),
+            tls,
             _segmenter: segmenter,
         })
     }
@@ -242,10 +262,9 @@ impl HlsServer {
         let ring = self.ring.clone();
         let adaptive = self.adaptive.clone();
         let stats = self.stats.clone();
+        let tls = self.tls.clone();
         tokio::spawn(async move {
-            if let Err(e) = http::handle(socket, ring, adaptive, stats).await {
-                trace!(peer = %peer, error = %e, "HLS connection ended");
-            }
+            spawn_handler(socket, peer.to_string(), tls, ring, adaptive, stats).await;
         });
         Ok(())
     }
@@ -260,17 +279,58 @@ impl HlsServer {
                     let ring = self.ring.clone();
                     let adaptive = self.adaptive.clone();
                     let stats = self.stats.clone();
-              
+                    let tls = self.tls.clone();
+
                     tokio::spawn(async move {
-                        if let Err(e) = http::handle(socket, ring, adaptive, stats).await {
-                            trace!(peer = %peer, error = %e, "HLS connection ended");
-                        }
+                        spawn_handler(
+                            socket,
+                            peer.to_string(),
+                            tls,
+                            ring,
+                            adaptive,
+                            stats,
+                        )
+                        .await;
                     });
                 }
                 Err(e) => {
                     error!(error = %e, "HLS listener accept failed");
                     return Err(FerricastError::from(e));
                 }
+            }
+        }
+    }
+}
+
+/// Common per-connection dispatch: best-effort `TCP_NODELAY`, then
+/// either pass the raw TCP socket to [`http::handle`] (plain HLS)
+/// or wrap it in a `TlsAcceptor::accept` first (HTTPS). All HLS
+/// servers in this crate funnel through here so the TLS branch
+/// stays in one place.
+async fn spawn_handler(
+    socket: TcpStream,
+    peer: String,
+    tls: Option<TlsAcceptor>,
+    ring: Arc<RwLock<SegmentRing>>,
+    adaptive: Option<Arc<ferricast_core::AdaptiveBitrateState>>,
+    stats: Arc<stats::SessionStats>,
+) {
+    let _ = socket.set_nodelay(true);
+    match tls {
+        Some(acceptor) => match acceptor.accept(socket).await {
+            Ok(tls_stream) => {
+                if let Err(e) = http::handle(peer.clone(), tls_stream, ring, adaptive, stats).await
+                {
+                    trace!(%peer, error = %e, "HLS connection ended");
+                }
+            }
+            Err(e) => {
+                trace!(%peer, error = %e, "TLS handshake failed");
+            }
+        },
+        None => {
+            if let Err(e) = http::handle(peer.clone(), socket, ring, adaptive, stats).await {
+                trace!(%peer, error = %e, "HLS connection ended");
             }
         }
     }
@@ -289,6 +349,10 @@ impl HlsServer {
 /// receiver can pull from.
 pub struct HlsFrameSink {
     addr: SocketAddr,
+    /// `"http"` or `"https"` depending on whether [`HlsConfig::tls`]
+    /// was supplied. Exposed so the caller (chromecast LOAD URL
+    /// builder) doesn't have to track the same option twice.
+    scheme: &'static str,
     ring: Arc<RwLock<SegmentRing>>,
     _segmenter: JoinHandle<()>,
     accept: JoinHandle<()>,
@@ -345,6 +409,8 @@ impl HlsFrameSink {
         let accept_adaptive = config.adaptive.clone();
         let stats = Arc::new(stats::SessionStats::new());
         let accept_stats = stats.clone();
+        let acceptor = config.tls.clone().map(TlsAcceptor::from);
+        let scheme: &'static str = if acceptor.is_some() { "https" } else { "http" };
         let accept = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -352,10 +418,9 @@ impl HlsFrameSink {
                         let r = accept_ring.clone();
                         let a = accept_adaptive.clone();
                         let s = accept_stats.clone();
+                        let t = acceptor.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = http::handle(socket, r, a, s).await {
-                                trace!(peer = %peer, error = %e, "HLS connection ended");
-                            }
+                            spawn_handler(socket, peer.to_string(), t, r, a, s).await;
                         });
                     }
                     Err(e) => {
@@ -368,6 +433,7 @@ impl HlsFrameSink {
 
         info!(
             listen = %local,
+            scheme,
             segment_target_s = config.segment_target_secs,
             playlist_target_s = config.playlist_target_duration,
             keep = config.keep_segments,
@@ -376,6 +442,7 @@ impl HlsFrameSink {
 
         Ok(Self {
             addr: local,
+            scheme,
             ring,
             _segmenter: segmenter,
             accept,
@@ -386,6 +453,13 @@ impl HlsFrameSink {
     /// the caller asked for `:0`).
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// `"http"` when [`HlsConfig::tls`] was `None`, `"https"` when it
+    /// was set. The chromecast LOAD URL builder uses this to keep
+    /// scheme + TLS toggle in one place.
+    pub fn scheme(&self) -> &'static str {
+        self.scheme
     }
 
     /// Wait until at least one segment has been pushed to the ring.

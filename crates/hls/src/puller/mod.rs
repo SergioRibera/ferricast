@@ -259,7 +259,7 @@ async fn run_worker(
     // after each segment; on live we re-fetch the playlist when we
     // run off the end of the current snapshot, on VOD we send Eos.
     let mut current_pl = pl;
-    let mut current_base = media_url.clone();
+    let current_base = media_url.clone();
     let mut next_index = 1usize;
     /// If we fall this many segments behind the live edge, skip
     /// forward instead of plodding through expired segments. The
@@ -387,7 +387,6 @@ async fn run_worker(
                             next_index = skip_to;
                             current_pl = new_pl;
                             demuxer = TsDemuxer::new();
-                            let _ = current_base; // kept for future origin migration; unused otherwise
                             continue;
                         }
                         Err(e) => {
