@@ -13,6 +13,8 @@ use ferricast_core::{
     MdnsDiscovery, Result,
 };
 
+use crate::self_filter;
+
 const CHROMECAST_SERVICE_TYPE: &str = "_googlecast._tcp.local.";
 const CHROMECAST_ICON: Bytes = Bytes::from_static(include_bytes!("../../../assets/chromecast.svg"));
 
@@ -99,6 +101,24 @@ impl Discovery for ChromecastDiscovery {
                             .collect();
 
                         trace!(?txt, "TXT records");
+
+                        // Self-filter: if this resolved service is
+                        // our own in-process receiver advertisement,
+                        // skip it. Same-machine sender+receiver in
+                        // one binary otherwise lists itself in the
+                        // picker and (worse) lets the user pick
+                        // itself, which deadlocks the HLS pipeline
+                        // through the loopback path.
+                        if let Some(id) = txt.get("id") {
+                            if self_filter::contains(id) {
+                                debug!(
+                                    name = info.get_fullname(),
+                                    device_id = %id,
+                                    "skipping self-advertised chromecast receiver"
+                                );
+                                continue;
+                            }
+                        }
 
                         let device_uuid = txt
                             .get("id")

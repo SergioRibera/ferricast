@@ -20,12 +20,17 @@
 use ferricast_core::{AdvertiseInfo, Advertiser, FerricastError, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 
+use crate::self_filter;
+
 pub const SERVICE_TYPE: &str = "_googlecast._tcp.local.";
 
 #[derive(Default)]
 pub struct ChromecastReceiverAdvertiser {
     daemon: Option<ServiceDaemon>,
     fullname: Option<String>,
+    /// Cached for `stop()` so we can unregister from the self-filter
+    /// without holding onto the full [`AdvertiseInfo`].
+    device_id: Option<String>,
 }
 
 impl ChromecastReceiverAdvertiser {
@@ -76,13 +81,19 @@ impl Advertiser for ChromecastReceiverAdvertiser {
             daemon
                 .register(service)
                 .map_err(|e| FerricastError::Receiver(format!("mDNS register: {e}")))?;
+            // Tell the in-process Chromecast discovery to skip this
+            // device's id when it resolves. Otherwise same-process
+            // sender+receiver lists ourselves in the picker.
+            self_filter::register(&info.device_id);
             tracing::info!(
                 fullname,
                 port = info.port,
+                device_id = %info.device_id,
                 "Chromecast receiver advertised via mDNS"
             );
             self.daemon = Some(daemon);
             self.fullname = Some(fullname);
+            self.device_id = Some(info.device_id);
             Ok(())
         }
     }
@@ -92,6 +103,9 @@ impl Advertiser for ChromecastReceiverAdvertiser {
             if let (Some(daemon), Some(fullname)) = (self.daemon.take(), self.fullname.take()) {
                 let _ = daemon.unregister(&fullname);
                 let _ = daemon.shutdown();
+            }
+            if let Some(id) = self.device_id.take() {
+                self_filter::unregister(&id);
             }
             Ok(())
         }

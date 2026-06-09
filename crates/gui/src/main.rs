@@ -87,8 +87,19 @@ async fn main() -> anyhow::Result<()> {
                 if info.video.is_some() { " (video)" } else { " (audio)" },
             );
             let counters = Arc::new(receiver_window::ReceiverCounters::default());
-            let (video_tx, video_rx) = mpsc::channel::<receiver_window::VideoFrame>(2);
-            let (audio_tx, audio_rx) = mpsc::channel::<receiver_window::AudioBuf>(64);
+            // Channel depths sized to absorb window-startup latency
+            // (Freya + Skia + rodio + alsa init takes several
+            // hundred ms before the drain tasks start consuming).
+            // Video is `try_send` on the sink side — capacity 4 is
+            // just a tiny coalescing buffer, the latest frame wins.
+            // Audio used to be `send().await` with capacity 64; that
+            // path could backpressure the puller into stalling and
+            // losing segments to ring eviction. We now `try_send`
+            // audio too (with a generous 256-slot buffer ≈ 5 s of
+            // playback), trading occasional audio dropouts under
+            // sustained overload for a pipeline that never wedges.
+            let (video_tx, video_rx) = mpsc::channel::<receiver_window::VideoFrame>(4);
+            let (audio_tx, audio_rx) = mpsc::channel::<receiver_window::AudioBuf>(256);
             let req = ReceiverWindowReq {
                 remote: remote.clone(),
                 info: info.clone(),

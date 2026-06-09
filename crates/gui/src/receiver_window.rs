@@ -160,11 +160,24 @@ impl FrameSink for WindowSink {
             sample_rate: audio.sample_rate,
             channels: audio.channels,
         };
-        // Audio backpressure is real: dropping audio buffers
-        // produces audible glitches. Bound to 64 and `send` rather
-        // than `try_send` so the decoder waits if the playback task
-        // falls behind.
-        let _ = self.audio_tx.send(buf).await;
+        // Drop on backpressure (matches video). The window-side
+        // drain task is bottlenecked by rodio's playback clock —
+        // `Sink::append` only blocks the decoder if the channel
+        // fills past the drain task's pace. We used to `send().await`
+        // here so audio frames never dropped, but a slow window
+        // startup (Freya + Skia + alsa init, hundreds of ms) drained
+        // the puller via the manager pump and tripped HLS segment
+        // eviction on the sender. Capacity 256 (~5 s @ 21 ms/buffer)
+        // absorbs the startup spike; under steady-state overload
+        // we'd rather glitch audio than stall the whole pipeline.
+        if let Err(e) = self.audio_tx.try_send(buf) {
+            if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                tracing::warn!(
+                    receiver = %self.label,
+                    "audio buffer dropped — channel full"
+                );
+            }
+        }
         Ok(())
     }
 }

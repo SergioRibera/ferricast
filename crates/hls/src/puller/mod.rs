@@ -76,7 +76,15 @@ impl MediaPuller for HlsPuller {
             // on misuse either.
             self.close().await?;
 
-            let (packet_tx, packet_rx) = mpsc::channel::<Result<MediaPacket>>(64);
+            // 256-slot media-packet buffer (was 64). The downstream
+            // consumer is the manager's pump, which decodes + pushes
+            // to a sink — each slow per-frame decode used to back-
+            // pressure into here and stall the segment-fetch loop,
+            // letting the sender's HLS ring rotate past us. With
+            // skip-to-live (below) the puller can now bail out of
+            // a stale playlist instead of plodding through 404s,
+            // but a larger soft buffer keeps short hiccups silent.
+            let (packet_tx, packet_rx) = mpsc::channel::<Result<MediaPacket>>(256);
             let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(4);
             let (info_tx, info_rx) = oneshot::channel::<Result<MediaInfo>>();
 
@@ -251,8 +259,14 @@ async fn run_worker(
     // after each segment; on live we re-fetch the playlist when we
     // run off the end of the current snapshot, on VOD we send Eos.
     let mut current_pl = pl;
-    let current_base = media_url.clone();
+    let mut current_base = media_url.clone();
     let mut next_index = 1usize;
+    /// If we fall this many segments behind the live edge, skip
+    /// forward instead of plodding through expired segments. The
+    /// sender's `keep_segments` is typically 12 (see
+    /// `ferricast_hls::HlsConfig`); 3 leaves enough margin that
+    /// we're still inside the ring but never wading through history.
+    const LIVE_EDGE_LAG_THRESHOLD: usize = 3;
 
     loop {
         // Drain any cmd that arrived between iterations.
@@ -297,6 +311,29 @@ async fn run_worker(
                             current_pl.media_sequence as i64 + next_index as i64;
                         let new_first = new_pl.media_sequence as i64;
                         next_index = (old_first - new_first).max(0) as usize;
+                        // Skip-to-live: if a decoder hiccup pushed us
+                        // multiple segments behind, jump to the live
+                        // edge instead of plodding through everything
+                        // we missed. Without this, a single slow
+                        // window-startup spike snowballs into the
+                        // sender's ring rotating past us and us
+                        // chasing 404s until reconnect.
+                        let pending = new_pl.segments.len().saturating_sub(next_index);
+                        if pending > LIVE_EDGE_LAG_THRESHOLD {
+                            let skip_to =
+                                new_pl.segments.len().saturating_sub(LIVE_EDGE_LAG_THRESHOLD);
+                            tracing::warn!(
+                                from_index = next_index,
+                                to_index = skip_to,
+                                pending,
+                                "HLS puller fell behind live edge — skipping forward"
+                            );
+                            next_index = skip_to;
+                            // Drop demuxer state because we're about
+                            // to discontinuity-jump; the demuxer
+                            // resyncs on the next PAT/PMT.
+                            demuxer = TsDemuxer::new();
+                        }
                         current_pl = new_pl;
                     }
                     Err(e) => {
@@ -326,9 +363,49 @@ async fn run_worker(
             }
         };
 
-        let bytes = match http_get(&client, seg_url.as_str()).await {
-            Ok(b) => b,
-            Err(e) => {
+        let bytes = match http_get_segment(&client, seg_url.as_str()).await {
+            SegmentFetch::Ok(b) => b,
+            SegmentFetch::NotFound => {
+                // Segment evicted from the sender's ring before we
+                // asked for it — almost certainly because the decode
+                // pump fell behind. Refresh the playlist, skip to
+                // live, and resync the demuxer. Non-fatal: live HLS
+                // is allowed to lose history; we just rejoin at the
+                // current edge.
+                tracing::warn!(
+                    seq = next_index,
+                    url = %seg_url,
+                    "HLS segment 404 — segment evicted; refreshing playlist + skipping to live"
+                );
+                match http_get(&client, current_base.as_str()).await {
+                    Ok(refreshed) => match m3u8_rs::parse_media_playlist_res(&refreshed) {
+                        Ok(new_pl) => {
+                            let skip_to = new_pl
+                                .segments
+                                .len()
+                                .saturating_sub(LIVE_EDGE_LAG_THRESHOLD);
+                            next_index = skip_to;
+                            current_pl = new_pl;
+                            demuxer = TsDemuxer::new();
+                            let _ = current_base; // kept for future origin migration; unused otherwise
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = packet_tx
+                                .send(Err(FerricastError::Pull(format!(
+                                    "playlist refresh after 404: {e}"
+                                ))))
+                                .await;
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        let _ = packet_tx.send(Err(e)).await;
+                        return;
+                    }
+                }
+            }
+            SegmentFetch::Err(e) => {
                 let _ = packet_tx.send(Err(e)).await;
                 return;
             }
@@ -381,8 +458,55 @@ fn build_client(headers: &HashMap<String, String>) -> Result<Client> {
         // Whole-request timeout. Long enough for a single 10s
         // segment to download even on a 1 Mbps link.
         .timeout(Duration::from_secs(30))
+        // Accept self-signed TLS certs. The HLS sender in this
+        // workspace (`ferricast_hls::HlsFrameSink` with
+        // `HlsConfig::tls`) uses a per-session `rcgen` cert that
+        // is intentionally unsigned by any CA — the receiver isn't
+        // expected to validate identity over an ad-hoc cast link.
+        // Public HLS origins are usually CA-signed so this only
+        // takes effect when we'd otherwise reject ourselves; we
+        // keep the rustls TLS handshake itself (so the data is
+        // still encrypted on the wire).
+        .danger_accept_invalid_certs(true)
         .build()
         .map_err(|e| FerricastError::Pull(format!("reqwest client: {e}")))
+}
+
+/// Result of fetching a media segment. The 404 case is split out
+/// because it's recoverable — segments expire from the sender's ring
+/// in steady-state operation and the puller can skip-to-live instead
+/// of failing the session.
+enum SegmentFetch {
+    Ok(Bytes),
+    NotFound,
+    Err(FerricastError),
+}
+
+async fn http_get_segment(client: &Client, url: &str) -> SegmentFetch {
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => return SegmentFetch::Err(FerricastError::Pull(format!("GET {url}: {e}"))),
+    };
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return SegmentFetch::NotFound;
+    }
+    if !resp.status().is_success() {
+        return SegmentFetch::Err(FerricastError::Pull(format!(
+            "GET {url} -> {}",
+            resp.status()
+        )));
+    }
+    let mut stream = resp.bytes_stream();
+    let mut buf = bytes::BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(c) => buf.extend_from_slice(&c),
+            Err(e) => {
+                return SegmentFetch::Err(FerricastError::Pull(format!("body chunk: {e}")))
+            }
+        }
+    }
+    SegmentFetch::Ok(buf.freeze())
 }
 
 async fn http_get(client: &Client, url: &str) -> Result<Bytes> {
