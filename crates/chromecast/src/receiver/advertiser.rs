@@ -18,11 +18,20 @@
 //! supplying a key there wins over our defaults.
 
 use ferricast_core::{AdvertiseInfo, Advertiser, FerricastError, Result};
-use mdns_sd::{ServiceDaemon, ServiceInfo};
+use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 
 use crate::self_filter;
 
 pub const SERVICE_TYPE: &str = "_googlecast._tcp.local.";
+
+/// Env-var override for the LAN-facing interface. Setting it to either
+/// an interface name (`eth0`) or an IPv4 (`192.168.1.10`) pins mDNS
+/// announces to that interface and skips runtime detection. Useful on
+/// hosts where the default-route heuristic picks the wrong NIC —
+/// e.g. machines where a VPN holds the default route but the LAN
+/// receiver is on a separate subnet, or hosts with multiple LAN
+/// adapters.
+pub const ADVERTISE_INTERFACE_VAR: &str = "FERRICAST_CAST_INTERFACE";
 
 #[derive(Default)]
 pub struct ChromecastReceiverAdvertiser {
@@ -46,6 +55,28 @@ impl Advertiser for ChromecastReceiverAdvertiser {
         async move {
             let daemon = ServiceDaemon::new()
                 .map_err(|e| FerricastError::Receiver(format!("mDNS daemon: {e}")))?;
+
+            // Restrict announces to a single physical LAN interface.
+            // Without this, on hosts with many interfaces (docker
+            // bridges, virbr0, tailscale0, libvirt, WSL bridges, VPN
+            // tunnels, multi-NIC servers — typical NixOS dev or any
+            // cloud-ish box) mdns-sd fans out the announce across
+            // every IP it finds. Cast Discovery on Android reads the
+            // first response packet it sees per service; if that
+            // response came from a virtual interface that only got
+            // the SRV/A record in time (the TXT goes in a separate
+            // packet whose ordering across 15+ multicast sockets is
+            // racy), Android marks the service incomplete and
+            // refuses to connect — the "texts: ,  network: 997"
+            // failure mode in MdnsDeviceScannerEntry's log.
+            //
+            // IPv6 is always disabled: Cast Discovery on every sender
+            // we care about (YouTube, Spotify, VLC mobile, Cast SDK
+            // apps) only uses IPv4 multicast (224.0.0.251), so IPv6
+            // announces would only ever add wire noise without ever
+            // being read.
+            let _ = daemon.disable_interface(IfKind::IPv6);
+            let pinned_ip = pin_lan_interface(&daemon);
 
             // Default TXT keys real Chromecast senders look for.
             // `AdvertiseInfo::txt` overrides anything we set here.
@@ -109,16 +140,14 @@ impl Advertiser for ChromecastReceiverAdvertiser {
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
 
-            // Detect the LAN-facing IPv4 explicitly instead of relying
-            // on mdns-sd's `enable_addr_auto`. With `enable_addr_auto`
-            // the initial announce can land before mdns-sd has finished
-            // discovering host interfaces, which on some setups
-            // (notably WSL + multiple network namespaces) produces a
-            // response with SRV but no TXT or A — exactly the
-            // "Device status is missing" failure mode reported in
-            // Android's MdnsDeviceScannerEntry log.
-            let lan_ip = detect_lan_ipv4();
-            let host_ip_str = match lan_ip {
+            // Build the announce. When `pin_lan_interface` succeeded
+            // we already know the IP we'll be announcing on — embed
+            // it directly so the initial response packet carries the
+            // A record. Falling back to `enable_addr_auto()` (used
+            // only when detection fails completely) is correct but
+            // produces a slightly later A record that can race the
+            // TXT across consumers; we prefer the explicit path.
+            let host_ip_str = match pinned_ip {
                 Some(ip) => ip.to_string(),
                 None => String::new(),
             };
@@ -132,9 +161,7 @@ impl Advertiser for ChromecastReceiverAdvertiser {
                 &props_ref[..],
             )
             .map_err(|e| FerricastError::Receiver(format!("mDNS ServiceInfo: {e}")))?;
-            // Fall back to auto-detect only if explicit detection
-            // returned nothing — better than crashing the receiver.
-            if lan_ip.is_none() {
+            if pinned_ip.is_none() {
                 service = service.enable_addr_auto();
             }
 
@@ -150,7 +177,7 @@ impl Advertiser for ChromecastReceiverAdvertiser {
                 fullname,
                 port = info.port,
                 device_id = %info.device_id,
-                lan_ip = ?lan_ip,
+                lan_ip = ?pinned_ip,
                 txt_keys = %props.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(","),
                 "Chromecast receiver advertised via mDNS"
             );
@@ -179,22 +206,71 @@ impl Advertiser for ChromecastReceiverAdvertiser {
     }
 }
 
-/// Discover the host's outgoing-route IPv4. Connects a UDP socket to
-/// a public sink (no packets sent — `connect` on UDP just primes the
-/// kernel's source-address selection); the bound local address is
-/// the IP the kernel would actually use for off-link traffic, i.e.
-/// the LAN-facing interface. Returns `None` on hosts with no IPv4
-/// route at all (rare; the fallback is `enable_addr_auto`).
-fn detect_lan_ipv4() -> Option<std::net::IpAddr> {
+/// Detect the LAN-facing IPv4 and configure `daemon` so mDNS
+/// announces only go out on that interface. Two paths:
+///
+/// 1. **Env override** (`FERRICAST_CAST_INTERFACE`) — if set, the
+///    value is interpreted as either an interface name (`eth0`,
+///    `wlan0`) or a literal IPv4 (`192.168.1.10`). We always
+///    accept whatever the user supplied; if the host doesn't have
+///    that interface mdns-sd will just emit nothing, which is the
+///    desired failure mode for a manual override.
+/// 2. **UDP + `connect`** heuristic — open a non-routed UDP socket,
+///    `connect()` to a routable IPv4 sink (`8.8.8.8:53`). The
+///    kernel runs source-address selection and binds the socket to
+///    the IP it would use for that destination; we read it back
+///    with `local_addr()`. No packets actually leave the host
+///    because we never call `send_to` — purely a kernel-side
+///    address lookup. Works on every Linux/macOS/Windows host with
+///    a default IPv4 route, including offline LAN-only hosts (the
+///    kernel still picks a source based on routing table even when
+///    there's no path to 8.8.8.8).
+///
+/// Returns the pinned IP so the caller can embed it directly in the
+/// `ServiceInfo`. When both paths fail (no routes at all, very rare),
+/// returns `None` and the caller falls back to `enable_addr_auto`.
+fn pin_lan_interface(daemon: &ServiceDaemon) -> Option<std::net::IpAddr> {
+    if let Ok(val) = std::env::var(ADVERTISE_INTERFACE_VAR) {
+        let val = val.trim();
+        if !val.is_empty() {
+            // Try IP first; if parsing succeeds it's an Addr, else
+            // treat as interface name.
+            let kind = match val.parse::<std::net::IpAddr>() {
+                Ok(ip) => IfKind::Addr(ip),
+                Err(_) => IfKind::Name(val.to_string()),
+            };
+            let _ = daemon.disable_interface(IfKind::All);
+            let _ = daemon.enable_interface(kind.clone());
+            tracing::info!(
+                override_value = val,
+                ?kind,
+                "mDNS interface pinned via {} env var",
+                ADVERTISE_INTERFACE_VAR
+            );
+            // We don't know the resulting IP up front when only the
+            // name was given. Returning None makes the caller fall
+            // back to `enable_addr_auto` for the ServiceInfo, which
+            // is fine — mdns-sd's auto-detect runs against the
+            // already-filtered interface set, so it resolves to the
+            // pinned IP anyway.
+            if let IfKind::Addr(ip) = kind {
+                return Some(ip);
+            }
+            return None;
+        }
+    }
+
+    let detected = detect_default_route_ipv4()?;
+    let _ = daemon.disable_interface(IfKind::All);
+    let _ = daemon.enable_interface(IfKind::Addr(detected));
+    Some(detected)
+}
+
+fn detect_default_route_ipv4() -> Option<std::net::IpAddr> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    // 8.8.8.8 is just a routable peer to coax the kernel into
-    // picking a source address; no packets get sent because we
-    // don't actually call `send_to`. The dual-stack 1.1.1.1 would
-    // work equally well — the choice doesn't matter as long as it's
-    // outside the host's loopback / link-local range.
     sock.connect("8.8.8.8:53").ok()?;
     let addr = sock.local_addr().ok()?.ip();
-    if addr.is_unspecified() || addr.is_loopback() {
+    if addr.is_unspecified() || addr.is_loopback() || !addr.is_ipv4() {
         None
     } else {
         Some(addr)
