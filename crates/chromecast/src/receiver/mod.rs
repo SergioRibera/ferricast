@@ -32,6 +32,7 @@
 mod advertiser;
 mod control;
 mod tls;
+mod util;
 
 use std::sync::Arc;
 
@@ -94,7 +95,19 @@ impl ReceiverProtocol for ChromecastReceiver {
     }
 
     fn create_control(&self) -> Result<Self::Control> {
-        ChromecastReceiverControl::new(self.inner.port, Vec::new())
+        // The TLS cert SANs must include every host the sender will
+        // resolve us as. Most senders dial the IP they got from mDNS
+        // directly (`192.168.x.x`), so the *crucial* SAN is the
+        // LAN-facing IPv4. Without it, strict-validating TLS clients
+        // (VLC mobile's GnuTLS in particular) abort the handshake
+        // with a generic "Interrupted system call" error before any
+        // Cast traffic flows.
+        //
+        // The same detection logic the mDNS advertiser uses runs
+        // here; if the user pinned a specific NIC via
+        // `FERRICAST_CAST_INTERFACE`, we honour the pinned IP.
+        let ips = util::detect_advertise_ips();
+        ChromecastReceiverControl::new(self.inner.port, ips)
     }
 
     fn create_puller(&self) -> Result<Self::Puller> {

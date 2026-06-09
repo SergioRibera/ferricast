@@ -266,13 +266,4 @@ fn pin_lan_interface(daemon: &ServiceDaemon) -> Option<std::net::IpAddr> {
     Some(detected)
 }
 
-fn detect_default_route_ipv4() -> Option<std::net::IpAddr> {
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect("8.8.8.8:53").ok()?;
-    let addr = sock.local_addr().ok()?.ip();
-    if addr.is_unspecified() || addr.is_loopback() || !addr.is_ipv4() {
-        None
-    } else {
-        Some(addr)
-    }
-}
+use super::util::detect_default_route_ipv4;
