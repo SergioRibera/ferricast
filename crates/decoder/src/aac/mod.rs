@@ -16,7 +16,6 @@
 //! format every Linux audio sink (PipeWire, ALSA, PulseAudio)
 //! accepts without further conversion.
 
-use bytes::Bytes;
 use ferricast_core::{
     AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame, DecodedAudio, FerricastError, Result,
 };
@@ -87,7 +86,7 @@ impl AudioDecoder for AacDecoder {
         let pcm = interleave_s16(buf);
 
         Ok(Some(DecodedAudio {
-            pcm: Bytes::from(pcm),
+            pcm,
             sample_rate: self.sample_rate,
             channels: self.channels,
             timestamp_us: ts,
@@ -103,13 +102,13 @@ impl AudioDecoder for AacDecoder {
 }
 
 /// Convert a symphonia `AudioBufferRef` (whatever sample format the
-/// decoder picked internally) into interleaved s16le bytes. AAC's
+/// decoder picked internally) into interleaved i16 samples. AAC's
 /// natural output is f32; the conversion clips at ±1.0 and rounds
 /// to the nearest integer.
-fn interleave_s16(buf: AudioBufferRef<'_>) -> Vec<u8> {
+fn interleave_s16(buf: AudioBufferRef<'_>) -> Vec<i16> {
     let frames = buf.frames();
     let channels = buf.spec().channels.count();
-    let mut out = Vec::with_capacity(frames * channels * 2);
+    let mut out = Vec::with_capacity(frames * channels);
 
     // The macro-like helper that handles every sample variant
     // symphonia might hand us. F32 is the common path for AAC; the
@@ -120,8 +119,7 @@ fn interleave_s16(buf: AudioBufferRef<'_>) -> Vec<u8> {
             for frame_idx in 0..frames {
                 for ch_idx in 0..channels {
                     let s: f32 = $convert($buf.chan(ch_idx)[frame_idx]);
-                    let i16_sample = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
-                    out.extend_from_slice(&i16_sample.to_le_bytes());
+                    out.push((s.clamp(-1.0, 1.0) * 32767.0).round() as i16);
                 }
             }
         }};

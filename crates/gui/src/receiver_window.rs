@@ -67,12 +67,14 @@ pub struct VideoFrame {
     pub stride: u32,
 }
 
-/// Cross-thread payload for one decoded audio buffer. Already s16le
+/// Cross-thread payload for one decoded audio buffer. Already s16
 /// interleaved as `Vec<i16>` so rodio's [`rodio::buffer::SamplesBuffer`]
-/// can take it without further conversion.
-#[derive(Clone, Debug)]
+/// can take it without further conversion. The samples vec moves
+/// through the channel directly (no `Arc` clone) — the audio drain
+/// task is the single consumer.
+#[derive(Debug)]
 pub struct AudioBuf {
-    pub samples: Arc<Vec<i16>>,
+    pub samples: Vec<i16>,
     pub sample_rate: u32,
     pub channels: u16,
 }
@@ -153,17 +155,8 @@ impl FrameSink for WindowSink {
                 "WindowSink: audio"
             );
         }
-        // Pack the s16le bytes into Vec<i16>. We could keep them as
-        // bytes and have the audio task interleave — but rodio's
-        // `SamplesBuffer` constructor wants typed samples, so doing
-        // the cast here keeps the audio task simple.
-        let samples: Vec<i16> = audio
-            .pcm
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]))
-            .collect();
         let buf = AudioBuf {
-            samples: Arc::new(samples),
+            samples: audio.pcm,
             sample_rate: audio.sample_rate,
             channels: audio.channels,
         };
@@ -226,9 +219,22 @@ impl App for ReceiverWindowApp {
         let mut tick = use_state(|| 0u64);
         let _ = tick.read();
 
+        // Stream-ended signal: flipped by whichever drain task sees
+        // its channel close first (sender disconnect, manager pump
+        // stop, or normal end-of-stream). The render branch below
+        // shows a "Stream ended" banner and grays out the metadata.
+        // Keeping the last frame visible is intentional — closing
+        // the window or hiding the canvas would feel like the
+        // receiver app crashed; freezing on the last frame is the
+        // expected receiver-side UX (matches a Chromecast TV showing
+        // the last frame when the casting phone leaves).
+        let ended = use_state(|| false);
+        let ended_now = *ended.read();
+
         // Drain video into the slot.
         let video_rx_take = self.video_rx.clone();
         let video_slot_for_task = video_slot.clone();
+        let mut ended_for_video = ended;
         use_hook(move || {
             if let Some(mut rx) = video_rx_take.borrow_mut().take() {
                 let slot = video_slot_for_task;
@@ -239,6 +245,8 @@ impl App for ReceiverWindowApp {
                         }
                         *tick.write() += 1;
                     }
+                    *ended_for_video.write() = true;
+                    *tick.write() += 1;
                 });
             }
         });
@@ -248,6 +256,7 @@ impl App for ReceiverWindowApp {
         // tears the stream down mid-playback. Stash it in a hook
         // closure so it's owned by the task.
         let audio_rx_take = self.audio_rx.clone();
+        let mut ended_for_audio = ended;
         use_hook(move || {
             if let Some(mut rx) = audio_rx_take.borrow_mut().take() {
                 spawn(async move {
@@ -268,14 +277,14 @@ impl App for ReceiverWindowApp {
                     // Keep `stream` alive: drop = device closed.
                     let _stream_keepalive = stream;
                     while let Some(buf) = rx.recv().await {
-                        let samples: Vec<i16> = (*buf.samples).clone();
                         let source = rodio::buffer::SamplesBuffer::new(
                             buf.channels,
                             buf.sample_rate,
-                            samples,
+                            buf.samples,
                         );
                         sink.append(source);
                     }
+                    *ended_for_audio.write() = true;
                 });
             }
         });
@@ -283,8 +292,27 @@ impl App for ReceiverWindowApp {
         let video_n = counters.video_frames.load(Ordering::Relaxed);
         let audio_n = counters.audio_frames.load(Ordering::Relaxed);
 
-        let title = receiver_title(&remote, &info);
-        let codec_line = codec_line(&info);
+        let raw_title = receiver_title(&remote, &info);
+        let title = if ended_now {
+            format!("● Stream ended — {raw_title}")
+        } else {
+            raw_title
+        };
+        let codec_line = if ended_now {
+            "sender disconnected — last frame frozen".to_string()
+        } else {
+            codec_line(&info)
+        };
+        let title_color = if ended_now {
+            (200, 140, 140)
+        } else {
+            (230, 230, 240)
+        };
+        let meta_color = if ended_now {
+            (120, 120, 130)
+        } else {
+            (200, 200, 220)
+        };
         let video_meta = info
             .video
             .as_ref()
@@ -379,7 +407,7 @@ impl App for ReceiverWindowApp {
                         label()
                             .text(title)
                             .font_size(16.)
-                            .color((230, 230, 240)),
+                            .color(title_color),
                     )
                     .child(
                         label()
@@ -395,13 +423,13 @@ impl App for ReceiverWindowApp {
                                 label()
                                     .text(video_meta)
                                     .font_size(11.)
-                                    .color((200, 200, 220)),
+                                    .color(meta_color),
                             )
                             .child(
                                 label()
                                     .text(audio_meta)
                                     .font_size(11.)
-                                    .color((200, 200, 220)),
+                                    .color(meta_color),
                             ),
                     )
                     .child(

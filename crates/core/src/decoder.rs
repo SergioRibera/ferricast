@@ -8,8 +8,6 @@
 //! readback, the same way the VA-API encoder consumes
 //! `CapturedFrame::Gpu` on the sender side.
 
-use bytes::Bytes;
-
 use crate::error::Result;
 use crate::frame::{AudioCodec, AudioFrame, CapturedFrame, EncodedFrame, PixelFormat};
 use crate::protocol::Codec;
@@ -55,12 +53,18 @@ pub struct AudioDecoderConfig {
 }
 
 /// PCM output from an audio decoder. Always interleaved, 16-bit
-/// signed little-endian for now — every audio path on Linux
+/// signed native-endian samples — every audio path on Linux
 /// (PipeWire, ALSA, PulseAudio) accepts that format without
-/// conversion, so we don't bother carrying a sample format tag yet.
+/// conversion, so we don't carry a sample format tag yet.
+///
+/// `pcm` is a `Vec<i16>` (not `Bytes` of LE-encoded bytes) so the
+/// sink can hand it straight to `rodio::buffer::SamplesBuffer::new`
+/// without a per-sample byte-unpack pass. Keeping the natural shape
+/// here also lets a future zero-copy SIMD f32→i16 path land without
+/// churning the trait surface again.
 #[derive(Debug, Clone)]
 pub struct DecodedAudio {
-    pub pcm: Bytes,
+    pub pcm: Vec<i16>,
     pub sample_rate: u32,
     pub channels: u16,
     pub timestamp_us: u64,
