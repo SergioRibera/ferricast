@@ -331,7 +331,14 @@ async fn dispatch(
         .unwrap_or("");
     let request_id = value.get("requestId").and_then(|v| v.as_i64());
 
-    tracing::debug!(ns, msg_type, ?request_id, "cast← receiver");
+    tracing::info!(
+        ns,
+        msg_type,
+        ?request_id,
+        source = %msg.source_id,
+        dest = %msg.destination_id,
+        "cast← receiver"
+    );
 
     match ns {
         namespace::CONNECTION => {
@@ -340,6 +347,11 @@ async fn dispatch(
             if msg_type == "CONNECT" {
                 let mut guard = state.lock().await;
                 let sender_id = msg.source_id.clone();
+                tracing::info!(
+                    %sender_id,
+                    dest = %msg.destination_id,
+                    "Chromecast receiver: virtual CONNECT opened"
+                );
                 if guard.is_none() {
                     *guard = Some(SessionState::new(sender_id.clone()));
                 } else if let Some(s) = guard.as_mut() {
@@ -381,6 +393,11 @@ async fn dispatch(
                     .and_then(|v| v.as_str())
                     .unwrap_or(DEFAULT_MEDIA_RECEIVER_APP_ID)
                     .to_string();
+                tracing::info!(
+                    %app_id,
+                    sender = %msg.source_id,
+                    "Chromecast receiver: LAUNCH"
+                );
                 let mut guard = state.lock().await;
                 if guard.is_none() {
                     *guard = Some(SessionState::new(msg.source_id.clone()));
@@ -389,6 +406,11 @@ async fn dispatch(
                 s.app_id = Some(app_id.clone());
                 let reply =
                     build_receiver_status(s, request_id, &msg.destination_id, &msg.source_id)?;
+                tracing::info!(
+                    transport_id = %s.transport_id,
+                    session_id = %s.session_id,
+                    "Chromecast receiver: RECEIVER_STATUS reply for LAUNCH built"
+                );
                 let _ = cmd_tx.send(Ok(MediaCommand::LaunchApp { app_id })).await;
                 drop(guard);
                 server_send(writer, &reply).await
@@ -431,6 +453,10 @@ async fn dispatch(
                     .unwrap_or("")
                     .to_string();
                 if url.is_empty() {
+                    tracing::warn!(
+                        full_payload = %payload,
+                        "LOAD without media.contentId — sender sent malformed request"
+                    );
                     return Err(FerricastError::Receiver(
                         "LOAD without media.contentId".into(),
                     ));
@@ -439,6 +465,12 @@ async fn dispatch(
                     .and_then(|m| m.get("contentType"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
+                tracing::info!(
+                    %url,
+                    content_type = ?content_type,
+                    sender = %msg.source_id,
+                    "Chromecast receiver: LOAD"
+                );
                 let autoplay = value
                     .get("autoplay")
                     .and_then(|v| v.as_bool())
@@ -534,7 +566,21 @@ async fn dispatch(
             _ => Ok(()),
         },
         _ => {
-            tracing::debug!(ns, "unknown namespace; ignoring");
+            // Bumped from debug → info because the most common
+            // sender-rejects-us failure mode is a namespace the
+            // sender insists on that we don't implement (notably
+            // `urn:x-cast:com.google.cast.tp.deviceauth` for senders
+            // that enforce CA signing). Surfacing this in the log
+            // makes those failures instantly diagnosable instead of
+            // silent.
+            tracing::info!(
+                ns,
+                msg_type,
+                source = %msg.source_id,
+                dest = %msg.destination_id,
+                payload_head = %payload.chars().take(160).collect::<String>(),
+                "Chromecast receiver: namespace not implemented — ignoring"
+            );
             Ok(())
         }
     }
