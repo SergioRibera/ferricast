@@ -366,8 +366,10 @@ fn init_tracing_for_daemon() {
     // Without `RUST_LOG` we fall back to a quiet default suitable for
     // interactive use.
     let default_filter = "warn,freya=off,freya_core=off,freya_winit=off,\
-                          ragnarok=off,ferricast_chromecast=info,\
-                          ferricast_encoder=info,ferricast_gui=info";
+                          ragnarok=off,ferricast=info,ferricast_chromecast=info,\
+                          ferricast_encoder=info,ferricast_gui=info,\
+                          ferricast_hls=info,ferricast_muxer=info,\
+                          ferricast_capture=info";
     let make_filter = || {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter))
     };
