@@ -60,6 +60,7 @@ default = [
     "vaapi",
     "nvenc",
     "aac",
+    "fdk-aac",
 ]
 chromecast = ["dep:ferricast-chromecast"]
 # Capture backends — re-exported from `ferricast-capture`. At least
@@ -82,6 +83,14 @@ nvenc-zero-copy = ["ferricast-encoder/nvenc-zero-copy", "nvenc"]
 # does hardware AAC); plenty fast for one stream. Default on so
 # `ferricast = "*"` builds with both H.264 and AAC decode wired up.
 aac = ["ferricast-decoder/aac"]
+# AAC-LC encode via libfdk-aac for the sender side (chromecast HLS
+# audio). Requires `libfdk-aac` on the link path — the flake's
+# devShell ships it; on Debian/Ubuntu install `libfdk-aac-dev`.
+# Without this feature the chromecast audio pipeline starts, captures
+# PCM from PipeWire, then dies on the first frame with
+# `AacEncoder: no backend compiled in` — video keeps streaming,
+# the silent-AAC fallback fills the audio PID so playback continues.
+fdk-aac = ["ferricast-encoder/fdk-aac"]
 # Wayland source enumeration (foreign-toplevel + xdg-output).
 # Orthogonal to `pipewire`: that's for *capture* on Wayland; this is
 # for *picking the source to capture* via an in-process picker

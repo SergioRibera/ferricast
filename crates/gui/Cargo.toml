@@ -22,6 +22,7 @@ default = [
     "vaapi",
     "nvenc",
     "aac",
+    "fdk-aac",
 ]
 chromecast = ["ferricast/chromecast"]
 pipewire = ["ferricast/pipewire"]
@@ -34,6 +35,11 @@ openh264 = ["ferricast/openh264"]
 vaapi = ["ferricast/vaapi"]
 nvenc = ["ferricast/nvenc"]
 aac = ["ferricast/aac"]
+# AAC-LC sender-side encoder via libfdk-aac. Required for the
+# chromecast HLS audio pipeline. Without this the audio task in
+# `StreamManager` panics on first PCM with `AacEncoder: no backend
+# compiled in` — video keeps working but audio is silent fallback.
+fdk-aac = ["ferricast/fdk-aac"]
 nvenc-zero-copy = ["ferricast/nvenc-zero-copy", "nvenc"]
 # Wayland source enumeration. Defaults on so `ferricast-gui windows`
 # works out of the box on every modern compositor that exposes
