@@ -5,7 +5,6 @@ members = [
     "crates/core",
     "crates/capture",
     "crates/chromecast",
-    "crates/dial",
     "crates/airplay",
     "crates/miracast",
     "crates/encoder",
@@ -22,7 +21,6 @@ ferricast = { path = ".", default-features = false }
 ferricast-core = { path = "crates/core" }
 ferricast-capture = { path = "crates/capture", default-features = false }
 ferricast-chromecast = { path = "crates/chromecast" }
-ferricast-dial = { path = "crates/dial" }
 ferricast-airplay = { path = "crates/airplay" }
 ferricast-miracast = { path = "crates/miracast" }
 ferricast-encoder = { path = "crates/encoder", default-features = false }
@@ -97,7 +95,6 @@ wlroots = ["ferricast-capture/wlroots"]
 wayland-direct = ["ferricast-capture/wayland-direct", "wlroots"]
 # Reserved for upcoming protocol crates; toggling on requires
 # uncommenting the matching workspace member + dep below.
-# dial = ["dep:ferricast-dial"]
 # airplay = ["dep:ferricast-airplay"]
 # miracast = ["dep:ferricast-miracast"]
 
@@ -113,7 +110,6 @@ ferricast-encoder.workspace = true
 ferricast-decoder.workspace = true
 ferricast-hls.workspace = true
 ferricast-chromecast = { workspace = true, optional = true }
-# ferricast-dial = { workspace = true, optional = true }
 # ferricast-airplay = { workspace = true, optional = true }
 # ferricast-miracast = { workspace = true, optional = true }
 
