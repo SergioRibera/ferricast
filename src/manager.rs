@@ -860,6 +860,25 @@ impl StreamManager {
         // skip the whole thing — the chromecast HLS pipeline falls
         // back to the silent-AAC injection for receivers that
         // require it.
+        let mut session = (proto.create_session)()?;
+        session.connect(&device).await?;
+        session.setup_stream(&session_config).await?;
+
+        // Audio pipeline. Spawned *after* `session.connect()` finishes
+        // so PipeWire-captured PCM doesn't pile up while the chromecast
+        // handshake is running (LAUNCH ack + virtual-connect can take
+        // 3-6 s). Without this delay the queue chain
+        // `pipewire → AAC encoder → tx (64) → audio_tx (64)` fills
+        // entirely during the wait, then the segmenter drains stale
+        // frames whose `timestamp_us` is from seconds ago — the
+        // muxer's silent-AAC watermark advances past those PTSes
+        // immediately and the real audio is rejected for the rest
+        // of the stream's life.
+        //
+        // When `config.audio` is `None` (caller didn't opt in), we
+        // skip the whole thing — the chromecast HLS pipeline falls
+        // back to the silent-AAC injection for receivers that
+        // require it.
         let (audio_task, audio_frame_rx, audio_mute) = match config.audio.clone() {
             Some(audio_cfg) => {
                 let (tx, rx) = mpsc::channel::<AudioFrame>(64);
@@ -879,10 +898,6 @@ impl StreamManager {
             None => (None, None, None),
         };
         let _ = audio_mute; // surfaced separately when UI mute API lands
-
-        let mut session = (proto.create_session)()?;
-        session.connect(&device).await?;
-        session.setup_stream(&session_config).await?;
 
         // Factory the supervisor uses to rebuild a session on
         // receiver-side disconnect. Cloned `Arc` — cheap and `Send`.
