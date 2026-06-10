@@ -373,8 +373,22 @@ pub async fn run_from_frames(
         ring.write().await.enable_low_latency(pt);
     }
 
-    let mut pts_us: u64 = 0;
-    let mut effective_frame_period_us: u64 = frame_period_us;
+    // Video PTS uses the encoded frame's *capture-time* wall
+    // timestamp, offset from the first video frame's wall ts. Both
+    // audio and video PTS now share a single wall-time origin, so
+    // A/V sync is mechanical: no synthetic ramp can drift away from
+    // wall, no EMA needs to converge.
+    //
+    // The previous synthetic ramp (`pts_us += effective_frame_
+    // period_us` per frame) was introduced to absorb encoder
+    // jitter — but the receiver's playback buffer (≥3 s on
+    // chromecast) already handles jitter at presentation, and the
+    // ramp's mismatch with the wall-anchored audio side caused a
+    // permanently-growing audio delay (audio.wall accumulated
+    // faster than synth_pts on any host where real fps fell short
+    // of `target_fps`, which is common when the encoder's per-frame
+    // latency adds onto the capture cadence).
+    let mut video_wall_anchor: Option<u64> = None;
     let mut pending: Option<EncodedFrame> = None;
 
     // When real audio is wired in, take over the audio PID from the
@@ -388,24 +402,21 @@ pub async fn run_from_frames(
         .with_external_audio(external_audio_enabled);
     muxer.config(parameter_sets.clone())?;
 
-    // First-video anchor: the `(synth_pts_us, wall_ts_us)` pair
-    // latched on the very first video frame we push. Used to
-    // translate audio's capture-clock `timestamp_us` into the
-    // segmenter's synthetic PTS counter:
-    //   audio_synth = synth_anchor + (audio_wall - wall_anchor)
+    // Both audio and video timestamps come from `SystemTime::UNIX_EPOCH`
+    // (see `pipewire_audio::now_us` and `wayland_direct::now_us`), so
+    // they share a clock origin. Audio PTS is therefore
+    // `audio.ts.saturating_sub(video_wall_anchor)`, identical to the
+    // video formula. Any audio captured BEFORE the first video frame
+    // saturates to 0 and gets dropped downstream by the muxer's
+    // silent-AAC watermark — exactly what we want, since the receiver
+    // timeline starts at the first video keyframe.
     //
-    // We anchor on the first frame (not the latest) so audio that
-    // sits in the segmenter's input queue for a while still gets a
-    // PTS reflecting its true capture instant. With `HlsConfig::
-    // target_fps` now propagated from the manager-side `effective_
-    // fps`, the segmenter's synthetic clock advances at the real
-    // wall rate from the start, so this scheme stays sample-accurate
-    // even across many segments. Anchoring on the latest frame —
-    // which we briefly tried — collapses to nonsense the moment
-    // audio gets buffered: `audio_wall - latest_video_wall` goes
-    // negative, the saturating-sub clamps to 0, and several
-    // queued-up AAC frames end up with identical PTS.
-    let mut pts_anchor: Option<(u64, u64)> = None;
+    // Previous attempts to introduce a second `audio_origin_us` anchor
+    // injected a permanent A/V lag equal to the time between first
+    // video keyframe and first audio frame the segmenter processed
+    // (typically ~1.4 s on Wayland because xdg-screencopy takes longer
+    // to negotiate than the PipeWire audio graph). The shared
+    // `video_wall_anchor` avoids that class of bug entirely.
     let mut audio_frames_pushed: u64 = 0;
 
     loop {
@@ -419,7 +430,8 @@ pub async fn run_from_frames(
                 // audio is dropped because the segmenter hasn't
                 // anchored its timeline yet — the first audio frame
                 // that survives is the one arriving after the first
-                // video frame, which is when we set `pts_anchor`.
+                // video frame, which is when we latch
+                // `video_wall_anchor`.
                 tokio::select! {
                     biased;
                     f = frames.recv() => match f {
@@ -443,16 +455,21 @@ pub async fn run_from_frames(
         let started = Instant::now();
         let mut frames_in_segment: u64 = 0;
         let first_wall_ts = first.timestamp_us;
-        push_frame(&mut muxer, &first, pts_us)?;
-        if pts_anchor.is_none() {
-            pts_anchor = Some((pts_us, first_wall_ts));
+        // Latch the global wall-time origin on the very first video
+        // frame the segmenter ever sees. All subsequent video and
+        // audio PTS values are computed as `wall - video_wall_anchor`,
+        // so the receiver's reference clock starts at 0 and advances
+        // exactly with capture wall time.
+        if video_wall_anchor.is_none() {
+            video_wall_anchor = Some(first_wall_ts);
             debug!(
-                synth_pts_us = pts_us,
                 wall_ts_us = first_wall_ts,
-                "A/V timeline anchored on first video frame"
+                "A/V timeline wall anchor latched"
             );
         }
-        pts_us = pts_us.saturating_add(effective_frame_period_us);
+        let origin = video_wall_anchor.unwrap_or(first_wall_ts);
+        let video_pts_us = first_wall_ts.saturating_sub(origin);
+        push_frame(&mut muxer, &first, video_pts_us)?;
         frames_in_segment += 1;
 
         // LL-HLS state for this segment.
@@ -496,8 +513,9 @@ pub async fn run_from_frames(
                         pending = Some(encoded);
                         break;
                     }
-                    push_frame(&mut muxer, &encoded, pts_us)?;
-                    pts_us = pts_us.saturating_add(effective_frame_period_us);
+                    let wall_ts = encoded.timestamp_us;
+                    let video_pts_us = wall_ts.saturating_sub(origin);
+                    push_frame(&mut muxer, &encoded, video_pts_us)?;
                     frames_in_segment += 1;
                 }
                 SegEvent::Audio(None) => {
@@ -514,7 +532,7 @@ pub async fn run_from_frames(
                 }
                 SegEvent::Audio(Some(audio)) => {
                     if let Err(e) =
-                        push_audio_frame(&mut muxer, &audio, pts_anchor)
+                        push_audio_frame(&mut muxer, &audio, video_wall_anchor)
                     {
                         warn!(error = %e, "audio PES push failed");
                     } else {
@@ -553,21 +571,23 @@ pub async fn run_from_frames(
 
         let elapsed = started.elapsed();
 
-        if frames_in_segment >= 30 {
-            let measured = (elapsed.as_micros() as u64).saturating_div(frames_in_segment);
-            let lo = frame_period_us / 2;
-            let hi = frame_period_us.saturating_mul(3);
-            let measured_clamped = measured.clamp(lo, hi);
-            effective_frame_period_us =
-                (effective_frame_period_us.saturating_mul(7) + measured_clamped) / 8;
-            if measured > hi {
-                warn!(
-                    measured_us = measured,
-                    cap_us = hi,
-                    effective_frame_period_us,
-                    "segment production below 1/3 of target_fps; PTS pacing capped (player will drift)"
-                );
-            }
+        // Diagnostic: report the per-segment measured wall cadence
+        // against the configured frame period. Big delta → encoder
+        // / capture is slower than `target_fps`. Doesn't drive PTS
+        // anymore (video PTS is wall-anchored), so the warn is
+        // informational only — the receiver stays in A/V sync
+        // regardless.
+        let measured_period_us = if frames_in_segment > 0 {
+            (elapsed.as_micros() as u64).saturating_div(frames_in_segment)
+        } else {
+            0
+        };
+        if frames_in_segment >= 30 && measured_period_us > frame_period_us.saturating_mul(3) {
+            warn!(
+                measured_us = measured_period_us,
+                cap_us = frame_period_us.saturating_mul(3),
+                "segment production below 1/3 of target_fps (capture / encoder bottleneck)"
+            );
         }
 
         // Drain whatever's left in the muxer at segment close. In
@@ -618,7 +638,7 @@ pub async fn run_from_frames(
                 duration_ms = elapsed.as_millis() as u64,
                 size_kb = size_bytes / 1024,
                 encoded_kbps,
-                effective_frame_period_us,
+                measured_period_us,
                 parts = parts_count,
                 "segment ready"
             );
@@ -628,7 +648,7 @@ pub async fn run_from_frames(
                 duration_ms = elapsed.as_millis() as u64,
                 size_kb = size_bytes / 1024,
                 encoded_kbps,
-                effective_frame_period_us,
+                measured_period_us,
                 parts = parts_count,
                 "segment ready"
             );
@@ -677,40 +697,35 @@ async fn recv_audio(
 }
 
 /// Translate an audio frame's capture-clock `timestamp_us` into the
-/// segmenter's synthetic PTS timeline and forward to the MPEG-TS
-/// muxer.
+/// receiver-side PTS timeline and forward to the MPEG-TS muxer.
 ///
-/// PTS uses the **first** video frame as anchor:
-///   `audio_synth = synth_anchor + (audio_wall - wall_anchor)`
+/// Both audio and video timestamps come from `SystemTime::UNIX_EPOCH`
+/// (see `now_us()` in `pipewire_audio.rs` and `wayland_direct.rs`),
+/// so audio PTS uses the same formula as video:
+///   `pts_us = wall_ts.saturating_sub(video_wall_anchor)`
 ///
-/// With `HlsConfig::target_fps` now sourced from the manager-side
-/// `effective_fps`, the segmenter's synthetic PTS counter advances
-/// at real wall-clock rate from the first frame, so a fixed origin
-/// keeps audio frames at their true capture instants no matter how
-/// long they sat in the input queue.
-///
-/// Audio whose computed PTS lands behind the muxer's silent-fallback
-/// watermark is dropped silently inside `add_audio_frame` — the
-/// muxer is the authoritative gatekeeper, see `audio_pts_90k`'s
-/// docs in `ferricast_muxer::mpeg_ts`.
+/// Audio whose wall ts is older than the video anchor (PipeWire audio
+/// started capturing before the first video keyframe arrived — common
+/// on Wayland where xdg-screencopy negotiation takes ~1 s longer than
+/// PipeWire audio graph setup) saturates to PTS=0 and gets dropped by
+/// the muxer's silent-AAC watermark, which is exactly what we want:
+/// the receiver timeline starts at the first video frame, anything
+/// captured before that is uninteresting.
 fn push_audio_frame(
     muxer: &mut MpegTs,
     audio: &AudioFrame,
-    pts_anchor: Option<(u64, u64)>,
+    video_wall_anchor: Option<u64>,
 ) -> Result<(), FerricastError> {
-    let Some((synth_anchor_us, wall_anchor_us)) = pts_anchor else {
-        // First video frame hasn't been pushed yet — drop quietly.
+    let Some(anchor) = video_wall_anchor else {
+        // First video frame hasn't been seen yet — drop quietly.
         return Ok(());
     };
-
-    let delta_us = audio.timestamp_us.saturating_sub(wall_anchor_us);
-    let pts_us = synth_anchor_us.saturating_add(delta_us);
+    let pts_us = audio.timestamp_us.saturating_sub(anchor);
     let pts_90k = pts_us.saturating_mul(9) / 100;
     trace!(
         audio_wall = audio.timestamp_us,
-        wall_anchor = wall_anchor_us,
-        synth_anchor = synth_anchor_us,
-        audio_synth_us = pts_us,
+        video_wall_anchor = anchor,
+        audio_pts_us = pts_us,
         pts_90k,
         bytes = audio.data.len(),
         "audio PES push"
