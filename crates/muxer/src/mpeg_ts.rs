@@ -98,6 +98,20 @@ const SILENT_INJECT_LAG_90K: u64 = 45_000;
 /// flood the TS body with silence on a one-off video-pts jump.
 const SILENT_INJECT_MAX_PER_FRAME: u32 = 8;
 
+/// Max ticks an incoming real-audio PTS may be behind the watermark
+/// before we treat it as stale. AAC-LC at 48 kHz / 1024 samples per
+/// frame is "exactly" 1920 ticks of 90 kHz, but the encoder's
+/// per-frame PTS comes out of `samples_emitted * 1e6 / sample_rate`
+/// truncated to integer microseconds, then the segmenter re-scales
+/// by `9 / 100` — two integer truncations that drift the per-frame
+/// delta between 1919 / 1920 / 1921 ticks on a 1-of-3 cycle. The
+/// muxer's watermark advances by a flat +1920 per push, so without
+/// tolerance every other frame lands "1 tick behind" and gets
+/// dropped — chromecast audio degenerates to a robotic stutter.
+/// 4 ticks (~44 µs) covers the rounding jitter with margin to
+/// spare; anything more genuinely behind is still treated as stale.
+const AUDIO_PTS_TOLERANCE_90K: u64 = 4;
+
 /// Distance (in 90 kHz ticks) by which PCR is biased *behind* PTS so
 /// that `PCR <= first_PTS_in_packet` holds even with rounding. ~2 ms.
 const PCR_PTS_OFFSET: u64 = 200;
@@ -203,10 +217,15 @@ impl MpegTs {
             return Ok(());
         }
         // Drop real audio that's behind where the silent-fallback
-        // has already filled. Keeps the audio PID strictly
-        // monotonic in PTS.
+        // has already filled, but tolerate `AUDIO_PTS_TOLERANCE_90K`
+        // ticks of slack — the encoder's per-frame PTS jitters
+        // ±1 tick around the nominal 1920-tick AAC-LC step (see the
+        // constant's docs). Without tolerance ~2 out of every 3 real
+        // frames get rejected here even on a perfectly healthy
+        // stream, which on the receiver sounds like a robotic
+        // ratcheting stutter.
         if let Some(watermark) = self.audio_pts_90k {
-            if pts_90k < watermark {
+            if pts_90k.saturating_add(AUDIO_PTS_TOLERANCE_90K) < watermark {
                 tracing::debug!(
                     pts_90k,
                     watermark,
@@ -241,8 +260,13 @@ impl MpegTs {
         // Advance the watermark past this frame so any subsequent
         // silent-injection check correctly bypasses the slot we
         // just filled, and any later real-audio frame with the
-        // same or lower PTS is recognised as stale.
-        self.audio_pts_90k = Some(pts_90k.saturating_add(AAC_FRAME_TICKS_90K));
+        // same or lower PTS is recognised as stale. `max` with the
+        // existing watermark guards against rollback when a real
+        // frame was admitted via `AUDIO_PTS_TOLERANCE_90K` after
+        // the silent-fill loop had already advanced past it.
+        let advanced = pts_90k.saturating_add(AAC_FRAME_TICKS_90K);
+        let prev = self.audio_pts_90k.unwrap_or(0);
+        self.audio_pts_90k = Some(advanced.max(prev));
         Ok(())
     }
 
