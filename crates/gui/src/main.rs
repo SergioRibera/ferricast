@@ -7,7 +7,9 @@ use ferricast::ManagerEvent;
 use ferricast::prelude::*;
 use freya::{prelude::*, radio::*};
 use tokio::sync::{Mutex, mpsc};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt,
+};
 use uuid::Uuid;
 
 use crate::app::ReceiverWindowReq;
@@ -360,14 +362,97 @@ async fn run_client(cmd: Command) -> anyhow::Result<()> {
 }
 
 fn init_tracing_for_daemon() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new(
-                "warn,freya=off,freya_core=off,freya_winit=off,ragnarok=off,\
-                 ferricast_chromecast=info,ferricast_encoder=info,ferricast_gui=info",
-            )
-        }))
-        .init();
+    // Shared filter: `RUST_LOG` drives BOTH console and file layers.
+    // Without `RUST_LOG` we fall back to a quiet default suitable for
+    // interactive use.
+    let default_filter = "warn,freya=off,freya_core=off,freya_winit=off,\
+                          ragnarok=off,ferricast_chromecast=info,\
+                          ferricast_encoder=info,ferricast_gui=info";
+    let make_filter = || {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter))
+    };
+
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(make_filter());
+
+    // File path resolution:
+    //   * `FERRICAST_TRACE_LOG=` (empty)     → disable file output
+    //   * `FERRICAST_TRACE_LOG=/path/file`  → explicit path
+    //   * otherwise                          → OS cache dir
+    //       Linux:   $XDG_CACHE_HOME or $HOME/.cache,  + /ferricast/ferricast.log
+    //       macOS:   $HOME/Library/Caches/ferricast/ferricast.log
+    //       Windows: alongside the running executable
+    let file_path: Option<std::path::PathBuf> = match std::env::var("FERRICAST_TRACE_LOG") {
+        Ok(p) if p.is_empty() => None,
+        Ok(p) => Some(std::path::PathBuf::from(p)),
+        Err(_) => default_trace_log_path(),
+    };
+
+    let file_layer = file_path.as_ref().and_then(|path| {
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "ferricast: cannot create trace log dir {}: {e}",
+                parent.display()
+            );
+            return None;
+        }
+        let filename = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "ferricast.log".to_string());
+        let appender = tracing_appender::rolling::never(parent, &filename);
+        let (writer, guard) = tracing_appender::non_blocking(appender);
+        // Leak the guard so the worker thread lives for the whole
+        // process; otherwise it drops at function exit and flushes
+        // stop firing.
+        Box::leak(Box::new(guard));
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_filter(make_filter()),
+        )
+    });
+
+    let registry = tracing_subscriber::registry().with(console_layer);
+    if let Some(file) = file_layer {
+        registry.with(file).init();
+    } else {
+        registry.init();
+    }
+
+    if let Some(p) = file_path {
+        tracing::info!(trace_log = %p.display(), "trace log file enabled");
+    }
+}
+
+/// Default trace-log path per platform. `None` only on platforms
+/// where we couldn't resolve a sensible location.
+fn default_trace_log_path() -> Option<std::path::PathBuf> {
+    let dir = if cfg!(windows) {
+        // Windows: same dir as the running .exe so the log is next to
+        // the binary the user launched.
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))?
+    } else if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME")?;
+        std::path::PathBuf::from(home)
+            .join("Library/Caches/ferricast")
+    } else {
+        // Linux / BSD / other Unix → XDG cache.
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))
+            })?
+            .join("ferricast")
+    };
+    Some(dir.join("ferricast.log"))
 }
 
 fn init_tracing_for_client() {
