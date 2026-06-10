@@ -447,24 +447,24 @@ impl ChromecastSession {
         } else {
             None
         };
-        // Self-signed TLS for the per-session HLS server. CAF 1.56+
-        // (post-2023) rejects plain `http://` URLs on some firmware
-        // even on the LAN; serving HTTPS unconditionally sidesteps
-        // that without breaking older devices, which accept either.
-        // SAN list includes the LAN-side IP we observed during TLS
-        // connect — receivers don't validate but rcgen wants a SAN.
-        let tls = match ferricast_hls::build_self_signed_server_config(&[local_ip]) {
-            Ok(cfg) => Some(cfg),
-            Err(e) => {
-                tracing::warn!(%e, "HLS TLS material failed; falling back to plain HTTP");
-                None
-            }
-        };
+        // HLS over plain HTTP. We *tried* self-signed HTTPS for a
+        // while (commit 7d20a22) on the theory that CAF 1.56+ refused
+        // `http://` URLs even on the LAN, but the Default Media
+        // Receiver runs inside the Chromecast's onboard Chrome and
+        // Chrome's HLS fetch path strictly validates TLS — self-signed
+        // certs get rejected before the playlist is even read, which
+        // surfaces as `LOAD_FAILED` with `detailedErrorCode=None`
+        // (no MEDIA_NETWORK, no decoder error — the load just dies in
+        // the cert-check stage). Field-tested 2026-06: Dormitorio
+        // (md=Chromecast) consistently 0/N over HTTPS, 100% over HTTP.
+        // Newer cast firmwares that genuinely require HTTPS will need
+        // a proper trust path (system root or pre-shared CA the
+        // receiver trusts) — out of scope for ad-hoc local cast.
         let hls_config = HlsConfig {
             inject_silent_audio: requires_audio,
             adaptive: adaptive_for_hls,
             part_target_secs,
-            tls,
+            tls: None,
             ..Default::default()
         };
         let sink = HlsFrameSink::start("0.0.0.0:0", frame_rx, parameter_sets, hls_config).await?;
