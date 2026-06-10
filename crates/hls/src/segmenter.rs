@@ -711,6 +711,18 @@ async fn recv_audio(
 /// the muxer's silent-AAC watermark, which is exactly what we want:
 /// the receiver timeline starts at the first video frame, anything
 /// captured before that is uninteresting.
+///
+/// Frames whose `timestamp_us` is more than `MAX_AUDIO_STALENESS_US`
+/// behind current wall time are dropped before they hit the muxer.
+/// Without this, when any link in the
+/// `PipeWire → AAC encoder → manager tx → session audio_tx`
+/// chain (each 64-deep) gets backlogged by a slow consumer, the
+/// segmenter eventually drains a wad of frames whose PTS lands behind
+/// the muxer's silent-fallback watermark — silent injection has
+/// already advanced past those slots, so they'd be rejected one by
+/// one and clutter the log with `dropping real AAC frame` lines
+/// for the rest of the session. Better to catch them here, log the
+/// staleness once per gap, and keep the trace useful.
 fn push_audio_frame(
     muxer: &mut MpegTs,
     audio: &AudioFrame,
@@ -720,6 +732,20 @@ fn push_audio_frame(
         // First video frame hasn't been seen yet — drop quietly.
         return Ok(());
     };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    let staleness_us = now.saturating_sub(audio.timestamp_us);
+    if staleness_us > MAX_AUDIO_STALENESS_US {
+        debug!(
+            staleness_us,
+            audio_wall = audio.timestamp_us,
+            now_us = now,
+            "segmenter: dropping stale AAC frame (upstream backlog)"
+        );
+        return Ok(());
+    }
     let pts_us = audio.timestamp_us.saturating_sub(anchor);
     let pts_90k = pts_us.saturating_mul(9) / 100;
     trace!(
@@ -732,3 +758,11 @@ fn push_audio_frame(
     );
     muxer.add_audio_frame(audio.data.as_ref(), pts_90k)
 }
+
+/// Maximum age (capture-wall to processing-wall) a real audio frame
+/// is allowed to have. Past this we treat it as backlogged garbage
+/// and drop. 300 ms is comfortable headroom for normal pipeline
+/// jitter (tens of ms) while being well under the muxer's 500 ms
+/// silent-injection lag threshold, so a real frame that survives
+/// this filter is still in the window the muxer will accept.
+const MAX_AUDIO_STALENESS_US: u64 = 300_000;
