@@ -5,9 +5,9 @@ edition = "2024"
 
 [features]
 # Encoder backends, each gated behind its own feature so a build
-# can opt out of any combination. At least one backend MUST be
-# enabled — `lib.rs` emits a `compile_error!` when all three are
-# off, since the H.264 facade has nothing to dispatch to.
+# can opt out of any combination. At least one H.264 backend MUST
+# be enabled — `lib.rs` emits a `compile_error!` when all three
+# are off, since the H.264 facade has nothing to dispatch to.
 #
 # - `openh264` — software fallback, always available at runtime.
 #             The only path with no system-library coupling that
@@ -19,14 +19,18 @@ edition = "2024"
 #             Loads libcuda + libnvidia-encode at runtime; missing
 #             libraries make `probe()` fall through to the next
 #             backend at runtime.
+# - `fdk-aac` — AAC-LC via libfdk-aac. Off → the AAC facade
+#             routes everything to the pure-Rust oxideav-aac
+#             fallback (always compiled in).
 #
 # Disable any one you can't build on a particular host. Typical
 # fix for cros-libva ABI mismatches:
-#   ferricast = { default-features = false, features = ["openh264", "nvenc"] }
-default = ["openh264", "vaapi", "nvenc"]
+#   ferricast = { default-features = false, features = ["openh264", "nvenc", "fdk-aac"] }
+default = ["openh264", "vaapi", "nvenc", "fdk-aac"]
 openh264 = ["dep:openh264"]
 vaapi = ["dep:cros-libva"]
 nvenc = ["dep:shiguredo_nvcodec"]
+fdk-aac = ["dep:fdk-aac"]
 
 # Zero-copy DMA-BUF input on NVENC. Requires a forked
 # `shiguredo_nvcodec` that exposes `Encoder::register_external_dmabuf`
@@ -66,3 +70,19 @@ cros-libva = { git = "https://github.com/SergioRibera/cros-libva", branch = "fix
 # dlopen'd at runtime. Missing libs cause `Encoder::new` to error
 # and the factory falls back through VA-API / openh264.
 shiguredo_nvcodec = { version = "2026.1.0", optional = true }
+
+# AAC-LC encoder via libfdk-aac. Picked over a pure-Rust path
+# because no production-grade AAC encoder exists in Rust and the
+# chromecast HLS pipeline requires AAC-LC inside MPEG-TS. The crate
+# links against the system `libfdk-aac` (`libfdk-aac-dev` on
+# Debian/Ubuntu, `fdk_aac` on Nix); flake.nix lists it under
+# `libraries` so the dev shell has it on the link path.
+#
+# Optional, on by default. Disable with `--no-default-features` to
+# build without libfdk-aac — the runtime falls back to the pure-Rust
+# `oxideav-aac` encoder below. We keep fdk-aac as the preferred path
+# because Fraunhofer's encoder is universally regarded as the
+# reference AAC implementation; oxideav-aac is the fallback for
+# environments where pulling in the C library is impractical.
+fdk-aac = { version = "0.8", optional = true }
+

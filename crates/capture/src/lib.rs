@@ -15,6 +15,8 @@ mod native;
 
 #[cfg(feature = "pipewire")]
 mod pipewire;
+#[cfg(feature = "pipewire")]
+mod pipewire_audio;
 #[cfg(feature = "x11")]
 mod x11;
 #[cfg(feature = "x11")]
@@ -50,6 +52,8 @@ pub use native::NativeCapture;
 
 #[cfg(feature = "pipewire")]
 pub use pipewire::PipeWireCapture;
+#[cfg(feature = "pipewire")]
+pub use pipewire_audio::PipeWireAudioCapture;
 #[cfg(feature = "x11")]
 pub use x11::X11Capture;
 #[cfg(feature = "x11")]

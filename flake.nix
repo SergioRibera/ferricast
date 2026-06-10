@@ -46,6 +46,12 @@
           alsa-lib.dev
 	  xorg.libXcursor
 
+          # Fraunhofer FDK AAC encoder. Used by the audio side of
+          # the streaming pipeline (`crates/encoder/src/aac`) to
+          # produce ADTS-framed AAC-LC for chromecast HLS. Required
+          # to link `fdk-aac-sys` at build time; no runtime hook.
+          fdk_aac
+
           wayland
 
           # gbm + libdrm: DMA-BUF allocation for the wayland-direct

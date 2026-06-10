@@ -101,7 +101,8 @@ pub mod prelude {
     pub use crate::capture::NativeCapture;
     pub use crate::encoder::h264::H264Encoder;
     pub use crate::{
-        CaptureSource, Codec, Device, DeviceCapabilities, FerricastError, ManagerEvent,
-        ProtocolHandler, Result, StreamConfig, StreamManager, StreamManagerBuilder,
+        AudioCodec, AudioMuteHandle, AudioStreamConfig, CaptureSource, Codec, Device,
+        DeviceCapabilities, FerricastError, ManagerEvent, ProtocolHandler, Result, StreamConfig,
+        StreamManager, StreamManagerBuilder,
     };
 }

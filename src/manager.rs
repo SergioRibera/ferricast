@@ -8,14 +8,17 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use ferricast_capture::PipeWireAudioCapture;
 use ferricast_core::{
-    AdvertiseInfo, Advertiser, AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame,
-    CaptureConfig, CaptureSource, CapturedFrame, CastSession, Codec, ControlSession, DecodedAudio,
-    DecoderConfig, Device, Discovery, DiscoveryEvent, EncodedFrame, EncoderConfig, FerricastError,
-    FrameSink, MediaCommand, MediaInfo, MediaPacket, MediaPuller, PixelFormat, PlaybackState,
-    ProtocolHandler, PullSpec, ReceiverProtocol, RemoteSender, Result, ScreenCapture, StreamConfig,
-    VideoDecoder, VideoEncoder,
+    AdvertiseInfo, Advertiser, AudioCapture, AudioCaptureConfig, AudioCodec, AudioDecoder,
+    AudioDecoderConfig, AudioEncoder, AudioEncoderConfig, AudioFrame, AudioSource, CaptureConfig,
+    CaptureSource, CapturedFrame, CastSession, Codec, ControlSession, DecodedAudio, DecoderConfig,
+    Device, Discovery, DiscoveryEvent, EncodedFrame, EncoderConfig, FerricastError, FrameSink,
+    MediaCommand, MediaInfo, MediaPacket, MediaPuller, PixelFormat, PlaybackState, ProtocolHandler,
+    PullSpec, ReceiverProtocol, RemoteSender, Result, ScreenCapture, StreamConfig, VideoDecoder,
+    VideoEncoder,
 };
+use ferricast_encoder::aac::AacEncoder;
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -37,6 +40,7 @@ trait ErasedSession: Send + Sync {
     fn connect<'a>(&'a mut self, device: &'a Device) -> BoxFut<'a, Result<()>>;
     fn setup_stream<'a>(&'a mut self, config: &'a StreamConfig) -> BoxFut<'a, Result<()>>;
     fn send_frame<'a>(&'a mut self, frame: &'a EncodedFrame) -> BoxFut<'a, Result<()>>;
+    fn send_audio_frame<'a>(&'a mut self, frame: &'a AudioFrame) -> BoxFut<'a, Result<()>>;
     fn stop(&mut self) -> BoxFut<'_, Result<()>>;
     fn is_alive(&self) -> bool;
 }
@@ -50,6 +54,9 @@ impl<T: CastSession> ErasedSession for T {
     }
     fn send_frame<'a>(&'a mut self, frame: &'a EncodedFrame) -> BoxFut<'a, Result<()>> {
         Box::pin(CastSession::send_frame(self, frame))
+    }
+    fn send_audio_frame<'a>(&'a mut self, frame: &'a AudioFrame) -> BoxFut<'a, Result<()>> {
+        Box::pin(CastSession::send_audio_frame(self, frame))
     }
     fn stop(&mut self) -> BoxFut<'_, Result<()>> {
         Box::pin(CastSession::stop(self))
@@ -828,10 +835,50 @@ impl StreamManager {
             "adaptive: controller initialised; bandwidth probe will fire after first {} segments",
             ferricast_hls::PROBE_SAMPLES_FOR_DOC,
         );
+        // Hand the receiver session the *clamped* fps + bitrate
+        // (device-cap-aware) rather than the raw values from the UI.
+        // Without this, the HLS segmenter inside the chromecast
+        // session sizes its synthetic PTS counter to the UI's 60 fps
+        // even when we're really only producing 30, and audio
+        // (whose PTS tracks wall clock through the audio capture
+        // path) drifts ahead of video on the receiver.
         let session_config = StreamConfig {
             adaptive: Some(adaptive.clone()),
+            fps: effective_fps,
+            bitrate_kbps: effective_bitrate_kbps,
             ..config.clone()
         };
+
+        // Audio pipeline. Spawned as its own tokio task so PipeWire
+        // audio capture (which blocks on its main loop thread) and
+        // AAC encoding don't share the supervisor's hot path with
+        // video. The task pushes encoded AAC frames into
+        // `audio_frame_rx`; the supervisor then forwards them via
+        // `session.send_audio_frame`. Aborted on stream stop.
+        //
+        // When `config.audio` is `None` (caller didn't opt in), we
+        // skip the whole thing — the chromecast HLS pipeline falls
+        // back to the silent-AAC injection for receivers that
+        // require it.
+        let (audio_task, audio_frame_rx, audio_mute) = match config.audio.clone() {
+            Some(audio_cfg) => {
+                let (tx, rx) = mpsc::channel::<AudioFrame>(64);
+                let mute = audio_cfg.mute.clone();
+                let mute_for_task = mute.clone();
+                let task = tokio::spawn(async move {
+                    if let Err(e) =
+                        run_audio_pipeline(audio_cfg, mute_for_task, tx).await
+                    {
+                        tracing::error!(%e, "audio pipeline exited with error");
+                    } else {
+                        tracing::info!("audio pipeline exited cleanly");
+                    }
+                });
+                (Some(task), Some(rx), Some(mute))
+            }
+            None => (None, None, None),
+        };
+        let _ = audio_mute; // surfaced separately when UI mute API lands
 
         let mut session = (proto.create_session)()?;
         session.connect(&device).await?;
@@ -847,8 +894,12 @@ impl StreamManager {
         let event_tx = self.event_tx.clone();
         let device_name = device.name.clone();
         let did = device.id;
-
+        // Task captures the device by move (the reconnect supervisor
+        // hands `&device_clone` to `s.connect`), and `ActiveStream`
+        // below also needs the original — clone once before the spawn.
         let device_clone = device.clone();
+        let mut audio_frame_rx = audio_frame_rx;
+        let audio_task_handle = audio_task;
 
         let task = tokio::spawn(async move {
             let _ = event_tx
@@ -1030,6 +1081,28 @@ impl StreamManager {
                             let _ = session.stop().await;
                             break 'supervisor;
                         }
+                        audio = recv_audio_frame(&mut audio_frame_rx), if audio_frame_rx.is_some() => {
+                            match audio {
+                                Some(af) => {
+                                    if let Err(e) = session.send_audio_frame(&af).await {
+                                        // Audio errors do NOT kill
+                                        // the stream — video is the
+                                        // primary content. Log and
+                                        // keep going.
+                                        tracing::warn!(%e, "send_audio_frame failed");
+                                    }
+                                }
+                                None => {
+                                    // Audio pipeline exited (clean
+                                    // EOF or fatal error inside the
+                                    // task). Drop the receiver so the
+                                    // `if audio_frame_rx.is_some()`
+                                    // guard disables this arm and
+                                    // the supervisor stops polling.
+                                    audio_frame_rx = None;
+                                }
+                            }
+                        }
                         frame_result = async {
                             if let Some(f) = seed.take() {
                                 last_frame = Some(f.clone());
@@ -1123,6 +1196,15 @@ impl StreamManager {
             }
 
             let _ = capture.stop().await;
+            // Tear the audio task down alongside the video pipeline
+            // so the PipeWire audio thread and AAC encoder don't
+            // outlive the stream. Aborting is safe — the task
+            // doesn't hold any externally-visible resources besides
+            // its own PipeWire loop, which is cleaned up by the
+            // capture's Drop.
+            if let Some(h) = &audio_task_handle {
+                h.abort();
+            }
             active_streams.lock().await.remove(&did);
             // Surface a final error if the supervisor gave up.
             // `StreamStopped` is always emitted afterwards so the
@@ -1598,4 +1680,98 @@ impl StreamManagerBuilder {
             .expect("freshly built manager always has its event_rx");
         (self.manager, rx)
     }
+}
+
+/// Helper for the supervisor's `tokio::select!` arm reading from
+/// the optional audio frame channel. `select!` can't dispatch on an
+/// `Option<&mut Receiver<_>>` directly, so we resolve it here:
+/// returns `None` when no receiver is wired (the arm's `if` guard
+/// disables it anyway, but we keep the future well-formed).
+async fn recv_audio_frame(
+    chan: &mut Option<mpsc::Receiver<AudioFrame>>,
+) -> Option<AudioFrame> {
+    match chan {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Run the PipeWire audio capture → AAC encoder pipeline forever.
+/// Lives in its own task so the blocking PipeWire main-loop thread
+/// doesn't interfere with the supervisor's video hot path.
+///
+/// The encoder is configured with the same sample rate / channel
+/// layout PipeWire negotiated, so resampling is the audio graph's
+/// job (not ours). Encoded AAC frames go out through `tx`; dropping
+/// the supervisor's receiver makes `tx.send` fail and we exit
+/// cleanly.
+async fn run_audio_pipeline(
+    audio_cfg: ferricast_core::AudioStreamConfig,
+    mute: ferricast_core::AudioMuteHandle,
+    tx: mpsc::Sender<AudioFrame>,
+) -> Result<()> {
+    let mut capture = PipeWireAudioCapture::new();
+    let cap_cfg = AudioCaptureConfig {
+        sample_rate: audio_cfg.sample_rate,
+        channels: audio_cfg.channels,
+    };
+    capture
+        .start(AudioSource::DefaultMonitor, cap_cfg, mute)
+        .await?;
+    tracing::info!(
+        requested_sample_rate = audio_cfg.sample_rate,
+        requested_channels = audio_cfg.channels,
+        bitrate_kbps = audio_cfg.bitrate_kbps,
+        "audio capture started; encoder will be configured on first PCM chunk"
+    );
+
+    // Lazy AAC encoder construction: the encoder is configured the
+    // first time PCM arrives, using whatever rate / channels
+    // PipeWire actually negotiated. Without this, a sink that
+    // delivers samples at, say, 44.1 kHz against our 48 kHz
+    // request would have us writing AAC frames with the wrong
+    // ADTS sample-rate index, and the chromecast would play
+    // them at the wrong pitch ("audio raro" / "mal procesado"
+    // even though the bitstream itself parses fine).
+    let mut encoder = AacEncoder::new();
+    let mut encoder_configured = false;
+
+    loop {
+        let pcm = match capture.next_frame().await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(%e, "audio capture next_frame failed; stopping pipeline");
+                break;
+            }
+        };
+        if !encoder_configured {
+            encoder.configure(&AudioEncoderConfig {
+                codec: audio_cfg.codec,
+                sample_rate: pcm.sample_rate,
+                channels: pcm.channels,
+                bitrate_kbps: audio_cfg.bitrate_kbps,
+            })?;
+            tracing::info!(
+                sample_rate = pcm.sample_rate,
+                channels = pcm.channels,
+                bitrate_kbps = audio_cfg.bitrate_kbps,
+                "AAC encoder configured against PipeWire's negotiated format"
+            );
+            encoder_configured = true;
+        }
+        if let Err(e) = encoder.encode(&pcm) {
+            tracing::warn!(%e, "AAC encode failed; dropping audio chunk");
+            continue;
+        }
+        for aac in encoder.take_output() {
+            if tx.send(aac).await.is_err() {
+                tracing::info!("audio supervisor dropped receiver; exiting pipeline");
+                let _ = capture.stop().await;
+                return Ok(());
+            }
+        }
+    }
+
+    let _ = capture.stop().await;
+    Ok(())
 }

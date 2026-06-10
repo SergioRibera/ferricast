@@ -385,7 +385,27 @@ impl ManagerService {
         let m = self.manager.lock().await;
         let capture = NativeCapture::new();
         let encoder = H264Encoder::default();
-        let config = StreamConfig::default();
+        let config = if source.audio() {
+            // D-Bus client opted into audio capture. Same defaults
+            // as the in-process picker path (48 kHz stereo AAC-LC
+            // @ 128 kbps). Mute handle dropped — no D-Bus method
+            // to toggle it yet; expose one when the GUI gains a
+            // mute control.
+            let mute = AudioMuteHandle::default();
+            let audio_cfg = AudioStreamConfig {
+                codec: AudioCodec::Aac,
+                sample_rate: 48_000,
+                channels: 2,
+                bitrate_kbps: 128,
+                mute: mute.clone(),
+            };
+            StreamConfig {
+                audio: Some(audio_cfg),
+                ..StreamConfig::default()
+            }
+        } else {
+            StreamConfig::default()
+        };
         m.start_stream(id, cap_source, capture, encoder, config)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;

@@ -69,6 +69,35 @@ const SILENT_AAC_FRAME: [u8; 13] = [
 /// In MPEG-TS 90 kHz ticks: 1024 × (90000 / 48000) = 1920.
 const AAC_FRAME_TICKS_90K: u64 = 1920;
 
+/// How far behind the current video PTS the audio elementary stream
+/// is allowed to drift before the muxer starts plugging the gap
+/// with silent AAC frames. 45 000 ticks = ~500 ms.
+///
+/// External-audio mode (real PipeWire-captured AAC pushed via
+/// [`MpegTs::add_audio_frame`]) leaves the audio PID alive only as
+/// long as the upstream actually delivers frames. When the system
+/// audio source goes idle (paused media, suspended sink) PipeWire
+/// stops emitting buffers — the encoder produces nothing, the
+/// segmenter pushes nothing, and the PID's elementary stream goes
+/// silent in the literal "no packets at all" sense. The chromecast
+/// (and any receiver that pre-buffers audio before letting video
+/// play) interprets that as "stream loading" and freezes on the
+/// last-seen video frame. Filling the gap with silent ADTS frames
+/// keeps the PID alive and lets the receiver progress.
+///
+/// 500 ms is generous enough that brief gaps in real audio (encoder
+/// warmup, segment-close stalls, a system audio cue between two
+/// captured sounds) don't cause silent insertions that would then
+/// collide with the real audio about to arrive — but short enough
+/// that the receiver never enters its starvation timeout.
+const SILENT_INJECT_LAG_90K: u64 = 45_000;
+
+/// Hard cap on silent frames emitted per `add_frame` (video) call.
+/// Past this we're already 8 × 21 ms = 170 ms ahead of where we
+/// started; further injection wouldn't unstick anything and could
+/// flood the TS body with silence on a one-off video-pts jump.
+const SILENT_INJECT_MAX_PER_FRAME: u32 = 8;
+
 /// Distance (in 90 kHz ticks) by which PCR is biased *behind* PTS so
 /// that `PCR <= first_PTS_in_packet` holds even with rounding. ~2 ms.
 const PCR_PTS_OFFSET: u64 = 200;
@@ -101,12 +130,23 @@ pub struct MpegTs {
     /// flips this on when the target device's
     /// `DeviceCapabilities::requires_audio` is true.
     inject_silent_audio: bool,
-    /// Next audio PTS to emit, in 90 kHz ticks. Advances by
-    /// `AAC_FRAME_TICKS_90K` for each silent AAC frame inserted.
-    /// `None` until the first video frame has anchored the timeline;
-    /// after that the audio side is kept caught up to (slightly
-    /// behind) the video PTS so the receiver sees both streams
-    /// progressing in lockstep.
+    /// When `true`, the muxer expects external audio frames to be
+    /// pushed via [`Self::add_audio_frame`] and advertises the audio
+    /// PID in the PMT. This takes precedence over
+    /// `inject_silent_audio`: when both are set, the external audio
+    /// path wins and silence injection is suppressed (the live
+    /// stream is the source of truth).
+    has_external_audio: bool,
+    /// Shared watermark for the audio elementary stream's PTS.
+    /// `add_audio_frame` (real audio) advances it past each pushed
+    /// frame; the silent-fallback loop inside `add_frame` (video)
+    /// advances it for each silent ADTS frame it injects to bridge
+    /// a gap. Either path consults it: silent injection only fires
+    /// when the watermark trails the current video PTS by more
+    /// than `SILENT_INJECT_LAG_90K`, and real audio whose PTS is
+    /// behind the watermark is dropped (a silent frame already
+    /// occupies that slot). `None` until the first video frame
+    /// initialises it.
     audio_pts_90k: Option<u64>,
     out: Vec<u8>,
 }
@@ -121,6 +161,96 @@ impl MpegTs {
     pub fn with_silent_audio(mut self, inject: bool) -> Self {
         self.inject_silent_audio = inject;
         self
+    }
+
+    /// Switch the muxer into "external audio" mode: advertise the
+    /// audio PID in the PMT and stop injecting silence. The caller
+    /// is then expected to push every audio frame via
+    /// [`Self::add_audio_frame`]. Used by the chromecast HLS
+    /// pipeline when the user opted into real-audio capture
+    /// (`StreamConfig::audio = Some(_)`).
+    pub fn with_external_audio(mut self, enable: bool) -> Self {
+        self.has_external_audio = enable;
+        self
+    }
+
+    /// Append one already-encoded audio access unit (today: ADTS-
+    /// framed AAC-LC) with its 90 kHz PTS. The muxer takes care of
+    /// PES packetisation, audio-PID continuity-counter bookkeeping
+    /// and 188-byte TS framing.
+    ///
+    /// Returns `Err` if the muxer wasn't put into external-audio
+    /// mode via [`Self::with_external_audio`].
+    ///
+    /// Audio whose PTS is *behind* the muxer's silent-injection
+    /// watermark (`audio_pts_90k`) is dropped silently: the silent
+    /// fallback has already filled that slot, and pushing the real
+    /// frame anyway would create out-of-order PTS on the audio PID
+    /// that some receivers fail to splice. This only fires when
+    /// the upstream lagged the lag-threshold; in normal flow real
+    /// audio's PTS always stays ahead of the watermark.
+    pub fn add_audio_frame(
+        &mut self,
+        payload: &[u8],
+        pts_90k: u64,
+    ) -> Result<(), FerricastError> {
+        if !self.has_external_audio {
+            return Err(FerricastError::Encoder(
+                "MpegTs::add_audio_frame called without with_external_audio(true)".into(),
+            ));
+        }
+        if payload.is_empty() {
+            return Ok(());
+        }
+        // Drop real audio that's behind where the silent-fallback
+        // has already filled. Keeps the audio PID strictly
+        // monotonic in PTS.
+        if let Some(watermark) = self.audio_pts_90k {
+            if pts_90k < watermark {
+                tracing::debug!(
+                    pts_90k,
+                    watermark,
+                    behind_90k = watermark - pts_90k,
+                    "muxer: dropping real AAC frame behind silent watermark"
+                );
+                return Ok(());
+            }
+        }
+        // PSI must still appear first if no video has shown up yet
+        // (rare for the live screencast pipeline: audio anchors at
+        // about the same wall-clock instant as the first IDR, but
+        // a few audio chunks may arrive *just* before it). Emitting
+        // PAT/PMT here on demand keeps the segment self-contained.
+        if !self.psi_emitted {
+            self.emit_pat();
+            self.emit_pmt();
+            self.psi_emitted = true;
+        }
+        let pes = build_audio_pes(payload, pts_90k);
+        // PCR stays exclusive to PID_VIDEO (the PMT's declared
+        // `PCR_PID`). Emitting PCR on the audio PID confuses the
+        // receiver's STC PLL and produces glitchy A/V on chromecast.
+        write_pes_to_ts(
+            &mut self.out,
+            PID_AUDIO,
+            &mut self.cc_audio,
+            &pes,
+            /* random_access_indicator */ false,
+            None,
+        );
+        // Advance the watermark past this frame so any subsequent
+        // silent-injection check correctly bypasses the slot we
+        // just filled, and any later real-audio frame with the
+        // same or lower PTS is recognised as stale.
+        self.audio_pts_90k = Some(pts_90k.saturating_add(AAC_FRAME_TICKS_90K));
+        Ok(())
+    }
+
+    /// True when the muxer is currently advertising an audio PID.
+    /// Used by the HLS segmenter to decide whether silent-AAC
+    /// injection should be suppressed.
+    pub fn audio_advertised(&self) -> bool {
+        self.inject_silent_audio || self.has_external_audio
     }
 }
 
@@ -165,39 +295,73 @@ impl Muxer for MpegTs {
             &mut self.cc_video,
             &pes,
             frame.is_keyframe,
-            pcr,
+            Some(pcr),
         );
 
-        // Catch the audio side up to (just behind) the video PTS,
-        // but only when this muxer instance was configured to inject
-        // a silent audio track. The chromecast HLS pipeline turns
-        // this on for `requires_audio` receivers (1st/2nd gen
-        // Chromecast) and leaves it off everywhere else.
-        if self.inject_silent_audio {
-            let mut apts = self.audio_pts_90k.unwrap_or(pts_90k);
-            let mut frames_emitted = 0;
-            while apts <= pts_90k {
-                let aac_pes = build_audio_pes(&SILENT_AAC_FRAME, apts);
-                write_pes_to_ts(
-                    &mut self.out,
-                    PID_AUDIO,
-                    &mut self.cc_audio,
-                    &aac_pes,
-                    /* keyframe (random_access_indicator) */ false,
-                    pcr,
-                );
-                apts = apts.saturating_add(AAC_FRAME_TICKS_90K);
-                frames_emitted += 1;
-                // Safety cap: at most ~4 frames per video frame
-                // (≈ 85 ms of audio) — anything beyond that means
-                // the video PTS jumped non-monotonically and we'd
-                // rather not flood the TS with thousands of resync
-                // frames.
-                if frames_emitted >= 4 {
-                    break;
+        // Silent-AAC fallback. Runs whenever the audio PID is
+        // advertised (either old-Chromecast silent-only mode OR
+        // external-audio mode) and the audio elementary stream has
+        // drifted more than `SILENT_INJECT_LAG_90K` (~500 ms) behind
+        // the video PTS we just emitted.
+        //
+        // Why coexist with external audio: when the user's system
+        // audio source goes idle (paused media, suspended sink),
+        // PipeWire stops delivering monitor buffers → encoder
+        // produces no AAC → muxer's `add_audio_frame` never gets
+        // called → the audio PID in the segment is *advertised but
+        // empty*. The chromecast (and most receivers that prebuffer
+        // audio before starting video playback) interpret that as
+        // "loading" and freeze on the last-seen video frame. Filling
+        // the gap with silent ADTS frames keeps the PID alive.
+        //
+        // The 500 ms lag threshold is intentional: real audio coming
+        // through gets a comfortable window to land before the
+        // muxer starts plugging slots silent, so we don't end up
+        // emitting silent right next to real audio with adjacent
+        // PTSes. `audio_pts_90k` is the shared watermark — both
+        // `add_audio_frame` and this loop advance it, so the
+        // two paths never collide.
+        let _ = pcr; // pcr binding kept alive for video write above
+        if self.inject_silent_audio || self.has_external_audio {
+            let lag_threshold = pts_90k.saturating_sub(SILENT_INJECT_LAG_90K);
+            let start_apts = self
+                .audio_pts_90k
+                .unwrap_or(lag_threshold);
+            if start_apts < lag_threshold {
+                let mut apts = start_apts;
+                let mut frames_emitted = 0u32;
+                while apts < lag_threshold
+                    && frames_emitted < SILENT_INJECT_MAX_PER_FRAME
+                {
+                    let aac_pes = build_audio_pes(&SILENT_AAC_FRAME, apts);
+                    write_pes_to_ts(
+                        &mut self.out,
+                        PID_AUDIO,
+                        &mut self.cc_audio,
+                        &aac_pes,
+                        /* random_access_indicator */ false,
+                        None,
+                    );
+                    apts = apts.saturating_add(AAC_FRAME_TICKS_90K);
+                    frames_emitted += 1;
                 }
+                if frames_emitted > 0 {
+                    tracing::debug!(
+                        frames_emitted,
+                        from_pts_90k = start_apts,
+                        to_pts_90k = apts,
+                        video_pts_90k = pts_90k,
+                        "muxer: injected silent AAC to bridge audio gap"
+                    );
+                }
+                self.audio_pts_90k = Some(apts);
+            } else if self.audio_pts_90k.is_none() {
+                // Anchor the watermark even when no silent fill
+                // happens this frame — keeps the first real audio
+                // arrival from accidentally fighting an unset
+                // counter.
+                self.audio_pts_90k = Some(start_apts);
             }
-            self.audio_pts_90k = Some(apts);
         }
 
         Ok(())
@@ -227,7 +391,12 @@ impl MpegTs {
     }
 
     fn emit_pmt(&mut self) {
-        let section = build_pmt_section(self.inject_silent_audio);
+        // PMT advertises audio whenever EITHER silent injection or
+        // external-audio mode is on — both share the same PID and
+        // both produce AAC ADTS bytes, so the receiver doesn't need
+        // to distinguish.
+        let with_audio = self.inject_silent_audio || self.has_external_audio;
+        let section = build_pmt_section(with_audio);
         write_psi_packet(&mut self.out, PID_PMT, &mut self.cc_pmt, &section);
     }
 }
@@ -410,22 +579,35 @@ fn write_psi_packet(out: &mut Vec<u8>, pid: u16, cc: &mut u8, section: &[u8]) {
 
 /// Split a PES packet across as many 188-byte TS packets as needed.
 ///
+/// `pcr_90k` controls whether the first packet carries a Program
+/// Clock Reference in its adaptation field. The PMT declares
+/// `PCR_PID = PID_VIDEO`, so only the video PID must call this with
+/// `Some(pcr)`; audio (and any other elementary stream) passes
+/// `None` to keep PCR exclusive to the video timeline. Without this
+/// gate, both PIDs emit PCRs at different rates and the receiver's
+/// STC PLL (which uses `PCR_PID` to lock its system-time clock) gets
+/// confused by the extra PCRs on a non-PCR PID — manifesting as
+/// glitchy audio + stuttering video on chromecast even though every
+/// frame's PTS is correct in isolation.
+///
 /// Layout:
-/// * **First packet**: PUSI=1, AFC=11, adaptation field carrying PCR
-///   (and `random_access_indicator=1` for keyframes). Stuffing keeps
-///   the packet at exactly 188 bytes when the PES is small.
+/// * **First packet**: PUSI=1. AF carries PCR (video) or RAI-only
+///   (keyframe without PCR) or no AF / stuffing AF (audio, no PCR).
+///   Stuffing keeps the packet at exactly 188 bytes when the PES is
+///   small.
 /// * **Middle packets**: AFC=01, full 184-byte payload.
-/// * **Last packet**: AFC=11 with a stuffing-only adaptation field if
-///   the remaining payload doesn't fill 184 bytes; otherwise AFC=01
-///   like a middle packet.
+/// * **Last packet**: stuffing-only adaptation field if the
+///   remaining payload doesn't fill 184 bytes; otherwise full
+///   payload like a middle packet.
 fn write_pes_to_ts(
     out: &mut Vec<u8>,
     pid: u16,
     cc: &mut u8,
     pes: &[u8],
     keyframe: bool,
-    pcr_90k: u64,
+    pcr_90k: Option<u64>,
 ) {
+    const PAYLOAD_SPACE_NO_AF: usize = TS_PACKET_SIZE - 4; // 184
     let mut offset = 0usize;
     let mut first = true;
 
@@ -440,41 +622,82 @@ fn write_pes_to_ts(
         out.push(hdr1);
         out.push((pid & 0xFF) as u8);
         let afc_cc_pos = out.len();
-        out.push(0); // patched once we know AFC
+        out.push(0); // afc + cc patched below
 
         let remaining = pes.len() - offset;
         let payload_len: usize;
         let af_present: bool;
 
-        if first {
-            // Adaptation field carries the PCR + RAI. Minimum AF body
-            // = flags(1) + PCR(6) = 7 bytes.
-            const AF_BODY_MIN: usize = 7;
-            const MAX_PAYLOAD: usize = TS_PACKET_SIZE - 4 /*hdr*/ - 1 /*af_len*/ - AF_BODY_MIN;
-            let want = remaining.min(MAX_PAYLOAD);
-            let stuffing = MAX_PAYLOAD - want;
-            let af_len = AF_BODY_MIN + stuffing;
+        // Decide what the first packet's adaptation field needs:
+        // * PCR (video PID only) → 6-byte PCR field, flags byte.
+        //   Optional RAI flag piggybacks on the same flags byte.
+        // * RAI without PCR (rare: audio keyframe-equivalent — we
+        //   don't surface that for AAC today, so this branch is
+        //   defensive) → 1-byte flags only.
+        // * Neither → no AF unless we need stuffing to round the
+        //   packet out to 188 bytes.
+        let first_af_body = if first {
+            if pcr_90k.is_some() {
+                7 // flags(1) + PCR(6)
+            } else if keyframe {
+                1 // flags(1)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        if first && first_af_body > 0 {
+            // First packet with PCR and/or RAI in the AF.
+            let max_payload = PAYLOAD_SPACE_NO_AF - 1 /*af_len byte*/ - first_af_body;
+            let want = remaining.min(max_payload);
+            let stuffing = max_payload - want;
+            let af_len = first_af_body + stuffing;
             out.push(af_len as u8);
             let mut flags = 0u8;
             if keyframe {
                 flags |= 0x40; // random_access_indicator
             }
-            flags |= 0x10; // PCR_flag
+            if pcr_90k.is_some() {
+                flags |= 0x10; // PCR_flag
+            }
             out.push(flags);
-            out.extend_from_slice(&encode_pcr(pcr_90k));
+            if let Some(pcr) = pcr_90k {
+                out.extend_from_slice(&encode_pcr(pcr));
+            }
             for _ in 0..stuffing {
                 out.push(0xFF);
             }
             payload_len = want;
             af_present = true;
-        } else if remaining < TS_PACKET_SIZE - 4 {
-            // Last packet: stuff to fill 188 bytes.
-            const SPACE: usize = TS_PACKET_SIZE - 4;
-            let af_total = SPACE - remaining; // bytes including af_len byte
+        } else if first && remaining >= PAYLOAD_SPACE_NO_AF {
+            // First packet, no PCR / RAI, payload fills the slot —
+            // ship it without an adaptation field.
+            payload_len = PAYLOAD_SPACE_NO_AF;
+            af_present = false;
+        } else if first {
+            // First-and-only packet of a small PES (≤ 183 bytes,
+            // no PCR/RAI) — pad with a stuffing-only AF so the TS
+            // packet still hits 188 bytes.
+            let af_total = PAYLOAD_SPACE_NO_AF - remaining; // includes af_len byte
             let af_len = af_total - 1;
             out.push(af_len as u8);
             if af_len >= 1 {
-                out.push(0); // flags = 0 (no PCR, no RAI)
+                out.push(0); // flags = 0
+                for _ in 0..(af_len - 1) {
+                    out.push(0xFF);
+                }
+            }
+            payload_len = remaining;
+            af_present = true;
+        } else if remaining < PAYLOAD_SPACE_NO_AF {
+            // Last packet: stuff to fill 188 bytes.
+            let af_total = PAYLOAD_SPACE_NO_AF - remaining;
+            let af_len = af_total - 1;
+            out.push(af_len as u8);
+            if af_len >= 1 {
+                out.push(0);
                 for _ in 0..(af_len - 1) {
                     out.push(0xFF);
                 }
@@ -482,7 +705,8 @@ fn write_pes_to_ts(
             payload_len = remaining;
             af_present = true;
         } else {
-            payload_len = TS_PACKET_SIZE - 4;
+            // Middle packet, full payload, no AF.
+            payload_len = PAYLOAD_SPACE_NO_AF;
             af_present = false;
         }
 
@@ -574,7 +798,7 @@ mod tests {
         let mut cc = 0;
         // 5000 bytes — forces multiple TS packets.
         let pes = build_pes(&vec![0xAB; 5000], 90_000, 90_000);
-        write_pes_to_ts(&mut out, PID_VIDEO, &mut cc, &pes, true, 89_800);
+        write_pes_to_ts(&mut out, PID_VIDEO, &mut cc, &pes, true, Some(89_800));
         assert!(!out.is_empty());
         assert_eq!(out.len() % TS_PACKET_SIZE, 0);
         for i in (0..out.len()).step_by(TS_PACKET_SIZE) {
@@ -587,7 +811,48 @@ mod tests {
         let mut out = Vec::new();
         let mut cc = 0;
         let pes = build_pes(&[0x01, 0x02, 0x03], 0, 0);
-        write_pes_to_ts(&mut out, PID_VIDEO, &mut cc, &pes, true, 0);
+        write_pes_to_ts(&mut out, PID_VIDEO, &mut cc, &pes, true, Some(0));
         assert_eq!(out.len(), TS_PACKET_SIZE);
+    }
+
+    #[test]
+    fn audio_pes_carries_no_pcr() {
+        // First TS packet of an audio PES (PCR=None) must NOT set
+        // the PCR_flag bit in its adaptation field, regardless of
+        // whether stuffing forces an AF to exist.
+        let mut out = Vec::new();
+        let mut cc = 0;
+        let pes = build_audio_pes(&[0x55; 32], 90_000);
+        write_pes_to_ts(&mut out, PID_AUDIO, &mut cc, &pes, false, None);
+        assert_eq!(out.len(), TS_PACKET_SIZE);
+        let afc = (out[3] >> 4) & 0b11;
+        // AF expected (the PES is short, so stuffing AF runs).
+        assert!(afc == 0b11 || afc == 0b10, "afc={afc}");
+        if afc == 0b11 || afc == 0b10 {
+            let af_len = out[4] as usize;
+            if af_len >= 1 {
+                let flags = out[5];
+                assert_eq!(
+                    flags & 0x10, 0,
+                    "audio PES first packet must NOT set PCR_flag"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn audio_keyframe_emits_rai_without_pcr() {
+        // Defensive: when audio is marked random_access with no
+        // PCR, the AF should set RAI=1 but PCR_flag=0.
+        let mut out = Vec::new();
+        let mut cc = 0;
+        let pes = build_audio_pes(&[0xAA; 64], 90_000);
+        write_pes_to_ts(&mut out, PID_AUDIO, &mut cc, &pes, true, None);
+        assert_eq!(out.len(), TS_PACKET_SIZE);
+        let afc = (out[3] >> 4) & 0b11;
+        assert!(afc == 0b11 || afc == 0b10);
+        let flags = out[5];
+        assert_eq!(flags & 0x40, 0x40, "RAI should be set");
+        assert_eq!(flags & 0x10, 0, "PCR_flag must remain clear");
     }
 }

@@ -131,20 +131,32 @@ async fn start_stream_with_dto(
 ) -> Result<()> {
     let cap_source = dto_to_capture_source(&source);
     let audio = source.audio();
-    if audio {
-        // The picker collected an audio preference, but the
-        // `StreamManager` doesn't have an audio-capture path wired
-        // through yet — log it loudly so the user can see the flag
-        // arrived end-to-end and we don't quietly drop the choice.
-        tracing::info!(
-            ?device_id,
-            "picker requested audio, but StreamManager has no audio pipeline yet — flag stored, no audio captured"
-        );
-    }
     let sm = stream_manager.lock().await;
     let capture = NativeCapture::new();
     let encoder = H264Encoder::default();
-    let config = StreamConfig::default();
+    let config = if audio {
+        // Opt the new stream into PipeWire audio capture
+        // (default sink monitor → AAC-LC, 48 kHz stereo @ 128 kbps).
+        // The mute handle is dropped here for now — once the UI
+        // grows a mute toggle the handle needs to be threaded back
+        // out into AppState. The manager keeps its own clone for
+        // the lifetime of the audio task, so dropping ours doesn't
+        // disable capture.
+        let mute = AudioMuteHandle::default();
+        let audio_cfg = AudioStreamConfig {
+            codec: AudioCodec::Aac,
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate_kbps: 128,
+            mute: mute.clone(),
+        };
+        StreamConfig {
+            audio: Some(audio_cfg),
+            ..StreamConfig::default()
+        }
+    } else {
+        StreamConfig::default()
+    };
     sm.start_stream(device_id, cap_source, capture, encoder, config)
         .await
 }

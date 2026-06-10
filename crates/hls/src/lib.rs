@@ -46,7 +46,9 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, trace};
 
-use ferricast_core::{EncodedFrame, FerricastError, Result, ScreenCapture, VideoEncoder};
+use ferricast_core::{
+    AudioFrame, EncodedFrame, FerricastError, Result, ScreenCapture, VideoEncoder,
+};
 
 pub use ring::SegmentRing;
 pub use tls::build_self_signed_server_config;
@@ -366,6 +368,7 @@ impl HlsFrameSink {
     pub async fn start<A: ToSocketAddrs>(
         addr: A,
         frames: mpsc::Receiver<EncodedFrame>,
+        audio_frames: Option<mpsc::Receiver<AudioFrame>>,
         parameter_sets: Vec<u8>,
         config: HlsConfig,
     ) -> Result<Self> {
@@ -392,6 +395,7 @@ impl HlsFrameSink {
         let segmenter = tokio::spawn(async move {
             if let Err(e) = segmenter::run_from_frames(
                 frames,
+                audio_frames,
                 parameter_sets,
                 segmenter_ring,
                 cfg_for_segmenter,

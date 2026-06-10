@@ -17,7 +17,10 @@ pub mod source;
 
 pub use adaptive::AdaptiveBitrateState;
 pub use advertiser::{AdvertiseInfo, Advertiser, MdnsAdvertiser};
-pub use capture::{CaptureConfig, CaptureSource, ScreenCapture, WindowIdentifier};
+pub use capture::{
+    AudioCapture, AudioCaptureConfig, AudioMuteHandle, AudioSource, CaptureConfig, CaptureSource,
+    ScreenCapture, WindowIdentifier,
+};
 pub use control::{
     ControlSession, MediaCommand, PlaybackState, QueueItem, RemoteSender, RepeatMode,
     TrackSelection,
@@ -25,7 +28,7 @@ pub use control::{
 pub use decoder::{AudioDecoder, AudioDecoderConfig, DecodedAudio, DecoderConfig, VideoDecoder};
 pub use device::{Device, DeviceCapabilities, DiscoveryEvent, H264Profile};
 pub use discovery::{Discovery, MdnsDiscovery};
-pub use encoder::{EncoderConfig, VideoEncoder};
+pub use encoder::{AudioEncoder, AudioEncoderConfig, EncoderConfig, VideoEncoder};
 pub use error::{FerricastError, Result};
 pub use frame::{
     AudioCodec, AudioFrame, CapturedFrame, DmaBufImporter, DmaBufPlane, EncodedFrame, GpuFrame,
@@ -34,7 +37,7 @@ pub use frame::{
 pub use net::local_addr_for;
 pub use protocol::{Codec, ProtocolHandler, ReceiverProtocol};
 pub use puller::{AudioStreamInfo, MediaInfo, MediaPacket, MediaPuller, PullSpec, VideoStreamInfo};
-pub use session::{CastSession, StreamConfig};
+pub use session::{AudioStreamConfig, CastSession, StreamConfig};
 pub use sink::FrameSink;
 pub use source::{
     EnumerationCapability, Geometry, MonitorInfo, SourceChange, SourceEnumerator, SourceError,

@@ -27,9 +27,11 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
-use ferricast_core::{CapturedFrame, EncodedFrame, FerricastError, ScreenCapture, VideoEncoder};
+use ferricast_core::{
+    AudioFrame, CapturedFrame, EncodedFrame, FerricastError, ScreenCapture, VideoEncoder,
+};
 use ferricast_muxer::Muxer;
 use ferricast_muxer::mpeg_ts::MpegTs;
 
@@ -348,6 +350,7 @@ fn record_frame_dt(last: &mut Option<Instant>, kind: &'static str) {
 /// live edge and segments expire underneath it.
 pub async fn run_from_frames(
     mut frames: mpsc::Receiver<EncodedFrame>,
+    mut audio_frames: Option<mpsc::Receiver<AudioFrame>>,
     parameter_sets: Vec<u8>,
     ring: Arc<RwLock<SegmentRing>>,
     config: HlsConfig,
@@ -374,8 +377,36 @@ pub async fn run_from_frames(
     let mut effective_frame_period_us: u64 = frame_period_us;
     let mut pending: Option<EncodedFrame> = None;
 
-    let mut muxer = MpegTs::default().with_silent_audio(config.inject_silent_audio);
+    // When real audio is wired in, take over the audio PID from the
+    // silent-injection path. Silent injection used to be necessary
+    // to placate the old chromecast firmware; now that we have real
+    // PCM coming through, that placeholder traffic would collide on
+    // PID_AUDIO with the real PES packets we mux below.
+    let external_audio_enabled = audio_frames.is_some();
+    let mut muxer = MpegTs::default()
+        .with_silent_audio(config.inject_silent_audio && !external_audio_enabled)
+        .with_external_audio(external_audio_enabled);
     muxer.config(parameter_sets.clone())?;
+
+    // First-video anchor: the `(synth_pts_us, wall_ts_us)` pair
+    // latched on the very first video frame we push. Used to
+    // translate audio's capture-clock `timestamp_us` into the
+    // segmenter's synthetic PTS counter:
+    //   audio_synth = synth_anchor + (audio_wall - wall_anchor)
+    //
+    // We anchor on the first frame (not the latest) so audio that
+    // sits in the segmenter's input queue for a while still gets a
+    // PTS reflecting its true capture instant. With `HlsConfig::
+    // target_fps` now propagated from the manager-side `effective_
+    // fps`, the segmenter's synthetic clock advances at the real
+    // wall rate from the start, so this scheme stays sample-accurate
+    // even across many segments. Anchoring on the latest frame —
+    // which we briefly tried — collapses to nonsense the moment
+    // audio gets buffered: `audio_wall - latest_video_wall` goes
+    // negative, the saturating-sub clamps to 0, and several
+    // queued-up AAC frames end up with identical PTS.
+    let mut pts_anchor: Option<(u64, u64)> = None;
+    let mut audio_frames_pushed: u64 = 0;
 
     loop {
         muxer.start_segment();
@@ -383,10 +414,27 @@ pub async fn run_from_frames(
         let first = match pending.take() {
             Some(f) => f,
             None => loop {
-                match frames.recv().await {
-                    Some(f) if f.is_keyframe => break f,
-                    Some(_) => continue,
-                    None => return Ok(()),
+                // Drain audio while we're waiting for the first
+                // keyframe so its channel doesn't backlog. Pre-IDR
+                // audio is dropped because the segmenter hasn't
+                // anchored its timeline yet — the first audio frame
+                // that survives is the one arriving after the first
+                // video frame, which is when we set `pts_anchor`.
+                tokio::select! {
+                    biased;
+                    f = frames.recv() => match f {
+                        Some(f) if f.is_keyframe => break f,
+                        Some(_) => continue,
+                        None => return Ok(()),
+                    },
+                    a = recv_audio(&mut audio_frames), if audio_frames.is_some() => {
+                        // Audio that arrived before the first video
+                        // frame: drop it. The mute / capture path
+                        // keeps pushing frames so the channel never
+                        // closes, and warm-up audio is < 100 ms of
+                        // content.
+                        let _ = a;
+                    }
                 }
             },
         };
@@ -394,7 +442,16 @@ pub async fn run_from_frames(
 
         let started = Instant::now();
         let mut frames_in_segment: u64 = 0;
+        let first_wall_ts = first.timestamp_us;
         push_frame(&mut muxer, &first, pts_us)?;
+        if pts_anchor.is_none() {
+            pts_anchor = Some((pts_us, first_wall_ts));
+            debug!(
+                synth_pts_us = pts_us,
+                wall_ts_us = first_wall_ts,
+                "A/V timeline anchored on first video frame"
+            );
+        }
         pts_us = pts_us.saturating_add(effective_frame_period_us);
         frames_in_segment += 1;
 
@@ -414,21 +471,62 @@ pub async fn run_from_frames(
 
         let mut sender_hung_up = false;
         loop {
-            let encoded = match frames.recv().await {
-                Some(f) => f,
-                None => {
-                    sender_hung_up = true;
-                    break;
+            // Interleave audio and video on the way to the muxer.
+            // `biased`-free select! lets either side win the next
+            // iteration based on arrival order, which keeps the
+            // 21 ms-cadence audio frames closely interleaved with
+            // the ~16 ms-cadence video frames inside the same TS
+            // segment — the receiver's audio decoder fills its
+            // jitter buffer from PID 0x101 without us having to
+            // emit a burst of audio at segment close.
+            let event = tokio::select! {
+                v = frames.recv() => SegEvent::Video(v),
+                a = recv_audio(&mut audio_frames), if audio_frames.is_some() => {
+                    SegEvent::Audio(a)
                 }
             };
 
-            if encoded.is_keyframe && started.elapsed() >= target {
-                pending = Some(encoded);
-                break;
+            match event {
+                SegEvent::Video(None) => {
+                    sender_hung_up = true;
+                    break;
+                }
+                SegEvent::Video(Some(encoded)) => {
+                    if encoded.is_keyframe && started.elapsed() >= target {
+                        pending = Some(encoded);
+                        break;
+                    }
+                    push_frame(&mut muxer, &encoded, pts_us)?;
+                    pts_us = pts_us.saturating_add(effective_frame_period_us);
+                    frames_in_segment += 1;
+                }
+                SegEvent::Audio(None) => {
+                    // Audio side closed mid-stream — likely the
+                    // user disabled the audio capture. Stop trying
+                    // to read it; the rest of the stream is video-
+                    // only. We do *not* clear `has_external_audio`
+                    // on the muxer mid-segment because the PMT for
+                    // this segment was already emitted with the
+                    // audio PID; clearing it would create a PMT
+                    // discontinuity the receiver doesn't expect.
+                    audio_frames = None;
+                    continue;
+                }
+                SegEvent::Audio(Some(audio)) => {
+                    if let Err(e) =
+                        push_audio_frame(&mut muxer, &audio, pts_anchor)
+                    {
+                        warn!(error = %e, "audio PES push failed");
+                    } else {
+                        audio_frames_pushed =
+                            audio_frames_pushed.saturating_add(1);
+                    }
+                    // Audio frames must not trigger LL-HLS part
+                    // flushes on their own — the part target is
+                    // a *time* budget; let video close them.
+                    continue;
+                }
             }
-            push_frame(&mut muxer, &encoded, pts_us)?;
-            pts_us = pts_us.saturating_add(effective_frame_period_us);
-            frames_in_segment += 1;
 
             // LL-HLS: if we've held bytes long enough, flush them as
             // a part. The muxer's continuity counters carry across
@@ -554,4 +652,68 @@ fn push_frame(
     let pts_90k = pts_us.saturating_mul(9) / 100;
     // Baseline H.264 has no B-frames → DTS == PTS.
     muxer.add_frame(encoded, pts_90k, pts_90k)
+}
+
+/// One event the segment inner loop dispatches on.
+enum SegEvent {
+    Video(Option<EncodedFrame>),
+    Audio(Option<AudioFrame>),
+}
+
+/// Helper around `Option<Receiver<AudioFrame>>::recv()` that's
+/// `await`-safe inside a `tokio::select!` arm — the inner `Option`
+/// can't appear inside `select!`'s pattern matcher directly, so we
+/// resolve it here and return `None` when no receiver is wired up.
+async fn recv_audio(
+    chan: &mut Option<mpsc::Receiver<AudioFrame>>,
+) -> Option<AudioFrame> {
+    match chan {
+        Some(rx) => rx.recv().await,
+        // Never resolves — but `select!`'s `, if cond` guard above
+        // makes sure this arm is disabled when the option is `None`,
+        // so the future never actually polls.
+        None => std::future::pending().await,
+    }
+}
+
+/// Translate an audio frame's capture-clock `timestamp_us` into the
+/// segmenter's synthetic PTS timeline and forward to the MPEG-TS
+/// muxer.
+///
+/// PTS uses the **first** video frame as anchor:
+///   `audio_synth = synth_anchor + (audio_wall - wall_anchor)`
+///
+/// With `HlsConfig::target_fps` now sourced from the manager-side
+/// `effective_fps`, the segmenter's synthetic PTS counter advances
+/// at real wall-clock rate from the first frame, so a fixed origin
+/// keeps audio frames at their true capture instants no matter how
+/// long they sat in the input queue.
+///
+/// Audio whose computed PTS lands behind the muxer's silent-fallback
+/// watermark is dropped silently inside `add_audio_frame` — the
+/// muxer is the authoritative gatekeeper, see `audio_pts_90k`'s
+/// docs in `ferricast_muxer::mpeg_ts`.
+fn push_audio_frame(
+    muxer: &mut MpegTs,
+    audio: &AudioFrame,
+    pts_anchor: Option<(u64, u64)>,
+) -> Result<(), FerricastError> {
+    let Some((synth_anchor_us, wall_anchor_us)) = pts_anchor else {
+        // First video frame hasn't been pushed yet — drop quietly.
+        return Ok(());
+    };
+
+    let delta_us = audio.timestamp_us.saturating_sub(wall_anchor_us);
+    let pts_us = synth_anchor_us.saturating_add(delta_us);
+    let pts_90k = pts_us.saturating_mul(9) / 100;
+    trace!(
+        audio_wall = audio.timestamp_us,
+        wall_anchor = wall_anchor_us,
+        synth_anchor = synth_anchor_us,
+        audio_synth_us = pts_us,
+        pts_90k,
+        bytes = audio.data.len(),
+        "audio PES push"
+    );
+    muxer.add_audio_frame(audio.data.as_ref(), pts_90k)
 }

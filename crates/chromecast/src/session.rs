@@ -26,7 +26,8 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use ferricast_core::{
-    CastSession, Codec, Device, EncodedFrame, FerricastError, Result, StreamConfig,
+    AudioCodec, AudioFrame, CastSession, Codec, Device, EncodedFrame, FerricastError, Result,
+    StreamConfig,
 };
 use ferricast_hls::{HlsConfig, HlsFrameSink};
 use tokio::sync::{mpsc, oneshot};
@@ -46,6 +47,16 @@ use crate::wire::{self, SharedWriter};
 /// (file IO, lock contention) doesn't backpressure the encoder, but
 /// small enough to drop frames quickly if the player can't keep up.
 const FRAME_QUEUE_DEPTH: usize = 64;
+
+/// Channel depth for the audio frame side. Each AAC-LC frame is
+/// ~21 ms of audio so a queue of 64 absorbs ~1.36 s of segmenter
+/// backlog before frames start getting dropped — paired with the
+/// `MAX_AUDIO_STALENESS_US` check inside the segmenter, that's
+/// enough headroom to ride out brief HTTP / lock-contention stalls
+/// without bloating the queue to the point where buffered audio
+/// arrives at the muxer with PTS values seconds in the past
+/// (which the chromecast then plays as choppy / wrong-order audio).
+const AUDIO_QUEUE_DEPTH: usize = 64;
 
 /// How often we ping the receiver. The Chromecast disconnects
 /// senders that go silent for ~10 s.
@@ -103,6 +114,12 @@ struct StreamState {
     /// Sender into the HLS segmenter task. Dropping it (via `stop`)
     /// makes the segmenter drain and exit cleanly.
     frame_tx: mpsc::Sender<EncodedFrame>,
+    /// Audio sender, when `StreamConfig::audio` was set in
+    /// `setup_stream`. `None` keeps the segmenter in video-only
+    /// mode (falls back to silent-AAC injection if the receiver
+    /// is a 1st/2nd-gen Chromecast). Dropping it cleanly signals
+    /// EOF to the audio side of the segmenter.
+    audio_tx: Option<mpsc::Sender<AudioFrame>>,
     /// HLS endpoint. Owns the TCP listener + segmenter task; held
     /// solely for its Drop side-effect (cleanup) — the wait+LOAD
     /// task gets its own clone of the readiness future.
@@ -332,6 +349,47 @@ impl CastSession for ChromecastSession {
         Ok(())
     }
 
+    async fn send_audio_frame(&mut self, frame: &AudioFrame) -> Result<()> {
+        if frame.codec != AudioCodec::Aac {
+            return Err(FerricastError::Encoder(format!(
+                "chromecast: expected AAC audio, got {:?}",
+                frame.codec
+            )));
+        }
+        // Audio that arrives before the HLS bootstrap (first video
+        // keyframe) is dropped: the segmenter has no PTS anchor yet
+        // and pushing audio without it would mis-align A/V.
+        let Some(stream) = self.stream.as_mut() else {
+            trace!("dropping pre-bootstrap audio frame");
+            return Ok(());
+        };
+        let Some(audio_tx) = stream.audio_tx.as_ref() else {
+            // Stream was bootstrapped without audio (e.g. the user
+            // didn't enable PipeWire audio capture). Treat as a
+            // silent drop so the manager's audio task can keep
+            // pushing without spamming errors.
+            return Ok(());
+        };
+        match audio_tx.try_send(frame.clone()) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // With AUDIO_QUEUE_DEPTH=256 (~5.4 s), this only
+                // fires when the segmenter is wedged for longer
+                // than one segment-target window — i.e. something
+                // is genuinely wrong (HTTP starvation, ring
+                // RwLock pathologically contended). Surface at
+                // `warn!` so it's visible without `RUST_LOG=trace`.
+                warn!("HLS audio segmenter backlogged 5+ s, dropping AAC frame");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(FerricastError::Streaming(
+                    "HLS audio segmenter channel closed".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn stop(&mut self) -> Result<()> {
         // Drop HLS first so the segmenter sees EOF on its channel
         // before we kill the TLS link.
@@ -424,6 +482,22 @@ impl ChromecastSession {
 
         let (frame_tx, frame_rx) = mpsc::channel::<EncodedFrame>(FRAME_QUEUE_DEPTH);
 
+        // Audio channel — created lazily when `setup_stream` was
+        // handed an `audio` block. Without that, the HLS sink stays
+        // in classic video-only mode (which preserves the silent-
+        // AAC fallback for old Chromecasts).
+        let audio_enabled = self
+            .cfg
+            .as_ref()
+            .map(|c| c.audio.is_some())
+            .unwrap_or(false);
+        let (audio_tx, audio_rx) = if audio_enabled {
+            let (tx, rx) = mpsc::channel::<AudioFrame>(AUDIO_QUEUE_DEPTH);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
         // Bind on every interface but advertise the LAN-side IP we
         // observed during TLS connect — `0.0.0.0` is unroutable.
         // `inject_silent_audio` comes from the device's
@@ -460,14 +534,44 @@ impl ChromecastSession {
         // Newer cast firmwares that genuinely require HTTPS will need
         // a proper trust path (system root or pre-shared CA the
         // receiver trusts) — out of scope for ad-hoc local cast.
+        //
+        // Mirror the manager-negotiated `fps` into the HLS
+        // segmenter so its synthetic PTS counter advances at the
+        // same rate the encoder + capture pipeline is actually
+        // producing frames. Without this, the segmenter's
+        // `target_fps` stays at the `HlsConfig::default` value (60)
+        // even when the chromecast caps to 30, the segmenter's
+        // EMA needs a full segment to re-converge, and during that
+        // window video PTS lags wall — which makes the audio PID
+        // (whose PTS tracks wall directly) drift ahead of video on
+        // the receiver and forces it to stash audio in its jitter
+        // buffer for a few hundred ms. Pinning `target_fps` to the
+        // real value eliminates that startup misalignment entirely.
+        let stream_fps = self
+            .cfg
+            .as_ref()
+            .map(|c| c.fps)
+            .unwrap_or(HlsConfig::default().target_fps);
         let hls_config = HlsConfig {
+            // Silent-AAC injection stays gated on the device flag,
+            // but real audio (`audio_enabled`) overrides it inside
+            // the segmenter so we never end up with both silence
+            // and real samples on the same audio PID.
             inject_silent_audio: requires_audio,
             adaptive: adaptive_for_hls,
             part_target_secs,
             tls: None,
+            target_fps: stream_fps,
             ..Default::default()
         };
-        let sink = HlsFrameSink::start("0.0.0.0:0", frame_rx, parameter_sets, hls_config).await?;
+        let sink = HlsFrameSink::start(
+            "0.0.0.0:0",
+            frame_rx,
+            audio_rx,
+            parameter_sets,
+            hls_config,
+        )
+        .await?;
         let local_addr = sink.local_addr();
         let scheme = sink.scheme();
         let media_url = format!("{scheme}://{}:{}/index.m3u8", local_ip, local_addr.port());
@@ -548,6 +652,7 @@ impl ChromecastSession {
 
         self.stream = Some(StreamState {
             frame_tx,
+            audio_tx,
             _sink: sink,
             load_task,
         });
