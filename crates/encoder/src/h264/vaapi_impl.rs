@@ -441,7 +441,7 @@ fn build_encoder_cfg(
         height_crop,
         fps: cfg.fps.max(1),
         bitrate_bps: (cfg.bitrate_kbps.max(1) as u32).saturating_mul(1000),
-        keyframe_interval: cfg.keyframe_interval.max(1),
+        keyframe_interval: cfg.keyframe_interval_frames(),
         initial_qp: 26,
         level_idc,
     })
