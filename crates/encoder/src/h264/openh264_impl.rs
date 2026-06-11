@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use ferricast_core::{Codec, EncodedFrame, FerricastError, H264Profile, PixelFormat, VideoEncoder};
-use openh264::{OpenH264API, encoder::{BitRate, Encoder, EncoderConfig, FrameType, Profile}, formats::{BgraSliceU8, RgbaSliceU8, YUVBuffer}};
+use openh264::{OpenH264API, encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, Profile, QpRange, VuiConfig}, formats::{BgraSliceU8, RgbaSliceU8, YUVBuffer}};
 
 pub const OPEN_H264_THREADS_VAR: &'static str = "FERRICAST_OPEN_H264_THREADS";
 
@@ -26,18 +26,53 @@ impl VideoEncoder for OpenH264Encoder {
             H264Profile::Main => Profile::Main,
             H264Profile::High => Profile::High,
          };
+
+         let threads = match std::env::var(OPEN_H264_THREADS_VAR).unwrap_or("0".to_string()).as_str() {
+            "0" => { 
+                tracing::info!("OpenH264 Threads: Auto");
+                0 
+            },
+            "1" => {
+                tracing::info!("OpenH264 Threads: Single Threaded");
+                1 
+            },
+            n => {
+                match n.parse::<u16>() {
+                    Ok(num) => {
+                        tracing::info!("OpenH264 Threads: fixed {} threads", num);
+                        num
+                    }
+                    Err(_) => {
+                        tracing::info!("OpenH264 Threads: Unknown Value {}, Fallback to Auto", n);
+                        0
+                    }
+                }
+            }, 
+         };
+         
     
         
          let encoder_config = EncoderConfig::new()
              .profile(profile)
-             .skip_frames(false)
-             .usage_type(openh264::encoder::UsageType::CameraVideoRealTime)
-             
+             .qp(QpRange::new(28, 28))
+             .rate_control_mode(openh264::encoder::RateControlMode::Off)
+             .complexity(openh264::encoder::Complexity::Low)
+             .adaptive_quantization(false)
+             .scene_change_detect(false)
+             .background_detection(false)
+             .max_frame_rate(FrameRate::from_hz(config.fps as f32))
+             .vui(VuiConfig::srgb())              
+             .num_threads(threads)
+             .usage_type(openh264::encoder::UsageType::ScreenContentRealTime) 
              .bitrate(BitRate::from_bps(config.bitrate_kbps * 1000));
+
+
         let mut encoder = Encoder::with_api_config(api, encoder_config).map_err(|e| FerricastError::Encoder(format!("Cannot create openh264 encoder {:?}", e)))?;
         
         let empty_frame = YUVBuffer::new(config.width as usize, config.height as usize);
+
         let encoded = encoder.encode(&empty_frame).map_err(|_| FerricastError::Encoding("Cannot encode empty frame".to_string()))?;
+    
         let data = encoded.to_vec();
 
         let sps_pps = super::utils::extract_sps_pps(&data);
@@ -77,7 +112,11 @@ impl VideoEncoder for OpenH264Encoder {
         };
 
         let encoded = encoder.encode(&yuv_buffer).map_err(|_| FerricastError::Encoding("Cannot encode frame".to_string()))?;
+      
         let data = encoded.to_vec();
+ 
+  
+
 
         let pts = (self.frame_count * 1000) / self.fps;
         self.frame_count += 1;
@@ -86,9 +125,9 @@ impl VideoEncoder for OpenH264Encoder {
         Ok(EncodedFrame {  
             codec: Codec::H264,
             data: Bytes::from(data),
-            timestamp_us: 0,
-            is_keyframe: encoded.frame_type() == FrameType::IDR,
-            duration_us: None, 
+            timestamp_us: (encoded.raw_info().uiTimeStamp as u64) * 1000,
+            is_keyframe: matches!(encoded.frame_type(), FrameType::IDR | FrameType::I),
+            duration_us: Some((10000 / self.fps) as u64), 
             pts_dts: (pts as u64, pts as u64)
         })
         

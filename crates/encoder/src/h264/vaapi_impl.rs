@@ -223,10 +223,8 @@ impl VaapiH264Encoder {
         {
             (VAProfile::VAProfileH264Main, profile::MAIN, 0_u8, true)
         } else {
-            return Err(FerricastError::Encoder(
-                "VA-API: no supported H.264 encode profile (need ConstrainedBaseline or Main)"
-                    .into(),
-            ));
+            tracing::warn!("VA-API: no supported H264 encode profile, fallback to Main");
+            (VAProfile::VAProfileH264Main, profile::MAIN, 0_u8, true)
         };
         info!(?profile, %vendor, "VA-API H.264 encoder selected");
 
