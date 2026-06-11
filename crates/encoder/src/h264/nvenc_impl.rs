@@ -51,6 +51,17 @@ use shiguredo_nvcodec::{
 };
 use tracing::{debug, info};
 
+#[cfg(feature = "nvenc-zero-copy")]
+use std::collections::HashMap;
+#[cfg(feature = "nvenc-zero-copy")]
+use std::os::fd::RawFd;
+#[cfg(feature = "nvenc-zero-copy")]
+use ferricast_core::GpuFrame;
+#[cfg(feature = "nvenc-zero-copy")]
+use shiguredo_nvcodec::RegisteredResource;
+#[cfg(feature = "nvenc-zero-copy")]
+use tracing::warn;
+
 pub struct NvencH264Encoder {
     encoder: NvEncoder,
     cfg: NvencCfg,
@@ -62,6 +73,22 @@ pub struct NvencH264Encoder {
     /// the segmenter can anchor segment boundaries to wall clock
     /// when the capture stalls.
     pending_keyframe: bool,
+    /// `NvEncRegisterResource` is expensive (driver round-trip plus
+    /// `cuExternalMemoryImport`), so we cache the registration
+    /// keyed by `(fd, modifier)`. PipeWire and our wayland-direct
+    /// dmabuf path both reuse fds across frames (buffer pools), so
+    /// the steady-state hit rate is ~100% — only the first frame
+    /// after each pool slot pays the registration cost.
+    ///
+    /// Eviction: on `configure()` (dimension change). Stale fds
+    /// fail registration on next encode and we drop the entry
+    /// implicitly via the soft-fallback path.
+    ///
+    /// Only present when the `nvenc-zero-copy` feature is on —
+    /// requires a forked `shiguredo_nvcodec` that exposes the
+    /// registration methods upstream keeps `pub(crate)`.
+    #[cfg(feature = "nvenc-zero-copy")]
+    dmabuf_cache: HashMap<DmabufKey, RegisteredResource>,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +97,20 @@ struct NvencCfg {
     height: u32,
     fps: u32,
     keyframe_interval: u32,
+}
+
+/// Stable identity of a DMA-BUF for registration caching. We key on
+/// `(fd, modifier)` rather than `fd` alone because some compositors
+/// recycle fd numbers after `close(2)` and a stale `RegisteredResource`
+/// would happily encode garbage.
+#[cfg(feature = "nvenc-zero-copy")]
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct DmabufKey {
+    fd: RawFd,
+    modifier: u64,
+    width: u32,
+    height: u32,
+    stride: u32,
 }
 
 // SAFETY: the underlying `shiguredo_nvcodec::Encoder` holds a CUDA
@@ -204,7 +245,80 @@ impl NvencH264Encoder {
             },
             frame_count: 0,
             pending_keyframe: false,
+            #[cfg(feature = "nvenc-zero-copy")]
+            dmabuf_cache: HashMap::new(),
         })
+    }
+
+    fn encode_cpu(&mut self, host: &[u8], options: &EncodeOptions) -> Result<()> {
+        let expected = (self.cfg.width as usize)
+            .saturating_mul(self.cfg.height as usize)
+            .saturating_mul(4);
+        if host.len() < expected {
+            return Err(FerricastError::Encoder(format!(
+                "NVENC: short frame {} bytes, want {expected}",
+                host.len()
+            )));
+        }
+        self.encoder
+            .encode(&host[..expected], options)
+            .map_err(|e| FerricastError::Encoder(format!("NVENC encode (cpu): {e}")))
+    }
+
+    /// Zero-copy encode via the forked `shiguredo_nvcodec` API.
+    /// Registers the DMA-BUF (or hits the per-fd cache) and tells
+    /// the encoder to use that resource as the input surface for
+    /// this frame. No CPU bytes touched.
+    #[cfg(feature = "nvenc-zero-copy")]
+    fn encode_dmabuf(&mut self, g: &GpuFrame, options: &EncodeOptions) -> Result<()> {
+        let format = match g.format {
+            PixelFormat::Bgra => BufferFormat::Argb,
+            PixelFormat::Rgba => BufferFormat::Abgr,
+            other => {
+                return Err(FerricastError::Encoder(format!(
+                    "NVENC: unsupported GPU pixel format {other:?}"
+                )));
+            }
+        };
+
+        let key = DmabufKey {
+            fd: g.plane.fd,
+            modifier: g.plane.modifier,
+            width: g.width,
+            height: g.height,
+            stride: g.plane.stride,
+        };
+
+        if !self.dmabuf_cache.contains_key(&key) {
+            // First time we see this `(fd, dims)` tuple. Register
+            // it. This is the expensive call — `cuImportExternalMemory`
+            // + `cuExternalMemoryGetMappedBuffer` + `NvEncRegisterResource`
+            // each round-trip the driver. Steady-state cost: zero
+            // (pool fds repeat).
+            let registered = self
+                .encoder
+                .register_external_dmabuf(
+                    g.plane.fd,
+                    g.plane.modifier,
+                    g.width,
+                    g.height,
+                    g.plane.stride,
+                    format,
+                )
+                .map_err(|e| {
+                    FerricastError::Encoder(format!("NVENC register_external_dmabuf: {e}"))
+                })?;
+            self.dmabuf_cache.insert(key, registered);
+        }
+        let registered = self
+            .dmabuf_cache
+            .get(&key)
+            .expect("just-inserted above");
+
+        self.encoder
+            .encode_external(registered, options)
+            .map_err(|e| FerricastError::Encoder(format!("NVENC encode_external: {e}")))?;
+        Ok(())
     }
 }
 
@@ -217,42 +331,37 @@ impl VideoEncoder for NvencH264Encoder {
         // tearing down the CUDA context and rebuilding the session;
         // we don't support that today (the factory hands us a
         // freshly-probed instance whenever the resolution changes).
+        //
+        // Drop the dmabuf cache anyway — `register_external_dmabuf`
+        // bakes the dimensions into NVENC's internal surface, so a
+        // cached `RegisteredResource` from a previous size is junk
+        // even if the fd happens to match. The cache will refill
+        // organically on the first encode at the new size.
+        #[cfg(feature = "nvenc-zero-copy")]
+        self.dmabuf_cache.clear();
         Ok(())
     }
 
     fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
         // NVENC accepts BGRA/RGBA directly via `BufferFormat::Argb`/
-        // `::Abgr`. For `Gpu` frames we still need CPU bytes —
-        // `shiguredo_nvcodec`'s `encode()` does its own host→device
-        // copy via `cuMemcpyHtoD`.
+        // `::Abgr`. Two ingest paths, picked at runtime:
         //
-        // TODO(zero-copy): replace this with the
-        // `cuImportExternalMemory(OPAQUE_FD)` →
-        // `cuExternalMemoryGetMappedBuffer` →
-        // `NvEncRegisterResource(CUDADEVICEPTR)` chain so the
-        // PipeWire dmabuf goes straight into NVENC. shiguredo
-        // doesn't expose the registration step (its
-        // `register_input_resource` is `pub(crate)`); when the
-        // perf gap matters we vendor the crate or fork it the
-        // same way we did with cros-libva, mirror its
-        // `CudaLibrary` with the two extra `cu*ExternalMemory*`
-        // function pointers, and add a `register_external_dmabuf`
-        // method on `Encoder`. ~200 lines once we commit. The
-        // current readback path costs ~5 ms / frame at 1080p
-        // (Vulkan blit + memcpy + libcuda host->device); a future
-        // commit eliminates it entirely.
-        let raw = frame.into_cpu()?;
-
-        let expected = (self.cfg.width as usize)
-            .saturating_mul(self.cfg.height as usize)
-            .saturating_mul(4);
-        if raw.data.len() < expected {
-            return Err(FerricastError::Encoder(format!(
-                "NVENC: short frame {} bytes, want {expected}",
-                raw.data.len()
-            )));
-        }
-
+        // 1. `CapturedFrame::Gpu(g)` → `register_external_dmabuf`
+        //    + `encode_external`. Internally:
+        //      - `cuImportExternalMemory(OPAQUE_FD)` against `g.plane.fd`
+        //      - `cuExternalMemoryGetMappedBuffer` → CUdeviceptr
+        //      - `NvEncRegisterResource(CUDADEVICEPTR)` → `RegisteredResource`
+        //      - `NvEncMapInputResource` → mapped pointer
+        //      - `NvEncEncodePicture` with the mapped pointer
+        //      - `NvEncUnmapInputResource`
+        //    The registration is cached by `(fd, modifier, dims)` so
+        //    pool-recycled fds (PipeWire, our wayland-direct buffer
+        //    rotation) only pay the import cost once.
+        //
+        // 2. `CapturedFrame::Cpu(_)` (and `Gpu` if registration
+        //    fails — e.g. the GPU isn't NVIDIA, or the modifier is
+        //    rejected) → fall back to `encoder.encode(&host_bytes)`
+        //    which does the host→device copy itself.
         let force_idr = self.frame_count % (self.cfg.keyframe_interval as u64) == 0
             || std::mem::take(&mut self.pending_keyframe);
         let options = EncodeOptions {
@@ -265,9 +374,36 @@ impl VideoEncoder for NvencH264Encoder {
             output_spspps: force_idr,
         };
 
-        self.encoder
-            .encode(&raw.data[..expected], &options)
-            .map_err(|e| FerricastError::Encoder(format!("NVENC encode: {e}")))?;
+        let timestamp_us = frame.timestamp_us();
+        #[cfg(feature = "nvenc-zero-copy")]
+        {
+            match frame {
+                CapturedFrame::Gpu(g) => {
+                    if let Err(e) = self.encode_dmabuf(&g, &options) {
+                        // Soft fall-back: log and try the CPU path
+                        // on the same frame. Costs one Vulkan readback
+                        // for this frame; subsequent frames retry
+                        // the GPU path so single-frame failures don't
+                        // sticky.
+                        warn!(%e, "NVENC dmabuf path failed; falling back to CPU readback for this frame");
+                        let raw = CapturedFrame::Gpu(g).into_cpu()?;
+                        self.encode_cpu(&raw.data, &options)?;
+                    }
+                }
+                CapturedFrame::Cpu(raw) => {
+                    self.encode_cpu(&raw.data, &options)?;
+                }
+            }
+        }
+        // Without the `nvenc-zero-copy` feature the encode body is
+        // the old "readback then upload" path — `into_cpu()` is a
+        // no-op for `Cpu` frames and triggers Vulkan readback for
+        // `Gpu`. Same code shape as before the zero-copy commit.
+        #[cfg(not(feature = "nvenc-zero-copy"))]
+        {
+            let raw = frame.into_cpu()?;
+            self.encode_cpu(&raw.data, &options)?;
+        }
 
         // shiguredo's encoder buffers encoded frames internally
         // (NVENC may emit multiple frames per call when it
@@ -286,7 +422,7 @@ impl VideoEncoder for NvencH264Encoder {
         Ok(EncodedFrame {
             codec: Codec::H264,
             data: Bytes::from(nv_frame.into_data()),
-            timestamp_us: raw.timestamp_us,
+            timestamp_us,
             duration_us: Some(1_000_000 / self.cfg.fps as u64),
             is_keyframe,
             pts_dts: (pts, pts),
