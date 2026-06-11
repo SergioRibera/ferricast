@@ -306,6 +306,9 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         caps.requires_audio = false;
         caps.max_h264_profile = Some(H264Profile::High);
         caps.supported_codecs.extend([Codec::H265, Codec::Vp9]);
+        // Ultra firmware (CAF receiver) handles EXT-X-VERSION:6 +
+        // EXT-X-PART-INF. Cuts glass-to-glass from ~6 s to ~1-2 s.
+        caps.supports_low_latency_hls = true;
     } else if md_lc.contains("google tv") || md_lc.contains("android tv") {
         // Cast-built-in on Google / Android TV. Decoder is the
         // TV's hardware codec — uniformly capable of 1080p @ 60
@@ -314,6 +317,8 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         caps.max_bitrate_kbps = Some(15_000);
         caps.requires_audio = false;
         caps.max_h264_profile = Some(H264Profile::High);
+        // Modern CAF receiver ships LL-HLS support.
+        caps.supports_low_latency_hls = true;
     } else if md_lc == "chromecast audio" {
         // No display.
         caps.supports_video = false;
