@@ -131,6 +131,7 @@ impl ReceiverProtocol for ChromecastReceiver {
                 max_height: Some(2160),
                 max_fps: Some(60),
                 max_bitrate_kbps: Some(35_000),
+                max_audio_bitrate_kbps: Some(320),
                 requires_audio: false,
                 max_h264_profile: Some(H264Profile::High),
                 supported_codecs: vec![Codec::H264, Codec::H265],

@@ -66,6 +66,25 @@ impl Default for AudioStreamConfig {
     }
 }
 
+impl AudioStreamConfig {
+    /// Build a config sized to a target device's capabilities. Picks
+    /// `bitrate_kbps` from
+    /// [`crate::DeviceCapabilities::max_audio_bitrate_kbps`] so the
+    /// call site doesn't need to know how to derive it. `mute` is
+    /// caller-supplied because the handle has to be shared with the
+    /// UI side.
+    pub fn for_device(caps: &crate::DeviceCapabilities, mute: AudioMuteHandle) -> Self {
+        let default = Self::default();
+        Self {
+            codec: default.codec,
+            sample_rate: default.sample_rate,
+            channels: default.channels,
+            bitrate_kbps: caps.max_audio_bitrate_kbps.unwrap_or(default.bitrate_kbps),
+            mute,
+        }
+    }
+}
+
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {

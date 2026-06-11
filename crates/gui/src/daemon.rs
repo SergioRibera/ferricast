@@ -386,18 +386,18 @@ impl ManagerService {
         let capture = NativeCapture::new();
         let encoder = H264Encoder::default();
         let config = if source.audio() {
-            // D-Bus client opted into audio capture. Same defaults
-            // as the in-process picker path (48 kHz stereo AAC-LC
-            // @ 128 kbps). Mute handle dropped — no D-Bus method
-            // to toggle it yet; expose one when the GUI gains a
-            // mute control.
+            // D-Bus client opted into audio capture. Bitrate comes
+            // from the target device's capability table — see
+            // `AudioStreamConfig::for_device`. Mute handle dropped
+            // — no D-Bus method to toggle it yet; expose one when
+            // the GUI gains a mute control.
             let mute = AudioMuteHandle::default();
-            let audio_cfg = AudioStreamConfig {
-                codec: AudioCodec::Aac,
-                sample_rate: 48_000,
-                channels: 2,
-                bitrate_kbps: 128,
-                mute: mute.clone(),
+            let audio_cfg = match m.devices().await.into_iter().find(|d| d.id == id) {
+                Some(d) => AudioStreamConfig::for_device(&d.capabilities, mute.clone()),
+                None => AudioStreamConfig {
+                    mute: mute.clone(),
+                    ..AudioStreamConfig::default()
+                },
             };
             StreamConfig {
                 audio: Some(audio_cfg),
