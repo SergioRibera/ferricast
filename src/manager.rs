@@ -817,6 +817,11 @@ impl StreamManager {
             fps: effective_fps,
             bitrate_kbps: effective_bitrate_kbps,
             max_h264_profile: effective_h264_profile,
+            // Natural GOP = 2 s, matching HlsConfig::segment_target_secs.
+            // Keeps encoder's internal IDR cadence aligned with the
+            // segmenter's wall-clock requests so we don't pay for an
+            // extra IDR mid-segment on 60 fps devices.
+            keyframe_interval_secs: 2.0,
             ..Default::default()
         })?;
 
@@ -952,7 +957,11 @@ impl StreamManager {
             let mut last_frame: Option<CapturedFrame> = None;
 
             // Wall-clock keyframe pacing — see longer comment below.
-            let keyframe_interval = Duration::from_secs(4);
+            // Pinned to 2 s to match HlsConfig::segment_target_secs;
+            // the segmenter already forces an IDR per segment via
+            // request_keyframe, but this guarantees one even if the
+            // capture stalls between segmenter ticks.
+            let keyframe_interval = Duration::from_secs(2);
             let mut next_keyframe_at = Instant::now();
 
             // Mirror of `adaptive.target_kbps()` we've actually

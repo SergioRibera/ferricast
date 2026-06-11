@@ -282,6 +282,9 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         // (Ultra / Google TV / Android TV) overrides this in the
         // branches below.
         max_bitrate_kbps: Some(2_500),
+        // 128 kbps AAC-LC is the Cast spec floor for 1st/2nd-gen
+        // hardware. Modern model branches below bump this.
+        max_audio_bitrate_kbps: Some(128),
         requires_audio: true,
         max_h264_profile: Some(H264Profile::Main),
         supported_codecs: vec![Codec::H264, Codec::Vp8],
@@ -303,17 +306,25 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         caps.max_height = Some(2160);
         caps.max_fps = Some(30);
         caps.max_bitrate_kbps = Some(30_000);
+        // Ultra accepts 320 kbps AAC-LC stereo without trouble.
+        caps.max_audio_bitrate_kbps = Some(320);
         caps.requires_audio = false;
         caps.max_h264_profile = Some(H264Profile::High);
         caps.supported_codecs.extend([Codec::H265, Codec::Vp9]);
+        // Ultra firmware (CAF receiver) handles EXT-X-VERSION:6 +
+        // EXT-X-PART-INF. Cuts glass-to-glass from ~6 s to ~1-2 s.
+        caps.supports_low_latency_hls = true;
     } else if md_lc.contains("google tv") || md_lc.contains("android tv") {
         // Cast-built-in on Google / Android TV. Decoder is the
         // TV's hardware codec — uniformly capable of 1080p @ 60
         // High @ L4.2 minimum. Doesn't insist on audio.
         caps.max_fps = Some(60);
         caps.max_bitrate_kbps = Some(15_000);
+        caps.max_audio_bitrate_kbps = Some(256);
         caps.requires_audio = false;
         caps.max_h264_profile = Some(H264Profile::High);
+        // Modern CAF receiver ships LL-HLS support.
+        caps.supports_low_latency_hls = true;
     } else if md_lc == "chromecast audio" {
         // No display.
         caps.supports_video = false;
@@ -323,6 +334,9 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         caps.max_fps = None;
         caps.max_h264_profile = None;
         caps.supported_codecs.clear();
+        // Audio-only device — push fidelity, this is the entire
+        // point of the unit.
+        caps.max_audio_bitrate_kbps = Some(320);
     } else if md_lc == "chromecast" {
         // Matches the conservative defaults above explicitly so
         // this branch documents the floor.
@@ -334,6 +348,7 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         // below Ultra to be safe.
         caps.max_fps = Some(60);
         caps.max_bitrate_kbps = Some(10_000);
+        caps.max_audio_bitrate_kbps = Some(192);
         caps.requires_audio = false;
         caps.max_h264_profile = Some(H264Profile::High);
     }

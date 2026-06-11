@@ -178,7 +178,7 @@ impl NvencH264Encoder {
                 // decoder silently rejects the bitstream, never
                 // progresses.
                 profile: Some(profile),
-                idr_period: Some(cfg.keyframe_interval.max(1)),
+                idr_period: Some(cfg.keyframe_interval_frames()),
             }),
             width: cfg.width.max(16),
             height: cfg.height.max(16),
@@ -190,7 +190,7 @@ impl NvencH264Encoder {
             preset: Preset::P3,
             tuning_info: TuningInfo::LOW_LATENCY,
             rate_control_mode: RateControlMode::Cbr,
-            gop_length: Some(cfg.keyframe_interval.max(1)),
+            gop_length: Some(cfg.keyframe_interval_frames()),
             // No B-frames — keeps every segment self-contained for
             // the HLS / cast-protocol consumers.
             frame_interval_p: 1,
@@ -241,7 +241,7 @@ impl NvencH264Encoder {
                 width: cfg.width.max(16),
                 height: cfg.height.max(16),
                 fps: cfg.fps.max(1),
-                keyframe_interval: cfg.keyframe_interval.max(1),
+                keyframe_interval: cfg.keyframe_interval_frames(),
             },
             frame_count: 0,
             pending_keyframe: false,

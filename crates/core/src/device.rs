@@ -34,6 +34,12 @@ pub struct DeviceCapabilities {
     /// the encoder doesn't blast 30 Mbps at a device that tops out
     /// at 5 Mbps.
     pub max_bitrate_kbps: Option<u32>,
+    /// Bitrate ceiling for the audio codec (AAC-LC today). 128 kbps
+    /// stereo is transparent for most chromecast-class receivers and
+    /// the conservative floor; modern receivers (Ultra, Google /
+    /// Android TV, soundbars) handle 256+ kbps. `None` = caller
+    /// picks its own default.
+    pub max_audio_bitrate_kbps: Option<u32>,
     /// Some receivers (older Chromecast firmwares, certain
     /// `md == \"Chromecast\"` 1st/2nd gen) reject HLS streams whose
     /// MPEG-TS PMT only carries video — the demuxer expects video +

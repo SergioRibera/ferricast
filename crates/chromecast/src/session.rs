@@ -562,6 +562,13 @@ impl ChromecastSession {
             part_target_secs,
             tls: None,
             target_fps: stream_fps,
+            // Startup-latency tuning: 2 s segments + 4 s playlist
+            // target. Receiver still starts ~3 segments behind live
+            // edge, so steady-state glass-to-glass drops from
+            // 3×4=12 s to 3×2=6 s. Tradeoff: ~2× the IDR rate, so
+            // expect a ~10-15 % bitrate uptick at fixed quality.
+            segment_target_secs: 2.0,
+            playlist_target_duration: 4,
             ..Default::default()
         };
         let sink = HlsFrameSink::start(

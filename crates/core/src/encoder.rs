@@ -9,7 +9,13 @@ pub struct EncoderConfig {
     pub height: u32,
     pub bitrate_kbps: u32,
     pub fps: u32,
-    pub keyframe_interval: u32,
+    /// Target GOP length in seconds. Backends convert to frames
+    /// internally using [`Self::fps`] so the call site doesn't need
+    /// to keep frame counts in sync with framerate (a frame-count
+    /// field would silently halve the GOP duration on a 60 fps device
+    /// vs a 30 fps device). 2.0 by default to match the HLS
+    /// segmenter's `segment_target_secs`.
+    pub keyframe_interval_secs: f32,
     pub pixel_format: PixelFormat,
     /// Upper bound on the H.264 profile the encoder is allowed to
     /// emit. Set by the manager from the target device's
@@ -17,6 +23,20 @@ pub struct EncoderConfig {
     /// bitstream the receiver's hardware decoder can't handle.
     /// `None` = encoder picks its own default.
     pub max_h264_profile: Option<H264Profile>,
+}
+
+impl EncoderConfig {
+    /// Resolved GOP length in frames at the configured framerate.
+    /// Clamped to at least 1 so `idr_period`/`gop_length` parameters
+    /// passed to the underlying codec are always valid.
+    pub fn keyframe_interval_frames(&self) -> u32 {
+        let frames = (self.keyframe_interval_secs * self.fps as f32).round();
+        if frames.is_finite() && frames >= 1.0 {
+            frames as u32
+        } else {
+            1
+        }
+    }
 }
 
 impl Default for EncoderConfig {
@@ -27,7 +47,7 @@ impl Default for EncoderConfig {
             height: 1080,
             bitrate_kbps: 5000,
             fps: 60,
-            keyframe_interval: 60,
+            keyframe_interval_secs: 2.0,
             pixel_format: PixelFormat::Bgra,
             max_h264_profile: None,
         }

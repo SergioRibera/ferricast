@@ -135,20 +135,27 @@ async fn start_stream_with_dto(
     let capture = NativeCapture::new();
     let encoder = H264Encoder::default();
     let config = if audio {
-        // Opt the new stream into PipeWire audio capture
-        // (default sink monitor → AAC-LC, 48 kHz stereo @ 128 kbps).
+        // Opt the new stream into PipeWire audio capture (default
+        // sink monitor → AAC-LC). Bitrate comes from the target
+        // device's capability table — see
+        // `AudioStreamConfig::for_device`.
         // The mute handle is dropped here for now — once the UI
         // grows a mute toggle the handle needs to be threaded back
         // out into AppState. The manager keeps its own clone for
         // the lifetime of the audio task, so dropping ours doesn't
         // disable capture.
         let mute = AudioMuteHandle::default();
-        let audio_cfg = AudioStreamConfig {
-            codec: AudioCodec::Aac,
-            sample_rate: 48_000,
-            channels: 2,
-            bitrate_kbps: 128,
-            mute: mute.clone(),
+        let audio_cfg = match sm
+            .devices()
+            .await
+            .into_iter()
+            .find(|d| d.id == device_id)
+        {
+            Some(d) => AudioStreamConfig::for_device(&d.capabilities, mute.clone()),
+            None => AudioStreamConfig {
+                mute: mute.clone(),
+                ..AudioStreamConfig::default()
+            },
         };
         StreamConfig {
             audio: Some(audio_cfg),
