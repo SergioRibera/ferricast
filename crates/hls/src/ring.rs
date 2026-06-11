@@ -323,6 +323,6 @@ pub async fn wait_for_first_segment(ring: &Arc<RwLock<SegmentRing>>) {
         if !ring.read().await.is_empty() {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

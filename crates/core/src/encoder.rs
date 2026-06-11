@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::frame::{CapturedFrame, EncodedFrame};
+use crate::frame::{AudioCodec, AudioFrame, CapturedFrame, EncodedFrame};
 use crate::{Codec, H264Profile, PixelFormat};
 
 #[derive(Debug, Clone)]
@@ -86,4 +86,70 @@ pub trait VideoEncoder: Send {
     fn set_bitrate_kbps(&mut self, _kbps: u32) -> Result<()> {
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AudioEncoderConfig {
+    /// Output codec. Only [`AudioCodec::Aac`] is wired through the
+    /// chromecast HLS pipeline today; the field stays so future
+    /// protocols (AirPlay → ALAC, raw PCM; Miracast → AAC/AC-3) can
+    /// pick at runtime without re-shaping the trait.
+    pub codec: AudioCodec,
+    /// Input PCM sample rate (Hz). Encoders accept whatever the
+    /// upstream [`crate::AudioCapture`] backend negotiated — most
+    /// HLS deployments use 48000.
+    pub sample_rate: u32,
+    /// Input channel count.
+    pub channels: u16,
+    /// Target average bitrate in kbps. AAC-LC at 128 kbps stereo is
+    /// the chromecast-friendly default (transparent above ~96 kbps).
+    pub bitrate_kbps: u32,
+}
+
+impl Default for AudioEncoderConfig {
+    fn default() -> Self {
+        Self {
+            codec: AudioCodec::Aac,
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate_kbps: 128,
+        }
+    }
+}
+
+/// Encoder trait that mirrors [`VideoEncoder`]. The contract is
+/// "consume PCM, emit codec-framed bytes with a 90 kHz-friendly PTS".
+/// Returning `Ok(None)` is legal — block-coded encoders (AAC) need
+/// to accumulate at least one frame of input (1024 samples for
+/// AAC-LC) before they can emit, so the first N input chunks
+/// typically return `None` while internal state warms up.
+pub trait AudioEncoder: Send {
+    fn configure(&mut self, config: &AudioEncoderConfig) -> Result<()>;
+
+    /// Push one chunk of PCM. The encoder may produce zero, one, or
+    /// more output frames per input; output frames are drained via
+    /// [`Self::take_output`] after this call. `timestamp_us` is the
+    /// upstream capture timestamp of the first sample in the chunk —
+    /// the encoder advances its internal monotonic counter from it
+    /// so subsequent output frames carry strictly-increasing PTS in
+    /// the same timeline.
+    fn encode(&mut self, frame: &AudioFrame) -> Result<()>;
+
+    /// Drain any output frames produced by the latest `encode`
+    /// (and any previously-buffered residue). Returns an empty
+    /// vec when the encoder is still warming up.
+    fn take_output(&mut self) -> Vec<AudioFrame>;
+
+    /// Optional codec-specific configuration descriptor (e.g. the
+    /// 2-byte AudioSpecificConfig that the MPEG-TS muxer can use
+    /// for the AAC ADTS header). Returns empty when the codec doesn't
+    /// need an out-of-band header (every output frame is self-
+    /// describing — true for ADTS-framed AAC).
+    fn codec_config(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Flush any internal frames and return them. Called once at
+    /// shutdown.
+    fn flush(self) -> Result<Vec<AudioFrame>>;
 }

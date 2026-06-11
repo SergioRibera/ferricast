@@ -1,0 +1,53 @@
+# Cargo aliases for build configurations the workspace defaults
+# don't cover.
+#
+# `cargo build` still uses the workspace defaults — every encoder /
+# capture backend on. The aliases below stop short of any backend
+# whose system dependency commonly breaks the build on a moving
+# target distro (NixOS unstable, Arch when libva ticks).
+#
+# Use `cargo b-min` instead of `cargo build` when:
+#   - cros-libva's pinned bindings don't match the host libva
+#     version (the workaround until the fork rev bumps).
+#   - You're building from a sandbox / CI runner without libva-dev.
+#
+# To toggle a single backend back on, append it to the feature
+# list, e.g. `cargo b-min --features vaapi`.
+#
+# Aliases use the array form (not a single string) because Cargo's
+# string-alias splitter treats `--features "a,b,c"` as one feature
+# named `"a,b,c"` rather than three — array form is explicit and
+# always works.
+
+[alias]
+# "Minimal but useful" build: every protocol + capture backend
+# the workspace ships, openh264 and NVENC encoders, no VA-API. This is
+# the right command on NixOS + recent libva, or any host where
+# cros-libva refuses to compile against the system headers.
+b-min = [
+    "build",
+    "--no-default-features",
+    "--features",
+    "chromecast,pipewire,x11,wlroots,wayland-direct,openh264,nvenc",
+]
+r-min = [
+    "run",
+    "--no-default-features",
+    "--features",
+    "chromecast,pipewire,x11,wlroots,wayland-direct,openh264,nvenc",
+]
+c-min = [
+    "check",
+    "--no-default-features",
+    "--features",
+    "chromecast,pipewire,x11,wlroots,wayland-direct,openh264,nvenc",
+]
+
+# openh264-only fallback. Useful on hosts without any GPU encode
+# library at all (CI, minimal containers, Wayland-on-llvmpipe).
+b-soft = [
+    "build",
+    "--no-default-features",
+    "--features",
+    "chromecast,pipewire,x11,wlroots,wayland-direct,openh264",
+]

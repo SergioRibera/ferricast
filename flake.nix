@@ -36,9 +36,34 @@
           pipewire.dev
           pipewire
           libva
+
+          # ALSA headers — rodio's audio output goes through cpal,
+          # which on Linux talks to libasound. PipeWire installs an
+          # alsa-emulation layer at runtime so playback still ends
+          # up in the PipeWire graph, but the build-time dep is
+          # alsa-lib regardless.
+          alsa-lib
+          alsa-lib.dev
 	  xorg.libXcursor
 
+          # Fraunhofer FDK AAC encoder. Used by the audio side of
+          # the streaming pipeline (`crates/encoder/src/aac`) to
+          # produce ADTS-framed AAC-LC for chromecast HLS. Required
+          # to link `fdk-aac-sys` at build time; no runtime hook.
+          fdk_aac
+
           wayland
+
+          # gbm + libdrm: DMA-BUF allocation for the wayland-direct
+          # capture backend. `libgbm` is mesa's general-purpose
+          # buffer manager — present on every desktop Linux except
+          # systems with *only* the proprietary NVIDIA driver
+          # installed (NixOS hosts always have it because mesa is
+          # used for software fallback / Xwayland regardless of GPU).
+          # Newer nixpkgs split it out of `mesa` into its own
+          # `libgbm` attribute; older ones still expose it via mesa.
+          libgbm
+          libdrm
 
           vulkan-loader
 	  vulkan-validation-layers

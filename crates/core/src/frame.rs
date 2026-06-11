@@ -185,7 +185,7 @@ pub struct AudioFrame {
     pub channels: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AudioCodec {
     Aac,
     Opus,

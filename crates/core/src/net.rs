@@ -31,7 +31,6 @@ use crate::error::{FerricastError, Result};
 /// * `ferricast-chromecast` for the HLS playlist URL passed to
 ///   the Default Media Receiver via `LOAD`.
 /// * (future) `ferricast-airplay` for the RTSP `Transport:` URL.
-/// * (future) `ferricast-dial` for the app-specific `Origin:` header.
 pub fn local_addr_for(target: IpAddr) -> Result<IpAddr> {
     let bind: SocketAddr = match target {
         IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),

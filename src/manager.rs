@@ -8,11 +8,17 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use ferricast_capture::PipeWireAudioCapture;
 use ferricast_core::{
-    CaptureConfig, CaptureSource, CapturedFrame, CastSession, Device, Discovery, DiscoveryEvent,
-    EncodedFrame, EncoderConfig, FerricastError, ProtocolHandler, Result, ScreenCapture,
-    StreamConfig, VideoEncoder,
+    AdvertiseInfo, Advertiser, AudioCapture, AudioCaptureConfig, AudioCodec, AudioDecoder,
+    AudioDecoderConfig, AudioEncoder, AudioEncoderConfig, AudioFrame, AudioSource, CaptureConfig,
+    CaptureSource, CapturedFrame, CastSession, Codec, ControlSession, DecodedAudio, DecoderConfig,
+    Device, Discovery, DiscoveryEvent, EncodedFrame, EncoderConfig, FerricastError, FrameSink,
+    MediaCommand, MediaInfo, MediaPacket, MediaPuller, PixelFormat, PlaybackState, ProtocolHandler,
+    PullSpec, ReceiverProtocol, RemoteSender, Result, ScreenCapture, StreamConfig, VideoDecoder,
+    VideoEncoder,
 };
+use ferricast_encoder::aac::AacEncoder;
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -34,6 +40,7 @@ trait ErasedSession: Send + Sync {
     fn connect<'a>(&'a mut self, device: &'a Device) -> BoxFut<'a, Result<()>>;
     fn setup_stream<'a>(&'a mut self, config: &'a StreamConfig) -> BoxFut<'a, Result<()>>;
     fn send_frame<'a>(&'a mut self, frame: &'a EncodedFrame) -> BoxFut<'a, Result<()>>;
+    fn send_audio_frame<'a>(&'a mut self, frame: &'a AudioFrame) -> BoxFut<'a, Result<()>>;
     fn stop(&mut self) -> BoxFut<'_, Result<()>>;
     fn is_alive(&self) -> bool;
 }
@@ -48,12 +55,140 @@ impl<T: CastSession> ErasedSession for T {
     fn send_frame<'a>(&'a mut self, frame: &'a EncodedFrame) -> BoxFut<'a, Result<()>> {
         Box::pin(CastSession::send_frame(self, frame))
     }
+    fn send_audio_frame<'a>(&'a mut self, frame: &'a AudioFrame) -> BoxFut<'a, Result<()>> {
+        Box::pin(CastSession::send_audio_frame(self, frame))
+    }
     fn stop(&mut self) -> BoxFut<'_, Result<()>> {
         Box::pin(CastSession::stop(self))
     }
     fn is_alive(&self) -> bool {
         CastSession::is_alive(self)
     }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Receiver-side erasure. Mirrors the sender-side erasure above:
+// every receiver trait that the manager talks to via `dyn`-style
+// dispatch goes through an `ErasedX` shim because the native trait
+// uses RPITIT (`impl Future + Send`) which isn't object-safe.
+
+trait ErasedAdvertiser: Send + Sync {
+    fn start(&mut self, info: AdvertiseInfo) -> BoxFut<'_, Result<()>>;
+    fn stop(&mut self) -> BoxFut<'_, Result<()>>;
+}
+
+impl<T: Advertiser> ErasedAdvertiser for T {
+    fn start(&mut self, info: AdvertiseInfo) -> BoxFut<'_, Result<()>> {
+        Box::pin(Advertiser::start(self, info))
+    }
+    fn stop(&mut self) -> BoxFut<'_, Result<()>> {
+        Box::pin(Advertiser::stop(self))
+    }
+}
+
+trait ErasedControlSession: Send + Sync {
+    fn accept(&mut self) -> BoxFut<'_, Result<RemoteSender>>;
+    fn next_command(&mut self) -> BoxFut<'_, Result<MediaCommand>>;
+    fn report_state(&mut self, state: PlaybackState) -> BoxFut<'_, Result<()>>;
+    fn close(&mut self) -> BoxFut<'_, Result<()>>;
+}
+
+impl<T: ControlSession> ErasedControlSession for T {
+    fn accept(&mut self) -> BoxFut<'_, Result<RemoteSender>> {
+        Box::pin(ControlSession::accept(self))
+    }
+    fn next_command(&mut self) -> BoxFut<'_, Result<MediaCommand>> {
+        Box::pin(ControlSession::next_command(self))
+    }
+    fn report_state(&mut self, state: PlaybackState) -> BoxFut<'_, Result<()>> {
+        Box::pin(ControlSession::report_state(self, state))
+    }
+    fn close(&mut self) -> BoxFut<'_, Result<()>> {
+        Box::pin(ControlSession::close(self))
+    }
+}
+
+trait ErasedPuller: Send {
+    fn open(&mut self, spec: PullSpec) -> BoxFut<'_, Result<MediaInfo>>;
+    fn next(&mut self) -> BoxFut<'_, Result<MediaPacket>>;
+    fn seek(&mut self, position_us: u64) -> BoxFut<'_, Result<()>>;
+    fn close(&mut self) -> BoxFut<'_, Result<()>>;
+}
+
+impl<T: MediaPuller> ErasedPuller for T {
+    fn open(&mut self, spec: PullSpec) -> BoxFut<'_, Result<MediaInfo>> {
+        Box::pin(MediaPuller::open(self, spec))
+    }
+    fn next(&mut self) -> BoxFut<'_, Result<MediaPacket>> {
+        Box::pin(MediaPuller::next(self))
+    }
+    fn seek(&mut self, position_us: u64) -> BoxFut<'_, Result<()>> {
+        Box::pin(MediaPuller::seek(self, position_us))
+    }
+    fn close(&mut self) -> BoxFut<'_, Result<()>> {
+        Box::pin(MediaPuller::close(self))
+    }
+}
+
+// Decoders and sinks aren't async (or are async but don't need
+// lifetime tricks), so plain `dyn` works. `Box<dyn ErasedVideoDecoder>`
+// is what the pipeline holds; the wrapper just exists so `decode`'s
+// concrete type doesn't leak out of the registry.
+
+trait ErasedVideoDecoder: Send {
+    fn configure(&mut self, config: &DecoderConfig) -> Result<()>;
+    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>>;
+}
+
+impl<T: VideoDecoder> ErasedVideoDecoder for T {
+    fn configure(&mut self, config: &DecoderConfig) -> Result<()> {
+        VideoDecoder::configure(self, config)
+    }
+    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+        VideoDecoder::decode(self, frame)
+    }
+}
+
+trait ErasedAudioDecoder: Send {
+    fn configure(&mut self, config: &AudioDecoderConfig) -> Result<()>;
+    fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>>;
+}
+
+impl<T: AudioDecoder> ErasedAudioDecoder for T {
+    fn configure(&mut self, config: &AudioDecoderConfig) -> Result<()> {
+        AudioDecoder::configure(self, config)
+    }
+    fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
+        AudioDecoder::decode(self, frame)
+    }
+}
+
+// `FrameSink` is already object-safe (uses `async_trait`) so the
+// pipeline holds `Box<dyn FrameSink>` directly — no `ErasedSink`
+// wrapper needed.
+
+// Factory used by the receiver pipeline to ask the application
+// (typically the GUI) for somewhere to send decoded frames. Called
+// once per accepted session, after the puller has reported
+// `MediaInfo` — that way the app can open an audio-only card view
+// vs. a video window based on whether `info.video.is_some()`.
+type SinkFactory = Arc<
+    dyn Fn(&RemoteSender, &MediaInfo) -> BoxFut<'static, Result<Box<dyn FrameSink>>> + Send + Sync,
+>;
+
+struct RegisteredReceiver {
+    protocol: &'static str,
+    create_advertiser: Box<dyn Fn() -> Box<dyn ErasedAdvertiser> + Send + Sync>,
+    create_control: Arc<dyn Fn() -> Result<Box<dyn ErasedControlSession>> + Send + Sync>,
+    create_puller: Arc<dyn Fn() -> Result<Box<dyn ErasedPuller>> + Send + Sync>,
+    advertise_info: AdvertiseInfo,
+}
+
+struct ActiveReceiver {
+    protocol: &'static str,
+    cancel_tx: mpsc::Sender<()>,
+    task: JoinHandle<()>,
+    advertiser: Box<dyn ErasedAdvertiser>,
 }
 
 struct RegisteredProtocol {
@@ -111,6 +246,43 @@ pub enum ManagerEvent {
         protocol: &'static str,
         message: String,
     },
+
+    // ── receiver-side events ──────────────────────────────────────
+    /// A remote sender connected on a registered receiver protocol's
+    /// control channel. Fired before any LOAD command arrives — at
+    /// this point we know who connected but not what they want to
+    /// play. UI can open a "Connecting…" placeholder.
+    ReceiverIncoming {
+        receiver_id: Uuid,
+        protocol: &'static str,
+        remote: RemoteSender,
+    },
+    /// The remote sender's first LOAD has been processed and the
+    /// puller has resolved [`MediaInfo`]. UI uses this to decide
+    /// between a video window and an audio-only card view
+    /// (`info.video.is_none()` ⇒ audio only).
+    ReceiverStarted {
+        receiver_id: Uuid,
+        remote: RemoteSender,
+        info: MediaInfo,
+    },
+    /// Playback state changed (PLAY/PAUSE/STOP from remote, EOS, …).
+    /// Mirrors what the manager reports back to the sender through
+    /// [`ControlSession::report_state`] so the GUI stays in sync
+    /// without polling.
+    ReceiverStateChanged {
+        receiver_id: Uuid,
+        state: PlaybackState,
+    },
+    /// Remote disconnected cleanly or the puller hit EOS.
+    ReceiverStopped { receiver_id: Uuid },
+    /// Fatal receiver error — pipeline task terminated. Distinct
+    /// from `ReceiverStopped` so the UI can surface a toast / retry
+    /// affordance.
+    ReceiverError {
+        receiver_id: Uuid,
+        message: String,
+    },
 }
 
 pub struct StreamManager {
@@ -121,6 +293,20 @@ pub struct StreamManager {
     event_tx: mpsc::Sender<ManagerEvent>,
     event_rx: Option<mpsc::Receiver<ManagerEvent>>,
     running: bool,
+
+    // ── receiver-side state ──────────────────────────────────────
+    receivers: Vec<RegisteredReceiver>,
+    /// Codec → factory map. Pipeline picks a video decoder based on
+    /// what the puller's `MediaInfo` declares; multiple decoders
+    /// MAY register for the same codec (e.g. VA-API + NVDEC + sw)
+    /// and the last one wins — register the preferred backend last,
+    /// or use the builder's `with_*_decoder` helpers which append
+    /// in priority order.
+    video_decoders: HashMap<Codec, Arc<dyn Fn() -> Box<dyn ErasedVideoDecoder> + Send + Sync>>,
+    audio_decoders: HashMap<AudioCodec, Arc<dyn Fn() -> Box<dyn ErasedAudioDecoder> + Send + Sync>>,
+    sink_factory: Option<SinkFactory>,
+    active_receivers: Arc<Mutex<HashMap<Uuid, ActiveReceiver>>>,
+    receivers_running: bool,
 }
 
 impl Default for StreamManager {
@@ -134,6 +320,12 @@ impl Default for StreamManager {
             event_tx,
             event_rx: Some(event_rx),
             running: false,
+            receivers: Vec::new(),
+            video_decoders: HashMap::new(),
+            audio_decoders: HashMap::new(),
+            sink_factory: None,
+            active_receivers: Arc::new(Mutex::new(HashMap::new())),
+            receivers_running: false,
         }
     }
 }
@@ -164,6 +356,82 @@ impl StreamManager {
 
     pub fn registered_protocols(&self) -> Vec<&'static str> {
         self.protocols.iter().map(|p| p.protocol).collect()
+    }
+
+    /// Register a receiver-side protocol (advertiser + control +
+    /// puller). Mirror of [`Self::register`] for senders.
+    pub fn register_receiver<P>(&mut self)
+    where
+        P: ReceiverProtocol + Clone + Default + 'static,
+    {
+        let p_adv = P::default();
+        let p_ctrl = p_adv.clone();
+        let p_pull = p_adv.clone();
+        let info = p_adv.advertise_info();
+
+        self.receivers.push(RegisteredReceiver {
+            protocol: P::PROTOCOL,
+            create_advertiser: Box::new(move || {
+                Box::new(p_adv.create_advertiser()) as Box<dyn ErasedAdvertiser>
+            }),
+            create_control: Arc::new(move || {
+                let c = p_ctrl.create_control()?;
+                Ok(Box::new(c) as Box<dyn ErasedControlSession>)
+            }),
+            create_puller: Arc::new(move || {
+                let p = p_pull.create_puller()?;
+                Ok(Box::new(p) as Box<dyn ErasedPuller>)
+            }),
+            advertise_info: info,
+        });
+    }
+
+    /// Register a video decoder. Pipeline picks one per session by
+    /// `D::CODEC`. Last registration for a given codec wins —
+    /// register the preferred backend last (the builder's `with_*`
+    /// helpers do this in NVDEC → VA-API → sw order, same priority
+    /// the encoder uses).
+    pub fn register_video_decoder<D>(&mut self)
+    where
+        D: VideoDecoder + Default + 'static,
+    {
+        self.video_decoders.insert(
+            D::CODEC,
+            Arc::new(|| Box::new(D::default()) as Box<dyn ErasedVideoDecoder>),
+        );
+    }
+
+    pub fn register_audio_decoder<D>(&mut self)
+    where
+        D: AudioDecoder + Default + 'static,
+    {
+        self.audio_decoders.insert(
+            D::CODEC,
+            Arc::new(|| Box::new(D::default()) as Box<dyn ErasedAudioDecoder>),
+        );
+    }
+
+    /// Install the callback the pipeline uses to ask the host
+    /// application for a [`FrameSink`] whenever a new receiver
+    /// session resolves its `MediaInfo`. The GUI typically opens a
+    /// new window here (video) or a transport-control card (audio
+    /// only) and returns the sink the window owns. Required before
+    /// [`Self::start_receivers`] — without it the pipeline rejects
+    /// inbound sessions because it has nowhere to put decoded
+    /// frames.
+    pub fn set_sink_factory<F, Fut>(&mut self, factory: F)
+    where
+        F: Fn(&RemoteSender, &MediaInfo) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Box<dyn FrameSink>>> + Send + 'static,
+    {
+        self.sink_factory = Some(Arc::new(move |remote, info| {
+            let fut = factory(remote, info);
+            Box::pin(async move { fut.await })
+        }));
+    }
+
+    pub fn registered_receivers(&self) -> Vec<&'static str> {
+        self.receivers.iter().map(|r| r.protocol).collect()
     }
 
     pub async fn start_discovery(&mut self) -> Result<()> {
@@ -234,6 +502,156 @@ impl StreamManager {
         }
         self.discovery_handles.clear();
         self.running = false;
+        Ok(())
+    }
+
+    /// Start every registered receiver protocol's advertiser and
+    /// per-protocol accept supervisor. Requires
+    /// [`Self::set_sink_factory`] to have been called.
+    pub async fn start_receivers(&mut self) -> Result<()> {
+        if self.receivers_running {
+            return Ok(());
+        }
+        let sink_factory = self.sink_factory.clone().ok_or_else(|| {
+            FerricastError::Receiver(
+                "start_receivers called before set_sink_factory — \
+                 the pipeline has nowhere to send decoded frames"
+                    .into(),
+            )
+        })?;
+
+        for proto in &self.receivers {
+            let mut advertiser = (proto.create_advertiser)();
+            if let Err(e) = advertiser.start(proto.advertise_info.clone()).await {
+                tracing::warn!(
+                    protocol = proto.protocol,
+                    %e,
+                    "receiver advertiser failed to start; skipping"
+                );
+                continue;
+            }
+            tracing::info!(
+                protocol = proto.protocol,
+                friendly_name = %proto.advertise_info.friendly_name,
+                port = proto.advertise_info.port,
+                "receiver advertised"
+            );
+
+            // Per-protocol accept supervisor. One control session at
+            // a time — when it dies (remote closed, fatal error) we
+            // build a fresh one and call `accept()` again. Mirrors
+            // the supervisor pattern on the sender side.
+            let receiver_id = Uuid::new_v4();
+            let create_control = proto.create_control.clone();
+            let create_puller = proto.create_puller.clone();
+            let event_tx = self.event_tx.clone();
+            let active = self.active_receivers.clone();
+            let video_decoders = self.video_decoders.clone();
+            let audio_decoders = self.audio_decoders.clone();
+            let sink_factory = sink_factory.clone();
+            let protocol = proto.protocol;
+            let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
+
+            let task = tokio::spawn(async move {
+                loop {
+                    let mut control = match (create_control)() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(protocol, %e, "create_control failed; exiting supervisor");
+                            let _ = event_tx
+                                .send(ManagerEvent::ReceiverError {
+                                    receiver_id,
+                                    message: format!("create_control: {e}"),
+                                })
+                                .await;
+                            return;
+                        }
+                    };
+
+                    let remote = tokio::select! {
+                        _ = cancel_rx.recv() => return,
+                        r = control.accept() => match r {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!(protocol, %e, "control.accept failed; retrying");
+                                continue;
+                            }
+                        }
+                    };
+                    tracing::info!(
+                        protocol,
+                        sender_id = %remote.id,
+                        sender_addr = %remote.addr,
+                        "receiver: remote sender connected"
+                    );
+                    let _ = event_tx
+                        .send(ManagerEvent::ReceiverIncoming {
+                            receiver_id,
+                            protocol,
+                            remote: remote.clone(),
+                        })
+                        .await;
+
+                    let session_result = run_receiver_session(
+                        receiver_id,
+                        protocol,
+                        remote,
+                        &mut control,
+                        create_puller.clone(),
+                        &video_decoders,
+                        &audio_decoders,
+                        sink_factory.clone(),
+                        event_tx.clone(),
+                        &mut cancel_rx,
+                    )
+                    .await;
+
+                    if let Err(e) = session_result {
+                        tracing::warn!(protocol, %e, "receiver session ended with error");
+                        let _ = event_tx
+                            .send(ManagerEvent::ReceiverError {
+                                receiver_id,
+                                message: e.to_string(),
+                            })
+                            .await;
+                    }
+                    let _ = control.close().await;
+                    let _ = event_tx
+                        .send(ManagerEvent::ReceiverStopped { receiver_id })
+                        .await;
+                }
+            });
+
+            active.lock().await.insert(
+                receiver_id,
+                ActiveReceiver {
+                    protocol,
+                    cancel_tx,
+                    task,
+                    advertiser,
+                },
+            );
+        }
+
+        self.receivers_running = true;
+        Ok(())
+    }
+
+    pub async fn stop_receivers(&mut self) -> Result<()> {
+        let active = {
+            let mut guard = self.active_receivers.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        for (_, mut r) in active {
+            let _ = r.cancel_tx.send(()).await;
+            let _ = r.advertiser.stop().await;
+            match tokio::time::timeout(Duration::from_secs(5), r.task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(?e, "receiver task panicked"),
+                Err(_) => tracing::warn!(protocol = r.protocol, "receiver task did not finish in 5s"),
+            }
+        }
+        self.receivers_running = false;
         Ok(())
     }
 
@@ -417,14 +835,69 @@ impl StreamManager {
             "adaptive: controller initialised; bandwidth probe will fire after first {} segments",
             ferricast_hls::PROBE_SAMPLES_FOR_DOC,
         );
+        // Hand the receiver session the *clamped* fps + bitrate
+        // (device-cap-aware) rather than the raw values from the UI.
+        // Without this, the HLS segmenter inside the chromecast
+        // session sizes its synthetic PTS counter to the UI's 60 fps
+        // even when we're really only producing 30, and audio
+        // (whose PTS tracks wall clock through the audio capture
+        // path) drifts ahead of video on the receiver.
         let session_config = StreamConfig {
             adaptive: Some(adaptive.clone()),
+            fps: effective_fps,
+            bitrate_kbps: effective_bitrate_kbps,
             ..config.clone()
         };
 
+        // Audio pipeline. Spawned as its own tokio task so PipeWire
+        // audio capture (which blocks on its main loop thread) and
+        // AAC encoding don't share the supervisor's hot path with
+        // video. The task pushes encoded AAC frames into
+        // `audio_frame_rx`; the supervisor then forwards them via
+        // `session.send_audio_frame`. Aborted on stream stop.
+        //
+        // When `config.audio` is `None` (caller didn't opt in), we
+        // skip the whole thing — the chromecast HLS pipeline falls
+        // back to the silent-AAC injection for receivers that
+        // require it.
         let mut session = (proto.create_session)()?;
         session.connect(&device).await?;
         session.setup_stream(&session_config).await?;
+
+        // Audio pipeline. Spawned *after* `session.connect()` finishes
+        // so PipeWire-captured PCM doesn't pile up while the chromecast
+        // handshake is running (LAUNCH ack + virtual-connect can take
+        // 3-6 s). Without this delay the queue chain
+        // `pipewire → AAC encoder → tx (64) → audio_tx (64)` fills
+        // entirely during the wait, then the segmenter drains stale
+        // frames whose `timestamp_us` is from seconds ago — the
+        // muxer's silent-AAC watermark advances past those PTSes
+        // immediately and the real audio is rejected for the rest
+        // of the stream's life.
+        //
+        // When `config.audio` is `None` (caller didn't opt in), we
+        // skip the whole thing — the chromecast HLS pipeline falls
+        // back to the silent-AAC injection for receivers that
+        // require it.
+        let (audio_task, audio_frame_rx, audio_mute) = match config.audio.clone() {
+            Some(audio_cfg) => {
+                let (tx, rx) = mpsc::channel::<AudioFrame>(64);
+                let mute = audio_cfg.mute.clone();
+                let mute_for_task = mute.clone();
+                let task = tokio::spawn(async move {
+                    if let Err(e) =
+                        run_audio_pipeline(audio_cfg, mute_for_task, tx).await
+                    {
+                        tracing::error!(%e, "audio pipeline exited with error");
+                    } else {
+                        tracing::info!("audio pipeline exited cleanly");
+                    }
+                });
+                (Some(task), Some(rx), Some(mute))
+            }
+            None => (None, None, None),
+        };
+        let _ = audio_mute; // surfaced separately when UI mute API lands
 
         // Factory the supervisor uses to rebuild a session on
         // receiver-side disconnect. Cloned `Arc` — cheap and `Send`.
@@ -436,8 +909,12 @@ impl StreamManager {
         let event_tx = self.event_tx.clone();
         let device_name = device.name.clone();
         let did = device.id;
-
+        // Task captures the device by move (the reconnect supervisor
+        // hands `&device_clone` to `s.connect`), and `ActiveStream`
+        // below also needs the original — clone once before the spawn.
         let device_clone = device.clone();
+        let mut audio_frame_rx = audio_frame_rx;
+        let audio_task_handle = audio_task;
 
         let task = tokio::spawn(async move {
             let _ = event_tx
@@ -619,6 +1096,28 @@ impl StreamManager {
                             let _ = session.stop().await;
                             break 'supervisor;
                         }
+                        audio = recv_audio_frame(&mut audio_frame_rx), if audio_frame_rx.is_some() => {
+                            match audio {
+                                Some(af) => {
+                                    if let Err(e) = session.send_audio_frame(&af).await {
+                                        // Audio errors do NOT kill
+                                        // the stream — video is the
+                                        // primary content. Log and
+                                        // keep going.
+                                        tracing::warn!(%e, "send_audio_frame failed");
+                                    }
+                                }
+                                None => {
+                                    // Audio pipeline exited (clean
+                                    // EOF or fatal error inside the
+                                    // task). Drop the receiver so the
+                                    // `if audio_frame_rx.is_some()`
+                                    // guard disables this arm and
+                                    // the supervisor stops polling.
+                                    audio_frame_rx = None;
+                                }
+                            }
+                        }
                         frame_result = async {
                             if let Some(f) = seed.take() {
                                 last_frame = Some(f.clone());
@@ -712,6 +1211,15 @@ impl StreamManager {
             }
 
             let _ = capture.stop().await;
+            // Tear the audio task down alongside the video pipeline
+            // so the PipeWire audio thread and AAC encoder don't
+            // outlive the stream. Aborting is safe — the task
+            // doesn't hold any externally-visible resources besides
+            // its own PipeWire loop, which is cleaned up by the
+            // capture's Drop.
+            if let Some(h) = &audio_task_handle {
+                h.abort();
+            }
             active_streams.lock().await.remove(&did);
             // Surface a final error if the supervisor gave up.
             // `StreamStopped` is always emitted afterwards so the
@@ -776,8 +1284,282 @@ impl StreamManager {
         for id in ids {
             let _ = self.stop_stream(id).await;
         }
+        let _ = self.stop_receivers().await;
         self.stop_discovery().await
     }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Receiver pipeline helpers.
+//
+// `run_receiver_session` is the per-control-connection state machine:
+// it reads commands off the control channel, on LOAD it builds a
+// fresh puller + decoders + sink and hands them to `run_pump`, and
+// it forwards PLAY/PAUSE/STOP/SEEK to the pump via `PumpCmd`.
+
+enum PumpCmd {
+    Play,
+    Pause,
+    Stop,
+    Seek(u64),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_receiver_session(
+    receiver_id: Uuid,
+    protocol: &'static str,
+    remote: RemoteSender,
+    control: &mut Box<dyn ErasedControlSession>,
+    create_puller: Arc<dyn Fn() -> Result<Box<dyn ErasedPuller>> + Send + Sync>,
+    video_decoders: &HashMap<Codec, Arc<dyn Fn() -> Box<dyn ErasedVideoDecoder> + Send + Sync>>,
+    audio_decoders: &HashMap<AudioCodec, Arc<dyn Fn() -> Box<dyn ErasedAudioDecoder> + Send + Sync>>,
+    sink_factory: SinkFactory,
+    event_tx: mpsc::Sender<ManagerEvent>,
+    cancel_rx: &mut mpsc::Receiver<()>,
+) -> Result<()> {
+    let mut pump: Option<JoinHandle<()>> = None;
+    let mut pump_tx: Option<mpsc::Sender<PumpCmd>> = None;
+
+    loop {
+        tokio::select! {
+            _ = cancel_rx.recv() => {
+                if let Some(tx) = pump_tx.take() { let _ = tx.send(PumpCmd::Stop).await; }
+                if let Some(h) = pump.take() { let _ = h.await; }
+                return Ok(());
+            }
+            cmd = control.next_command() => {
+                let cmd = cmd?;
+                match cmd {
+                    MediaCommand::Load { url, autoplay, .. } => {
+                        // Tear down any in-flight pump from a prior LOAD.
+                        if let Some(tx) = pump_tx.take() { let _ = tx.send(PumpCmd::Stop).await; }
+                        if let Some(h) = pump.take() { let _ = h.await; }
+
+                        let mut puller = (create_puller)()?;
+                        let info = puller
+                            .open(PullSpec { url: url.clone(), headers: HashMap::new() })
+                            .await?;
+                        tracing::info!(protocol, %url, ?info, "receiver: puller opened");
+
+                        let _ = event_tx
+                            .send(ManagerEvent::ReceiverStarted {
+                                receiver_id,
+                                remote: remote.clone(),
+                                info: info.clone(),
+                            })
+                            .await;
+
+                        let sink = (sink_factory)(&remote, &info).await?;
+
+                        let video_dec = match &info.video {
+                            Some(v) => {
+                                let f = video_decoders.get(&v.codec).ok_or_else(|| {
+                                    FerricastError::Decode(format!(
+                                        "no video decoder registered for codec {:?}",
+                                        v.codec
+                                    ))
+                                })?;
+                                let mut d = (f)();
+                                d.configure(&DecoderConfig {
+                                    codec: v.codec,
+                                    width: v.width,
+                                    height: v.height,
+                                    // NV12 is what every GPU decoder
+                                    // emits natively (VA-API VPP, NVDEC
+                                    // surface format); CPU fallbacks
+                                    // can convert if needed.
+                                    pixel_format: PixelFormat::Nv12,
+                                })?;
+                                Some(d)
+                            }
+                            None => None,
+                        };
+                        let audio_dec = match &info.audio {
+                            Some(a) => {
+                                let f = audio_decoders.get(&a.codec).ok_or_else(|| {
+                                    FerricastError::Decode(format!(
+                                        "no audio decoder registered for codec {:?}",
+                                        a.codec
+                                    ))
+                                })?;
+                                let mut d = (f)();
+                                d.configure(&AudioDecoderConfig {
+                                    codec: a.codec,
+                                    sample_rate: a.sample_rate,
+                                    channels: a.channels,
+                                })?;
+                                Some(d)
+                            }
+                            None => None,
+                        };
+
+                        let (ptx, prx) = mpsc::channel(8);
+                        let ev = event_tx.clone();
+                        let h = tokio::spawn(run_pump(
+                            receiver_id,
+                            puller,
+                            video_dec,
+                            audio_dec,
+                            sink,
+                            prx,
+                            ev,
+                            autoplay,
+                        ));
+                        pump = Some(h);
+                        pump_tx = Some(ptx);
+
+                        let state = if autoplay {
+                            PlaybackState::Playing
+                        } else {
+                            PlaybackState::Paused
+                        };
+                        let _ = control.report_state(state.clone()).await;
+                        let _ = event_tx
+                            .send(ManagerEvent::ReceiverStateChanged {
+                                receiver_id,
+                                state,
+                            })
+                            .await;
+                    }
+                    MediaCommand::Play => {
+                        if let Some(tx) = pump_tx.as_ref() {
+                            let _ = tx.send(PumpCmd::Play).await;
+                        }
+                        let _ = control.report_state(PlaybackState::Playing).await;
+                        let _ = event_tx
+                            .send(ManagerEvent::ReceiverStateChanged {
+                                receiver_id,
+                                state: PlaybackState::Playing,
+                            })
+                            .await;
+                    }
+                    MediaCommand::Pause => {
+                        if let Some(tx) = pump_tx.as_ref() {
+                            let _ = tx.send(PumpCmd::Pause).await;
+                        }
+                        let _ = control.report_state(PlaybackState::Paused).await;
+                        let _ = event_tx
+                            .send(ManagerEvent::ReceiverStateChanged {
+                                receiver_id,
+                                state: PlaybackState::Paused,
+                            })
+                            .await;
+                    }
+                    MediaCommand::Stop => {
+                        if let Some(tx) = pump_tx.take() {
+                            let _ = tx.send(PumpCmd::Stop).await;
+                        }
+                        if let Some(h) = pump.take() {
+                            let _ = h.await;
+                        }
+                        let _ = control.report_state(PlaybackState::Idle).await;
+                        let _ = event_tx
+                            .send(ManagerEvent::ReceiverStateChanged {
+                                receiver_id,
+                                state: PlaybackState::Idle,
+                            })
+                            .await;
+                    }
+                    MediaCommand::Seek { position_us } => {
+                        if let Some(tx) = pump_tx.as_ref() {
+                            let _ = tx.send(PumpCmd::Seek(position_us)).await;
+                        }
+                    }
+                    MediaCommand::GetStatus => {
+                        // Receiver protocol crates handle their own
+                        // status reporting cadence; the manager just
+                        // acknowledges the command was received and
+                        // moves on.
+                    }
+                    other => {
+                        // Queue ops, volume, track selection, app
+                        // launch — wire these through as the protocol
+                        // crates need them. Logged for diagnostic
+                        // visibility; not an error.
+                        tracing::debug!(
+                            protocol,
+                            ?other,
+                            "receiver: command accepted but not yet routed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_pump(
+    receiver_id: Uuid,
+    mut puller: Box<dyn ErasedPuller>,
+    mut video_dec: Option<Box<dyn ErasedVideoDecoder>>,
+    mut audio_dec: Option<Box<dyn ErasedAudioDecoder>>,
+    mut sink: Box<dyn FrameSink>,
+    mut cmd_rx: mpsc::Receiver<PumpCmd>,
+    event_tx: mpsc::Sender<ManagerEvent>,
+    autoplay: bool,
+) {
+    let mut playing = autoplay;
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => match cmd {
+                Some(PumpCmd::Play) => playing = true,
+                Some(PumpCmd::Pause) => playing = false,
+                Some(PumpCmd::Seek(pos)) => {
+                    if let Err(e) = puller.seek(pos).await {
+                        tracing::warn!(%e, "pump: seek failed");
+                    }
+                }
+                Some(PumpCmd::Stop) | None => break,
+            },
+            packet = puller.next(), if playing => match packet {
+                Ok(MediaPacket::Video(f)) => {
+                    let Some(d) = video_dec.as_mut() else { continue };
+                    match d.decode(f) {
+                        Ok(Some(frame)) => {
+                            if let Err(e) = sink.push_video(frame).await {
+                                tracing::warn!(%e, "pump: sink.push_video failed");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(%e, "pump: video decode failed"),
+                    }
+                }
+                Ok(MediaPacket::Audio(a)) => {
+                    let Some(d) = audio_dec.as_mut() else { continue };
+                    match d.decode(a) {
+                        Ok(Some(pcm)) => {
+                            if let Err(e) = sink.push_audio(pcm).await {
+                                tracing::warn!(%e, "pump: sink.push_audio failed");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(%e, "pump: audio decode failed"),
+                    }
+                }
+                Ok(MediaPacket::Eos) => {
+                    let _ = event_tx
+                        .send(ManagerEvent::ReceiverStateChanged {
+                            receiver_id,
+                            state: PlaybackState::Ended,
+                        })
+                        .await;
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!(%e, "pump: puller error");
+                    let _ = event_tx
+                        .send(ManagerEvent::ReceiverError {
+                            receiver_id,
+                            message: e.to_string(),
+                        })
+                        .await;
+                    break;
+                }
+            }
+        }
+    }
+    let _ = puller.close().await;
 }
 
 /// Forward `frame`'s timestamp by `delta_us` microseconds. Used by
@@ -835,6 +1617,66 @@ impl StreamManagerBuilder {
         self.register::<ferricast_chromecast::ChromecastHandler>()
     }
 
+    /// Register the Chromecast *receiver* — advertise this process
+    /// as a Cast target and accept LOAD / PLAY / PAUSE / SEEK from
+    /// senders.
+    #[cfg(feature = "chromecast")]
+    pub fn with_chromecast_receiver(self) -> Self {
+        self.register_receiver::<ferricast_chromecast::ChromecastReceiver>()
+    }
+
+    /// Register the bundled H.264 video decoder facade
+    /// ([`ferricast_decoder::H264Decoder`]).
+    pub fn with_h264_decoder(self) -> Self {
+        self.register_video_decoder::<ferricast_decoder::H264Decoder>()
+    }
+
+    /// Register the bundled AAC audio decoder
+    /// ([`ferricast_decoder::AacDecoder`]).
+    #[cfg(feature = "aac")]
+    pub fn with_aac_decoder(self) -> Self {
+        self.register_audio_decoder::<ferricast_decoder::AacDecoder>()
+    }
+
+    /// Register a receiver-side protocol handler.
+    pub fn register_receiver<P>(mut self) -> Self
+    where
+        P: ReceiverProtocol + Clone + Default + 'static,
+    {
+        self.manager.register_receiver::<P>();
+        self
+    }
+
+    /// Register a video decoder factory. See
+    /// [`StreamManager::register_video_decoder`] for ordering.
+    pub fn register_video_decoder<D>(mut self) -> Self
+    where
+        D: VideoDecoder + Default + 'static,
+    {
+        self.manager.register_video_decoder::<D>();
+        self
+    }
+
+    pub fn register_audio_decoder<D>(mut self) -> Self
+    where
+        D: AudioDecoder + Default + 'static,
+    {
+        self.manager.register_audio_decoder::<D>();
+        self
+    }
+
+    /// Set the sink factory the receiver pipeline asks for a
+    /// destination whenever a new transmission arrives. The GUI
+    /// typically opens a new window inside this callback.
+    pub fn set_sink_factory<F, Fut>(mut self, factory: F) -> Self
+    where
+        F: Fn(&RemoteSender, &MediaInfo) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Box<dyn FrameSink>>> + Send + 'static,
+    {
+        self.manager.set_sink_factory(factory);
+        self
+    }
+
     /// Finalize the builder and return the manager. The event
     /// receiver stays inside the manager; call
     /// [`StreamManager::take_event_rx`] when you need it.
@@ -853,4 +1695,98 @@ impl StreamManagerBuilder {
             .expect("freshly built manager always has its event_rx");
         (self.manager, rx)
     }
+}
+
+/// Helper for the supervisor's `tokio::select!` arm reading from
+/// the optional audio frame channel. `select!` can't dispatch on an
+/// `Option<&mut Receiver<_>>` directly, so we resolve it here:
+/// returns `None` when no receiver is wired (the arm's `if` guard
+/// disables it anyway, but we keep the future well-formed).
+async fn recv_audio_frame(
+    chan: &mut Option<mpsc::Receiver<AudioFrame>>,
+) -> Option<AudioFrame> {
+    match chan {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Run the PipeWire audio capture → AAC encoder pipeline forever.
+/// Lives in its own task so the blocking PipeWire main-loop thread
+/// doesn't interfere with the supervisor's video hot path.
+///
+/// The encoder is configured with the same sample rate / channel
+/// layout PipeWire negotiated, so resampling is the audio graph's
+/// job (not ours). Encoded AAC frames go out through `tx`; dropping
+/// the supervisor's receiver makes `tx.send` fail and we exit
+/// cleanly.
+async fn run_audio_pipeline(
+    audio_cfg: ferricast_core::AudioStreamConfig,
+    mute: ferricast_core::AudioMuteHandle,
+    tx: mpsc::Sender<AudioFrame>,
+) -> Result<()> {
+    let mut capture = PipeWireAudioCapture::new();
+    let cap_cfg = AudioCaptureConfig {
+        sample_rate: audio_cfg.sample_rate,
+        channels: audio_cfg.channels,
+    };
+    capture
+        .start(AudioSource::DefaultMonitor, cap_cfg, mute)
+        .await?;
+    tracing::info!(
+        requested_sample_rate = audio_cfg.sample_rate,
+        requested_channels = audio_cfg.channels,
+        bitrate_kbps = audio_cfg.bitrate_kbps,
+        "audio capture started; encoder will be configured on first PCM chunk"
+    );
+
+    // Lazy AAC encoder construction: the encoder is configured the
+    // first time PCM arrives, using whatever rate / channels
+    // PipeWire actually negotiated. Without this, a sink that
+    // delivers samples at, say, 44.1 kHz against our 48 kHz
+    // request would have us writing AAC frames with the wrong
+    // ADTS sample-rate index, and the chromecast would play
+    // them at the wrong pitch ("audio raro" / "mal procesado"
+    // even though the bitstream itself parses fine).
+    let mut encoder = AacEncoder::new();
+    let mut encoder_configured = false;
+
+    loop {
+        let pcm = match capture.next_frame().await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(%e, "audio capture next_frame failed; stopping pipeline");
+                break;
+            }
+        };
+        if !encoder_configured {
+            encoder.configure(&AudioEncoderConfig {
+                codec: audio_cfg.codec,
+                sample_rate: pcm.sample_rate,
+                channels: pcm.channels,
+                bitrate_kbps: audio_cfg.bitrate_kbps,
+            })?;
+            tracing::info!(
+                sample_rate = pcm.sample_rate,
+                channels = pcm.channels,
+                bitrate_kbps = audio_cfg.bitrate_kbps,
+                "AAC encoder configured against PipeWire's negotiated format"
+            );
+            encoder_configured = true;
+        }
+        if let Err(e) = encoder.encode(&pcm) {
+            tracing::warn!(%e, "AAC encode failed; dropping audio chunk");
+            continue;
+        }
+        for aac in encoder.take_output() {
+            if tx.send(aac).await.is_err() {
+                tracing::info!("audio supervisor dropped receiver; exiting pipeline");
+                let _ = capture.stop().await;
+                return Ok(());
+            }
+        }
+    }
+
+    let _ = capture.stop().await;
+    Ok(())
 }

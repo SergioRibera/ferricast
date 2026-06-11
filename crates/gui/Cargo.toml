@@ -2,7 +2,7 @@
 name = "ferricast-gui"
 version = "0.1.0"
 edition = "2024"
-description = "Freya-based desktop GUI for ferricast"
+description = "Freya-based desktop GUI + ferricast D-Bus daemon"
 
 [[bin]]
 name = "ferricast-gui"
@@ -12,18 +12,66 @@ path = "src/main.rs"
 # Forward the lib's backend/protocol features so packagers can build
 # the binary with only the surface they actually ship (e.g. Wayland-
 # only image: `--no-default-features --features pipewire,chromecast`).
-default = ["chromecast", "pipewire", "x11"]
+default = [
+    "chromecast",
+    "pipewire",
+    "x11",
+    "wlroots",
+    "wayland-direct",
+    "openh264",
+    "vaapi",
+    "nvenc",
+    "aac",
+    "fdk-aac",
+]
 chromecast = ["ferricast/chromecast"]
 pipewire = ["ferricast/pipewire"]
 x11 = ["ferricast/x11"]
+# Encoder backends — forwarded through the umbrella to ferricast-encoder.
+# Drop `vaapi` here when cros-libva can't compile against the host
+# libva version; the runtime backend chain then skips VA-API and
+# uses NVENC / openh264.
+openh264 = ["ferricast/openh264"]
+vaapi = ["ferricast/vaapi"]
+nvenc = ["ferricast/nvenc"]
+aac = ["ferricast/aac"]
+# AAC-LC sender-side encoder via libfdk-aac. Required for the
+# chromecast HLS audio pipeline. Without this the audio task in
+# `StreamManager` panics on first PCM with `AacEncoder: no backend
+# compiled in` — video keeps working but audio is silent fallback.
+fdk-aac = ["ferricast/fdk-aac"]
+nvenc-zero-copy = ["ferricast/nvenc-zero-copy", "nvenc"]
+# Wayland source enumeration. Defaults on so `ferricast-gui windows`
+# works out of the box on every modern compositor that exposes
+# foreign-toplevel (wlroots, niri, KDE Plasma 6); falls through to
+# the portal silently on GNOME / Mutter.
+wlroots = ["ferricast/wlroots"]
+# Wayland direct capture (zero-copy via wlr-screencopy + gbm).
+# Falls back to pipewire when the protocols aren't available.
+wayland-direct = ["ferricast/wayland-direct"]
 
 [dependencies]
 ferricast.workspace = true
+ferricast-dbus.workspace = true
 
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 uuid.workspace = true
+zbus.workspace = true
+clap.workspace = true
+futures-util.workspace = true
 
-freya = { version = "0.4.0-rc.11", features = ["icons", "router", "radio"] }
+freya = { version = "0.4.0-rc.19", features = ["icons", "router", "radio", "engine"] }
 rustls = { version = "0.23", features = ["ring"] }
+anyhow = "1"
+bytes.workspace = true
+async-trait.workspace = true
+
+# Audio output for receiver windows. `rodio` bundles `OutputStream`
+# + `Sink` over `cpal` (which uses PipeWire on modern Linux), and
+# the `symphonia-aac` feature lets us swap to direct-from-ADTS
+# decoding later if we want — for now the receiver pipeline
+# pre-decodes via `ferricast-decoder::AacDecoder` and we push PCM.
+rodio = { version = "0.20", default-features = false, features = ["symphonia-aac"] }

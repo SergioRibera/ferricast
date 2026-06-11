@@ -33,7 +33,7 @@
 //! ## Modules
 //!
 //! - [`capture`] — screen-capture backends (PipeWire, X11, native picker).
-//! - [`encoder`] — video encoders (x264, VA-API, NVENC) behind a unified trait.
+//! - [`encoder`] — video encoders (openh264, VA-API, NVENC) behind a unified trait.
 //! - [`protocols`] — receiver protocols (Chromecast today; DIAL/AirPlay/Miracast pending).
 //! - [`prelude`] — the everyday types most callers want in scope.
 
@@ -58,10 +58,20 @@ pub mod capture {
 /// Video encoders.
 ///
 /// The default H.264 entry point is [`encoder::h264::H264Encoder`].
-/// At runtime it negotiates NVENC → VA-API → x264 in order, so the
+/// At runtime it negotiates NVENC → VA-API → openh264 in order, so the
 /// same handle works across hardware without any caller changes.
 pub mod encoder {
     pub use ferricast_encoder::*;
+}
+
+/// Receiver-side decoders.
+///
+/// Today's facade exposes a CPU H.264 path via openh264 and an AAC-LC
+/// audio path via symphonia. The facade type ([`decoder::H264Decoder`])
+/// is shaped to absorb VA-API + NVDEC variants once those land
+/// without changing the call sites.
+pub mod decoder {
+    pub use ferricast_decoder::*;
 }
 
 /// HLS server primitives — exposed mainly so protocols outside this
@@ -91,7 +101,8 @@ pub mod prelude {
     pub use crate::capture::NativeCapture;
     pub use crate::encoder::h264::H264Encoder;
     pub use crate::{
-        CaptureSource, Codec, Device, DeviceCapabilities, FerricastError, ManagerEvent,
-        ProtocolHandler, Result, StreamConfig, StreamManager, StreamManagerBuilder,
+        AudioCodec, AudioMuteHandle, AudioStreamConfig, CaptureSource, Codec, Device,
+        DeviceCapabilities, FerricastError, ManagerEvent, ProtocolHandler, Result, StreamConfig,
+        StreamManager, StreamManagerBuilder,
     };
 }

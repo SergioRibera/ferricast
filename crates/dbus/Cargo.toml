@@ -1,0 +1,14 @@
+[package]
+name = "ferricast-dbus"
+version = "0.1.0"
+edition = "2024"
+description = "D-Bus interface types and proxy for ferricast — shared between daemon and clients"
+
+[dependencies]
+zbus = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+futures-util = { workspace = true }

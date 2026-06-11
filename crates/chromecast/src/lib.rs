@@ -1,6 +1,8 @@
 pub mod castv2;
 pub mod discovery;
+pub mod receiver;
 pub mod session;
+pub(crate) mod self_filter;
 mod wire;
 
 pub use castv2::{
@@ -8,6 +10,7 @@ pub use castv2::{
     namespace as cast_namespace,
 };
 pub use discovery::ChromecastDiscovery;
+pub use receiver::{ChromecastReceiver, ChromecastReceiverAdvertiser, ChromecastReceiverControl};
 pub use session::ChromecastSession;
 
 use ferricast_core::{Codec, ProtocolHandler, Result};

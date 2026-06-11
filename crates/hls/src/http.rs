@@ -19,9 +19,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 
@@ -47,21 +45,23 @@ const BLOCKING_RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per-connection entry point. Loops as long as the client wants to
 /// keep the TCP connection alive (HTTP/1.1 default; opt-out via
 /// `Connection: close`).
-pub async fn handle(
-    socket: TcpStream,
+///
+/// `io` is generic so the same handler runs on plain TCP and on
+/// `TlsStream<TcpStream>` (HTTPS). The TCP-specific `set_nodelay`
+/// and `peer_addr` work happens in the caller (the accept loop in
+/// [`crate::HlsFrameSink`] / [`crate::HlsServer`]) so this layer
+/// stays IO-agnostic.
+pub async fn handle<I>(
+    peer: String,
+    io: I,
     ring: Arc<RwLock<SegmentRing>>,
     adaptive: Option<Arc<AdaptiveBitrateState>>,
     stats: Arc<SessionStats>,
-) -> Result<()> {
-    let peer = socket
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "?".into());
-    // TCP_NODELAY: pre-fragment a request/response on its own TCP
-    // segment. Helps small responses (playlists, 304s) avoid waiting
-    // for the next batch of pacing data on the keep-alive path.
-    let _ = socket.set_nodelay(true);
-    let (read_half, mut write_half) = socket.into_split();
+) -> Result<()>
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let (read_half, mut write_half) = tokio::io::split(io);
     let mut reader = BufReader::new(read_half);
 
     loop {
@@ -399,7 +399,10 @@ pub async fn handle(
 /// (ffplay's HLS demuxer reloads several times a second) sometimes
 /// see EOF before the kernel has drained the response body — the
 /// drop-on-scope-exit close races the loopback FIN.
-async fn finalize(mut w: OwnedWriteHalf) {
+async fn finalize<W>(mut w: W)
+where
+    W: AsyncWrite + Unpin,
+{
     let _ = w.flush().await;
     let _ = w.shutdown().await;
 }

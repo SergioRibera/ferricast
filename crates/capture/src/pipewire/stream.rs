@@ -26,7 +26,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use ferricast_core::{CaptureConfig, CapturedFrame, FerricastError, RawFrame, Result};
+use ferricast_core::{
+    CaptureConfig, CapturedFrame, DmaBufPlane, FerricastError, GpuFrame, RawFrame, Result,
+};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -481,9 +483,15 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
     //   (no point in deferring since mmap is cheap and any consumer
     //   needs the bytes anyway).
     // * DmaBuf with tiled/compressed modifier + GPU importer → emit
-    //   `Gpu` carrying the fd. Readback is deferred until the
-    //   encoder actually asks for CPU bytes (or VA-API consumes the
-    //   fd directly).
+    //   `Gpu` carrying the fd + importer. The downstream encoder
+    //   either consumes the fd directly (VA-API / NVENC after the
+    //   dmabuf-input commits land) or calls `into_cpu()`, which
+    //   triggers a synchronous Vulkan readback via the importer. We
+    //   no longer eagerly pipeline the readback in the producer
+    //   thread — that hid ~10-15 ms of blit latency for the x264
+    //   path but turned every frame into a wasted memcpy for the
+    //   GPU encoder paths. Net: x264 picks up ~10-15 ms per frame,
+    //   GPU encoders skip a whole readback. Acceptable trade.
     // * DmaBuf with tiled modifier + no importer → drop with
     //   warning. Should be unreachable because we wouldn't have
     //   negotiated those modifiers in the first place.
@@ -515,6 +523,11 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
             })
         }
         DataType::DmaBuf => {
+            // We require the importer to have come up so that
+            // downstream CPU encoders (x264) can still read back. If
+            // it didn't, dropping is the safe move — emitting a Gpu
+            // frame with `importer: None` would just defer the same
+            // failure to `into_cpu()` later.
             let Some(importer) = ud.importer.as_ref() else {
                 warn!(
                     modifier = ?neg.modifier,
@@ -528,48 +541,33 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
                 warn!("DmaBuf plane has invalid fd");
                 return;
             }
-            // Pipelined Vulkan readback: submit *this* fd's blit on a
-            // free ring slot and take the bytes of the *previous*
-            // submission off another slot. The first call after
-            // startup or `reset_cache` returns `None` (nothing in
-            // flight yet) and we just drop the iteration; thereafter
-            // every callback sends one frame back. Net effect: the
-            // GPU blit for frame N+1 overlaps with the CPU memcpy of
-            // frame N, hiding the 12-30 ms blit cost behind the
-            // worker's own callback dispatch interval.
-            //
-            // Failures (lost device, OOM, bad modifier) are logged
-            // and the frame is dropped — `handle_process` is
-            // best-effort by design.
-            match importer.import_pipelined(
-                raw.fd as RawFd,
-                chunk_offset,
+            let plane_size = if raw.maxsize > 0 {
+                raw.maxsize.saturating_sub(chunk_offset)
+            } else {
+                stride.saturating_mul(neg.height)
+            };
+            // GPU emission: hand the encoder a `GpuFrame` carrying
+            // the raw fd + the importer for lazy readback. GPU-aware
+            // encoders (VA-API, NVENC) keep the fd zero-copy;
+            // CPU-only encoders (x264) call `frame.into_cpu()` which
+            // triggers `VulkanImporter::readback` via the trait. The
+            // pipelined-readback we used to do here is gone — see
+            // the decision-tree comment above for the trade-off.
+            CapturedFrame::Gpu(GpuFrame {
+                width: neg.width,
+                height: neg.height,
                 stride,
-                modifier,
-                neg.width,
-                neg.height,
-                neg.pixel_format,
+                format: neg.pixel_format,
                 timestamp_us,
-            ) {
-                Ok(Some(ready)) => CapturedFrame::Cpu(RawFrame {
-                    width: ready.width,
-                    height: ready.height,
-                    stride: ready.stride,
-                    format: ready.format,
-                    data: ready.bytes,
-                    timestamp_us: ready.timestamp_us,
-                }),
-                Ok(None) => {
-                    // Pipeline priming: the submit went out but
-                    // there's nothing to send back yet. We'll catch
-                    // the bytes on the next callback.
-                    return;
-                }
-                Err(e) => {
-                    warn!(error = %e, "Vulkan readback failed on PW thread — frame dropped");
-                    return;
-                }
-            }
+                plane: DmaBufPlane {
+                    fd: raw.fd as RawFd,
+                    offset: chunk_offset,
+                    stride,
+                    modifier,
+                    size: plane_size,
+                },
+                importer: Some(importer.clone() as Arc<dyn ferricast_core::DmaBufImporter>),
+            })
         }
         other => {
             warn!(?other, "unexpected SPA buffer data type");
