@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::frame::{AudioCodec, AudioFrame, CapturedFrame, EncodedFrame};
-use crate::{Codec, H264Profile, PixelFormat};
+use crate::{Codec, H264Profile, H265Profile, PixelFormat};
 
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
@@ -23,6 +23,11 @@ pub struct EncoderConfig {
     /// bitstream the receiver's hardware decoder can't handle.
     /// `None` = encoder picks its own default.
     pub max_h264_profile: Option<H264Profile>,
+    /// Upper bound on the HEVC profile the encoder is allowed to
+    /// emit. Mirror of [`Self::max_h264_profile`] for the H.265
+    /// pipeline. `None` = encoder picks Main (8-bit 4:2:0) as the
+    /// conservative floor every HEVC decoder accepts.
+    pub max_h265_profile: Option<H265Profile>,
 }
 
 impl EncoderConfig {
@@ -50,6 +55,7 @@ impl Default for EncoderConfig {
             keyframe_interval_secs: 2.0,
             pixel_format: PixelFormat::Bgra,
             max_h264_profile: None,
+            max_h265_profile: None,
         }
     }
 }

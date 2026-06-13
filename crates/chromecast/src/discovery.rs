@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use ferricast_core::{
     Codec, Device, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError, H264Profile,
-    MdnsDiscovery, Result,
+    H265Profile, MdnsDiscovery, Result,
 };
 
 use crate::self_filter;
@@ -287,6 +287,10 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         max_audio_bitrate_kbps: Some(128),
         requires_audio: true,
         max_h264_profile: Some(H264Profile::Main),
+        // 1st/2nd-gen Chromecasts have no HEVC decoder in hardware —
+        // the model branches below override to Main / Main10 only on
+        // devices known to support it.
+        max_h265_profile: None,
         supported_codecs: vec![Codec::H264, Codec::Vp8],
         // 1st/2nd-gen Chromecast firmware's HLS parser locks up on
         // EXT-X-VERSION:6 / EXT-X-PART-INF (field-tested). Newer
@@ -310,6 +314,7 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         caps.max_audio_bitrate_kbps = Some(320);
         caps.requires_audio = false;
         caps.max_h264_profile = Some(H264Profile::High);
+        caps.max_h265_profile = Some(H265Profile::Main10);
         caps.supported_codecs.extend([Codec::H265, Codec::Vp9]);
         // Ultra firmware (CAF receiver) handles EXT-X-VERSION:6 +
         // EXT-X-PART-INF. Cuts glass-to-glass from ~6 s to ~1-2 s.
@@ -323,6 +328,10 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         caps.max_audio_bitrate_kbps = Some(256);
         caps.requires_audio = false;
         caps.max_h264_profile = Some(H264Profile::High);
+        // Cast-built-in TVs ship hardware HEVC Main10 decoders;
+        // taking advantage cuts bitrate ~40% vs H.264 at equal
+        // perceptual quality.
+        caps.max_h265_profile = Some(H265Profile::Main10);
         // Modern CAF receiver ships LL-HLS support.
         caps.supports_low_latency_hls = true;
     } else if md_lc == "chromecast audio" {
@@ -333,6 +342,7 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         caps.max_height = None;
         caps.max_fps = None;
         caps.max_h264_profile = None;
+        caps.max_h265_profile = None;
         caps.supported_codecs.clear();
         // Audio-only device — push fidelity, this is the entire
         // point of the unit.

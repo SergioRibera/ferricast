@@ -37,7 +37,7 @@ mod util;
 use std::sync::Arc;
 
 use ferricast_core::{
-    AdvertiseInfo, Codec, DeviceCapabilities, H264Profile, ReceiverProtocol, Result,
+    AdvertiseInfo, Codec, DeviceCapabilities, H264Profile, H265Profile, ReceiverProtocol, Result,
 };
 use ferricast_hls::HlsPuller;
 use uuid::Uuid;
@@ -134,6 +134,7 @@ impl ReceiverProtocol for ChromecastReceiver {
                 max_audio_bitrate_kbps: Some(320),
                 requires_audio: false,
                 max_h264_profile: Some(H264Profile::High),
+                max_h265_profile: Some(H265Profile::Main10),
                 supported_codecs: vec![Codec::H264, Codec::H265],
                 supports_low_latency_hls: false,
             },

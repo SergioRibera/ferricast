@@ -26,7 +26,7 @@ pub use control::{
     TrackSelection,
 };
 pub use decoder::{AudioDecoder, AudioDecoderConfig, DecodedAudio, DecoderConfig, VideoDecoder};
-pub use device::{Device, DeviceCapabilities, DiscoveryEvent, H264Profile};
+pub use device::{Device, DeviceCapabilities, DiscoveryEvent, H264Profile, H265Profile};
 pub use discovery::{Discovery, MdnsDiscovery};
 pub use encoder::{AudioEncoder, AudioEncoderConfig, EncoderConfig, VideoEncoder};
 pub use error::{FerricastError, Result};

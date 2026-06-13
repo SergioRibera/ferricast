@@ -54,6 +54,11 @@ pub struct DeviceCapabilities {
     /// Android TV handle High without complaint. `None` = downstream
     /// encoder picks its own default.
     pub max_h264_profile: Option<H264Profile>,
+    /// Tightest HEVC profile the device's hardware decoder advertises.
+    /// `None` = downstream encoder picks Main (8-bit 4:2:0) as the
+    /// conservative floor — every HEVC-capable receiver we've shipped
+    /// against accepts Main; Main10 is opt-in per device class.
+    pub max_h265_profile: Option<H265Profile>,
     pub supported_codecs: Vec<crate::Codec>,
     /// Whether the receiver's HLS player understands Low-Latency
     /// HLS (RFC 8216bis): `#EXT-X-VERSION:6`,
@@ -91,6 +96,23 @@ pub enum H264Profile {
     /// compression ratio. Supported by Chromecast Ultra, Google
     /// TV, Android TV, AirPlay 2, modern Miracast sinks.
     High,
+}
+
+/// HEVC (H.265) profile constraint. Same negotiation contract as
+/// [`H264Profile`]: ordered "less featureful" → "more featureful";
+/// an encoder asked for Main10 falls back to Main when the hardware
+/// can't emit 10-bit. We only model the two production-relevant
+/// profiles — Main (8-bit 4:2:0) and Main10 (10-bit 4:2:0). Range
+/// Extensions / 4:4:4 are deliberately out of scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum H265Profile {
+    /// Main, 8-bit 4:2:0. Universally supported floor — every HEVC
+    /// decoder advertises Main.
+    Main,
+    /// Main10, 10-bit 4:2:0. HDR-capable receivers (Chromecast Ultra,
+    /// Google TV, modern Android TV, AirPlay 2) decode it; older
+    /// hardware does not.
+    Main10,
 }
 
 #[derive(Debug, Clone)]
