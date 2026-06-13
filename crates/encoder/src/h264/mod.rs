@@ -49,8 +49,6 @@ mod headers;
 #[cfg(feature = "vaapi")]
 mod yuv;
 
-#[cfg(feature = "nvenc")]
-mod nvenc_impl;
 #[cfg(feature = "openh264")]
 mod openh264_impl;
 #[cfg(feature = "vaapi")]
@@ -63,7 +61,7 @@ use ferricast_core::{
 use tracing::{info, warn};
 
 #[cfg(feature = "nvenc")]
-pub use nvenc_impl::NvencH264Encoder;
+pub use crate::nvenc::NvencH264Encoder;
 #[cfg(feature = "openh264")]
 pub use openh264_impl::OpenH264Encoder;
 #[cfg(feature = "vaapi")]

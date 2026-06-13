@@ -30,6 +30,12 @@ default = ["openh264", "vaapi", "nvenc", "fdk-aac"]
 openh264 = ["dep:openh264"]
 vaapi = ["dep:cros-libva"]
 nvenc = ["dep:shiguredo_nvcodec"]
+# HEVC (H.265) encode through NVENC. Builds on top of `nvenc` — the
+# generic `NvencEncoder<C>` carries the HEVC codec marker behind this
+# gate so a non-HEVC build doesn't compile the HEVC `CodecConfig`
+# mapping. Off by default because the H.265 facade (where this gets
+# routed through) is opt-in.
+nvenc-hevc = ["nvenc"]
 fdk-aac = ["dep:fdk-aac"]
 
 # Zero-copy DMA-BUF input on NVENC. Requires a forked
