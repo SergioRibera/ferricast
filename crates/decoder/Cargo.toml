@@ -24,6 +24,17 @@ aac = ["dep:symphonia"]
 # build that turns this feature on at compile time from accidentally
 # using a half-validated decode path.
 vaapi-decode = ["dep:cros-libva", "dep:h264-reader"]
+# VA-API HEVC decode. Sits next to `vaapi-decode` so the two share
+# the cros-libva dependency. Opt-in: HEVC decode is part of the
+# H.265 facade only.
+vaapi-hevc-decode = ["dep:cros-libva"]
+# NVDEC hardware decode (NVIDIA). Carries the generic `NvdecDecoder<C>`
+# whose codec marker selects H.264 today; the HEVC marker lives
+# behind `nvdec-hevc-decode` below.
+nvdec-decode = ["dep:shiguredo_nvcodec"]
+# NVDEC HEVC decode. Builds on top of `nvdec-decode`; only the codec
+# marker is gated, the dispatcher and CUDA plumbing are shared.
+nvdec-hevc-decode = ["nvdec-decode"]
 
 [dependencies]
 ferricast-core.workspace = true
@@ -41,3 +52,9 @@ cros-libva = { git = "https://github.com/SergioRibera/cros-libva", branch = "fix
 # VA-API backend to decode SPS / PPS so the VA buffer construction
 # has the bitstream-derived parameters it needs.
 h264-reader = { version = "0.7", optional = true }
+
+# NVDEC binding (same crate the encoder uses — the workspace is
+# already pinned to it, so wiring in decode here gets us NV12 output
+# from H.264 + HEVC bitstreams without a second NVIDIA library
+# dependency).
+shiguredo_nvcodec = { version = "2026.1.0", optional = true }

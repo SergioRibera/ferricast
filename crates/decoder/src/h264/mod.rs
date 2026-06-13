@@ -1,24 +1,23 @@
 //! H.264 decoder facade.
 //!
-//! Auto-selects a backend at first `configure()`. Today's chain:
+//! Auto-selects a backend at first `configure()`. Chain:
 //!
-//! 1. **VA-API** — opt-in only. Engaged when
+//! 1. **NVDEC** — NVIDIA hardware. Tried first when `nvdec-decode` is
+//!    compiled in and a CUDA-capable GPU is present at runtime.
+//! 2. **VA-API** — opt-in only. Engaged when
 //!    `FERRICAST_H264_DECODE_BACKEND=vaapi` is set in the environment.
-//!    The slice-submission path is incomplete (see
-//!    `vaapi_impl.rs`); leaving it out of the default chain prevents
-//!    accidental engagement of a half-validated decode path.
-//! 2. **openh264** — software CPU decode. Default. Always works
-//!    when compiled in.
-//!
-//! NVDEC slot is reserved for a follow-up — needs `cudarc` +
-//! `libnvcuvid` + CUDA→DMA-BUF interop, which is its own
-//! investigation.
+//!    The slice-submission path is incomplete (see `vaapi_impl.rs`);
+//!    leaving it out of the default chain prevents accidental
+//!    engagement of a half-validated decode path.
+//! 3. **openh264** — software CPU decode. Default fallback. Always
+//!    works when compiled in.
 
 #[cfg(not(feature = "openh264-decode"))]
 compile_error!(
     "ferricast-decoder requires the `openh264-decode` feature today — \
      it's the only universally-working H.264 backend wired up. VA-API \
-     is opt-in (off by default) and NVDEC follows in a later change."
+     is opt-in (off by default); NVDEC needs an NVIDIA GPU at runtime \
+     so it can't be the sole backend."
 );
 
 #[cfg(feature = "openh264-decode")]
@@ -32,6 +31,8 @@ use ferricast_core::{
 #[allow(unused_imports)]
 use tracing::info;
 
+#[cfg(feature = "nvdec-decode")]
+pub use crate::nvdec::NvdecH264Decoder;
 #[cfg(feature = "openh264-decode")]
 pub use openh264_impl::OpenH264Decoder;
 #[cfg(feature = "vaapi-decode")]
@@ -41,6 +42,8 @@ const H264_BACKEND_VAR: &str = "FERRICAST_H264_DECODE_BACKEND";
 
 pub enum H264Decoder {
     Pending,
+    #[cfg(feature = "nvdec-decode")]
+    Nvdec(NvdecH264Decoder),
     #[cfg(feature = "vaapi-decode")]
     Vaapi(VaapiH264Decoder),
     #[cfg(feature = "openh264-decode")]
@@ -66,6 +69,8 @@ impl VideoDecoder for H264Decoder {
         if !matches!(self, H264Decoder::Pending) {
             return match self {
                 H264Decoder::Pending => unreachable!(),
+                #[cfg(feature = "nvdec-decode")]
+                H264Decoder::Nvdec(d) => d.configure(config),
                 #[cfg(feature = "vaapi-decode")]
                 H264Decoder::Vaapi(d) => d.configure(config),
                 #[cfg(feature = "openh264-decode")]
@@ -74,6 +79,30 @@ impl VideoDecoder for H264Decoder {
         }
 
         let var = std::env::var(H264_BACKEND_VAR).unwrap_or_default();
+
+        // NVDEC first: hardware decode on NVIDIA. Same multi-GPU
+        // reasoning as the encoder facade — discrete NVIDIA + iGPU is
+        // a common laptop combo, and engaging NVDEC keeps the entire
+        // pipeline on the discrete GPU.
+        #[cfg(feature = "nvdec-decode")]
+        {
+            if var.is_empty() || var == "nvdec" {
+                match NvdecH264Decoder::probe() {
+                    Ok(()) => {
+                        let mut d = NvdecH264Decoder::new();
+                        d.configure(config)?;
+                        info!(
+                            width = config.width,
+                            height = config.height,
+                            "H.264 decoder backend: NVDEC"
+                        );
+                        *self = H264Decoder::Nvdec(d);
+                        return Ok(());
+                    }
+                    Err(e) => info!(error = %e, "NVDEC unavailable, trying VA-API / openh264"),
+                }
+            }
+        }
 
         // VA-API is opt-in: only engage when the env var explicitly
         // names it. Default chain skips straight to openh264.
@@ -100,7 +129,7 @@ impl VideoDecoder for H264Decoder {
 
         #[cfg(feature = "openh264-decode")]
         {
-            if var.is_empty() || var == "openh264" || var == "vaapi" {
+            if var.is_empty() || var == "openh264" || var == "vaapi" || var == "nvdec" {
                 info!("H.264 decoder backend: openh264 (software)");
                 let mut d = OpenH264Decoder::default();
                 d.configure(config)?;
@@ -119,6 +148,8 @@ impl VideoDecoder for H264Decoder {
             H264Decoder::Pending => Err(FerricastError::Decode(
                 "H264Decoder::decode called before configure()".into(),
             )),
+            #[cfg(feature = "nvdec-decode")]
+            H264Decoder::Nvdec(d) => d.decode(frame),
             #[cfg(feature = "vaapi-decode")]
             H264Decoder::Vaapi(d) => d.decode(frame),
             #[cfg(feature = "openh264-decode")]
@@ -129,6 +160,8 @@ impl VideoDecoder for H264Decoder {
     fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
         match self {
             H264Decoder::Pending => Ok(Vec::new()),
+            #[cfg(feature = "nvdec-decode")]
+            H264Decoder::Nvdec(d) => d.flush(),
             #[cfg(feature = "vaapi-decode")]
             H264Decoder::Vaapi(d) => d.flush(),
             #[cfg(feature = "openh264-decode")]

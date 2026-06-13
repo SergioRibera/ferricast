@@ -21,6 +21,9 @@
 
 pub mod h264;
 
+#[cfg(feature = "nvdec-decode")]
+pub mod nvdec;
+
 #[cfg(feature = "aac")]
 pub mod aac;
 
