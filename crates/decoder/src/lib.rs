@@ -21,6 +21,9 @@
 
 pub mod h264;
 
+#[cfg(any(feature = "nvdec-hevc-decode", feature = "vaapi-hevc-decode"))]
+pub mod h265;
+
 #[cfg(feature = "nvdec-decode")]
 pub mod nvdec;
 
@@ -30,3 +33,5 @@ pub mod aac;
 #[cfg(feature = "aac")]
 pub use aac::AacDecoder;
 pub use h264::H264Decoder;
+#[cfg(any(feature = "nvdec-hevc-decode", feature = "vaapi-hevc-decode"))]
+pub use h265::H265Decoder;
