@@ -32,7 +32,7 @@
 ///   even (the chroma subsampling assumes pairs).
 ///
 /// Stride may exceed `width * bpp` to honour driver alignment.
-pub(super) fn bgra_to_nv12(
+pub(crate) fn bgra_to_nv12(
     src: &[u8],
     src_stride: usize,
     width: u32,

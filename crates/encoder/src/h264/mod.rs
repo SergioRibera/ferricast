@@ -47,7 +47,7 @@ mod bitstream;
 #[cfg(feature = "vaapi")]
 mod headers;
 #[cfg(feature = "vaapi")]
-mod yuv;
+pub(crate) mod yuv;
 
 #[cfg(feature = "openh264")]
 mod openh264_impl;

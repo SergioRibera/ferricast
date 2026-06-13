@@ -36,6 +36,12 @@ nvenc = ["dep:shiguredo_nvcodec"]
 # mapping. Off by default because the H.265 facade (where this gets
 # routed through) is opt-in.
 nvenc-hevc = ["nvenc"]
+# HEVC (H.265) encode through VA-API (Intel / AMD). Builds the
+# packed VPS/SPS/PPS NAL writers and the HEVC parameter-buffer setup
+# on top of `vaapi`. Off by default, behind the same opt-in gate as
+# `nvenc-hevc` so the H.265 facade can be enabled without forcing
+# both hardware paths to compile.
+vaapi-hevc = ["vaapi"]
 fdk-aac = ["dep:fdk-aac"]
 
 # Zero-copy DMA-BUF input on NVENC. Requires a forked
