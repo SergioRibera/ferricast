@@ -42,6 +42,7 @@ pub struct X11Capture {
     /// configured value so downstream paces correctly.
     fps: u32,
     buffer_ptr: AtomicPtr<u8>,
+    time: Instant,
 }
 
 impl X11Capture {
@@ -55,6 +56,7 @@ impl X11Capture {
             size: (0, 0),
             source: None,
             fps: 0,
+            time: Instant::now(),
             buffer_ptr: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -297,6 +299,7 @@ impl ScreenCapture for X11Capture {
         self.size = (w, h);
         self.source = Some(resolved);
         self.fps = config.fps;
+        self.time = Instant::now();
         self.pixmap = Some(pixmap);
         Ok(())
     }
@@ -358,7 +361,7 @@ impl ScreenCapture for X11Capture {
             width: src.width,
             height: src.height,
             plane_mask: !0,
-            format: 2,
+            format: xcb::x::ImageFormat::ZPixmap as u8,
             shmseg: self.segment.unwrap(),
             offset: 0,
         });
@@ -372,14 +375,16 @@ impl ScreenCapture for X11Capture {
             return Err(FerricastError::Capture(format!("GetImage: {e}")));
         }
 
+        let bytes_per_pixel = (format.bits_per_pixel() / 8) as u32;
+
         Ok(ferricast_core::CapturedFrame::Cpu(
             ferricast_core::RawFrame {
                 width: self.size.0 as u32,
                 height: self.size.1 as u32,
-                stride: format.bits_per_pixel() as u32,
+                stride: (self.size.0 as u32) * bytes_per_pixel,
                 format: ferricast_core::PixelFormat::Bgra,
                 data: Bytes::from(buffer.to_vec()),
-                timestamp_us: Instant::now().elapsed().as_micros() as u64,
+                timestamp_us: self.time.elapsed().as_micros() as u64,
             },
         ))
     }
