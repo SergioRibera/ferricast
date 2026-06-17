@@ -387,10 +387,13 @@ impl VideoEncoder for VaapiH265Encoder {
     }
 
     fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
+        let target_recon_idx = self.state.borrow().next_recon;
+        let target_surface = &self.recon[target_recon_idx];
+
         let timestamp_us = frame.timestamp_us();
         match frame {
             CapturedFrame::Gpu(g) if self.vpp_context.is_some() => {
-                self.upload_dmabuf_via_vpp(&g)?;
+                self.upload_dmabuf_via_vpp(target_recon_idx, &g)?;
             }
             other => {
                 let raw = other.into_cpu()?;
@@ -400,7 +403,7 @@ impl VideoEncoder for VaapiH265Encoder {
                         raw.format
                     )));
                 }
-                upload_bgra_to_nv12(&self.input, &self.cfg, &raw.data, raw.stride as usize)?;
+                upload_bgra_to_nv12(target_surface, &self.cfg, &raw.data, raw.stride as usize)?;
             }
         }
 
@@ -987,7 +990,7 @@ impl ExternalBufferDescriptor for DmaBufImport {
 }
 
 impl VaapiH265Encoder {
-    fn upload_dmabuf_via_vpp(&self, g: &GpuFrame) -> Result<()> {
+    fn upload_dmabuf_via_vpp(&self, target_recon_idx: usize, g: &GpuFrame) -> Result<()> {
         let vpp = self
             .vpp_context
             .as_ref()
@@ -1060,7 +1063,8 @@ impl VaapiH265Encoder {
             .create_buffer(BufferType::ProcPipelineParameter(pipe))
             .map_err(|e| FerricastError::Encoder(format!("VA-API HEVC: vaCreateBuffer(VPP): {e}")))?;
 
-        let mut pic = Picture::new(g.timestamp_us, Rc::clone(vpp), &self.input);
+        let dest = &self.recon[target_recon_idx];
+        let mut pic = Picture::new(g.timestamp_us, Rc::clone(vpp), dest);
         pic.add_buffer(buffer);
         let pic = pic
             .begin::<()>()

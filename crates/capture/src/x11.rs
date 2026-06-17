@@ -221,13 +221,16 @@ impl ScreenCapture for X11Capture {
             FerricastError::Capture("X server returned no screen on this connection".into())
         })?;
 
+        let root_depth = screen.root_depth();
         let pixmap = conn
             .get_setup()
             .pixmap_formats()
             .iter()
-            .find(|f| f.depth() == f.bits_per_pixel())
+            .find(|f| f.depth() == root_depth)
             .ok_or_else(|| {
-                FerricastError::Capture("no matching pixmap format on this visual".into())
+                FerricastError::Capture(format!(
+                    "no pixmap format for root depth {root_depth}"
+                ))
             })?
             .to_owned();
 

@@ -541,8 +541,13 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
                 warn!("DmaBuf plane has invalid fd");
                 return;
             }
-            let plane_size = if raw.maxsize > 0 {
-                raw.maxsize.saturating_sub(chunk_offset)
+            // DMA-BUF object size: use maxsize directly (the total
+            // buffer including tiling padding). Do NOT subtract
+            // chunk_offset — VA-API's objects[0].size expects the
+            // full fd size, and the plane offset is stored separately
+            // in DmaBufPlane.offset.
+            let dmabuf_size = if raw.maxsize > 0 {
+                raw.maxsize
             } else {
                 stride.saturating_mul(neg.height)
             };
@@ -564,7 +569,7 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
                     offset: chunk_offset,
                     stride,
                     modifier,
-                    size: plane_size,
+                    size: dmabuf_size,
                 },
                 importer: Some(importer.clone() as Arc<dyn ferricast_core::DmaBufImporter>),
             })

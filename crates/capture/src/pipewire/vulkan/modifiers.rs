@@ -67,10 +67,23 @@ pub(super) fn query(inner: &Inner, format: vk::Format) -> Result<Vec<u64>> {
     // We only keep modifiers we can transfer-blit out of. Anything
     // that's storage-only / sampled-only would still arrive in the
     // dmabuf path but our staging-copy would fail.
+    //
+    // We also reject multi-plane modifiers (plane_count > 1). CCS
+    // compressed formats (e.g. I915_FORMAT_MOD_Y_TILED_GEN12_RC_CCS)
+    // require a second plane for compression metadata. Our import
+    // pipeline only handles single-plane formats — both the Vulkan
+    // explicit-modifier create and the VA-API DRM_PRIME_2 descriptor
+    // supply exactly one plane layout. Advertising a 2-plane modifier
+    // causes vkCreateImage to fail with
+    // ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT and VA-API's
+    // vaCreateSurfaces to return "invalid parameter".
     let needed = vk::FormatFeatureFlags::TRANSFER_SRC;
     let modifiers: Vec<u64> = storage
         .iter()
-        .filter(|p| p.drm_format_modifier_tiling_features.contains(needed))
+        .filter(|p| {
+            p.drm_format_modifier_tiling_features.contains(needed)
+                && p.drm_format_modifier_plane_count == 1
+        })
         .map(|p| p.drm_format_modifier)
         .collect();
 

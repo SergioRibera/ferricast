@@ -91,7 +91,7 @@ impl VideoEncoder for OpenH264Encoder {
         Ok(())
     }
     fn encode(&mut self, frame: ferricast_core::CapturedFrame) -> ferricast_core::Result<ferricast_core::EncodedFrame> {
-        let frame = frame.into_cpu().unwrap();
+        let frame = frame.into_cpu()?;
         let encoder = self.encoder.as_mut().expect("Ferricast(Openh264) bug: use of an encoder that has not been configured");
         
         let yuv_buffer = match frame.format {

@@ -479,20 +479,18 @@ impl VideoEncoder for VaapiH264Encoder {
     }
 
     fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
-        // Two paths into the encoder's `input` NV12 surface:
-        //
-        // 1. `CapturedFrame::Gpu(g)` + VPP available → import `g`'s
-        //    DMA-BUF as a BGRA/RGBA surface and run `vaProcPipeline`
-        //    to convert it into NV12 directly inside the driver. No
-        //    CPU bytes ever touched.
-        // 2. Otherwise → readback to CPU, run the existing
-        //    BGRA→NV12 conversion + `vaPutImage` upload. Pre-Gpu
-        //    behavior, kept for x264-style callers and as a
-        //    fallback when the driver doesn't expose VPP.
+        // The VA-API encoder reads from the surface passed to
+        // `vaBeginPicture`, which must be one of the context's render
+        // targets (the recon pool). Upload the frame data directly
+        // into the recon surface that `run_encode` will select as the
+        // current target — this is `state.next_recon`.
+        let target_recon_idx = self.state.borrow().next_recon;
+        let target_surface = &self.recon[target_recon_idx];
+
         let timestamp_us = frame.timestamp_us();
         match frame {
             CapturedFrame::Gpu(g) if self.vpp_context.is_some() => {
-                self.upload_dmabuf_via_vpp(&g)?;
+                self.upload_dmabuf_via_vpp(target_recon_idx, &g)?;
             }
             other => {
                 let raw = other.into_cpu()?;
@@ -502,7 +500,7 @@ impl VideoEncoder for VaapiH264Encoder {
                         raw.format
                     )));
                 }
-                upload_bgra_to_nv12(&self.input, &self.cfg, &raw.data, raw.stride as usize)?;
+                upload_bgra_to_nv12(target_surface, &self.cfg, &raw.data, raw.stride as usize)?;
             }
         }
 
@@ -790,7 +788,6 @@ fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         check_status(vaBeginPicture(dpy, ctx, target))
             .map_err(|s| FerricastError::Encoder(format!("vaBeginPicture: {s:#x}")))?;
 
-        println!("{:?}", all_ids.len());
         let render_status =
             vaRenderPicture(dpy, ctx, all_ids.as_ptr() as *mut _, all_ids.len() as i32);
         if let Err(s) = check_status(render_status) {
@@ -1114,9 +1111,9 @@ fn check_status(status: VAStatus) -> std::result::Result<(), VAStatus> {
 //
 // Zero-copy ingest: import the producer's DMA-BUF as a BGRA/RGBA
 // surface, then run a VPP `vaProcPipeline` step in-driver to copy +
-// colour-convert into `self.input` (NV12). The encoder then proceeds
-// exactly like the CPU path — `self.input` is the same surface
-// either way, just populated differently.
+// colour-convert into the current recon surface (NV12). The encoder
+// reads from this surface via `vaBeginPicture` and writes the
+// reconstruction back to it.
 //
 // The imported surface is **per-frame** because the fd may change
 // every frame (PipeWire rotates buffers in a pool, WaylandDirect
@@ -1168,7 +1165,7 @@ impl ExternalBufferDescriptor for DmaBufImport {
 }
 
 impl VaapiH264Encoder {
-    fn upload_dmabuf_via_vpp(&self, g: &GpuFrame) -> Result<()> {
+    fn upload_dmabuf_via_vpp(&self, target_recon_idx: usize, g: &GpuFrame) -> Result<()> {
         let vpp = self.vpp_context.as_ref().ok_or_else(|| {
             FerricastError::Encoder("VA-API: VPP not initialised".into())
         })?;
@@ -1211,10 +1208,8 @@ impl VaapiH264Encoder {
         let imported = surfaces.pop().expect("we asked for 1");
 
         // VAProcPipelineParameterBuffer points at `imported` as the
-        // source; the destination is implicit (the picture target,
-        // = self.input). We pass color standard `None` and let the
-        // driver pick BT.709 — captures from any modern Wayland
-        // compositor are already in sRGB / BT.709.
+        // source; the destination is the recon surface that
+        // `run_encode` will pass to `vaBeginPicture`.
         let pipe = ProcPipelineParameterBuffer::new(
             imported.id(),
             None, // surface_region = full
@@ -1244,8 +1239,10 @@ impl VaapiH264Encoder {
             .map_err(|e| FerricastError::Encoder(format!("VA-API: vaCreateBuffer(VPP): {e}")))?;
 
         // Picture lifecycle: New → add buffer → Begin → Render →
-        // End → Sync. After sync, self.input has NV12 data.
-        let mut pic = Picture::new(g.timestamp_us, Rc::clone(vpp), &self.input);
+        // End → Sync. After sync, the recon surface has NV12 data
+        // ready for the encoder to read via `vaBeginPicture`.
+        let dest = &self.recon[target_recon_idx];
+        let mut pic = Picture::new(g.timestamp_us, Rc::clone(vpp), dest);
         pic.add_buffer(buffer);
         let pic = pic
             .begin::<()>()
