@@ -91,6 +91,7 @@ impl VideoEncoder for OpenH264Encoder {
         Ok(())
     }
     fn encode(&mut self, frame: ferricast_core::CapturedFrame) -> ferricast_core::Result<ferricast_core::EncodedFrame> {
+        let timestamp_us = frame.timestamp_us();
         let frame = frame.into_cpu()?;
         let encoder = self.encoder.as_mut().expect("Ferricast(Openh264) bug: use of an encoder that has not been configured");
         
@@ -125,9 +126,9 @@ impl VideoEncoder for OpenH264Encoder {
         Ok(EncodedFrame {  
             codec: Codec::H264,
             data: Bytes::from(data),
-            timestamp_us: (encoded.raw_info().uiTimeStamp as u64) * 1000,
+            timestamp_us,
             is_keyframe: matches!(encoded.frame_type(), FrameType::IDR | FrameType::I),
-            duration_us: Some((10000 / self.fps) as u64), 
+            duration_us: Some(1_000_000 / self.fps as u64),
             pts_dts: (pts as u64, pts as u64)
         })
         
