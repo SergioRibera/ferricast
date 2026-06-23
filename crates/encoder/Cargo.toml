@@ -9,7 +9,7 @@ edition = "2024"
 # be enabled — `lib.rs` emits a `compile_error!` when all three
 # are off, since the H.264 facade has nothing to dispatch to.
 #
-# - `openh264` — software fallback, always available at runtime.
+# - `x264` — software fallback, always available at runtime.
 #             The only path with no system-library coupling that
 #             fails outside its compatible version window.
 # - `vaapi` — Intel iGPU / AMD Mesa hardware encode via cros-libva.
@@ -25,9 +25,9 @@ edition = "2024"
 #
 # Disable any one you can't build on a particular host. Typical
 # fix for cros-libva ABI mismatches:
-#   ferricast = { default-features = false, features = ["openh264", "nvenc", "fdk-aac"] }
-default = ["openh264", "vaapi", "nvenc", "fdk-aac"]
-openh264 = ["dep:openh264"]
+#   ferricast = { default-features = false, features = ["x264", "nvenc", "fdk-aac"] }
+default = ["x264", "vaapi", "nvenc", "fdk-aac"]
+x264 = ["dep:x264"]
 vaapi = ["dep:cros-libva"]
 nvenc = ["dep:shiguredo_nvcodec"]
 # HEVC (H.265) encode through NVENC. Builds on top of `nvenc` — the
@@ -61,8 +61,7 @@ ferricast-core.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 
-# Software encoder — pure-Rust binding around openh264.
-openh264 = { version = "0.9.3", optional = true }
+
 
 # VA-API binding without ffmpeg. Used to encode H.264 directly on
 # the GPU when the system has a VA-API driver. Loaded at runtime;
@@ -97,4 +96,4 @@ shiguredo_nvcodec = { version = "2026.1.0", optional = true }
 # reference AAC implementation; oxideav-aac is the fallback for
 # environments where pulling in the C library is impractical.
 fdk-aac = { version = "0.8", optional = true }
-
+x264 = { version = "0.5.0", optional = true }

@@ -75,7 +75,7 @@ x11 = ["ferricast-capture/x11"]
 #     ferricast = { default-features = false,
 #                   features = ["chromecast", "x11", "pipewire",
 #                               "openh264", "nvenc"] }
-openh264 = ["ferricast-encoder/openh264", "ferricast-decoder/openh264-decode"]
+openh264 = ["ferricast-encoder/x264", "ferricast-decoder/openh264-decode"]
 vaapi = ["ferricast-encoder/vaapi", "ferricast-decoder/vaapi-decode"]
 nvenc = ["ferricast-encoder/nvenc"]
 nvenc-zero-copy = ["ferricast-encoder/nvenc-zero-copy", "nvenc"]

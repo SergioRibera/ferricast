@@ -624,6 +624,7 @@ impl ChromecastSession {
                 );
             }
 
+            
             let request_id = request_id_counter.fetch_add(1, Ordering::Relaxed);
             let media = MediaInfo {
                 content_id: load_url.clone(),
@@ -646,6 +647,7 @@ impl ChromecastSession {
                 Ok(()) => info!(url = %load_url, "sent LOAD to chromecast"),
                 Err(e) => tracing::error!(%e, "LOAD send failed"),
             }
+            
         });
 
         // Seed the keyframe ourselves so the segmenter doesn't have

@@ -32,7 +32,7 @@
 //!   not supported, session creation refused, ...) it transparently
 //!   tries the next one.
 
-#[cfg(not(any(feature = "openh264", feature = "vaapi", feature = "nvenc")))]
+#[cfg(not(any(feature = "x264", feature = "vaapi", feature = "nvenc")))]
 compile_error!(
     "ferricast-encoder requires at least one of the `openh264` / `vaapi` / `nvenc` \
      features to be enabled — the H.264 facade has nothing to dispatch to otherwise. \
@@ -49,8 +49,8 @@ mod headers;
 #[cfg(feature = "vaapi")]
 pub(crate) mod yuv;
 
-#[cfg(feature = "openh264")]
-mod openh264_impl;
+#[cfg(feature = "x264")]
+mod x264_impl;
 #[cfg(feature = "vaapi")]
 mod vaapi_impl;
 
@@ -62,8 +62,8 @@ use tracing::{info, warn};
 
 #[cfg(feature = "nvenc")]
 pub use crate::nvenc::NvencH264Encoder;
-#[cfg(feature = "openh264")]
-pub use openh264_impl::OpenH264Encoder;
+#[cfg(feature = "x264")]
+pub use x264_impl::X264Encoder;
 #[cfg(feature = "vaapi")]
 pub use vaapi_impl::VaapiH264Encoder;
 
@@ -83,9 +83,9 @@ pub enum H264Encoder {
     /// Hardware NVENC path — NVIDIA.
     #[cfg(feature = "nvenc")]
     Nvenc(NvencH264Encoder),
-    /// Software openh264 path — always works when compiled in.
-    #[cfg(feature = "openh264")]
-    OpenH264(OpenH264Encoder),
+    /// Software x264 path — always works when compiled in.
+    #[cfg(feature = "x264")]
+    X264(X264Encoder),
 }
 
 impl H264Encoder {
@@ -165,18 +165,18 @@ impl VideoEncoder for H264Encoder {
                                 *self = H264Encoder::Vaapi(enc);
                                 return Ok(());
                             }
-                            Err(e) => info!(error = %e, "VA-API unavailable, falling back to openh264"),
+                            Err(e) => info!(error = %e, "VA-API unavailable, falling back to x264"),
                         }
                     }
                 }
 
-                #[cfg(feature = "openh264")]
+                #[cfg(feature = "x264")]
                 {
-                    if var.is_empty() || var == "openh264" {
-                        info!("H.264 encoder backend: openh264 (software)");
-                        let mut x = OpenH264Encoder::default();
+                    if var.is_empty() || var == "x264" {
+                        info!("H.264 encoder backend: x264 (software)");
+                        let mut x = X264Encoder::default();
                         x.configure(config)?;
-                        *self = H264Encoder::OpenH264(x);
+                        *self = H264Encoder::X264(x);
                         return Ok(());
                     }
                 }
@@ -188,15 +188,15 @@ impl VideoEncoder for H264Encoder {
             #[cfg(feature = "vaapi")]
             H264Encoder::Vaapi(e) => match e.configure(config) {
                 Ok(()) => Ok(()),
-                Err(err) => fall_back_to_openh264_or_pending(self, config, err, "VA-API"),
+                Err(err) => fall_back_to_x264_or_pending(self, config, err, "VA-API"),
             },
             #[cfg(feature = "nvenc")]
             H264Encoder::Nvenc(e) => match e.configure(config) {
                 Ok(()) => Ok(()),
-                Err(err) => fall_back_to_openh264_or_pending(self, config, err, "NVENC"),
+                Err(err) => fall_back_to_x264_or_pending(self, config, err, "NVENC"),
             },
-            #[cfg(feature = "openh264")]
-            H264Encoder::OpenH264(e) => e.configure(config),
+            #[cfg(feature = "x264")]
+            H264Encoder::X264(e) => e.configure(config),
         }
     }
 
@@ -209,8 +209,8 @@ impl VideoEncoder for H264Encoder {
             H264Encoder::Vaapi(e) => e.encode(frame),
             #[cfg(feature = "nvenc")]
             H264Encoder::Nvenc(e) => e.encode(frame),
-            #[cfg(feature = "openh264")]
-            H264Encoder::OpenH264(e) => e.encode(frame),
+            #[cfg(feature = "x264")]
+            H264Encoder::X264(e) => e.encode(frame),
         }
     }
 
@@ -221,8 +221,8 @@ impl VideoEncoder for H264Encoder {
             H264Encoder::Vaapi(e) => e.flush(),
             #[cfg(feature = "nvenc")]
             H264Encoder::Nvenc(e) => e.flush(),
-            #[cfg(feature = "openh264")]
-            H264Encoder::OpenH264(e) => e.flush(),
+            #[cfg(feature = "x264")]
+            H264Encoder::X264(e) => e.flush(),
         }
     }
 
@@ -235,8 +235,8 @@ impl VideoEncoder for H264Encoder {
             H264Encoder::Vaapi(e) => e.get_headers(),
             #[cfg(feature = "nvenc")]
             H264Encoder::Nvenc(e) => e.get_headers(),
-            #[cfg(feature = "openh264")]
-            H264Encoder::OpenH264(e) => e.get_headers(),
+            #[cfg(feature = "x264")]
+            H264Encoder::X264(e) => e.get_headers(),
         }
     }
 
@@ -250,8 +250,8 @@ impl VideoEncoder for H264Encoder {
             H264Encoder::Vaapi(e) => e.request_keyframe(),
             #[cfg(feature = "nvenc")]
             H264Encoder::Nvenc(e) => e.request_keyframe(),
-            #[cfg(feature = "openh264")]
-            H264Encoder::OpenH264(e) => e.request_keyframe(),
+            #[cfg(feature = "x264")]
+            H264Encoder::X264(e) => e.request_keyframe(),
         }
     }
 }
@@ -261,21 +261,21 @@ impl VideoEncoder for H264Encoder {
 /// next `configure()` runs the discovery chain from scratch. Keeps
 /// the per-backend match arms short and the policy in one place.
 #[cfg(any(feature = "vaapi", feature = "nvenc"))]
-fn fall_back_to_openh264_or_pending(
+fn fall_back_to_x264_or_pending(
     slot: &mut H264Encoder,
     config: &EncoderConfig,
     err: FerricastError,
     backend_name: &'static str,
 ) -> Result<()> {
-    #[cfg(feature = "openh264")]
+    #[cfg(feature = "x264")]
     {
         warn!(error = %err, backend = backend_name, "reconfigure failed, switching to openh264");
-        let mut x = OpenH264Encoder::default();
+        let mut x = X264Encoder::default();
         x.configure(config)?;
-        *slot = H264Encoder::OpenH264(x);
+        *slot = H264Encoder::X264(x);
         Ok(())
     }
-    #[cfg(not(feature = "openh264"))]
+    #[cfg(not(feature = "x264"))]
     {
         let _ = (slot, config);
         warn!(
