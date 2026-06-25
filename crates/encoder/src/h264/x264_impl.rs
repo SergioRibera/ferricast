@@ -1,7 +1,10 @@
 use bytes::Bytes;
 use ferricast_core::{Codec, EncodedFrame, FerricastError, H264Profile, VideoEncoder};
-use x264::{Colorspace, Encoder, Image};
+use x264::{Colorspace, Encoder, Image, Preset, Setup, Tune};
 
+
+const X264_PRESET_VAR: &'static str = "FERRICAST_X264_PRESET";
+const X264_TUNE_VAR: &'static str = "FERRICAST_TUNE_PRESET";
 
 #[derive(Default)]
 pub struct X264Encoder {
@@ -19,14 +22,46 @@ impl VideoEncoder for X264Encoder
     const CODEC: Codec = Codec::H264;
     
     fn configure(&mut self, config: &ferricast_core::EncoderConfig) -> ferricast_core::Result<()> {
-        let builder = Encoder::builder();
+        let preset = match std::env::var(X264_PRESET_VAR).unwrap_or("veryfast".to_string()).as_str() {
+            "placebo" => {
+                tracing::warn!("Using the placebo preset is not recommended due to its impact on performance; Use a faster preset.");
+                Preset::Placebo
+            },
+            "veryslow" => Preset::Veryslow,
+            "slower" => Preset::Slower,
+            "slow" => Preset::Slow,
+            "medium" => Preset::Medium,
+            "fast" => Preset::Fast,
+            "faster" => Preset::Faster,
+            "veryfast" => Preset::Veryfast,
+            "superfast" => Preset::Superfast,
+            "ultrafast" => Preset::Ultrafast,
+            _ => {
+                return Err(FerricastError::Encoder("Invalid preset".to_string()));
+            },
+        };
+
+        let tune = match std::env::var(X264_TUNE_VAR).unwrap_or("none".to_string()).as_str() {
+            "none" => Tune::None,
+            "film" => Tune::Film,
+            "animation" => Tune::Animation,
+            "grain" => Tune::Grain,
+            "stillimage" => Tune::StillImage,
+            "psnr" => Tune::Psnr,
+            "ssim" => Tune::Ssim,
+            _ => {
+                return Err(FerricastError::Encoder("Invalid tune".to_string()))
+            }
+        };
+
+        let builder = Setup::preset(preset, tune, false, true);
         let builder = match config.max_h264_profile.unwrap_or(H264Profile::High) {
             H264Profile::Baseline => builder.baseline(),
             H264Profile::Main => builder.main(),
             H264Profile::High => builder.high(),
         };
 
-        let mut encoder = builder.fps(config.fps, 1).build(Colorspace::BGRA, config.width as _, config.height as _).map_err(|_| FerricastError::Encoding("Cannot create encoder".to_string()))?;
+        let mut encoder = builder.fps(config.fps, 1).bitrate(config.bitrate_kbps as i32).build(Colorspace::BGRA, config.width as _, config.height as _).map_err(|_| FerricastError::Encoding("Cannot create encoder".to_string()))?;
 
     
 
