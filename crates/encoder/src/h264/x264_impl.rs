@@ -11,7 +11,7 @@ pub struct X264Encoder {
     pub encoder: Option<Encoder>,
     pub frame_count: usize,
     pub fps: usize,
-    pub sps_pps: Vec<u8>
+    pub sps_pps: Vec<u8>,
 }
 
 unsafe impl Sync for X264Encoder {}
@@ -54,19 +54,24 @@ impl VideoEncoder for X264Encoder
             }
         };
 
-        let builder = Setup::preset(preset, tune, false, true);
+        let builder = Setup::preset(preset, tune, false, false);
         let builder = match config.max_h264_profile.unwrap_or(H264Profile::High) {
             H264Profile::Baseline => builder.baseline(),
             H264Profile::Main => builder.main(),
             H264Profile::High => builder.high(),
         };
 
-        let mut encoder = builder.fps(config.fps, 1).bitrate(config.bitrate_kbps as i32).build(Colorspace::BGRA, config.width as _, config.height as _).map_err(|_| FerricastError::Encoding("Cannot create encoder".to_string()))?;
+        let keyframe_interval = config.keyframe_interval_frames() as i32;
+        let mut encoder = builder
+            .fps(config.fps, 1)
+            .bitrate(config.bitrate_kbps as i32)
+            .max_keyframe_interval(keyframe_interval)
+            .scenecut_threshold(0)
+            .build(Colorspace::BGRA, config.width as _, config.height as _)
+            .map_err(|_| FerricastError::Encoding("Cannot create encoder".to_string()))?;
 
-    
+        let header = encoder.headers().map_err(|_| FerricastError::Encoding("Cannot get sps/pps".to_string()))?.entirety().to_vec();
 
-        let header = encoder.headers().map_err(|_| FerricastError::Encoding("Cannot get sps/pps".to_string()))?.entirety().to_vec(); 
-        
         self.sps_pps = header;
         self.fps = config.fps as usize;
         self.encoder = Some(encoder);
@@ -115,7 +120,7 @@ impl VideoEncoder for X264Encoder
         Ok(self.sps_pps.clone())
     }
     fn request_keyframe(&mut self) {
-        tracing::warn!("X264 backend can't request keyframe");
+        tracing::debug!("X264: on-demand IDR not supported; relying on configured keyframe interval");
     }
 }
 
