@@ -479,9 +479,14 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
         // already via this method, so we synthesise them here via
         // `nvEncGetSequenceParams` — which returns SPS/PPS for H.264
         // and VPS/SPS/PPS for HEVC.
-        self.encoder.get_sequence_params().map_err(|e| {
+        let a = self.encoder.get_sequence_params().map_err(|e| {
             FerricastError::Encoder(format!("NVENC ({}): get_sequence_params: {e}", C::NAME))
-        })
+        });
+
+        // TEMP CHANGE
+        println!("nvenc sps/pps {:?}", a);
+
+        a
     }
 }
 

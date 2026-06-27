@@ -2,6 +2,8 @@ use bytes::Bytes;
 use ferricast_core::{Codec, EncodedFrame, FerricastError, H264Profile, VideoEncoder};
 use x264::{Colorspace, Encoder, Image, Preset, Setup, Tune};
 
+use crate::h264::utils::extract_sps_pps;
+
 
 const X264_PRESET_VAR: &'static str = "FERRICAST_X264_PRESET";
 const X264_TUNE_VAR: &'static str = "FERRICAST_TUNE_PRESET";
@@ -72,7 +74,13 @@ impl VideoEncoder for X264Encoder
 
         let header = encoder.headers().map_err(|_| FerricastError::Encoding("Cannot get sps/pps".to_string()))?.entirety().to_vec();
 
-        self.sps_pps = header;
+        let sps_pps = extract_sps_pps(&header);
+
+        if sps_pps.is_empty() {
+            return Err(FerricastError::Encoder("No Sps/Pps found".to_string()));
+        }
+
+        self.sps_pps = sps_pps;
         self.fps = config.fps as usize;
         self.encoder = Some(encoder);
 
@@ -99,9 +107,6 @@ impl VideoEncoder for X264Encoder
         }
 
         final_payload.extend(content);
-
-
-
 
         Ok(EncodedFrame {  
             codec: Codec::H264,
