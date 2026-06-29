@@ -1,37 +1,35 @@
 //! BGRA → NV12 conversion for the VA-API encoder upload path.
 //!
-//! VA-API H.264 encoders consume YUV 4:2:0 surfaces (NV12 layout:
-//! one plane of `Y`, then a tightly-interleaved `UV` plane at half
-//! width and half height). Capture sources hand us packed BGRA, so
-//! we colour-convert before uploading.
+//! Thin wrapper over the SIMD-accelerated `yuv` crate's
+//! `bgra_to_yuv_nv12`. The previous hand-rolled scalar version ran at
+//! ~3-5 ms per 1080p frame; the SIMD path is under 1 ms on any host
+//! with SSE4.2/AVX2/RDM, which matters at 60 fps or 1440p+ when
+//! capture and encode are competing for the same cores.
 //!
-//! Uses BT.601 limited-range coefficients — the same convention
-//! every H.264 decoder defaults to when `colour_primaries` /
-//! `matrix_coefficients` aren't specified in VUI. Limited range
-//! (`Y` ∈ [16,235], `UV` ∈ [16,240]) keeps the output decodable on
-//! receivers that don't honour full-range signalling.
-//!
-//! Performance: this is a per-frame CPU loop. For a 1920×1080
-//! frame that's 8 MB read + 3 MB write. A scalar implementation
-//! runs in ~3-5 ms; SIMD would bring it under 1 ms but the encoder
-//! is the bottleneck either way (encode dominates). When/if we
-//! switch to a VA-API VPP path the BGRA dmabuf is converted in the
-//! GPU and this whole module becomes legacy.
+//! BT.601 limited range — the convention every H.264/HEVC decoder
+//! defaults to when `colour_primaries` / `matrix_coefficients` aren't
+//! signalled in VUI. Limited range (`Y` ∈ [16,235], `UV` ∈ [16,240])
+//! is what every receiver in our matrix (Chromecast, Miracast,
+//! AirPlay) expects on the wire.
 
 #![allow(dead_code)] // referenced from vaapi_impl
 
-/// Convert a packed BGRA plane to two planar surfaces (`Y`, `UV`)
-/// in NV12 layout.
+use yuv::{
+    BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvRange, YuvStandardMatrix,
+    bgra_to_yuv_nv12,
+};
+
+/// Convert a packed BGRA plane into the driver-allocated NV12
+/// destination planes (split-borrowed because the Y and UV regions
+/// live in the same mapped VAImage buffer).
 ///
-/// * `src` — input pixels, `src_stride` bytes per row, `height`
-///   rows. The first byte of each pixel is `B`, then `G`, `R`, `A`.
+/// * `src` / `src_stride` — input BGRA bytes; stride may exceed
+///   `width * 4` if the source has row padding.
+/// * `width`, `height` — image dimensions in pixels. Must both be
+///   even (chroma subsampling assumes 2×2 blocks).
 /// * `y_dst` / `y_stride` — destination luma plane.
 /// * `uv_dst` / `uv_stride` — destination chroma plane (interleaved
-///   `U`/`V`, half width × half height).
-/// * `width`, `height` — image dimensions in pixels. Must both be
-///   even (the chroma subsampling assumes pairs).
-///
-/// Stride may exceed `width * bpp` to honour driver alignment.
+///   `U`/`V`, half height, full byte width).
 pub(crate) fn bgra_to_nv12(
     src: &[u8],
     src_stride: usize,
@@ -43,59 +41,36 @@ pub(crate) fn bgra_to_nv12(
     uv_stride: usize,
 ) {
     debug_assert!(width % 2 == 0 && height % 2 == 0, "even dims required");
-    let w = width as usize;
-    let h = height as usize;
 
-    // Two rows at a time so we can subsample chroma per 2×2 block.
-    for y in (0..h).step_by(2) {
-        let src_row0 = &src[y * src_stride..y * src_stride + w * 4];
-        let src_row1 = &src[(y + 1) * src_stride..(y + 1) * src_stride + w * 4];
-        // Split `y_dst` into two non-overlapping row slices so the
-        // borrow checker is happy.
-        let (y_lo, y_hi) = y_dst.split_at_mut((y + 1) * y_stride);
-        let y_row0 = &mut y_lo[y * y_stride..y * y_stride + w];
-        let y_row1 = &mut y_hi[..w];
-        let uv_off = (y / 2) * uv_stride;
+    // The yuv crate borrows both destination planes mutably inside a
+    // single `YuvBiPlanarImageMut`. The driver buffer is already
+    // split into two non-overlapping slices by the caller's
+    // `split_at_mut`, so we wrap each as a `Borrowed` variant —
+    // zero copy, same lifetimes.
+    let mut bi = YuvBiPlanarImageMut::<u8> {
+        y_plane: BufferStoreMut::Borrowed(y_dst),
+        y_stride: y_stride as u32,
+        uv_plane: BufferStoreMut::Borrowed(uv_dst),
+        uv_stride: uv_stride as u32,
+        width,
+        height,
+    };
 
-        for x in (0..w).step_by(2) {
-            let p00 = &src_row0[x * 4..x * 4 + 4];
-            let p01 = &src_row0[(x + 1) * 4..(x + 1) * 4 + 4];
-            let p10 = &src_row1[x * 4..x * 4 + 4];
-            let p11 = &src_row1[(x + 1) * 4..(x + 1) * 4 + 4];
-
-            // BGRA layout.
-            let (b00, g00, r00) = (p00[0] as i32, p00[1] as i32, p00[2] as i32);
-            let (b01, g01, r01) = (p01[0] as i32, p01[1] as i32, p01[2] as i32);
-            let (b10, g10, r10) = (p10[0] as i32, p10[1] as i32, p10[2] as i32);
-            let (b11, g11, r11) = (p11[0] as i32, p11[1] as i32, p11[2] as i32);
-
-            // BT.601 limited range, coefficients ×256:
-            //   Y = (66*R + 129*G +  25*B) / 256 + 16
-            //   U = (-38*R -  74*G + 112*B) / 256 + 128
-            //   V = (112*R -  94*G -  18*B) / 256 + 128
-            let y00 = ((66 * r00 + 129 * g00 + 25 * b00 + 128) >> 8) + 16;
-            let y01 = ((66 * r01 + 129 * g01 + 25 * b01 + 128) >> 8) + 16;
-            let y10 = ((66 * r10 + 129 * g10 + 25 * b10 + 128) >> 8) + 16;
-            let y11 = ((66 * r11 + 129 * g11 + 25 * b11 + 128) >> 8) + 16;
-
-            y_row0[x] = y00.clamp(0, 255) as u8;
-            y_row0[x + 1] = y01.clamp(0, 255) as u8;
-            y_row1[x] = y10.clamp(0, 255) as u8;
-            y_row1[x + 1] = y11.clamp(0, 255) as u8;
-
-            // Chroma: average the four pixels' colour components
-            // before converting (cheaper and correct for 4:2:0).
-            let r_avg = (r00 + r01 + r10 + r11) >> 2;
-            let g_avg = (g00 + g01 + g10 + g11) >> 2;
-            let b_avg = (b00 + b01 + b10 + b11) >> 2;
-            let u = ((-38 * r_avg - 74 * g_avg + 112 * b_avg + 128) >> 8) + 128;
-            let v = ((112 * r_avg - 94 * g_avg - 18 * b_avg + 128) >> 8) + 128;
-
-            // NV12: U then V interleaved for each 2×2 block.
-            uv_dst[uv_off + x] = u.clamp(0, 255) as u8;
-            uv_dst[uv_off + x + 1] = v.clamp(0, 255) as u8;
-        }
-    }
+    // `bgra_to_yuv_nv12` validates plane lengths against (width,
+    // height, strides) and returns YuvError on mismatch. The
+    // VA-API caller derives all of those from the same surface
+    // geometry it allocated, so an error here is a programmer bug
+    // not a runtime condition — surface with an `expect` so it's
+    // loud if the invariants ever drift.
+    bgra_to_yuv_nv12(
+        &mut bi,
+        src,
+        src_stride as u32,
+        YuvRange::Limited,
+        YuvStandardMatrix::Bt601,
+        YuvConversionMode::Balanced,
+    )
+    .expect("BGRA→NV12: plane geometry mismatch (programmer bug)");
 }
 
 #[cfg(test)]
