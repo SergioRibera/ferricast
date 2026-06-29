@@ -539,6 +539,45 @@ pub async fn run_from_frames(
                         audio_frames_pushed =
                             audio_frames_pushed.saturating_add(1);
                     }
+                    // Drain every AAC frame that's already queued.
+                    // Without this loop the segmenter consumes one
+                    // audio per select! wake-up; AAC arrives at
+                    // ~47 fps (1024 samples / 48 kHz) while the
+                    // pre-segmenter `session.audio_tx` channel
+                    // holds 64 frames (~1.36 s). When the encoder
+                    // is slow (x264 software, busy CPU) the
+                    // supervisor batches audio pushes — the queue
+                    // fills, `try_send` returns Full, and
+                    // `session.send_audio_frame` logs
+                    // "HLS audio segmenter backlogged 5+ s,
+                    // dropping AAC frame" repeatedly. Burst-
+                    // draining here lets the segmenter empty the
+                    // channel in the same iteration it noticed it
+                    // had work, which keeps the upstream buffer
+                    // small regardless of video cadence.
+                    if let Some(rx) = audio_frames.as_mut() {
+                        loop {
+                            match rx.try_recv() {
+                                Ok(extra) => {
+                                    if let Err(e) = push_audio_frame(
+                                        &mut muxer,
+                                        &extra,
+                                        video_wall_anchor,
+                                    ) {
+                                        warn!(error = %e, "audio PES push failed (drain)");
+                                    } else {
+                                        audio_frames_pushed =
+                                            audio_frames_pushed.saturating_add(1);
+                                    }
+                                }
+                                Err(mpsc::error::TryRecvError::Empty) => break,
+                                Err(mpsc::error::TryRecvError::Disconnected) => {
+                                    audio_frames = None;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     // Audio frames must not trigger LL-HLS part
                     // flushes on their own — the part target is
                     // a *time* budget; let video close them.
