@@ -1099,27 +1099,8 @@ impl StreamManager {
                 // recreate.
                 'inner: loop {
                     tokio::select! {
-                        // `biased` polls arms in declaration order.
-                        // Audio comes BEFORE the frame arm on purpose:
-                        // when the video encoder is slow (x264 at
-                        // 1080p on `veryfast` runs ~100 ms per frame
-                        // vs NVENC's microseconds), the synchronous
-                        // `encoder.encode()` inside the frame arm
-                        // body blocks this task for the full encode
-                        // duration. During that window the audio task
-                        // (running on a separate tokio worker) keeps
-                        // pushing AAC frames at 47 fps into the
-                        // channel. Without `biased` the fair-picker
-                        // would on average serve only ~1 audio per
-                        // encode (50/50 vs the also-ready frame arm),
-                        // and the channel would fill until the
-                        // segmenter started dropping real audio as
-                        // stale. With `biased` plus the drain-all
-                        // loop below, every supervisor wake-up
-                        // flushes the entire pending audio queue
-                        // before letting the frame arm grab the
-                        // encoder again — audio drain rate is no
-                        // longer coupled to encode latency.
+                        // Audio polled before frame arm so slow
+                        // x264 encodes can't starve the AAC queue.
                         biased;
                         _ = cancel_rx.recv() => {
                             tracing::info!(?did, "Stream cancelled");
@@ -1137,18 +1118,8 @@ impl StreamManager {
                                         // keep going.
                                         tracing::warn!(%e, "send_audio_frame failed");
                                     }
-                                    // Drain any further AAC frames
-                                    // that piled up while the encoder
-                                    // was busy. `try_recv` is
-                                    // non-blocking so we exit the
-                                    // moment the queue is empty; the
-                                    // surrounding `select!` arm then
-                                    // yields and the frame arm gets
-                                    // its turn. Without this loop, a
-                                    // single wake-up only consumed
-                                    // one AAC frame even if 5+ were
-                                    // queued, leaving x264 streams
-                                    // permanently behind on audio.
+                                    // Drain remaining queued frames
+                                    // in this wake-up.
                                     if let Some(rx) = audio_frame_rx.as_mut() {
                                         loop {
                                             match rx.try_recv() {

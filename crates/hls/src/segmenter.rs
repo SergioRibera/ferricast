@@ -418,6 +418,10 @@ pub async fn run_from_frames(
     // to negotiate than the PipeWire audio graph). The shared
     // `video_wall_anchor` avoids that class of bug entirely.
     let mut audio_frames_pushed: u64 = 0;
+    // Throughput watchdog — operator-visible audio/video consume rate.
+    let mut last_throughput_log = Instant::now();
+    let mut audio_pushed_window: u64 = 0;
+    let mut video_pushed_window: u64 = 0;
 
     loop {
         muxer.start_segment();
@@ -517,6 +521,7 @@ pub async fn run_from_frames(
                     let video_pts_us = wall_ts.saturating_sub(origin);
                     push_frame(&mut muxer, &encoded, video_pts_us)?;
                     frames_in_segment += 1;
+                    video_pushed_window = video_pushed_window.saturating_add(1);
                 }
                 SegEvent::Audio(None) => {
                     // Audio side closed mid-stream — likely the
@@ -538,23 +543,10 @@ pub async fn run_from_frames(
                     } else {
                         audio_frames_pushed =
                             audio_frames_pushed.saturating_add(1);
+                        audio_pushed_window = audio_pushed_window.saturating_add(1);
                     }
-                    // Drain every AAC frame that's already queued.
-                    // Without this loop the segmenter consumes one
-                    // audio per select! wake-up; AAC arrives at
-                    // ~47 fps (1024 samples / 48 kHz) while the
-                    // pre-segmenter `session.audio_tx` channel
-                    // holds 64 frames (~1.36 s). When the encoder
-                    // is slow (x264 software, busy CPU) the
-                    // supervisor batches audio pushes — the queue
-                    // fills, `try_send` returns Full, and
-                    // `session.send_audio_frame` logs
-                    // "HLS audio segmenter backlogged 5+ s,
-                    // dropping AAC frame" repeatedly. Burst-
-                    // draining here lets the segmenter empty the
-                    // channel in the same iteration it noticed it
-                    // had work, which keeps the upstream buffer
-                    // small regardless of video cadence.
+                    // Burst-drain to keep the upstream queue empty
+                    // regardless of video cadence.
                     if let Some(rx) = audio_frames.as_mut() {
                         loop {
                             match rx.try_recv() {
@@ -568,6 +560,8 @@ pub async fn run_from_frames(
                                     } else {
                                         audio_frames_pushed =
                                             audio_frames_pushed.saturating_add(1);
+                                        audio_pushed_window =
+                                            audio_pushed_window.saturating_add(1);
                                     }
                                 }
                                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -583,6 +577,19 @@ pub async fn run_from_frames(
                     // a *time* budget; let video close them.
                     continue;
                 }
+            }
+
+            if last_throughput_log.elapsed() >= Duration::from_secs(5) {
+                let secs = last_throughput_log.elapsed().as_secs_f64();
+                tracing::info!(
+                    audio_per_s = (audio_pushed_window as f64 / secs) as u32,
+                    video_per_s = (video_pushed_window as f64 / secs) as u32,
+                    audio_total = audio_frames_pushed,
+                    "segmenter throughput"
+                );
+                last_throughput_log = Instant::now();
+                audio_pushed_window = 0;
+                video_pushed_window = 0;
             }
 
             // LL-HLS: if we've held bytes long enough, flush them as

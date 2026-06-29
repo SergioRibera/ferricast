@@ -123,3 +123,16 @@ ferricast-chromecast = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+# Optimise hot-path crates in dev: x264/yuv/fdk-aac at opt=0 are
+# 5-10× slower and starve the audio pipeline.
+[profile.dev.package.x264]
+opt-level = 3
+[profile.dev.package.x264-sys]
+opt-level = 3
+[profile.dev.package.yuv]
+opt-level = 3
+[profile.dev.package.fdk-aac]
+opt-level = 3
+[profile.dev.package.fdk-aac-sys]
+opt-level = 3
