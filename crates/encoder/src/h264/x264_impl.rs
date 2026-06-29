@@ -184,35 +184,15 @@ impl VideoEncoder for X264Encoder {
 
         let content = data.entirety();
 
-        if plane.keyframe() {
-            // Diagnostic: how many SPS (NAL type 7) and PPS (NAL
-            // type 8) units does the raw x264 output already carry?
-            // Used to verify whether libx264's `b_repeat_headers=1`
-            // default is active in this build — if it is, our manual
-            // `extend_from_slice(&self.sps_pps)` below double-emits
-            // the parameter sets on every IDR. Logged at INFO so it
-            // shows up in a normal ferricast run without raising
-            // RUST_LOG.
-            let (raw_sps, raw_pps) = count_param_sets(content);
-            tracing::info!(
-                raw_sps,
-                raw_pps,
-                prepend_bytes = self.sps_pps.len(),
-                "x264 IDR NAL diagnostics (B5 verification)"
-            );
-        }
-
-        let mut final_payload = Vec::new();
-
-        if plane.keyframe() {
-            final_payload.extend_from_slice(&self.sps_pps);
-        }
-
-        final_payload.extend(content);
+        // libx264 default `b_repeat_headers=1` already prepends
+        // SPS+PPS to every IDR, so the encoder output is already
+        // self-contained — no manual prepend needed. The cached
+        // `self.sps_pps` is retained for `get_headers()` callers
+        // (e.g. HLS init segments).
 
         Ok(EncodedFrame {
             codec: Codec::H264,
-            data: Bytes::from(final_payload),
+            data: Bytes::copy_from_slice(content),
             timestamp_us,
             is_keyframe: plane.keyframe(),
             duration_us: Some(1_000_000 / self.fps as u64),
@@ -347,25 +327,6 @@ mod tests {
         )
         .expect("bgra→yuv");
 
-        let image = Image::new(
-            Colorspace::I420,
-            raw.width as i32,
-            raw.height as i32,
-            &[
-                Plane {
-                    stride: planar.y_stride as i32,
-                    data: planar.y_plane.borrow(),
-                },
-                Plane {
-                    stride: planar.u_stride as i32,
-                    data: planar.u_plane.borrow(),
-                },
-                Plane {
-                    stride: planar.v_stride as i32,
-                    data: planar.v_plane.borrow(),
-                },
-            ],
-        );
         // libx264 buffers a few input frames before emitting output
         // (lookahead). Push the same frame repeatedly until the
         // encoder produces a keyframe, then inspect that one. Cap
