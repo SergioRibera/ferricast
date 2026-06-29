@@ -1899,6 +1899,7 @@ dependencies = [
  "shiguredo_nvcodec",
  "tracing",
  "x264",
+ "yuv",
 ]
 
 [[package]]
@@ -7471,6 +7472,15 @@ dependencies = [
  "quote",
  "syn",
  "synstructure",
+]
+
+[[package]]
+name = "yuv"
+version = "0.8.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d85a782d94ee43f078bcfd6fa82d4e6a5b2d1cfbbad168e4df5a9f7b39ef48c"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]

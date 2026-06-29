@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use ferricast_core::{Codec, EncodedFrame, FerricastError, H264Profile, VideoEncoder};
-use x264::{Colorspace, Encoder, Image, Preset, Setup, Tune};
+use x264::{Colorspace, Encoder, Image, Plane, Preset, Setup, Tune};
+use yuv::{YuvPlanarImageMut, bgra_to_yuv420};
 
 use crate::h264::utils::extract_sps_pps;
 
@@ -69,7 +70,7 @@ impl VideoEncoder for X264Encoder
             .bitrate(config.bitrate_kbps as i32)
             .max_keyframe_interval(keyframe_interval)
             .scenecut_threshold(0)
-            .build(Colorspace::BGRA, config.width as _, config.height as _)
+            .build(Colorspace::I420, config.width as _, config.height as _)
             .map_err(|_| FerricastError::Encoding("Cannot create encoder".to_string()))?;
 
         let header = encoder.headers().map_err(|_| FerricastError::Encoding("Cannot get sps/pps".to_string()))?.entirety().to_vec();
@@ -90,8 +91,27 @@ impl VideoEncoder for X264Encoder
         let timestamp_us = frame.timestamp_us();
         let frame = frame.into_cpu()?;
         let encoder = self.encoder.as_mut().expect("Ferricast(X264) bug: use of an encoder that has not been configured");
-    
-        let image = Image::bgra(frame.width as i32, frame.height as i32, &frame.data);
+        
+        let mut planar = YuvPlanarImageMut::<u8>::alloc(frame.width, frame.height, yuv::YuvChromaSubsampling::Yuv420);
+
+        bgra_to_yuv420(&mut planar, &frame.data, frame.width * 4, yuv::YuvRange::Limited, yuv::YuvStandardMatrix::Bt601, yuv::YuvConversionMode::Balanced).map_err(|_| FerricastError::Encoding("Cannot convert BGRA to YUV 4:2:0".to_string()))?;
+
+        
+
+        let image = Image::new(Colorspace::I420, frame.width as i32, frame.height as i32, &[
+            Plane {
+                stride: planar.y_stride as i32,
+                data: planar.y_plane.borrow(),
+            },
+            Plane {
+                stride: planar.u_stride as i32,
+                data: planar.u_plane.borrow(),
+            },
+            Plane {
+                stride: planar.v_stride as i32,
+                data: planar.v_plane.borrow(),
+            },
+        ]);
 
         let pts = (self.frame_count * 1000) / self.fps;
         self.frame_count += 1;

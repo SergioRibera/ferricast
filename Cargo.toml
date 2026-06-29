@@ -21,8 +21,6 @@ ferricast = { path = ".", default-features = false }
 ferricast-core = { path = "crates/core" }
 ferricast-capture = { path = "crates/capture", default-features = false }
 ferricast-chromecast = { path = "crates/chromecast" }
-ferricast-airplay = { path = "crates/airplay" }
-ferricast-miracast = { path = "crates/miracast" }
 ferricast-encoder = { path = "crates/encoder", default-features = false }
 ferricast-decoder = { path = "crates/decoder", default-features = false }
 ferricast-m3u8 = { path = "crates/m3u8" }
