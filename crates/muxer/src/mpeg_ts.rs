@@ -203,11 +203,7 @@ impl MpegTs {
     /// that some receivers fail to splice. This only fires when
     /// the upstream lagged the lag-threshold; in normal flow real
     /// audio's PTS always stays ahead of the watermark.
-    pub fn add_audio_frame(
-        &mut self,
-        payload: &[u8],
-        pts_90k: u64,
-    ) -> Result<(), FerricastError> {
+    pub fn add_audio_frame(&mut self, payload: &[u8], pts_90k: u64) -> Result<(), FerricastError> {
         if !self.has_external_audio {
             return Err(FerricastError::Encoder(
                 "MpegTs::add_audio_frame called without with_external_audio(true)".into(),
@@ -348,15 +344,11 @@ impl Muxer for MpegTs {
         let _ = pcr; // pcr binding kept alive for video write above
         if self.inject_silent_audio || self.has_external_audio {
             let lag_threshold = pts_90k.saturating_sub(SILENT_INJECT_LAG_90K);
-            let start_apts = self
-                .audio_pts_90k
-                .unwrap_or(lag_threshold);
+            let start_apts = self.audio_pts_90k.unwrap_or(lag_threshold);
             if start_apts < lag_threshold {
                 let mut apts = start_apts;
                 let mut frames_emitted = 0u32;
-                while apts < lag_threshold
-                    && frames_emitted < SILENT_INJECT_MAX_PER_FRAME
-                {
+                while apts < lag_threshold && frames_emitted < SILENT_INJECT_MAX_PER_FRAME {
                     let aac_pes = build_audio_pes(&SILENT_AAC_FRAME, apts);
                     write_pes_to_ts(
                         &mut self.out,
@@ -857,7 +849,8 @@ mod tests {
             if af_len >= 1 {
                 let flags = out[5];
                 assert_eq!(
-                    flags & 0x10, 0,
+                    flags & 0x10,
+                    0,
                     "audio PES first packet must NOT set PCR_flag"
                 );
             }

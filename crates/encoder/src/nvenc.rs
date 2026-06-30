@@ -40,13 +40,13 @@ use shiguredo_nvcodec::{HevcEncoderConfig, HevcProfile as NvHevcProfile};
 use tracing::{debug, info};
 
 #[cfg(feature = "nvenc-zero-copy")]
-use std::collections::HashMap;
-#[cfg(feature = "nvenc-zero-copy")]
-use std::os::fd::RawFd;
-#[cfg(feature = "nvenc-zero-copy")]
 use ferricast_core::GpuFrame;
 #[cfg(feature = "nvenc-zero-copy")]
 use shiguredo_nvcodec::RegisteredResource;
+#[cfg(feature = "nvenc-zero-copy")]
+use std::collections::HashMap;
+#[cfg(feature = "nvenc-zero-copy")]
+use std::os::fd::RawFd;
 #[cfg(feature = "nvenc-zero-copy")]
 use tracing::warn;
 
@@ -213,8 +213,10 @@ impl<C: NvencCodec> NvencEncoder<C> {
 
         // Quick capability probe — fails fast on systems without NVENC
         // so the factory drops through cleanly.
-        let _caps = NvEncoder::query_caps(C::NV_ENCODER_CODEC, /* device_id = */ 0)
-            .map_err(|e| FerricastError::Encoder(format!("NVENC ({}): query_caps: {e}", C::NAME)))?;
+        let _caps =
+            NvEncoder::query_caps(C::NV_ENCODER_CODEC, /* device_id = */ 0).map_err(|e| {
+                FerricastError::Encoder(format!("NVENC ({}): query_caps: {e}", C::NAME))
+            })?;
         debug!(codec = C::NAME, "NVENC caps query OK");
 
         let nvcfg = NvCfg {
@@ -348,10 +350,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
                 })?;
             self.dmabuf_cache.insert(key, registered);
         }
-        let registered = self
-            .dmabuf_cache
-            .get(&key)
-            .expect("just-inserted above");
+        let registered = self.dmabuf_cache.get(&key).expect("just-inserted above");
 
         self.encoder
             .encode_external(registered, options)

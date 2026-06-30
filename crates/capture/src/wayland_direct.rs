@@ -141,7 +141,10 @@ impl DmabufAllocator {
 
         for node in &nodes {
             if let Some(d) = Self::try_open(Path::new(node), node) {
-                info!(node, "gbm device opened (fallback — no feedback main_device)");
+                info!(
+                    node,
+                    "gbm device opened (fallback — no feedback main_device)"
+                );
                 return Ok(DmabufAllocator {
                     device: d,
                     accepted: HashMap::new(),
@@ -157,7 +160,11 @@ impl DmabufAllocator {
         if !path.exists() {
             return None;
         }
-        let file = match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        {
             Ok(f) => f,
             Err(e) => {
                 debug!(node = node_str, %e, "could not open render node");
@@ -378,7 +385,6 @@ impl AllocatedBuffer {
     }
 }
 
-
 // ── ScreenCapture wrapper ─────────────────────────────────────────
 
 pub struct WaylandDirectCapture {
@@ -415,7 +421,9 @@ impl Drop for WorkerHandle {
 impl ScreenCapture for WaylandDirectCapture {
     async fn start(&mut self, source: CaptureSource, config: CaptureConfig) -> Result<()> {
         let output_name = match source {
-            CaptureSource::FullScreen { monitor: Some(name) } => name,
+            CaptureSource::FullScreen {
+                monitor: Some(name),
+            } => name,
             CaptureSource::FullScreen { monitor: None } => {
                 return Err(FerricastError::Capture(
                     "wayland-direct: monitor id required (we don't pop a portal picker)".into(),
@@ -452,13 +460,9 @@ impl ScreenCapture for WaylandDirectCapture {
             })
             .map_err(|e| FerricastError::Capture(format!("spawn: {e}")))?;
 
-        let size = size_rx
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| {
-                FerricastError::Capture(
-                    "wayland-direct: compositor didn't respond within 5s".into(),
-                )
-            })?;
+        let size = size_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| {
+            FerricastError::Capture("wayland-direct: compositor didn't respond within 5s".into())
+        })?;
 
         self.worker = Some(WorkerHandle {
             frames: frame_rx,
@@ -585,9 +589,7 @@ fn run_worker(
     // gbm picked isn't in the compositor's accept-list. Feedback
     // is best-effort: a v3 compositor doesn't have it and we fall
     // back to "open first available node, allocate LINEAR, hope".
-    let feedback_info = dmabuf
-        .as_ref()
-        .and_then(|d| query_feedback(&conn, d).ok());
+    let feedback_info = dmabuf.as_ref().and_then(|d| query_feedback(&conn, d).ok());
     if let Some(info) = feedback_info.as_ref() {
         info!(
             main_device = format!("0x{:016x}", info.main_device.unwrap_or(0)),
@@ -694,11 +696,8 @@ fn run_worker(
                     // spamming logs while doing wasted work. Once
                     // we've failed N allocs in a row, flip
                     // dmabuf_disabled and stop trying.
-                    dmabuf_consecutive_failures =
-                        dmabuf_consecutive_failures.saturating_add(1);
-                    if dmabuf_consecutive_failures >= DMABUF_FAILURE_THRESHOLD
-                        && !dmabuf_disabled
-                    {
+                    dmabuf_consecutive_failures = dmabuf_consecutive_failures.saturating_add(1);
+                    if dmabuf_consecutive_failures >= DMABUF_FAILURE_THRESHOLD && !dmabuf_disabled {
                         dmabuf_disabled = true;
                         warn!(
                             %e,
@@ -908,8 +907,16 @@ fn make_shm_buffer(
     qh: &QueueHandle<WorkerState>,
     info: &FrameInfo,
 ) -> Result<(WlBuffer, ShmBuffer)> {
-    let size = info.shm.as_ref().map(|s| s.stride * info.height).unwrap_or(0);
-    let stride = info.shm.as_ref().map(|s| s.stride).unwrap_or(info.width * 4);
+    let size = info
+        .shm
+        .as_ref()
+        .map(|s| s.stride * info.height)
+        .unwrap_or(0);
+    let stride = info
+        .shm
+        .as_ref()
+        .map(|s| s.stride)
+        .unwrap_or(info.width * 4);
     let shm_fmt = info.shm.as_ref().map(|s| s.format).unwrap_or(0);
     if size == 0 {
         return Err(FerricastError::Capture(
@@ -1037,8 +1044,7 @@ fn mmap_bo_to_raw(alloc: &AllocatedBuffer) -> std::result::Result<RawFrame, Ferr
         for y in 0..h {
             let src_off = y * map_stride;
             let dst_off = y * dst_stride;
-            buf[dst_off..dst_off + dst_stride]
-                .copy_from_slice(&src[src_off..src_off + dst_stride]);
+            buf[dst_off..dst_off + dst_stride].copy_from_slice(&src[src_off..src_off + dst_stride]);
         }
         Bytes::from(buf)
     };
@@ -1077,8 +1083,13 @@ fn dma_buf_sync(fd: std::os::fd::RawFd, flags: u64) -> std::io::Result<()> {
         flags: u64,
     }
     let req = DmaBufSync { flags };
-    let res =
-        unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &req as *const DmaBufSync as *const _) };
+    let res = unsafe {
+        libc::ioctl(
+            fd,
+            DMA_BUF_IOCTL_SYNC,
+            &req as *const DmaBufSync as *const _,
+        )
+    };
     if res < 0 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -1466,8 +1477,7 @@ fn query_feedback(
     conn: &Connection,
     dmabuf: &ZwpLinuxDmabufV1,
 ) -> std::result::Result<FeedbackInfo, FerricastError> {
-    let mut feedback_queue: wayland_client::EventQueue<FeedbackState> =
-        conn.new_event_queue();
+    let mut feedback_queue: wayland_client::EventQueue<FeedbackState> = conn.new_event_queue();
     let fb_qh = feedback_queue.handle();
 
     // `get_default_feedback` only exists since version 4 of the
@@ -1647,7 +1657,6 @@ fn decode_dev_t(device: &[u8]) -> Option<u64> {
         return None;
     }
     Some(u64::from_ne_bytes([
-        device[0], device[1], device[2], device[3],
-        device[4], device[5], device[6], device[7],
+        device[0], device[1], device[2], device[3], device[4], device[5], device[6], device[7],
     ]))
 }

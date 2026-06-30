@@ -329,13 +329,7 @@ impl App for ReceiverWindowApp {
         let video_meta = info
             .video
             .as_ref()
-            .map(|v| {
-                format!(
-                    "{} — {} frames",
-                    codec_label_video(v.codec),
-                    video_n
-                )
-            })
+            .map(|v| format!("{} — {} frames", codec_label_video(v.codec), video_n))
             .unwrap_or_else(|| "no video".to_string());
         let audio_meta = info
             .audio
@@ -365,8 +359,7 @@ impl App for ReceiverWindowApp {
                 None,
             );
             let data = Data::new_copy(&frame.bgra);
-            let Some(image) = SkImage::from_raster_data(&info, data, frame.stride as usize)
-            else {
+            let Some(image) = SkImage::from_raster_data(&info, data, frame.stride as usize) else {
                 return;
             };
             // Use the visible-area dimensions Freya gave us; the
@@ -384,12 +377,7 @@ impl App for ReceiverWindowApp {
             ctx.canvas.draw_image_rect_with_sampling_options(
                 &image,
                 None,
-                freya::engine::prelude::SkRect::new(
-                    dst.0,
-                    dst.1,
-                    dst.0 + dst.2,
-                    dst.1 + dst.3,
-                ),
+                freya::engine::prelude::SkRect::new(dst.0, dst.1, dst.0 + dst.2, dst.1 + dst.3),
                 SamplingOptions::default(),
                 &paint,
             );
@@ -416,12 +404,7 @@ impl App for ReceiverWindowApp {
                     .padding(Gaps::new(12., 16., 12., 16.))
                     .vertical()
                     .spacing(4.)
-                    .child(
-                        label()
-                            .text(title)
-                            .font_size(16.)
-                            .color(title_color),
-                    )
+                    .child(label().text(title).font_size(16.).color(title_color))
                     .child(
                         label()
                             .text(codec_line)
@@ -432,18 +415,8 @@ impl App for ReceiverWindowApp {
                         rect()
                             .horizontal()
                             .spacing(16.)
-                            .child(
-                                label()
-                                    .text(video_meta)
-                                    .font_size(11.)
-                                    .color(meta_color),
-                            )
-                            .child(
-                                label()
-                                    .text(audio_meta)
-                                    .font_size(11.)
-                                    .color(meta_color),
-                            ),
+                            .child(label().text(video_meta).font_size(11.).color(meta_color))
+                            .child(label().text(audio_meta).font_size(11.).color(meta_color)),
                     )
                     .child(
                         label()
@@ -458,12 +431,7 @@ impl App for ReceiverWindowApp {
 /// Aspect-fit `src` into `dst`, return `(x, y, w, h)` of the inset
 /// rectangle. Used by the canvas closure to letterbox the decoded
 /// frame inside the visible-area Freya measured for the canvas.
-fn aspect_fit(
-    dst_w: f32,
-    dst_h: f32,
-    src_w: f32,
-    src_h: f32,
-) -> (f32, f32, f32, f32) {
+fn aspect_fit(dst_w: f32, dst_h: f32, src_w: f32, src_h: f32) -> (f32, f32, f32, f32) {
     if src_w <= 0.0 || src_h <= 0.0 || dst_w <= 0.0 || dst_h <= 0.0 {
         return (0.0, 0.0, 0.0, 0.0);
     }

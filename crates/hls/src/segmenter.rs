@@ -57,7 +57,6 @@ where
             "encoder produced empty H.264 parameter sets; refusing to start segmenter".into(),
         ));
     }
-    
 
     let target = Duration::from_secs_f32(config.segment_target_secs);
     let frame_period = Duration::from_secs_f64(1.0 / (config.target_fps.max(1) as f64));
@@ -100,8 +99,6 @@ where
     let mut muxer = MpegTs::default().with_silent_audio(config.inject_silent_audio);
 
     muxer.config(parameter_sets.clone())?;
-
-
 
     // Inter-frame dt for diagnosing capture-side throughput. At 60 fps
     // we expect ~16-17 ms; values closer to 50-60 ms point at the
@@ -455,7 +452,6 @@ pub async fn run_from_frames(
             },
         };
 
-
         let started = Instant::now();
         let mut frames_in_segment: u64 = 0;
         let first_wall_ts = first.timestamp_us;
@@ -536,13 +532,10 @@ pub async fn run_from_frames(
                     continue;
                 }
                 SegEvent::Audio(Some(audio)) => {
-                    if let Err(e) =
-                        push_audio_frame(&mut muxer, &audio, video_wall_anchor)
-                    {
+                    if let Err(e) = push_audio_frame(&mut muxer, &audio, video_wall_anchor) {
                         warn!(error = %e, "audio PES push failed");
                     } else {
-                        audio_frames_pushed =
-                            audio_frames_pushed.saturating_add(1);
+                        audio_frames_pushed = audio_frames_pushed.saturating_add(1);
                         audio_pushed_window = audio_pushed_window.saturating_add(1);
                     }
                     // Burst-drain to keep the upstream queue empty
@@ -551,17 +544,13 @@ pub async fn run_from_frames(
                         loop {
                             match rx.try_recv() {
                                 Ok(extra) => {
-                                    if let Err(e) = push_audio_frame(
-                                        &mut muxer,
-                                        &extra,
-                                        video_wall_anchor,
-                                    ) {
+                                    if let Err(e) =
+                                        push_audio_frame(&mut muxer, &extra, video_wall_anchor)
+                                    {
                                         warn!(error = %e, "audio PES push failed (drain)");
                                     } else {
-                                        audio_frames_pushed =
-                                            audio_frames_pushed.saturating_add(1);
-                                        audio_pushed_window =
-                                            audio_pushed_window.saturating_add(1);
+                                        audio_frames_pushed = audio_frames_pushed.saturating_add(1);
+                                        audio_pushed_window = audio_pushed_window.saturating_add(1);
                                     }
                                 }
                                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -730,9 +719,7 @@ enum SegEvent {
 /// `await`-safe inside a `tokio::select!` arm — the inner `Option`
 /// can't appear inside `select!`'s pattern matcher directly, so we
 /// resolve it here and return `None` when no receiver is wired up.
-async fn recv_audio(
-    chan: &mut Option<mpsc::Receiver<AudioFrame>>,
-) -> Option<AudioFrame> {
+async fn recv_audio(chan: &mut Option<mpsc::Receiver<AudioFrame>>) -> Option<AudioFrame> {
     match chan {
         Some(rx) => rx.recv().await,
         // Never resolves — but `select!`'s `, if cond` guard above

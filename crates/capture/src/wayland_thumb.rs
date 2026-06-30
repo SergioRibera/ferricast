@@ -40,7 +40,8 @@ use ferricast_core::SourceError;
 use tracing::debug;
 
 use wayland_client::{
-    globals::{registry_queue_init, GlobalListContents},
+    Connection, Dispatch, Proxy, QueueHandle, WEnum,
+    globals::{GlobalListContents, registry_queue_init},
     protocol::{
         wl_buffer::WlBuffer,
         wl_output::{self, WlOutput},
@@ -48,7 +49,6 @@ use wayland_client::{
         wl_shm::{self, WlShm},
         wl_shm_pool::WlShmPool,
     },
-    Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
     ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
@@ -250,7 +250,15 @@ impl Default for FrameStatus {
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for MonitorState {
-    fn event(_: &mut Self, _: &WlRegistry, _: <WlRegistry as Proxy>::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlRegistry,
+        _: <WlRegistry as Proxy>::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<WlOutput, ()> for MonitorState {
@@ -293,16 +301,48 @@ impl Dispatch<WlOutput, ()> for MonitorState {
 }
 
 impl Dispatch<WlShm, ()> for MonitorState {
-    fn event(_: &mut Self, _: &WlShm, _: <WlShm as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlShm,
+        _: <WlShm as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<WlShmPool, ()> for MonitorState {
-    fn event(_: &mut Self, _: &WlShmPool, _: <WlShmPool as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlShmPool,
+        _: <WlShmPool as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<WlBuffer, ()> for MonitorState {
-    fn event(_: &mut Self, _: &WlBuffer, _: <WlBuffer as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlBuffer,
+        _: <WlBuffer as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<ZwlrScreencopyManagerV1, ()> for MonitorState {
-    fn event(_: &mut Self, _: &ZwlrScreencopyManagerV1, _: <ZwlrScreencopyManagerV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &ZwlrScreencopyManagerV1,
+        _: <ZwlrScreencopyManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<ZwlrScreencopyFrameV1, ()> for MonitorState {
@@ -404,9 +444,9 @@ pub fn window_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceErr
             .blocking_dispatch(&mut state)
             .map_err(|e| SourceError::Backend(format!("session wait: {e}")))?;
     }
-    let info = state
-        .buffer
-        .ok_or_else(|| SourceError::Backend("session emitted `done` without buffer_size/shm_format".into()))?;
+    let info = state.buffer.ok_or_else(|| {
+        SourceError::Backend("session emitted `done` without buffer_size/shm_format".into())
+    })?;
 
     let (fd, mmap) = alloc_shm(info.size())?;
     let pool = shm.create_pool(fd.as_fd(), info.size() as i32, &qh, ());
@@ -461,28 +501,92 @@ struct WindowState {
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for WindowState {
-    fn event(_: &mut Self, _: &WlRegistry, _: <WlRegistry as Proxy>::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlRegistry,
+        _: <WlRegistry as Proxy>::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<WlShm, ()> for WindowState {
-    fn event(_: &mut Self, _: &WlShm, _: <WlShm as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlShm,
+        _: <WlShm as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<WlShmPool, ()> for WindowState {
-    fn event(_: &mut Self, _: &WlShmPool, _: <WlShmPool as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlShmPool,
+        _: <WlShmPool as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<WlBuffer, ()> for WindowState {
-    fn event(_: &mut Self, _: &WlBuffer, _: <WlBuffer as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlBuffer,
+        _: <WlBuffer as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<ExtForeignToplevelImageCaptureSourceManagerV1, ()> for WindowState {
-    fn event(_: &mut Self, _: &ExtForeignToplevelImageCaptureSourceManagerV1, _: <ExtForeignToplevelImageCaptureSourceManagerV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &ExtForeignToplevelImageCaptureSourceManagerV1,
+        _: <ExtForeignToplevelImageCaptureSourceManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<ExtOutputImageCaptureSourceManagerV1, ()> for WindowState {
-    fn event(_: &mut Self, _: &ExtOutputImageCaptureSourceManagerV1, _: <ExtOutputImageCaptureSourceManagerV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &ExtOutputImageCaptureSourceManagerV1,
+        _: <ExtOutputImageCaptureSourceManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<ExtImageCaptureSourceV1, ()> for WindowState {
-    fn event(_: &mut Self, _: &ExtImageCaptureSourceV1, _: <ExtImageCaptureSourceV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &ExtImageCaptureSourceV1,
+        _: <ExtImageCaptureSourceV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<ExtImageCopyCaptureManagerV1, ()> for WindowState {
-    fn event(_: &mut Self, _: &ExtImageCopyCaptureManagerV1, _: <ExtImageCopyCaptureManagerV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &ExtImageCopyCaptureManagerV1,
+        _: <ExtImageCopyCaptureManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<ExtForeignToplevelListV1, ()> for WindowState {
@@ -643,7 +747,13 @@ fn alloc_shm(size: usize) -> Result<(OwnedFd, MmapRegion), SourceError> {
             std::io::Error::last_os_error()
         )));
     }
-    Ok((fd, MmapRegion { ptr: ptr as *mut u8, len: size }))
+    Ok((
+        fd,
+        MmapRegion {
+            ptr: ptr as *mut u8,
+            len: size,
+        },
+    ))
 }
 
 struct MmapRegion {
@@ -760,10 +870,7 @@ fn encode_png(
 
     let mut out = Vec::with_capacity(8 * 1024);
     thumb
-        .write_to(
-            &mut std::io::Cursor::new(&mut out),
-            image::ImageFormat::Png,
-        )
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
         .map_err(|e| SourceError::Backend(format!("png encode: {e}")))?;
     debug!(
         w = tw,
@@ -780,10 +887,7 @@ fn encode_png(
 /// thumbnail matches what the user sees on the monitor. The
 /// `Flipped*` variants are "flip horizontal then rotate by N"
 /// per the wayland spec — same operation order as wlroots' renderer.
-fn apply_wl_transform(
-    img: image::RgbaImage,
-    transform: wl_output::Transform,
-) -> image::RgbaImage {
+fn apply_wl_transform(img: image::RgbaImage, transform: wl_output::Transform) -> image::RgbaImage {
     use image::imageops as ops;
     use wl_output::Transform::*;
     match transform {
@@ -811,11 +915,10 @@ fn apply_wl_transform(
 /// `Xbgr8888` little-endian wire = `[R, G, B, X]` in memory.
 fn channels(format: u32) -> (usize, usize, usize, usize, bool) {
     match format {
-        0 => (2, 1, 0, 3, false),  // Argb8888
-        1 => (2, 1, 0, 3, true),   // Xrgb8888
+        0 => (2, 1, 0, 3, false),          // Argb8888
+        1 => (2, 1, 0, 3, true),           // Xrgb8888
         0x34324241 => (0, 1, 2, 3, false), // Abgr8888
         0x34325258 => (0, 1, 2, 3, true),  // Xbgr8888
         _ => (0, 1, 2, 3, true),
     }
 }
-

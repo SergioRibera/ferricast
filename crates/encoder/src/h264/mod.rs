@@ -49,10 +49,10 @@ mod headers;
 #[cfg(feature = "vaapi")]
 pub(crate) mod yuv;
 
-#[cfg(feature = "x264")]
-mod x264_impl;
 #[cfg(feature = "vaapi")]
 mod vaapi_impl;
+#[cfg(feature = "x264")]
+mod x264_impl;
 
 use ferricast_core::{
     CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, Result, VideoEncoder,
@@ -62,10 +62,10 @@ use tracing::{info, warn};
 
 #[cfg(feature = "nvenc")]
 pub use crate::nvenc::NvencH264Encoder;
-#[cfg(feature = "x264")]
-pub use x264_impl::X264Encoder;
 #[cfg(feature = "vaapi")]
 pub use vaapi_impl::VaapiH264Encoder;
+#[cfg(feature = "x264")]
+pub use x264_impl::X264Encoder;
 
 const H264_BACKEND_VAR: &'static str = "FERRICAST_H264_BACKEND";
 

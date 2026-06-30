@@ -39,7 +39,7 @@ use ferricast_core::{
     ControlSession, FerricastError, MediaCommand, PlaybackState, RemoteSender, Result,
 };
 
-use crate::castv2::{CastMessage, MAX_MESSAGE_SIZE, namespace, DEFAULT_MEDIA_RECEIVER_APP_ID};
+use crate::castv2::{CastMessage, DEFAULT_MEDIA_RECEIVER_APP_ID, MAX_MESSAGE_SIZE, namespace};
 
 use super::tls::build_server_config;
 
@@ -167,9 +167,9 @@ impl ControlSession for ChromecastReceiverControl {
             // re-use the same listener.
             if self.listener.is_none() {
                 let addr: SocketAddr = ([0, 0, 0, 0], self.port).into();
-                let listener = TcpListener::bind(addr).await.map_err(|e| {
-                    FerricastError::Receiver(format!("bind tcp {addr}: {e}"))
-                })?;
+                let listener = TcpListener::bind(addr)
+                    .await
+                    .map_err(|e| FerricastError::Receiver(format!("bind tcp {addr}: {e}")))?;
                 tracing::info!(%addr, "Chromecast receiver TLS listener up");
                 self.listener = Some(listener);
             }
@@ -181,17 +181,14 @@ impl ControlSession for ChromecastReceiverControl {
             tracing::info!(%peer, "Chromecast receiver: TCP connect");
 
             let acceptor = tokio_rustls::TlsAcceptor::from(self.tls_config.clone());
-            let tls = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                acceptor.accept(tcp),
-            )
-            .await
-            .map_err(|_| {
-                FerricastError::Receiver(format!(
-                    "TLS handshake with {peer} did not complete in 5s"
-                ))
-            })?
-            .map_err(|e| FerricastError::Receiver(format!("TLS handshake: {e}")))?;
+            let tls = tokio::time::timeout(std::time::Duration::from_secs(5), acceptor.accept(tcp))
+                .await
+                .map_err(|_| {
+                    FerricastError::Receiver(format!(
+                        "TLS handshake with {peer} did not complete in 5s"
+                    ))
+                })?
+                .map_err(|e| FerricastError::Receiver(format!("TLS handshake: {e}")))?;
             tracing::info!(%peer, "Chromecast receiver: TLS handshake complete");
 
             let (read_half, write_half) = split(tls);
@@ -220,14 +217,13 @@ impl ControlSession for ChromecastReceiverControl {
 
     fn next_command(&mut self) -> impl std::future::Future<Output = Result<MediaCommand>> + Send {
         async move {
-            let rx = self.commands_rx.as_mut().ok_or_else(|| {
-                FerricastError::Receiver("next_command before accept".into())
-            })?;
+            let rx = self
+                .commands_rx
+                .as_mut()
+                .ok_or_else(|| FerricastError::Receiver("next_command before accept".into()))?;
             match rx.recv().await {
                 Some(r) => r,
-                None => Err(FerricastError::Receiver(
-                    "control reader closed".into(),
-                )),
+                None => Err(FerricastError::Receiver("control reader closed".into())),
             }
         }
     }
@@ -325,10 +321,7 @@ async fn dispatch(
     let payload = msg.payload_utf8.as_deref().unwrap_or("{}");
     let value: Value = serde_json::from_str(payload)
         .map_err(|e| FerricastError::Receiver(format!("payload parse: {e}")))?;
-    let msg_type = value
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let request_id = value.get("requestId").and_then(|v| v.as_i64());
 
     tracing::info!(
@@ -486,16 +479,10 @@ async fn dispatch(
 
                 {
                     let mut guard = state.lock().await;
-                    let s = guard
-                        .get_or_insert_with(|| SessionState::new(msg.source_id.clone()));
+                    let s = guard.get_or_insert_with(|| SessionState::new(msg.source_id.clone()));
                     s.last_content_id = Some(url.clone());
                     s.last_content_type = content_type.clone();
-                    s.player_state = if autoplay {
-                        "BUFFERING"
-                    } else {
-                        "PAUSED"
-                    }
-                    .to_string();
+                    s.player_state = if autoplay { "BUFFERING" } else { "PAUSED" }.to_string();
                     s.current_time = current_time;
                 }
 
@@ -650,13 +637,8 @@ fn build_media_status(s: &SessionState, request_id: Option<i64>) -> CastMessage 
         }]
     });
     // unwrap: payload is always valid JSON we built ourselves
-    CastMessage::new_json(
-        &s.transport_id,
-        &s.sender_id,
-        namespace::MEDIA,
-        &payload,
-    )
-    .expect("MEDIA_STATUS payload encode")
+    CastMessage::new_json(&s.transport_id, &s.sender_id, namespace::MEDIA, &payload)
+        .expect("MEDIA_STATUS payload encode")
 }
 
 fn extract_metadata(v: &Value) -> std::collections::HashMap<String, String> {

@@ -26,7 +26,7 @@ use ferricast_core::{
 };
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
-use xcb::{x, randr, Xid, XidNew};
+use xcb::{Xid, XidNew, randr, x};
 
 /// Atom names we need to read window metadata. Cached per-connection
 /// because intern is cheap (one round-trip) but a list-of-200-windows
@@ -383,12 +383,9 @@ fn monitor_for(monitors: &[MonitorInfo], geo: &Geometry) -> Option<String> {
 }
 
 fn event_loop(tx: broadcast::Sender<SourceChange>) -> Result<(), SourceError> {
-    let (conn, screen_num) = xcb::Connection::connect_with_extensions(
-        None,
-        &[xcb::Extension::RandR],
-        &[],
-    )
-    .map_err(|e| SourceError::Backend(format!("connect: {e}")))?;
+    let (conn, screen_num) =
+        xcb::Connection::connect_with_extensions(None, &[xcb::Extension::RandR], &[])
+            .map_err(|e| SourceError::Backend(format!("connect: {e}")))?;
     let setup = conn.get_setup();
     let screen = setup
         .roots()
@@ -571,12 +568,7 @@ fn encode_drawable_png(
 
     let mut out = Vec::with_capacity(8 * 1024);
     thumb
-        .write_to(
-            &mut std::io::Cursor::new(&mut out),
-            image::ImageFormat::Png,
-        )
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
         .map_err(|e| SourceError::Backend(format!("png encode: {e}")))?;
     Ok(out)
 }
-
-

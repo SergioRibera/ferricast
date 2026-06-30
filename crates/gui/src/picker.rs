@@ -145,12 +145,7 @@ async fn start_stream_with_dto(
         // the lifetime of the audio task, so dropping ours doesn't
         // disable capture.
         let mute = AudioMuteHandle::default();
-        let audio_cfg = match sm
-            .devices()
-            .await
-            .into_iter()
-            .find(|d| d.id == device_id)
-        {
+        let audio_cfg = match sm.devices().await.into_iter().find(|d| d.id == device_id) {
             Some(d) => AudioStreamConfig::for_device(&d.capabilities, mute.clone()),
             None => AudioStreamConfig {
                 mute: mute.clone(),

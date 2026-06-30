@@ -63,10 +63,9 @@ impl AudioDecoder for AacDecoder {
     }
 
     fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
-        let decoder = self
-            .inner
-            .as_mut()
-            .ok_or_else(|| FerricastError::Decode("AacDecoder::decode before configure()".into()))?;
+        let decoder = self.inner.as_mut().ok_or_else(|| {
+            FerricastError::Decode("AacDecoder::decode before configure()".into())
+        })?;
 
         let ts = frame.timestamp_us;
         let packet = Packet::new_from_slice(0, ts, 0, &frame.data);

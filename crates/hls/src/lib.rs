@@ -229,7 +229,7 @@ impl HlsServer {
             }
         });
 
-       ring::wait_for_first_segment(&ring).await;
+        ring::wait_for_first_segment(&ring).await;
 
         info!(
             listen = %local,
@@ -284,15 +284,7 @@ impl HlsServer {
                     let tls = self.tls.clone();
 
                     tokio::spawn(async move {
-                        spawn_handler(
-                            socket,
-                            peer.to_string(),
-                            tls,
-                            ring,
-                            adaptive,
-                            stats,
-                        )
-                        .await;
+                        spawn_handler(socket, peer.to_string(), tls, ring, adaptive, stats).await;
                     });
                 }
                 Err(e) => {

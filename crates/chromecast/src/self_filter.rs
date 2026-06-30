@@ -44,8 +44,5 @@ pub fn unregister(id: &str) {
 /// receiver. Cheap — backed by a `Mutex<HashSet<String>>` with at most
 /// a handful of entries (one per active receiver advertiser).
 pub fn contains(id: &str) -> bool {
-    registry()
-        .lock()
-        .map(|g| g.contains(id))
-        .unwrap_or(false)
+    registry().lock().map(|g| g.contains(id)).unwrap_or(false)
 }

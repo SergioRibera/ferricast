@@ -245,7 +245,9 @@ impl Component for DeviceCard {
             .horizontal()
             .spacing(12.)
             .maybe(is_streaming, |r| r.on_press(move |_| (on_stop)()))
-            .maybe(!is_streaming, |r| r.on_press(move |_| (on_request_picker)()))
+            .maybe(!is_streaming, |r| {
+                r.on_press(move |_| (on_request_picker)())
+            })
             .child(
                 rect()
                     .center()

@@ -275,7 +275,9 @@ pub enum ManagerEvent {
         state: PlaybackState,
     },
     /// Remote disconnected cleanly or the puller hit EOS.
-    ReceiverStopped { receiver_id: Uuid },
+    ReceiverStopped {
+        receiver_id: Uuid,
+    },
     /// Fatal receiver error — pipeline task terminated. Distinct
     /// from `ReceiverStopped` so the UI can surface a toast / retry
     /// affordance.
@@ -648,7 +650,9 @@ impl StreamManager {
             match tokio::time::timeout(Duration::from_secs(5), r.task).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::warn!(?e, "receiver task panicked"),
-                Err(_) => tracing::warn!(protocol = r.protocol, "receiver task did not finish in 5s"),
+                Err(_) => {
+                    tracing::warn!(protocol = r.protocol, "receiver task did not finish in 5s")
+                }
             }
         }
         self.receivers_running = false;
@@ -890,9 +894,7 @@ impl StreamManager {
                 let mute = audio_cfg.mute.clone();
                 let mute_for_task = mute.clone();
                 let task = tokio::spawn(async move {
-                    if let Err(e) =
-                        run_audio_pipeline(audio_cfg, mute_for_task, tx).await
-                    {
+                    if let Err(e) = run_audio_pipeline(audio_cfg, mute_for_task, tx).await {
                         tracing::error!(%e, "audio pipeline exited with error");
                     } else {
                         tracing::info!("audio pipeline exited cleanly");
@@ -1347,7 +1349,10 @@ async fn run_receiver_session(
     control: &mut Box<dyn ErasedControlSession>,
     create_puller: Arc<dyn Fn() -> Result<Box<dyn ErasedPuller>> + Send + Sync>,
     video_decoders: &HashMap<Codec, Arc<dyn Fn() -> Box<dyn ErasedVideoDecoder> + Send + Sync>>,
-    audio_decoders: &HashMap<AudioCodec, Arc<dyn Fn() -> Box<dyn ErasedAudioDecoder> + Send + Sync>>,
+    audio_decoders: &HashMap<
+        AudioCodec,
+        Arc<dyn Fn() -> Box<dyn ErasedAudioDecoder> + Send + Sync>,
+    >,
     sink_factory: SinkFactory,
     event_tx: mpsc::Sender<ManagerEvent>,
     cancel_rx: &mut mpsc::Receiver<()>,
@@ -1722,8 +1727,9 @@ impl StreamManagerBuilder {
     /// Finalize and split out the event receiver in one step — the
     /// common shape for apps that wrap the manager in `Arc<Mutex<_>>`
     /// and need the rx accessible from a separate task.
-    pub fn build_with_events(mut self) -> (StreamManager, tokio::sync::mpsc::Receiver<ManagerEvent>)
-    {
+    pub fn build_with_events(
+        mut self,
+    ) -> (StreamManager, tokio::sync::mpsc::Receiver<ManagerEvent>) {
         let rx = self
             .manager
             .take_event_rx()
@@ -1737,9 +1743,7 @@ impl StreamManagerBuilder {
 /// `Option<&mut Receiver<_>>` directly, so we resolve it here:
 /// returns `None` when no receiver is wired (the arm's `if` guard
 /// disables it anyway, but we keep the future well-formed).
-async fn recv_audio_frame(
-    chan: &mut Option<mpsc::Receiver<AudioFrame>>,
-) -> Option<AudioFrame> {
+async fn recv_audio_frame(chan: &mut Option<mpsc::Receiver<AudioFrame>>) -> Option<AudioFrame> {
     match chan {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,

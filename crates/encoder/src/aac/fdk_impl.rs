@@ -73,14 +73,15 @@ impl FdkAacEncoder {
             channels: channel_mode,
             audio_object_type: AudioObjectType::Mpeg4LowComplexity,
         };
-        let enc = Encoder::new(params).map_err(|e| {
-            FerricastError::Encoder(format!("fdk-aac: Encoder::new failed: {e}"))
-        })?;
+        let enc = Encoder::new(params)
+            .map_err(|e| FerricastError::Encoder(format!("fdk-aac: Encoder::new failed: {e}")))?;
         Ok(Self {
             enc,
             sample_rate: config.sample_rate,
             channels: config.channels,
-            pcm_buffer: Vec::with_capacity(AAC_LC_FRAME_SAMPLES * config.channels.max(1) as usize * 4),
+            pcm_buffer: Vec::with_capacity(
+                AAC_LC_FRAME_SAMPLES * config.channels.max(1) as usize * 4,
+            ),
             pts_anchor_us: None,
             samples_emitted: 0,
             out_scratch: vec![0u8; ENC_OUTPUT_SCRATCH],
@@ -131,9 +132,7 @@ impl FdkAacEncoder {
             let info: EncodeInfo = self
                 .enc
                 .encode(input_view, &mut self.out_scratch)
-                .map_err(|e| {
-                    FerricastError::Encoder(format!("fdk-aac: encode failed: {e}"))
-                })?;
+                .map_err(|e| FerricastError::Encoder(format!("fdk-aac: encode failed: {e}")))?;
 
             if info.input_consumed == 0 && info.output_size == 0 {
                 // Encoder asked for more input but didn't consume
@@ -155,8 +154,8 @@ impl FdkAacEncoder {
                 // with no rounding error worth worrying about at
                 // 48 kHz; downstream MPEG-TS conversion scales by
                 // 9/100 to land in 90 kHz ticks.
-                let pts_offset_us = self.samples_emitted.saturating_mul(1_000_000)
-                    / self.sample_rate.max(1) as u64;
+                let pts_offset_us =
+                    self.samples_emitted.saturating_mul(1_000_000) / self.sample_rate.max(1) as u64;
                 let timestamp_us = self
                     .pts_anchor_us
                     .unwrap_or(0)
@@ -169,8 +168,9 @@ impl FdkAacEncoder {
                     sample_rate: self.sample_rate,
                     channels: self.channels,
                 });
-                self.samples_emitted =
-                    self.samples_emitted.saturating_add(AAC_LC_FRAME_SAMPLES as u64);
+                self.samples_emitted = self
+                    .samples_emitted
+                    .saturating_add(AAC_LC_FRAME_SAMPLES as u64);
             }
         }
 
@@ -202,8 +202,8 @@ impl FdkAacEncoder {
                 break;
             }
             let adts = Bytes::copy_from_slice(&self.out_scratch[..info.output_size]);
-            let pts_offset_us = self.samples_emitted.saturating_mul(1_000_000)
-                / self.sample_rate.max(1) as u64;
+            let pts_offset_us =
+                self.samples_emitted.saturating_mul(1_000_000) / self.sample_rate.max(1) as u64;
             let timestamp_us = self
                 .pts_anchor_us
                 .unwrap_or(0)
@@ -215,8 +215,9 @@ impl FdkAacEncoder {
                 sample_rate: self.sample_rate,
                 channels: self.channels,
             });
-            self.samples_emitted =
-                self.samples_emitted.saturating_add(AAC_LC_FRAME_SAMPLES as u64);
+            self.samples_emitted = self
+                .samples_emitted
+                .saturating_add(AAC_LC_FRAME_SAMPLES as u64);
         }
         Ok(std::mem::take(&mut self.pending))
     }

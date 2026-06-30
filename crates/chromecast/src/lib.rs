@@ -1,8 +1,8 @@
 pub mod castv2;
 pub mod discovery;
 pub mod receiver;
-pub mod session;
 pub(crate) mod self_filter;
+pub mod session;
 mod wire;
 
 pub use castv2::{

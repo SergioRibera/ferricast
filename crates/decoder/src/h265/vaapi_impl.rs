@@ -34,11 +34,11 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 
+use cros_libva::*;
 use ferricast_core::{
     CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, H265Profile, Result,
     VideoDecoder,
 };
-use cros_libva::*;
 use tracing::{debug, info, warn};
 
 const RENDER_NODES: &[&str] = &[
@@ -200,8 +200,10 @@ fn worker_main(
 
     // Decide profile from the DecoderConfig hint, falling back to
     // whatever the driver supports.
-    let want_main10 = matches!(initial_config.pixel_format, ferricast_core::PixelFormat::Nv12)
-        && supported.contains(&VA_PROFILE_HEVC_MAIN10)
+    let want_main10 = matches!(
+        initial_config.pixel_format,
+        ferricast_core::PixelFormat::Nv12
+    ) && supported.contains(&VA_PROFILE_HEVC_MAIN10)
         && profile_has_vld(&display, VA_PROFILE_HEVC_MAIN10);
     let profile = if want_main10 {
         VA_PROFILE_HEVC_MAIN10
