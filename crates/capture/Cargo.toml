@@ -59,8 +59,15 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = tru
 gbm = { version = "0.18", default-features = false, features = ["drm-support"], optional = true }
 drm-fourcc = { version = "2.2", optional = true }
 
-# pipewire backend
-ashpd = { version = "0.10", features = ["tokio"], optional = true }
+# pipewire backend.
+# `async-std` (NOT `tokio`) on purpose: the `tokio` feature pulls
+# `zbus/tokio`, which propagates via Cargo feature unification to
+# every other zbus user in the tree. That in turn breaks `mundy`
+# (theme detection in `freya-core`): mundy's subscription thread is
+# a plain `std::thread` with no Tokio reactor, so zbus panics with
+# "no Tokio 1.x runtime running" on GUI startup. `async-std` makes
+# zbus use `async-io`, which mundy already drives correctly.
+ashpd = { version = "0.10", features = ["async-std"], default-features = false, optional = true }
 pipewire = { version = "0.8", features = ["v0_3_77"], optional = true }
 # `MODIFIER_FIXATION_REQUIRED` is gated behind libspa's own `v0_3_75`
 # feature, which the `pipewire` crate doesn't pass through directly.

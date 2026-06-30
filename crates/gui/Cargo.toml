@@ -64,13 +64,6 @@ clap.workspace = true
 futures-util.workspace = true
 
 freya = { version = "0.4.0-rc.19", features = ["icons", "router", "radio", "engine"] }
-# freya-core pulls `mundy` (system theme detection). mundy defaults
-# enable `async-io`, but our `zbus` is in tokio reactor mode (pulled
-# by ferricast-dbus). Cargo feature unification means zbus would
-# panic on mundy's background thread ("no Tokio 1.x runtime") in
-# release. Force mundy's `tokio` feature so its subscription thread
-# spins up a current_thread tokio runtime that zbus is happy with.
-mundy = { version = "0.2", features = ["tokio"] }
 rustls = { version = "0.23", features = ["ring"] }
 anyhow = "1"
 bytes.workspace = true
