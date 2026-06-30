@@ -280,42 +280,6 @@ impl VideoEncoder for X264Encoder {
     }
 }
 
-/// Count SPS (NAL type 7) and PPS (NAL type 8) units inside an
-/// Annex-B-framed H.264 byte slice. Used by the B5 diagnostic to
-/// detect whether libx264 is already emitting parameter sets per
-/// IDR, which would make our manual prepend a duplicate.
-fn count_param_sets(annex_b: &[u8]) -> (u32, u32) {
-    let mut i = 0usize;
-    let mut sps = 0u32;
-    let mut pps = 0u32;
-    while i + 3 <= annex_b.len() {
-        let sc_len = if annex_b[i] == 0 && annex_b[i + 1] == 0 && annex_b[i + 2] == 1 {
-            3
-        } else if i + 4 <= annex_b.len()
-            && annex_b[i] == 0
-            && annex_b[i + 1] == 0
-            && annex_b[i + 2] == 0
-            && annex_b[i + 3] == 1
-        {
-            4
-        } else {
-            i += 1;
-            continue;
-        };
-        let nal_start = i + sc_len;
-        if nal_start >= annex_b.len() {
-            break;
-        }
-        match annex_b[nal_start] & 0x1f {
-            7 => sps += 1,
-            8 => pps += 1,
-            _ => {}
-        }
-        i = nal_start + 1;
-    }
-    (sps, pps)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,9 +288,11 @@ mod tests {
 
     fn black_bgra_frame(width: u32, height: u32) -> CapturedFrame {
         let mut buf = vec![0u8; (width * height * 4) as usize];
+        
         for px in buf.chunks_exact_mut(4) {
             px[3] = 0xff; // opaque alpha; BGR all zero
         }
+
         CapturedFrame::Cpu(RawFrame {
             width,
             height,
