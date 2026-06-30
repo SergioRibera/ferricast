@@ -1,7 +1,7 @@
 use bytes::Bytes;
-use ferricast_core::{Codec, EncodedFrame, FerricastError, H264Profile, VideoEncoder};
+use ferricast_core::{Codec, EncodedFrame, FerricastError, H264Profile, PixelFormat, VideoEncoder};
 use x264::{Colorspace, Encoder, Image, Plane, Preset, Setup, Tune};
-use yuv::{YuvChromaSubsampling, YuvPlanarImageMut, bgra_to_yuv420};
+use yuv::{YuvChromaSubsampling, YuvPlanarImageMut, bgra_to_yuv420, rgba_to_yuv420};
 
 use crate::h264::utils::extract_sps_pps;
 
@@ -140,35 +140,89 @@ impl VideoEncoder for X264Encoder {
         }
         let planar = self.planar.as_mut().expect("just allocated above");
 
-        bgra_to_yuv420(
-            planar,
-            &frame.data,
-            frame.width * 4,
-            yuv::YuvRange::Limited,
-            yuv::YuvStandardMatrix::Bt601,
-            yuv::YuvConversionMode::Balanced,
-        )
-        .map_err(|_| FerricastError::Encoding("Cannot convert BGRA to YUV 4:2:0".to_string()))?;
+        match frame.format {
+            PixelFormat::Bgra => {
+                bgra_to_yuv420(
+                    planar,
+                    &frame.data,
+                    frame.width * 4,
+                    yuv::YuvRange::Limited,
+                    yuv::YuvStandardMatrix::Bt601,
+                    yuv::YuvConversionMode::Balanced,
+                )
+                .map_err(|_| {
+                    FerricastError::Encoding("Cannot convert BGRA to YUV 4:2:0".to_string())
+                })?;
+            }
+            PixelFormat::Rgba => {
+                rgba_to_yuv420(
+                    planar,
+                    &frame.data,
+                    frame.width * 4,
+                    yuv::YuvRange::Limited,
+                    yuv::YuvStandardMatrix::Bt601,
+                    yuv::YuvConversionMode::Balanced,
+                )
+                .map_err(|_| {
+                    FerricastError::Encoding("Cannot convert RGBA to YUV 4:2:0".to_string())
+                })?;
+            }
+            PixelFormat::Nv12 => {
+                return Err(FerricastError::Encoding(
+                    "Nv12 is not supported".to_string(),
+                ));
+            }
+            PixelFormat::I420 => {}
+        };
 
-        let image = Image::new(
-            Colorspace::I420,
-            frame.width as i32,
-            frame.height as i32,
-            &[
-                Plane {
-                    stride: planar.y_stride as i32,
-                    data: planar.y_plane.borrow(),
-                },
-                Plane {
-                    stride: planar.u_stride as i32,
-                    data: planar.u_plane.borrow(),
-                },
-                Plane {
-                    stride: planar.v_stride as i32,
-                    data: planar.v_plane.borrow(),
-                },
-            ],
-        );
+        let image = match frame.format {
+            PixelFormat::I420 => {
+                let y_size = (frame.width * frame.height) as usize;
+                let uv_size = ((frame.width / 2) * (frame.height / 2)) as usize;
+
+                let (y, tmp) = frame.data.split_at(y_size);
+                let (u, v) = tmp.split_at(uv_size);
+
+                Image::new(
+                    Colorspace::I420,
+                    frame.width as i32,
+                    frame.height as i32,
+                    &[
+                        Plane {
+                            stride: frame.width as i32,
+                            data: y,
+                        },
+                        Plane {
+                            stride: (frame.width / 2) as i32,
+                            data: u,
+                        },
+                        Plane {
+                            stride: (frame.width / 2) as i32,
+                            data: v,
+                        },
+                    ],
+                )
+            }
+            _ => Image::new(
+                Colorspace::I420,
+                frame.width as i32,
+                frame.height as i32,
+                &[
+                    Plane {
+                        stride: planar.y_stride as i32,
+                        data: planar.y_plane.borrow(),
+                    },
+                    Plane {
+                        stride: planar.u_stride as i32,
+                        data: planar.u_plane.borrow(),
+                    },
+                    Plane {
+                        stride: planar.v_stride as i32,
+                        data: planar.v_plane.borrow(),
+                    },
+                ],
+            ),
+        };
 
         // x264 only requires monotonic PTS for ordering; the rate
         // model is driven by the `fps` we configured in `Setup::fps`.
@@ -220,7 +274,9 @@ impl VideoEncoder for X264Encoder {
         Ok(self.sps_pps.clone())
     }
     fn request_keyframe(&mut self) {
-        tracing::debug!("X264: on-demand IDR not supported; relying on configured keyframe interval");
+        tracing::debug!(
+            "X264: on-demand IDR not supported; relying on configured keyframe interval"
+        );
     }
 }
 
@@ -312,11 +368,8 @@ mod tests {
         let raw = frame.into_cpu().expect("cpu");
         let internal = enc.encoder.as_mut().expect("encoder built");
 
-        let mut planar = YuvPlanarImageMut::<u8>::alloc(
-            raw.width,
-            raw.height,
-            YuvChromaSubsampling::Yuv420,
-        );
+        let mut planar =
+            YuvPlanarImageMut::<u8>::alloc(raw.width, raw.height, YuvChromaSubsampling::Yuv420);
         bgra_to_yuv420(
             &mut planar,
             &raw.data,
@@ -367,7 +420,9 @@ mod tests {
         // Print so `cargo test -- --nocapture` shows the verdict
         // even though the assertion only documents the current state.
         eprintln!("B5 verification: raw encoder output IDR has SPS={raw_sps}, PPS={raw_pps}");
-        assert!(raw_sps >= 1 && raw_pps >= 1,
-            "libx264 default (b_repeat_headers=1) was expected to emit SPS/PPS — got SPS={raw_sps} PPS={raw_pps}. If this fires, the manual prepend in encode() is actually required and B5 is a non-issue.");
+        assert!(
+            raw_sps >= 1 && raw_pps >= 1,
+            "libx264 default (b_repeat_headers=1) was expected to emit SPS/PPS — got SPS={raw_sps} PPS={raw_pps}. If this fires, the manual prepend in encode() is actually required and B5 is a non-issue."
+        );
     }
 }

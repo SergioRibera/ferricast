@@ -20,9 +20,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
 
 fn main() {
     let daemon = ServiceDaemon::new().expect("ServiceDaemon");
-    let rx = daemon
-        .browse("_googlecast._tcp.local.")
-        .expect("browse");
+    let rx = daemon.browse("_googlecast._tcp.local.").expect("browse");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     println!("probing _googlecast._tcp.local. for 10 s ...");
     while std::time::Instant::now() < deadline {

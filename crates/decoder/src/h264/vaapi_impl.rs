@@ -285,9 +285,7 @@ fn run_worker(
                 let _ = reply_tx.send(Reply::Configured);
             }
             Cmd::Decode(frame) => {
-                let result = state
-                    .decode_picture(frame)
-                    .map_err(|e| e.to_string());
+                let result = state.decode_picture(frame).map_err(|e| e.to_string());
                 let _ = reply_tx.send(Reply::Frame(result));
             }
             Cmd::Flush => {
@@ -361,7 +359,11 @@ impl WorkerState {
             .map_err(|e| FerricastError::Decode(format!("VA-API create_context: {e:?}")))?;
         self.surfaces = surfaces;
         self.ctx = Some(ctx);
-        tracing::info!(width = w, height = h, "VA-API: context + surface pool created");
+        tracing::info!(
+            width = w,
+            height = h,
+            "VA-API: context + surface pool created"
+        );
         Ok(())
     }
 
@@ -474,9 +476,10 @@ impl WorkerState {
         // the next call may mutate the context bank.
         let pps = self
             .h264_ctx
-            .pps_by_id(h264_reader::nal::pps::ParamSetId::from_u32(
-                header_info.pps_id as u32,
-            ).map_err(|e| FerricastError::Decode(format!("PPS id: {e:?}")))?)
+            .pps_by_id(
+                h264_reader::nal::pps::ParamSetId::from_u32(header_info.pps_id as u32)
+                    .map_err(|e| FerricastError::Decode(format!("PPS id: {e:?}")))?,
+            )
             .ok_or_else(|| FerricastError::Decode("PPS missing".into()))?
             .clone();
         let sps = self
@@ -535,9 +538,7 @@ impl WorkerState {
                 None,
                 vec![()],
             )
-            .map_err(|e| {
-                FerricastError::Decode(format!("VA-API placeholder surface: {e:?}"))
-            })?
+            .map_err(|e| FerricastError::Decode(format!("VA-API placeholder surface: {e:?}")))?
             .into_iter()
             .next()
             .unwrap();
@@ -562,9 +563,7 @@ impl WorkerState {
             .create_buffer(BufferType::SliceParameter(SliceParameter::H264(
                 slice_param,
             )))
-            .map_err(|e| {
-                FerricastError::Decode(format!("VA-API slice_param buffer: {e:?}"))
-            })?;
+            .map_err(|e| FerricastError::Decode(format!("VA-API slice_param buffer: {e:?}")))?;
         picture.add_buffer(slice_param_buf);
 
         let slice_data_buf = ctx
@@ -638,8 +637,7 @@ fn build_pic_param(
 ) -> PictureParameterBufferH264 {
     let curr_pic = PictureH264::new(surfaces[output_idx].id(), hdr.frame_num, 0, 0, 0);
 
-    let invalid_ref =
-        PictureH264::new(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0);
+    let invalid_ref = PictureH264::new(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0);
     let mut refs: [PictureH264; 16] = std::array::from_fn(|_| {
         PictureH264::new(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0)
     });
@@ -850,11 +848,7 @@ struct SliceHdr {
 ///
 /// `slice_rbsp` is the RBSP (emulation-prevention bytes stripped)
 /// starting AT the byte after the NAL header.
-fn parse_slice_header(
-    slice_rbsp: &[u8],
-    nal_hdr: u8,
-    ctx: &H264Context,
-) -> Result<SliceHdr> {
+fn parse_slice_header(slice_rbsp: &[u8], nal_hdr: u8, ctx: &H264Context) -> Result<SliceHdr> {
     let mut br = BitReader::new(slice_rbsp);
     let first_mb_in_slice = br.read_ue()?;
     let slice_type_raw = br.read_ue()? as u8;

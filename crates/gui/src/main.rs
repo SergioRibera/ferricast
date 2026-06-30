@@ -7,9 +7,7 @@ use ferricast::ManagerEvent;
 use ferricast::prelude::*;
 use freya::{prelude::*, radio::*};
 use tokio::sync::{Mutex, mpsc};
-use tracing_subscriber::{
-    EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt,
-};
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 use crate::app::ReceiverWindowReq;
@@ -86,7 +84,11 @@ async fn main() -> anyhow::Result<()> {
                     .name
                     .clone()
                     .unwrap_or_else(|| remote.addr.to_string()),
-                if info.video.is_some() { " (video)" } else { " (audio)" },
+                if info.video.is_some() {
+                    " (video)"
+                } else {
+                    " (audio)"
+                },
             );
             let counters = Arc::new(receiver_window::ReceiverCounters::default());
             // Channel depths sized to absorb window-startup latency
@@ -292,7 +294,9 @@ fn run_window(
                                     .streaming
                                     .retain(|&s| s != device_id);
                             }
-                            Some(ManagerEvent::ReceiverIncoming { protocol, remote, .. }) => {
+                            Some(ManagerEvent::ReceiverIncoming {
+                                protocol, remote, ..
+                            }) => {
                                 tracing::info!(
                                     protocol,
                                     sender = %remote.addr,
@@ -310,10 +314,7 @@ fn run_window(
                                     "receiver: LOAD acknowledged, pipeline running"
                                 );
                             }
-                            Some(ManagerEvent::ReceiverStateChanged {
-                                receiver_id,
-                                state,
-                            }) => {
+                            Some(ManagerEvent::ReceiverStateChanged { receiver_id, state }) => {
                                 tracing::debug!(?receiver_id, ?state, "receiver state");
                             }
                             Some(ManagerEvent::ReceiverStopped { receiver_id })
@@ -370,9 +371,8 @@ fn init_tracing_for_daemon() {
                           ferricast_encoder=info,ferricast_gui=info,\
                           ferricast_hls=info,ferricast_muxer=info,\
                           ferricast_capture=info";
-    let make_filter = || {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter))
-    };
+    let make_filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
     let console_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
@@ -443,8 +443,7 @@ fn default_trace_log_path() -> Option<std::path::PathBuf> {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))?
     } else if cfg!(target_os = "macos") {
         let home = std::env::var_os("HOME")?;
-        std::path::PathBuf::from(home)
-            .join("Library/Caches/ferricast")
+        std::path::PathBuf::from(home).join("Library/Caches/ferricast")
     } else {
         // Linux / BSD / other Unix → XDG cache.
         std::env::var_os("XDG_CACHE_HOME")

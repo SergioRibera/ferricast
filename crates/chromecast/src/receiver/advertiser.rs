@@ -51,7 +51,10 @@ impl ChromecastReceiverAdvertiser {
 impl Advertiser for ChromecastReceiverAdvertiser {
     const PROTOCOL: &'static str = "chromecast";
 
-    fn start(&mut self, info: AdvertiseInfo) -> impl std::future::Future<Output = Result<()>> + Send {
+    fn start(
+        &mut self,
+        info: AdvertiseInfo,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
         async move {
             let daemon = ServiceDaemon::new()
                 .map_err(|e| FerricastError::Receiver(format!("mDNS daemon: {e}")))?;

@@ -69,7 +69,10 @@ impl HlsPuller {
 }
 
 impl MediaPuller for HlsPuller {
-    fn open(&mut self, spec: PullSpec) -> impl std::future::Future<Output = Result<MediaInfo>> + Send {
+    fn open(
+        &mut self,
+        spec: PullSpec,
+    ) -> impl std::future::Future<Output = Result<MediaInfo>> + Send {
         async move {
             // Already open? Replace the running worker. Real callers
             // re-open() only after close() but we don't want a leak
@@ -190,9 +193,7 @@ async fn run_worker(
         Some(s) => match media_url.join(&s.uri) {
             Ok(u) => u,
             Err(e) => {
-                let _ = info_tx.send(Err(FerricastError::Pull(format!(
-                    "segment URL join: {e}"
-                ))));
+                let _ = info_tx.send(Err(FerricastError::Pull(format!("segment URL join: {e}"))));
                 return;
             }
         },
@@ -307,8 +308,7 @@ async fn run_worker(
                         // its first segment; our `next_index` was
                         // relative to the old snapshot's first
                         // segment, so translate.
-                        let old_first =
-                            current_pl.media_sequence as i64 + next_index as i64;
+                        let old_first = current_pl.media_sequence as i64 + next_index as i64;
                         let new_first = new_pl.media_sequence as i64;
                         next_index = (old_first - new_first).max(0) as usize;
                         // Skip-to-live: if a decoder hiccup pushed us
@@ -320,8 +320,10 @@ async fn run_worker(
                         // chasing 404s until reconnect.
                         let pending = new_pl.segments.len().saturating_sub(next_index);
                         if pending > LIVE_EDGE_LAG_THRESHOLD {
-                            let skip_to =
-                                new_pl.segments.len().saturating_sub(LIVE_EDGE_LAG_THRESHOLD);
+                            let skip_to = new_pl
+                                .segments
+                                .len()
+                                .saturating_sub(LIVE_EDGE_LAG_THRESHOLD);
                             tracing::warn!(
                                 from_index = next_index,
                                 to_index = skip_to,
@@ -500,9 +502,7 @@ async fn http_get_segment(client: &Client, url: &str) -> SegmentFetch {
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(c) => buf.extend_from_slice(&c),
-            Err(e) => {
-                return SegmentFetch::Err(FerricastError::Pull(format!("body chunk: {e}")))
-            }
+            Err(e) => return SegmentFetch::Err(FerricastError::Pull(format!("body chunk: {e}"))),
         }
     }
     SegmentFetch::Ok(buf.freeze())
@@ -580,4 +580,3 @@ fn segment_index_for_position(pl: &m3u8_rs::MediaPlaylist, pos_us: u64) -> Optio
     }
     None
 }
-

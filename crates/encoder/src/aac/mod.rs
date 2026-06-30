@@ -18,7 +18,9 @@
 #[cfg(feature = "fdk-aac")]
 mod fdk_impl;
 
-use ferricast_core::{AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame, FerricastError, Result};
+use ferricast_core::{
+    AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame, FerricastError, Result,
+};
 
 #[cfg(feature = "fdk-aac")]
 pub use fdk_impl::FdkAacEncoder;

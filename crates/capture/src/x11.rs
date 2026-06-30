@@ -217,9 +217,13 @@ impl ScreenCapture for X11Capture {
         let (conn, screen_num) = xcb::Connection::connect(None)
             .map_err(|_| FerricastError::Capture("Cannot connect to server".to_string()))?;
 
-        let screen = conn.get_setup().roots().nth(screen_num as usize).ok_or_else(|| {
-            FerricastError::Capture("X server returned no screen on this connection".into())
-        })?;
+        let screen = conn
+            .get_setup()
+            .roots()
+            .nth(screen_num as usize)
+            .ok_or_else(|| {
+                FerricastError::Capture("X server returned no screen on this connection".into())
+            })?;
 
         let root_depth = screen.root_depth();
         let pixmap = conn
@@ -228,9 +232,7 @@ impl ScreenCapture for X11Capture {
             .iter()
             .find(|f| f.depth() == root_depth)
             .ok_or_else(|| {
-                FerricastError::Capture(format!(
-                    "no pixmap format for root depth {root_depth}"
-                ))
+                FerricastError::Capture(format!("no pixmap format for root depth {root_depth}"))
             })?
             .to_owned();
 
@@ -260,8 +262,7 @@ impl ScreenCapture for X11Capture {
         let segment = conn.generate_id();
 
         info!(w, h, "Creating shared memory");
-        let seg_id =
-            unsafe { libc::shmget(libc::IPC_PRIVATE, w * h * 4, libc::IPC_CREAT | 0o600) };
+        let seg_id = unsafe { libc::shmget(libc::IPC_PRIVATE, w * h * 4, libc::IPC_CREAT | 0o600) };
 
         if seg_id == -1 {
             return Err(FerricastError::Capture(

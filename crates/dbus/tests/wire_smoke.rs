@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ferricast_dbus::{
-    ActiveStreamDto, DeviceDto, ManagerProxy, MonitorInfoDto, SourceDto, WindowInfoDto, BUS_NAME,
-    INTERFACE, INTROSPECTION_XML, OBJECT_PATH,
+    ActiveStreamDto, BUS_NAME, DeviceDto, INTERFACE, INTROSPECTION_XML, ManagerProxy,
+    MonitorInfoDto, OBJECT_PATH, SourceDto, WindowInfoDto,
 };
 use tokio::sync::Mutex;
 use zbus::object_server::{InterfaceRef, SignalEmitter};

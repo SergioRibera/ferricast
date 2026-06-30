@@ -198,13 +198,11 @@ impl TsDemuxer {
         if section.len() < 12 {
             return;
         }
-        let program_info_length =
-            (((section[10] & 0x0f) as usize) << 8) | section[11] as usize;
+        let program_info_length = (((section[10] & 0x0f) as usize) << 8) | section[11] as usize;
         let mut i = 12 + program_info_length;
         while i + 5 <= section.len() {
             let stream_type = section[i];
-            let elementary_pid =
-                (((section[i + 1] & 0x1f) as u16) << 8) | section[i + 2] as u16;
+            let elementary_pid = (((section[i + 1] & 0x1f) as u16) << 8) | section[i + 2] as u16;
             let es_info_length =
                 (((section[i + 3] & 0x0f) as usize) << 8) | section[i + 4] as usize;
 
@@ -334,8 +332,8 @@ fn parse_adts_header(buf: &[u8]) -> Option<(u32, u16)> {
     // Sample rate index — 4 bits straddling byte 2 (bits 2-5).
     let sr_idx = ((buf[2] >> 2) & 0x0F) as usize;
     const RATES: [u32; 16] = [
-        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
-        0, 0, 0,
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350, 0,
+        0, 0,
     ];
     let rate = RATES.get(sr_idx).copied()?;
     if rate == 0 {

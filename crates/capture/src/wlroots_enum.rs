@@ -36,12 +36,12 @@ use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use wayland_client::{
-    globals::{registry_queue_init, GlobalListContents},
+    Connection, Dispatch, Proxy, QueueHandle,
+    globals::{GlobalListContents, registry_queue_init},
     protocol::{
         wl_output::{self, WlOutput},
         wl_registry::WlRegistry,
     },
-    Connection, Dispatch, Proxy, QueueHandle,
 };
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
     ext_foreign_toplevel_handle_v1::{self, ExtForeignToplevelHandleV1},
@@ -287,9 +287,10 @@ impl WaylandSourceEnumerator {
         // connected. New ones come in via the registry handler.
         for g in globals.contents().clone_list() {
             if g.interface == "wl_output" {
-                let output = globals
-                    .registry()
-                    .bind::<WlOutput, _, _>(g.name, g.version.min(4), &qh, ());
+                let output =
+                    globals
+                        .registry()
+                        .bind::<WlOutput, _, _>(g.name, g.version.min(4), &qh, ());
                 let mut data = OutputData::default();
                 // Trigger xdg-output binding for this wl_output if
                 // possible — populated lazily inside dispatch.
@@ -343,7 +344,8 @@ fn run_loop(_conn: Connection, mut queue: wayland_client::EventQueue<State>, mut
     use std::panic::AssertUnwindSafe;
 
     loop {
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| queue.blocking_dispatch(&mut state)));
+        let result =
+            std::panic::catch_unwind(AssertUnwindSafe(|| queue.blocking_dispatch(&mut state)));
         match result {
             Ok(Ok(_)) => state.recompute(),
             Ok(Err(e)) => {
@@ -394,9 +396,11 @@ impl SourceEnumerator for WaylandSourceEnumerator {
         max_height: u32,
     ) -> Result<Vec<u8>, SourceError> {
         let id = id.to_owned();
-        tokio::task::spawn_blocking(move || crate::wayland_thumb::monitor_png(&id, max_width, max_height))
-            .await
-            .map_err(|e| SourceError::Backend(format!("join: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            crate::wayland_thumb::monitor_png(&id, max_width, max_height)
+        })
+        .await
+        .map_err(|e| SourceError::Backend(format!("join: {e}")))?
     }
 
     async fn window_thumbnail(
@@ -406,9 +410,11 @@ impl SourceEnumerator for WaylandSourceEnumerator {
         max_height: u32,
     ) -> Result<Vec<u8>, SourceError> {
         let id = id.to_owned();
-        tokio::task::spawn_blocking(move || crate::wayland_thumb::window_png(&id, max_width, max_height))
-            .await
-            .map_err(|e| SourceError::Backend(format!("join: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            crate::wayland_thumb::window_png(&id, max_width, max_height)
+        })
+        .await
+        .map_err(|e| SourceError::Backend(format!("join: {e}")))?
     }
 
     fn subscribe(&self) -> broadcast::Receiver<SourceChange> {
@@ -441,7 +447,9 @@ impl Dispatch<WlRegistry, GlobalListContents> for State {
         {
             if interface == "wl_output" {
                 let out = registry.bind::<WlOutput, _, _>(name, version.min(4), qh, ());
-                state.outputs.insert(out.id().protocol_id(), (out, OutputData::default()));
+                state
+                    .outputs
+                    .insert(out.id().protocol_id(), (out, OutputData::default()));
                 state.monitors_dirty = true;
             }
         }
@@ -458,13 +466,12 @@ impl Dispatch<WlOutput, ()> for State {
         qh: &QueueHandle<Self>,
     ) {
         let id = proxy.id().protocol_id();
-        let entry = state.outputs.entry(id).or_insert_with(|| {
-            (proxy.clone(), OutputData::default())
-        });
+        let entry = state
+            .outputs
+            .entry(id)
+            .or_insert_with(|| (proxy.clone(), OutputData::default()));
         match event {
-            wl_output::Event::Geometry {
-                make, model, ..
-            } => {
+            wl_output::Event::Geometry { make, model, .. } => {
                 if !make.is_empty() {
                     entry.1.make = Some(make);
                 }
@@ -475,7 +482,11 @@ impl Dispatch<WlOutput, ()> for State {
             wl_output::Event::Mode { refresh, flags, .. } => {
                 // Only the *current* mode counts. wlroots flags the
                 // current one with `current` in the mode flags.
-                if flags.into_result().map(|f| f.contains(wl_output::Mode::Current)).unwrap_or(false) {
+                if flags
+                    .into_result()
+                    .map(|f| f.contains(wl_output::Mode::Current))
+                    .unwrap_or(false)
+                {
                     entry.1.refresh_mhz = refresh;
                 }
             }

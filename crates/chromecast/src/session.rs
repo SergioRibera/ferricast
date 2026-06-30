@@ -571,14 +571,8 @@ impl ChromecastSession {
             playlist_target_duration: 4,
             ..Default::default()
         };
-        let sink = HlsFrameSink::start(
-            "0.0.0.0:0",
-            frame_rx,
-            audio_rx,
-            parameter_sets,
-            hls_config,
-        )
-        .await?;
+        let sink = HlsFrameSink::start("0.0.0.0:0", frame_rx, audio_rx, parameter_sets, hls_config)
+            .await?;
         let local_addr = sink.local_addr();
         let scheme = sink.scheme();
         let media_url = format!("{scheme}://{}:{}/index.m3u8", local_ip, local_addr.port());
@@ -624,7 +618,6 @@ impl ChromecastSession {
                 );
             }
 
-            
             let request_id = request_id_counter.fetch_add(1, Ordering::Relaxed);
             let media = MediaInfo {
                 content_id: load_url.clone(),
@@ -647,7 +640,6 @@ impl ChromecastSession {
                 Ok(()) => info!(url = %load_url, "sent LOAD to chromecast"),
                 Err(e) => tracing::error!(%e, "LOAD send failed"),
             }
-            
         });
 
         // Seed the keyframe ourselves so the segmenter doesn't have
@@ -1044,7 +1036,6 @@ fn try_extract_app(msg: &CastMessage, app_id: &str) -> ExtractApp {
 /// Background heartbeat ticker. Stops as soon as the read loop
 /// flips `alive` to `false` or a ping write fails.
 async fn heartbeat_loop(writer: SharedWriter, alive: Arc<AtomicBool>) {
-    
     let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
     // First tick fires immediately; skip it so we don't ping before
     // launch settles.

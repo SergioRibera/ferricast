@@ -150,8 +150,9 @@ impl VaapiH265Encoder {
             )));
         }
 
-        let display = open_render_node()
-            .ok_or_else(|| FerricastError::Encoder("VA-API HEVC: no usable DRM render node".into()))?;
+        let display = open_render_node().ok_or_else(|| {
+            FerricastError::Encoder("VA-API HEVC: no usable DRM render node".into())
+        })?;
         let vendor = display.query_vendor_string().unwrap_or_default();
         debug!(%vendor, "VA-API display opened for HEVC encode");
 
@@ -256,7 +257,9 @@ impl VaapiH265Encoder {
             max_num_ref_frames: 1,
         };
         let vps_nal = headers::build_vps(&stream);
-        let sps_nal = headers::build_sps(&stream, /* min_cb_log2_minus3 */ 0, /* diff_max_min_cb_log2 */ 3);
+        let sps_nal = headers::build_sps(
+            &stream, /* min_cb_log2_minus3 */ 0, /* diff_max_min_cb_log2 */ 3,
+        );
         let pps_nal = headers::build_pps(cfg.initial_qp as i32 - 26);
 
         let (vpp_config, vpp_context) = match build_vpp(&display, &cfg) {
@@ -289,7 +292,11 @@ impl VaapiH265Encoder {
 
 fn build_vpp(display: &Rc<Display>, cfg: &EncoderCfg) -> Result<(Config, Rc<Context>)> {
     let config = display
-        .create_config(vec![], VAProfile::VAProfileNone, VAEntrypoint::VAEntrypointVideoProc)
+        .create_config(
+            vec![],
+            VAProfile::VAProfileNone,
+            VAEntrypoint::VAEntrypointVideoProc,
+        )
         .map_err(|e| FerricastError::Encoder(format!("vaCreateConfig(VPP): {e}")))?;
     let context = display
         .create_context::<()>(&config, cfg.width, cfg.padded_height(), None, true)
@@ -321,11 +328,7 @@ fn profile_has_enc_slice(display: &Display, profile: VAProfile::Type) -> bool {
     }
 }
 
-fn build_encoder_cfg(
-    profile_idc: u8,
-    bit_depth: u8,
-    cfg: &EncoderConfig,
-) -> Result<EncoderCfg> {
+fn build_encoder_cfg(profile_idc: u8, bit_depth: u8, cfg: &EncoderConfig) -> Result<EncoderCfg> {
     let width = cfg.width.max(32);
     let height = cfg.height.max(32);
     // CTU = 32 luma samples. Width / height counted in CTUs, rounded
@@ -601,9 +604,8 @@ fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         // submitted as a Sequence-type packed header — there's no
         // dedicated VPS packed-header type.
         for nal in [&enc.vps_nal, &enc.sps_nal, &enc.pps_nal] {
-            let (p, d) = unsafe {
-                create_packed_header(&enc.context, EncPackedHeaderType::Sequence, nal)?
-            };
+            let (p, d) =
+                unsafe { create_packed_header(&enc.context, EncPackedHeaderType::Sequence, nal)? };
             packed_buffer_ids.push(p);
             packed_buffer_ids.push(d);
         }
@@ -689,15 +691,11 @@ fn build_seq_param(cfg: &EncoderCfg) -> EncSequenceParameterBufferHEVC {
     );
 
     let vui = Some(HevcEncVuiFields::new(
-        /* aspect_ratio_info_present_flag */ 0,
-        /* neutral_chroma_indication_flag */ 0,
-        /* field_seq_flag */ 0,
-        /* vui_timing_info_present_flag */ 1,
-        /* bitstream_restriction_flag */ 0,
-        /* tiles_fixed_structure_flag */ 0,
+        /* aspect_ratio_info_present_flag */ 0, /* neutral_chroma_indication_flag */ 0,
+        /* field_seq_flag */ 0, /* vui_timing_info_present_flag */ 1,
+        /* bitstream_restriction_flag */ 0, /* tiles_fixed_structure_flag */ 0,
         /* motion_vectors_over_pic_boundaries_flag */ 1,
-        /* restricted_ref_pic_lists_flag */ 0,
-        /* log2_max_mv_length_horizontal */ 15,
+        /* restricted_ref_pic_lists_flag */ 0, /* log2_max_mv_length_horizontal */ 15,
         /* log2_max_mv_length_vertical */ 15,
     ));
 
@@ -746,7 +744,11 @@ fn build_pic_param(
 ) -> EncPictureParameterBufferHEVC {
     // coding_type: 1 = I (IRAP), 2 = P, 3 = B. IPPP: IDR = 1, rest = 2.
     let coding_type: u32 = if is_idr { 1 } else { 2 };
-    let nal_unit_type = if is_idr { HEVC_NAL_IDR_W_RADL } else { HEVC_NAL_TRAIL_R };
+    let nal_unit_type = if is_idr {
+        HEVC_NAL_IDR_W_RADL
+    } else {
+        HEVC_NAL_TRAIL_R
+    };
 
     let pic_fields = HEVCEncPicFields::new(
         /* idr_pic_flag */ if is_idr { 1 } else { 0 },
@@ -947,11 +949,7 @@ fn destroy_packed(display: &Rc<Display>, ids: &[VABufferID]) {
 }
 
 fn check_status(status: VAStatus) -> std::result::Result<(), VAStatus> {
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(status)
-    }
+    if status == 0 { Ok(()) } else { Err(status) }
 }
 
 struct DmaBufImport {
@@ -1061,22 +1059,25 @@ impl VaapiH265Encoder {
 
         let buffer = vpp
             .create_buffer(BufferType::ProcPipelineParameter(pipe))
-            .map_err(|e| FerricastError::Encoder(format!("VA-API HEVC: vaCreateBuffer(VPP): {e}")))?;
+            .map_err(|e| {
+                FerricastError::Encoder(format!("VA-API HEVC: vaCreateBuffer(VPP): {e}"))
+            })?;
 
         let dest = &self.recon[target_recon_idx];
         let mut pic = Picture::new(g.timestamp_us, Rc::clone(vpp), dest);
         pic.add_buffer(buffer);
-        let pic = pic
-            .begin::<()>()
-            .map_err(|e| FerricastError::Encoder(format!("VA-API HEVC: vaBeginPicture(VPP): {e}")))?;
-        let pic = pic
-            .render()
-            .map_err(|e| FerricastError::Encoder(format!("VA-API HEVC: vaRenderPicture(VPP): {e}")))?;
+        let pic = pic.begin::<()>().map_err(|e| {
+            FerricastError::Encoder(format!("VA-API HEVC: vaBeginPicture(VPP): {e}"))
+        })?;
+        let pic = pic.render().map_err(|e| {
+            FerricastError::Encoder(format!("VA-API HEVC: vaRenderPicture(VPP): {e}"))
+        })?;
         let pic = pic
             .end()
             .map_err(|e| FerricastError::Encoder(format!("VA-API HEVC: vaEndPicture(VPP): {e}")))?;
-        pic.sync::<()>()
-            .map_err(|(e, _)| FerricastError::Encoder(format!("VA-API HEVC: vaSyncSurface(VPP): {e}")))?;
+        pic.sync::<()>().map_err(|(e, _)| {
+            FerricastError::Encoder(format!("VA-API HEVC: vaSyncSurface(VPP): {e}"))
+        })?;
         drop(imported);
         Ok(())
     }

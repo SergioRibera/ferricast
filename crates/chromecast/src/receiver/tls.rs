@@ -34,8 +34,8 @@ pub fn build_server_config(advertised_ips: &[std::net::IpAddr]) -> Result<Arc<Se
     dn.push(DnType::CommonName, "ferricast-receiver");
     params.distinguished_name = dn;
 
-    let key_pair = KeyPair::generate()
-        .map_err(|e| FerricastError::Receiver(format!("rcgen keypair: {e}")))?;
+    let key_pair =
+        KeyPair::generate().map_err(|e| FerricastError::Receiver(format!("rcgen keypair: {e}")))?;
     let cert = params
         .self_signed(&key_pair)
         .map_err(|e| FerricastError::Receiver(format!("rcgen self-sign: {e}")))?;

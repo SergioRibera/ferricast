@@ -6,7 +6,7 @@
 //! them touch capture, encoders or protocol code — that's all behind
 //! the daemon.
 
-use ferricast_dbus::{ManagerProxy, SourceDto, BUS_NAME};
+use ferricast_dbus::{BUS_NAME, ManagerProxy, SourceDto};
 use futures_util::stream::StreamExt;
 
 use crate::cli::SourceKind;
@@ -70,8 +70,16 @@ pub async fn list(watch: bool) -> anyhow::Result<()> {
 }
 
 fn print_device_line(id: &str, name: &str, protocol: &str, model: &str, host: &str) {
-    let model_field = if model.is_empty() { "-".into() } else { model.to_string() };
-    let host_field = if host.is_empty() { "-".into() } else { host.to_string() };
+    let model_field = if model.is_empty() {
+        "-".into()
+    } else {
+        model.to_string()
+    };
+    let host_field = if host.is_empty() {
+        "-".into()
+    } else {
+        host.to_string()
+    };
     println!("{id}\t{name}\t{protocol}\t{model_field}\t{host_field}");
 }
 
@@ -193,14 +201,26 @@ pub async fn windows(watch: bool) -> anyhow::Result<()> {
 async fn print_windows(p: &ManagerProxy<'_>) -> anyhow::Result<()> {
     let ws = p.list_windows().await.map_err(rewrap)?;
     for w in ws {
-        let app = if w.app_id.is_empty() { "-".into() } else { w.app_id };
-        let pid = if w.pid == 0 { "-".into() } else { w.pid.to_string() };
+        let app = if w.app_id.is_empty() {
+            "-".into()
+        } else {
+            w.app_id
+        };
+        let pid = if w.pid == 0 {
+            "-".into()
+        } else {
+            w.pid.to_string()
+        };
         let geo = if w.has_geometry {
             format!("{}x{}+{},{}", w.width, w.height, w.x, w.y)
         } else {
             "-".into()
         };
-        let mon = if w.on_monitor.is_empty() { "-".into() } else { w.on_monitor };
+        let mon = if w.on_monitor.is_empty() {
+            "-".into()
+        } else {
+            w.on_monitor
+        };
         println!(
             "{id}\t{app}\t{pid}\t{geo}\t{mon}\t{title}",
             id = w.id,

@@ -1166,9 +1166,10 @@ impl ExternalBufferDescriptor for DmaBufImport {
 
 impl VaapiH264Encoder {
     fn upload_dmabuf_via_vpp(&self, target_recon_idx: usize, g: &GpuFrame) -> Result<()> {
-        let vpp = self.vpp_context.as_ref().ok_or_else(|| {
-            FerricastError::Encoder("VA-API: VPP not initialised".into())
-        })?;
+        let vpp = self
+            .vpp_context
+            .as_ref()
+            .ok_or_else(|| FerricastError::Encoder("VA-API: VPP not initialised".into()))?;
 
         let (va_fourcc, drm_fourcc) = match g.format {
             PixelFormat::Bgra => (VA_FOURCC_BGRA, DRM_FORMAT_ARGB8888),
@@ -1217,8 +1218,8 @@ impl VaapiH264Encoder {
             None, // output_region = full
             0,    // output_background_color
             0_u8, // VAProcColorStandardNone — driver picks BT.601/709.
-            0, // pipeline_flags
-            0, // filter_flags
+            0,    // pipeline_flags
+            0,    // filter_flags
             None,
             None,
             None,
@@ -1253,8 +1254,9 @@ impl VaapiH264Encoder {
         let pic = pic
             .end()
             .map_err(|e| FerricastError::Encoder(format!("VA-API: vaEndPicture(VPP): {e}")))?;
-        pic.sync::<()>()
-            .map_err(|(e, _)| FerricastError::Encoder(format!("VA-API: vaSyncSurface(VPP): {e}")))?;
+        pic.sync::<()>().map_err(|(e, _)| {
+            FerricastError::Encoder(format!("VA-API: vaSyncSurface(VPP): {e}"))
+        })?;
         // `imported` drops here, freeing the per-frame surface but
         // the driver has already finished with it.
         drop(imported);

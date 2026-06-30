@@ -19,8 +19,8 @@
 //! advancing without ever going silent in PTS terms.
 
 use std::io::Cursor;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
@@ -35,14 +35,12 @@ use pipewire as pw;
 use pw::context::Context;
 use pw::main_loop::MainLoop;
 use pw::properties::properties;
+use pw::spa::param::ParamType;
 use pw::spa::param::audio::AudioInfoRaw;
 use pw::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
 use pw::spa::param::format_utils;
-use pw::spa::param::ParamType;
-use pw::spa::pod::{serialize::PodSerializer, Object, Pod, Property, PropertyFlags, Value};
-use pw::spa::sys::{
-    SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_FORMAT_S16_LE,
-};
+use pw::spa::pod::{Object, Pod, Property, PropertyFlags, Value, serialize::PodSerializer};
+use pw::spa::sys::{SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_FORMAT_S16_LE};
 use pw::spa::utils::{Id, SpaTypes};
 use pw::stream::{Stream, StreamFlags, StreamRef, StreamState};
 
@@ -245,8 +243,8 @@ fn run_loop(
 ) -> Result<()> {
     pw::init();
 
-    let mainloop = MainLoop::new(None)
-        .map_err(|e| FerricastError::Capture(format!("audio MainLoop: {e}")))?;
+    let mainloop =
+        MainLoop::new(None).map_err(|e| FerricastError::Capture(format!("audio MainLoop: {e}")))?;
     let context = Context::new(&mainloop)
         .map_err(|e| FerricastError::Capture(format!("audio Context: {e}")))?;
     let core = context
@@ -397,11 +395,7 @@ fn handle_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
         .store(negotiated_channels as u32, Ordering::Relaxed);
 }
 
-fn handle_process(
-    stream: &StreamRef,
-    ud: &mut UserData,
-    frame_tx: &mpsc::Sender<AudioFrame>,
-) {
+fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender<AudioFrame>) {
     let Some(mut buffer) = stream.dequeue_buffer() else {
         trace!("audio process tick with no buffer");
         return;
@@ -442,8 +436,7 @@ fn handle_process(
     }
     let bytes = owned.freeze();
 
-    let samples_in_chunk =
-        (bytes.len() / BYTES_PER_SAMPLE / ud.channels.max(1) as usize) as u64;
+    let samples_in_chunk = (bytes.len() / BYTES_PER_SAMPLE / ud.channels.max(1) as usize) as u64;
     if samples_in_chunk == 0 {
         return;
     }
@@ -455,8 +448,8 @@ fn handle_process(
     // wall-clock jitter) while still being co-monotonic with video.
     let timestamp_us = match ud.pts_anchor_us {
         Some(anchor) => {
-            let off_us = ud.samples_since_anchor.saturating_mul(1_000_000)
-                / ud.sample_rate.max(1) as u64;
+            let off_us =
+                ud.samples_since_anchor.saturating_mul(1_000_000) / ud.sample_rate.max(1) as u64;
             anchor.saturating_add(off_us)
         }
         None => {
@@ -485,8 +478,7 @@ fn handle_process(
             // they diverge by > 1% something is wrong (PipeWire
             // backpressure dropping chunks, hidden resample,
             // sample-counting bug, etc.).
-            let effective_rate =
-                (ud.log_sample_counter as f64 / elapsed.as_secs_f64()) as u32;
+            let effective_rate = (ud.log_sample_counter as f64 / elapsed.as_secs_f64()) as u32;
             let expected = ud.sample_rate;
             let deviation_pct = if expected > 0 {
                 ((effective_rate as f64 - expected as f64).abs() / expected as f64) * 100.0

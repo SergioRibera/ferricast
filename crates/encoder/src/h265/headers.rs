@@ -10,7 +10,7 @@
 //! decoder (Chromecast Ultra, modern Android TV, hardware HEVC blocks
 //! on RDNA2 / Ampere / etc).
 
-use super::bitstream::{nal, BitWriter, finalize_nal};
+use super::bitstream::{BitWriter, finalize_nal, nal};
 
 /// Common parameters shared between VPS / SPS / PPS construction.
 #[derive(Clone, Copy)]
@@ -149,7 +149,11 @@ pub(super) fn build_vps(p: &StreamParams) -> Vec<u8> {
 
 /// Build an SPS matching the encoder's surface dimensions, profile,
 /// and IPPP / single-sublayer assumptions.
-pub(super) fn build_sps(p: &StreamParams, min_cb_log2_minus3: u8, diff_max_min_cb_log2: u8) -> Vec<u8> {
+pub(super) fn build_sps(
+    p: &StreamParams,
+    min_cb_log2_minus3: u8,
+    diff_max_min_cb_log2: u8,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
     // sps_video_parameter_set_id u(4) = 0
     w.write_bits(0, 4);

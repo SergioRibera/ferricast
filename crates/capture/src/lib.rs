@@ -17,16 +17,16 @@ mod native;
 mod pipewire;
 #[cfg(feature = "pipewire")]
 mod pipewire_audio;
+#[cfg(feature = "wayland-direct")]
+mod wayland_direct;
+#[cfg(feature = "wlroots")]
+mod wayland_thumb;
+#[cfg(feature = "wlroots")]
+mod wlroots_enum;
 #[cfg(feature = "x11")]
 mod x11;
 #[cfg(feature = "x11")]
 mod x11_enum;
-#[cfg(feature = "wlroots")]
-mod wlroots_enum;
-#[cfg(feature = "wlroots")]
-mod wayland_thumb;
-#[cfg(feature = "wayland-direct")]
-mod wayland_direct;
 
 /// Largest `(w, h)` that fits inside `(max_w, max_h)` while keeping
 /// the aspect ratio of `(src_w, src_h)`. Both dimensions are
@@ -54,14 +54,14 @@ pub use native::NativeCapture;
 pub use pipewire::PipeWireCapture;
 #[cfg(feature = "pipewire")]
 pub use pipewire_audio::PipeWireAudioCapture;
+#[cfg(feature = "wayland-direct")]
+pub use wayland_direct::WaylandDirectCapture;
+#[cfg(feature = "wlroots")]
+pub use wlroots_enum::WaylandSourceEnumerator;
 #[cfg(feature = "x11")]
 pub use x11::X11Capture;
 #[cfg(feature = "x11")]
 pub use x11_enum::X11SourceEnumerator;
-#[cfg(feature = "wlroots")]
-pub use wlroots_enum::WaylandSourceEnumerator;
-#[cfg(feature = "wayland-direct")]
-pub use wayland_direct::WaylandDirectCapture;
 
 use std::sync::Arc;
 

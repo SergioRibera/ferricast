@@ -37,8 +37,7 @@ pub const INTERFACE: &str = "rs.sergioribera.ferricast.Manager1";
 /// Static D-Bus introspection XML for the interface. Use with
 /// `gdbus-codegen`, `pydbus`, etc. Kept in sync with the proxy by
 /// `crates/dbus/xml/<interface>.xml`.
-pub const INTROSPECTION_XML: &str =
-    include_str!("../xml/rs.sergioribera.ferricast.Manager1.xml");
+pub const INTROSPECTION_XML: &str = include_str!("../xml/rs.sergioribera.ferricast.Manager1.xml");
 
 /// Snapshot of a device exposed over D-Bus. Mirrors
 /// [`ferricast_core::Device`] minus runtime-only fields (icon bytes,

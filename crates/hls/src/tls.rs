@@ -39,8 +39,8 @@ pub fn build_self_signed_server_config(
     dn.push(DnType::CommonName, "ferricast-hls");
     params.distinguished_name = dn;
 
-    let key_pair = KeyPair::generate()
-        .map_err(|e| FerricastError::Hls(format!("rcgen keypair: {e}")))?;
+    let key_pair =
+        KeyPair::generate().map_err(|e| FerricastError::Hls(format!("rcgen keypair: {e}")))?;
     let cert = params
         .self_signed(&key_pair)
         .map_err(|e| FerricastError::Hls(format!("rcgen self-sign: {e}")))?;

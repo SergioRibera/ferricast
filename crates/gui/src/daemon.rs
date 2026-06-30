@@ -38,7 +38,10 @@ fn device_to_dto(d: &Device) -> DeviceDto {
             caps.insert("max_h264_profile".into(), v);
         }
     }
-    caps.insert("requires_audio".into(), OwnedValue::from(d.capabilities.requires_audio));
+    caps.insert(
+        "requires_audio".into(),
+        OwnedValue::from(d.capabilities.requires_audio),
+    );
 
     DeviceDto {
         id: d.id.to_string(),
@@ -487,8 +490,8 @@ impl ManagerService {
     /// any picker change needed on the client side.
     #[zbus(property)]
     async fn capture_capabilities(&self) -> Vec<String> {
-        let on_x11 = std::env::var_os("DISPLAY").is_some()
-            && std::env::var_os("WAYLAND_DISPLAY").is_none();
+        let on_x11 =
+            std::env::var_os("DISPLAY").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_none();
         let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
         match (on_x11, on_wayland) {
             (true, _) => vec!["monitor".into(), "window".into()],
@@ -511,12 +514,12 @@ impl ManagerService {
         let (w, h) = clamp_thumbnail_box(max_width, max_height);
         match self.enumerator.monitor_thumbnail(&id, w, h).await {
             Ok(bytes) => Ok(bytes),
-            Err(ferricast::SourceError::Unsupported(_)) => Err(zbus::fdo::Error::NotSupported(
-                format!(
+            Err(ferricast::SourceError::Unsupported(_)) => {
+                Err(zbus::fdo::Error::NotSupported(format!(
                     "backend `{}` has no thumbnail capability",
                     self.enumerator.backend_name()
-                ),
-            )),
+                )))
+            }
             Err(ferricast::SourceError::NotFound(_)) => Err(zbus::fdo::Error::InvalidArgs(
                 format!("no monitor with id {id:?}"),
             )),
@@ -540,12 +543,12 @@ impl ManagerService {
         let (w, h) = clamp_thumbnail_box(max_width, max_height);
         match self.enumerator.window_thumbnail(&id, w, h).await {
             Ok(bytes) => Ok(bytes),
-            Err(ferricast::SourceError::Unsupported(_)) => Err(zbus::fdo::Error::NotSupported(
-                format!(
+            Err(ferricast::SourceError::Unsupported(_)) => {
+                Err(zbus::fdo::Error::NotSupported(format!(
                     "backend `{}` has no thumbnail capability",
                     self.enumerator.backend_name()
-                ),
-            )),
+                )))
+            }
             Err(ferricast::SourceError::NotFound(_)) => Err(zbus::fdo::Error::InvalidArgs(
                 format!("no window with id {id:?}"),
             )),
