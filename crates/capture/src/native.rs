@@ -4,8 +4,7 @@ use ferricast_core::ScreenCapture;
 use crate::PipeWireCapture;
 #[cfg(feature = "wayland-direct")]
 use crate::WaylandDirectCapture;
-#[cfg(feature = "x11")]
-use crate::X11Capture;
+
 
 /// Auto-selecting capture backend.
 ///
@@ -30,8 +29,6 @@ use crate::X11Capture;
 /// outer wrapper transparently retries on PipeWire (when its feature
 /// is enabled).
 pub enum NativeCapture {
-    #[cfg(feature = "x11")]
-    X11(X11Capture),
     #[cfg(feature = "wayland-direct")]
     WaylandDirect(WaylandDirectCapture),
     #[cfg(feature = "pipewire")]
@@ -46,11 +43,10 @@ impl NativeCapture {
                 "pipewire" => Self::Pipewire(PipeWireCapture::new()),
                 #[cfg(feature = "wayland-direct")]
                 "wayland-direct" => Self::WaylandDirect(WaylandDirectCapture::new()),
-                #[cfg(feature = "x11")]
-                "x11" => Self::X11(X11Capture::new()),
+                "x11" => panic!("X11 is not supported"),
                 other => panic!(
                     "FERRICAST_CAPTURE={other:?} but the matching backend was \
-                     not compiled in (check the `pipewire` / `x11` / \
+                     not compiled in (check the `pipewire` / \
                      `wayland-direct` features)"
                 ),
             };
@@ -62,8 +58,7 @@ impl NativeCapture {
                 "wayland" => return Self::WaylandDirect(WaylandDirectCapture::new()),
                 #[cfg(all(not(feature = "wayland-direct"), feature = "pipewire"))]
                 "wayland" => return Self::Pipewire(PipeWireCapture::new()),
-                #[cfg(feature = "x11")]
-                "x11" => return Self::X11(X11Capture::new()),
+                "x11" => panic!("X11 is not supported"),
                 _ => {}
             }
         }
@@ -85,10 +80,9 @@ impl NativeCapture {
         #[cfg(all(
             not(feature = "wayland-direct"),
             not(feature = "pipewire"),
-            feature = "x11"
         ))]
         {
-            Self::X11(X11Capture::new())
+            panic!("X11 is not supported") 
         }
     }
 }
@@ -117,8 +111,6 @@ impl ScreenCapture for NativeCapture {
             }
         }
         match self {
-            #[cfg(feature = "x11")]
-            Self::X11(x) => x.start(source, config).await,
             #[cfg(feature = "wayland-direct")]
             Self::WaylandDirect(d) => d.start(source, config).await,
             #[cfg(feature = "pipewire")]
@@ -127,8 +119,6 @@ impl ScreenCapture for NativeCapture {
     }
     fn get_pixel_format(&self) -> ferricast_core::PixelFormat {
         match self {
-            #[cfg(feature = "x11")]
-            Self::X11(x) => x.get_pixel_format(),
             #[cfg(feature = "wayland-direct")]
             Self::WaylandDirect(d) => d.get_pixel_format(),
             #[cfg(feature = "pipewire")]
@@ -137,8 +127,6 @@ impl ScreenCapture for NativeCapture {
     }
     fn get_screen_size(&self) -> (usize, usize) {
         match self {
-            #[cfg(feature = "x11")]
-            Self::X11(x) => x.get_screen_size(),
             #[cfg(feature = "wayland-direct")]
             Self::WaylandDirect(d) => d.get_screen_size(),
             #[cfg(feature = "pipewire")]
@@ -148,8 +136,6 @@ impl ScreenCapture for NativeCapture {
 
     fn get_framerate(&self) -> u32 {
         match self {
-            #[cfg(feature = "x11")]
-            Self::X11(x) => x.get_framerate(),
             #[cfg(feature = "wayland-direct")]
             Self::WaylandDirect(d) => d.get_framerate(),
             #[cfg(feature = "pipewire")]
@@ -159,8 +145,6 @@ impl ScreenCapture for NativeCapture {
 
     async fn next_frame(&mut self) -> ferricast_core::Result<ferricast_core::CapturedFrame> {
         match self {
-            #[cfg(feature = "x11")]
-            Self::X11(x) => x.next_frame().await,
             #[cfg(feature = "wayland-direct")]
             Self::WaylandDirect(d) => d.next_frame().await,
             #[cfg(feature = "pipewire")]
@@ -170,8 +154,6 @@ impl ScreenCapture for NativeCapture {
 
     async fn stop(&mut self) -> ferricast_core::Result<()> {
         match self {
-            #[cfg(feature = "x11")]
-            Self::X11(x) => x.stop().await,
             #[cfg(feature = "wayland-direct")]
             Self::WaylandDirect(d) => d.stop().await,
             #[cfg(feature = "pipewire")]
@@ -181,8 +163,6 @@ impl ScreenCapture for NativeCapture {
 
     fn is_running(&self) -> bool {
         match self {
-            #[cfg(feature = "x11")]
-            Self::X11(x) => x.is_running(),
             #[cfg(feature = "wayland-direct")]
             Self::WaylandDirect(d) => d.is_running(),
             #[cfg(feature = "pipewire")]

@@ -3,14 +3,14 @@
 // without either is always a configuration error rather than a
 // "headless" build. Fail loudly here instead of letting the user hit
 // a baffling "no variants" diagnostic on `NativeCapture` later.
-#[cfg(not(any(feature = "pipewire", feature = "x11")))]
+#[cfg(not(any(feature = "pipewire", feature = "wayland-direct")))]
 compile_error!(
     "ferricast-capture requires at least one capture backend feature to be enabled: \
-     `pipewire` (Wayland / xdg-desktop-portal) and/or `x11`. \
+     `pipewire` (Wayland / xdg-desktop-portal) \
      Enable one in your Cargo.toml, e.g. `ferricast-capture = { ..., features = [\"pipewire\"] }`."
 );
 
-#[cfg(any(feature = "pipewire", feature = "x11"))]
+#[cfg(feature = "pipewire")]
 mod native;
 
 #[cfg(feature = "pipewire")]
@@ -23,17 +23,14 @@ mod wayland_direct;
 mod wayland_thumb;
 #[cfg(feature = "wlroots")]
 mod wlroots_enum;
-#[cfg(feature = "x11")]
-mod x11;
-#[cfg(feature = "x11")]
-mod x11_enum;
+
 
 /// Largest `(w, h)` that fits inside `(max_w, max_h)` while keeping
 /// the aspect ratio of `(src_w, src_h)`. Both dimensions are
 /// clamped to at least 1 so degenerate inputs don't produce a
 /// 0-sized image buffer downstream. Shared by every thumbnail
 /// backend so picker output stays size-consistent across protocols.
-#[cfg(any(feature = "x11", feature = "wlroots"))]
+#[cfg(feature = "wlroots")]
 pub(crate) fn fit_box(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     if src_w == 0 || src_h == 0 || max_w == 0 || max_h == 0 {
         return (1, 1);
@@ -47,7 +44,7 @@ pub(crate) fn fit_box(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u
     (w, h)
 }
 
-#[cfg(any(feature = "pipewire", feature = "x11"))]
+#[cfg(feature = "pipewire")]
 pub use native::NativeCapture;
 
 #[cfg(feature = "pipewire")]
@@ -58,10 +55,7 @@ pub use pipewire_audio::PipeWireAudioCapture;
 pub use wayland_direct::WaylandDirectCapture;
 #[cfg(feature = "wlroots")]
 pub use wlroots_enum::WaylandSourceEnumerator;
-#[cfg(feature = "x11")]
-pub use x11::X11Capture;
-#[cfg(feature = "x11")]
-pub use x11_enum::X11SourceEnumerator;
+
 
 use std::sync::Arc;
 
@@ -100,13 +94,10 @@ pub fn auto_enumerator() -> Arc<dyn SourceEnumerator> {
             }
         }
     }
-    #[cfg(feature = "x11")]
+
     {
         if std::env::var_os("DISPLAY").is_some() {
-            match X11SourceEnumerator::try_new() {
-                Ok(e) => return Arc::new(e),
-                Err(e) => tracing::info!(%e, "x11 enumerator unavailable"),
-            }
+            panic!("X11 is not supported");
         }
     }
     Arc::new(ferricast_core::StubEnumerator::new())
