@@ -303,6 +303,38 @@ mod tests {
         })
     }
 
+    fn count_param_sets(annex_b: &[u8]) -> (u32, u32) {
+        let mut i = 0usize;
+        let mut sps = 0u32;
+        let mut pps = 0u32;
+        while i + 3 <= annex_b.len() {
+            let sc_len = if annex_b[i] == 0 && annex_b[i + 1] == 0 && annex_b[i + 2] == 1 {
+                3
+            } else if i + 4 <= annex_b.len()
+                && annex_b[i] == 0
+                && annex_b[i + 1] == 0
+                && annex_b[i + 2] == 0
+                && annex_b[i + 3] == 1
+            {
+                4
+            } else {
+                i += 1;
+                continue;
+            };
+            let nal_start = i + sc_len;
+            if nal_start >= annex_b.len() {
+                break;
+            }
+            match annex_b[nal_start] & 0x1f {
+                7 => sps += 1,
+                8 => pps += 1,
+                _ => {}
+            }
+            i = nal_start + 1;
+        }
+        (sps, pps)
+    }
+
     fn small_cfg() -> EncoderConfig {
         EncoderConfig {
             codec: ferricast_core::Codec::H264,
