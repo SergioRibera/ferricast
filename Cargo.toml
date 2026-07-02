@@ -51,7 +51,6 @@ path = "src/lib.rs"
 default = [
     "chromecast",
     "pipewire",
-    "x11",
     "wlroots",
     "wayland-direct",
     "openh264",
@@ -65,7 +64,7 @@ chromecast = ["dep:ferricast-chromecast"]
 # one MUST be enabled; the capture crate emits a `compile_error!` if
 # both are turned off.
 pipewire = ["ferricast-capture/pipewire"]
-x11 = ["ferricast-capture/x11"]
+
 # Encoder backends — re-exported from `ferricast-encoder`. At least
 # one MUST be enabled (the encoder crate emits a `compile_error!`
 # when all three are off). Typical escape hatch when cros-libva's

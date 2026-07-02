@@ -15,7 +15,6 @@ path = "src/main.rs"
 default = [
     "chromecast",
     "pipewire",
-    "x11",
     "wlroots",
     "wayland-direct",
     "openh264",
@@ -26,7 +25,7 @@ default = [
 ]
 chromecast = ["ferricast/chromecast"]
 pipewire = ["ferricast/pipewire"]
-x11 = ["ferricast/x11"]
+
 # Encoder backends — forwarded through the umbrella to ferricast-encoder.
 # Drop `vaapi` here when cros-libva can't compile against the host
 # libva version; the runtime backend chain then skips VA-API and

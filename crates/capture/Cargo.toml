@@ -9,9 +9,9 @@ description = "PipeWire and X11 screen capture for ferricast"
 # crate. Downstream callers that ship to a single environment (e.g.
 # a Wayland-only desktop appliance) can opt out via
 # `default-features = false` + the backend they want.
-default = ["pipewire", "x11", "wlroots", "wayland-direct"]
+default = ["pipewire", "wlroots", "wayland-direct"]
 pipewire = ["dep:ashpd", "dep:pipewire", "dep:libspa", "dep:ash"]
-x11 = ["dep:xcb"]
+
 # wayland (window/monitor enumeration). "wlroots" is the historical
 # name and stays for backward compat, but the backend now also
 # supports the standard `ext-foreign-toplevel-list-v1` protocol —
@@ -45,10 +45,6 @@ libc = "0.2.183"
 # back over D-Bus. Keeps capture's compile time + binary size in
 # check on builds that don't want jpeg/webp/avif support.
 image = { version = "0.25", default-features = false, features = ["png"] }
-
-# x11 backend — `randr` is used by the source enumerator for output
-# geometry; the existing capture path only needs `shm`.
-xcb = { version = "1.7.0", features = ["shm", "randr"], optional = true }
 
 # wlroots enumerator backend
 wayland-client = { version = "0.31", optional = true }
