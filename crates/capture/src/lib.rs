@@ -87,9 +87,9 @@ pub fn auto_enumerator() -> Arc<dyn SourceEnumerator> {
         if is_wayland {
             match WaylandSourceEnumerator::try_new() {
                 Ok(e) => return Arc::new(e),
-                Err(e) => tracing::info!(
+                Err(e) => tracing::warn!(
                     %e,
-                    "wayland enumerator unavailable, falling through (compositor exposes neither zwlr_foreign_toplevel_management_v1 nor ext_foreign_toplevel_list_v1)"
+                    "wayland enumerator unavailable, falling through to stub"
                 ),
             }
         }

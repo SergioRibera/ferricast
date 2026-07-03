@@ -224,6 +224,7 @@ impl State {
 pub struct WaylandSourceEnumerator {
     snapshot: Arc<Mutex<Snapshot>>,
     change_tx: broadcast::Sender<SourceChange>,
+    has_windows: bool,
 }
 
 impl WaylandSourceEnumerator {
@@ -259,19 +260,20 @@ impl WaylandSourceEnumerator {
         } else {
             None
         };
-        if foreign_manager.is_none() && ext_manager.is_none() {
-            return Err(SourceError::Backend(
-                "neither zwlr_foreign_toplevel_management_v1 nor \
-                 ext_foreign_toplevel_list_v1 is available — compositor \
-                 is GNOME / Mutter or an older stack; use the portal picker"
-                    .into(),
-            ));
+        let has_windows = foreign_manager.is_some() || ext_manager.is_some();
+        if has_windows {
+            tracing::info!(
+                wlr = foreign_manager.is_some(),
+                ext = ext_manager.is_some(),
+                "wayland enumerator: bound foreign-toplevel protocol"
+            );
+        } else {
+            tracing::warn!(
+                "wayland enumerator: neither zwlr_foreign_toplevel_management_v1 nor \
+                 ext_foreign_toplevel_list_v1 available — window enumeration disabled \
+                 (KDE/Plasma, GNOME/Mutter, or older compositor); monitors still work"
+            );
         }
-        tracing::info!(
-            wlr = foreign_manager.is_some(),
-            ext = ext_manager.is_some(),
-            "wayland enumerator: bound foreign-toplevel protocol"
-        );
         let xdg_output_manager = globals
             .bind::<ZxdgOutputManagerV1, _, _>(&qh, 2..=3, ())
             .ok();
@@ -330,6 +332,7 @@ impl WaylandSourceEnumerator {
         Ok(Self {
             snapshot,
             change_tx,
+            has_windows,
         })
     }
 }
@@ -376,16 +379,20 @@ impl SourceEnumerator for WaylandSourceEnumerator {
     }
 
     fn capabilities(&self) -> Vec<EnumerationCapability> {
-        vec![
-            EnumerationCapability::Monitors,
-            EnumerationCapability::Windows,
-        ]
+        let mut caps = vec![EnumerationCapability::Monitors];
+        if self.has_windows {
+            caps.push(EnumerationCapability::Windows);
+        }
+        caps
     }
 
     async fn list_monitors(&self) -> Result<Vec<MonitorInfo>, SourceError> {
         Ok(self.snapshot.lock().unwrap().monitors.clone())
     }
     async fn list_windows(&self) -> Result<Vec<WindowInfo>, SourceError> {
+        if !self.has_windows {
+            return Err(SourceError::Unsupported(EnumerationCapability::Windows));
+        }
         Ok(self.snapshot.lock().unwrap().windows.clone())
     }
 
