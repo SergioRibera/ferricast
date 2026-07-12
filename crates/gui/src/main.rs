@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
     let mut manager_builder = StreamManager::builder()
         .with_chromecast()
         .with_chromecast_receiver()
+        .with_miracast()
         .with_h264_decoder()
         .with_aac_decoder();
 

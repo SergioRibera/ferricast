@@ -16,6 +16,7 @@ default = [
     "chromecast",
     "pipewire",
     "wlroots",
+    "miracast",
     "wayland-direct",
     "openh264",
     "vaapi",
@@ -25,6 +26,7 @@ default = [
     "opus-rs",
 ]
 chromecast = ["ferricast/chromecast"]
+miracast = [ "ferricast/miracast" ]
 pipewire = ["ferricast/pipewire"]
 
 # Encoder backends — forwarded through the umbrella to ferricast-encoder.
