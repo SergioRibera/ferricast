@@ -28,6 +28,19 @@ pub struct Cli {
     #[arg(long)]
     pub background: bool,
 
+    /// First port in the range that protocol servers (HLS, …) may
+    /// bind to. Must be paired with --port-max. When omitted the OS
+    /// assigns an ephemeral port. Use with --port-max to open a
+    /// fixed range in your firewall (NixOS:
+    /// `networking.firewall.allowedTCPPortRanges`, ufw, iptables, …).
+    #[arg(long, requires = "port_max")]
+    pub port_min: Option<u16>,
+
+    /// Last port (inclusive) in the range. Must be paired with
+    /// --port-min and must be ≥ --port-min.
+    #[arg(long, requires = "port_min")]
+    pub port_max: Option<u16>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

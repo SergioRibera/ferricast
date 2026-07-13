@@ -27,7 +27,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use ferricast_core::{
     AudioCodec, AudioFrame, CastSession, Codec, Device, EncodedFrame, FerricastError, Result,
-    StreamConfig,
+    StreamConfig, bind_in_range,
 };
 use ferricast_hls::{HlsConfig, HlsFrameSink};
 use tokio::sync::{mpsc, oneshot};
@@ -571,8 +571,16 @@ impl ChromecastSession {
             playlist_target_duration: 4,
             ..Default::default()
         };
-        let sink = HlsFrameSink::start("0.0.0.0:0", frame_rx, audio_rx, parameter_sets, hls_config)
-            .await?;
+        let port_range = self.cfg.as_ref().and_then(|c| c.port_range);
+        let sink = match port_range {
+            Some((start, end)) => {
+                let listener = bind_in_range(start, end).await?;
+                HlsFrameSink::start_on_listener(listener, frame_rx, audio_rx, parameter_sets, hls_config).await?
+            }
+            None => {
+                HlsFrameSink::start("0.0.0.0:0", frame_rx, audio_rx, parameter_sets, hls_config).await?
+            }
+        };
         let local_addr = sink.local_addr();
         let scheme = sink.scheme();
         let media_url = format!("{scheme}://{}:{}/index.m3u8", local_ip, local_addr.port());

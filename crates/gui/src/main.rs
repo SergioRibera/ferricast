@@ -65,11 +65,23 @@ async fn main() -> anyhow::Result<()> {
     let (receiver_window_tx, receiver_window_rx) = mpsc::channel::<ReceiverWindowReq>(16);
     let receiver_window_tx_factory = receiver_window_tx.clone();
 
-    let (manager, manager_events) = StreamManager::builder()
+    let mut manager_builder = StreamManager::builder()
         .with_chromecast()
         .with_chromecast_receiver()
         .with_h264_decoder()
-        .with_aac_decoder()
+        .with_aac_decoder();
+
+    if let (Some(min), Some(max)) = (args.port_min, args.port_max) {
+        if max < min {
+            return Err(anyhow::anyhow!(
+                "--port-max ({max}) must be ≥ --port-min ({min})"
+            ));
+        }
+        manager_builder = manager_builder.with_port_range(min, max);
+        tracing::info!(port_min = min, port_max = max, "protocol port range set");
+    }
+
+    let (manager, manager_events) = manager_builder
         // Sink factory: per-session, allocate video+audio channels
         // and immediately request a window via
         // `receiver_window_tx`. Returns a `WindowSink` that the

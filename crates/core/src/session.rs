@@ -30,6 +30,13 @@ pub struct StreamConfig {
     /// behaviour: the chromecast HLS path falls back to silent-AAC
     /// injection when the device requires audio).
     pub audio: Option<AudioStreamConfig>,
+
+    /// Restrict protocol servers (HLS, future RTP, …) to this TCP/UDP
+    /// port range `(start, end)` inclusive. `None` = OS-assigned
+    /// ephemeral port. Set to a known range so any host firewall can
+    /// whitelist exactly those ports — works on NixOS
+    /// (`allowedTCPPortRanges`), ufw, iptables, etc.
+    pub port_range: Option<(u16, u16)>,
 }
 
 /// Audio-side configuration carried alongside [`StreamConfig`]. The
@@ -104,6 +111,7 @@ impl Default for StreamConfig {
             codec: crate::Codec::H264,
             adaptive: None,
             audio: None,
+            port_range: None,
         }
     }
 }

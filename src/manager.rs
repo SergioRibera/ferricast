@@ -309,6 +309,11 @@ pub struct StreamManager {
     sink_factory: Option<SinkFactory>,
     active_receivers: Arc<Mutex<HashMap<Uuid, ActiveReceiver>>>,
     receivers_running: bool,
+    /// Port range applied to every new stream session. `None` = OS
+    /// picks an ephemeral port (default). Set via
+    /// `StreamManagerBuilder::with_port_range` so firewall rules can
+    /// target a fixed range regardless of protocol.
+    port_range: Option<(u16, u16)>,
 }
 
 impl Default for StreamManager {
@@ -328,6 +333,7 @@ impl Default for StreamManager {
             sink_factory: None,
             active_receivers: Arc::new(Mutex::new(HashMap::new())),
             receivers_running: false,
+            port_range: None,
         }
     }
 }
@@ -669,8 +675,11 @@ impl StreamManager {
         source: CaptureSource,
         mut capture: impl ScreenCapture + 'static,
         mut encoder: impl VideoEncoder + 'static,
-        config: StreamConfig,
+        mut config: StreamConfig,
     ) -> Result<()> {
+        if config.port_range.is_none() {
+            config.port_range = self.port_range;
+        }
         let device = {
             let devices = self.devices.read().await;
             devices
@@ -1714,6 +1723,16 @@ impl StreamManagerBuilder {
         Fut: Future<Output = Result<Box<dyn FrameSink>>> + Send + 'static,
     {
         self.manager.set_sink_factory(factory);
+        self
+    }
+
+    /// Restrict every protocol's server sockets to ports in
+    /// `start..=end`. Applied to all future `start_stream` calls
+    /// (callers that explicitly set `StreamConfig::port_range` take
+    /// precedence). Useful for firewall-managed hosts: open exactly
+    /// this range and nothing else reaches the device.
+    pub fn with_port_range(mut self, start: u16, end: u16) -> Self {
+        self.manager.port_range = Some((start, end));
         self
     }
 

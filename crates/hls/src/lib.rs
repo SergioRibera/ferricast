@@ -369,6 +369,21 @@ impl HlsFrameSink {
         parameter_sets: Vec<u8>,
         config: HlsConfig,
     ) -> Result<Self> {
+        let listener = TcpListener::bind(addr).await?;
+        Self::start_on_listener(listener, frames, audio_frames, parameter_sets, config).await
+    }
+
+    /// Same as [`Self::start`] but accepts an already-bound listener.
+    /// Use this when the caller pre-bound the port (e.g. via
+    /// [`ferricast_core::bind_in_range`]) to keep the bind inside a
+    /// known firewall-friendly range.
+    pub async fn start_on_listener(
+        listener: TcpListener,
+        frames: mpsc::Receiver<EncodedFrame>,
+        audio_frames: Option<mpsc::Receiver<AudioFrame>>,
+        parameter_sets: Vec<u8>,
+        config: HlsConfig,
+    ) -> Result<Self> {
         if config.keep_segments < 3 {
             return Err(FerricastError::Hls(format!(
                 "keep_segments={} too small (minimum 3)",
@@ -382,7 +397,6 @@ impl HlsFrameSink {
             )));
         }
 
-        let listener = TcpListener::bind(addr).await?;
         let local = listener.local_addr().map_err(FerricastError::from)?;
 
         let ring = Arc::new(RwLock::new(SegmentRing::new(config.keep_segments)));

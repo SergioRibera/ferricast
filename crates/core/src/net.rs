@@ -9,6 +9,8 @@
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 
+use tokio::net::TcpListener;
+
 use crate::error::{FerricastError, Result};
 
 /// The local IP address the kernel would use to reach `target`.
@@ -46,6 +48,24 @@ pub fn local_addr_for(target: IpAddr) -> Result<IpAddr> {
     s.local_addr()
         .map(|a| a.ip())
         .map_err(|e| FerricastError::Other(format!("local_addr_for: local_addr: {e}")))
+}
+
+/// Bind a `TcpListener` to the first free port in `start..=end` on
+/// `0.0.0.0`. Returns the bound listener so the caller hands it
+/// directly to the server without a TOCTOU re-bind race.
+///
+/// Used by every protocol that serves a listener (HLS, future RTP
+/// control channel, …) when a `StreamConfig::port_range` is set.
+pub async fn bind_in_range(start: u16, end: u16) -> Result<TcpListener> {
+    for port in start..=end {
+        match TcpListener::bind(format!("0.0.0.0:{port}")).await {
+            Ok(l) => return Ok(l),
+            Err(_) => continue,
+        }
+    }
+    Err(FerricastError::Other(format!(
+        "no free TCP port in range {start}–{end}"
+    )))
 }
 
 #[cfg(test)]
