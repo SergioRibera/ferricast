@@ -1,5 +1,6 @@
 use crate::advertiser::{AdvertiseInfo, Advertiser};
 use crate::control::ControlSession;
+use crate::device::Device;
 use crate::discovery::Discovery;
 use crate::error::Result;
 use crate::puller::MediaPuller;
@@ -33,6 +34,15 @@ pub trait ProtocolHandler: Send + Sync {
 
     fn create_discovery(&self) -> Self::Discovery;
     fn create_session(&self) -> Result<Self::Session>;
+
+    /// Create a session tailored to a specific device. Default ignores
+    /// the device and delegates to [`create_session`]; protocol impls
+    /// that support multiple session types (e.g. HLS vs. Cast Streaming
+    /// on Chromecast) override this to pick based on
+    /// `device.capabilities`.
+    fn create_session_for_device(&self, _device: &Device) -> Result<Self::Session> {
+        self.create_session()
+    }
 }
 
 /// Receiver-side protocol — advertise the local process as a sink,

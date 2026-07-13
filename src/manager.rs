@@ -198,7 +198,9 @@ struct RegisteredProtocol {
     /// hold its own clone — needed for auto-reconnect, which builds
     /// a fresh session on `is_alive()` going false (chromecast 301,
     /// receiver-app crash) without tearing down capture/encoder.
-    create_session: Arc<dyn Fn() -> Result<Box<dyn ErasedSession>> + Send + Sync>,
+    /// Takes `&Device` so the factory can pick the right session type
+    /// per-device (e.g. Cast Streaming vs. HLS on Chromecast).
+    create_session: Arc<dyn Fn(&Device) -> Result<Box<dyn ErasedSession>> + Send + Sync>,
 }
 
 struct ActiveStream {
@@ -351,8 +353,8 @@ impl StreamManager {
             create_discovery: Box::new(move || {
                 Box::new(h_disc.create_discovery()) as Box<dyn ErasedDiscovery>
             }),
-            create_session: Arc::new(move || {
-                let session = h_sess.create_session()?;
+            create_session: Arc::new(move |device: &Device| {
+                let session = h_sess.create_session_for_device(device)?;
                 Ok(Box::new(session) as Box<dyn ErasedSession>)
             }),
         });
@@ -878,7 +880,7 @@ impl StreamManager {
         // skip the whole thing — the chromecast HLS pipeline falls
         // back to the silent-AAC injection for receivers that
         // require it.
-        let mut session = (proto.create_session)()?;
+        let mut session = (proto.create_session)(&device)?;
         session.connect(&device).await?;
         session.setup_stream(&session_config).await?;
 
@@ -1079,7 +1081,7 @@ impl StreamManager {
                             _ = tokio::time::sleep(backoff) => {}
                         }
 
-                        let mut s = match (create_session)() {
+                        let mut s = match (create_session)(&device_clone) {
                             Ok(s) => s,
                             Err(e) => {
                                 tracing::warn!(%e, "reconnect: create_session failed");
