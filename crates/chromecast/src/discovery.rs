@@ -361,6 +361,10 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         caps.max_audio_bitrate_kbps = Some(192);
         caps.requires_audio = false;
         caps.max_h264_profile = Some(H264Profile::High);
+        // Optimistic: most modern Cast-built-in firmware handles
+        // EXT-X-VERSION:6 + LL-HLS parts. Falls back gracefully —
+        // if the device locks up on LOADING, disable per-device.
+        caps.supports_low_latency_hls = true;
     }
 
     caps
