@@ -403,11 +403,15 @@ impl SourceEnumerator for WaylandSourceEnumerator {
         max_height: u32,
     ) -> Result<Vec<u8>, SourceError> {
         let id = id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            crate::wayland_thumb::monitor_png(&id, max_width, max_height)
-        })
-        .await
-        .map_err(|e| SourceError::Backend(format!("join: {e}")))?
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("ferricast-wl-thumb".into())
+            .spawn(move || {
+                let _ = tx.send(crate::wayland_thumb::monitor_png(&id, max_width, max_height));
+            })
+            .map_err(|e| SourceError::Backend(format!("spawn: {e}")))?;
+        rx.await
+            .map_err(|_| SourceError::Backend("thumbnail thread hung up".into()))?
     }
 
     async fn window_thumbnail(
@@ -417,11 +421,15 @@ impl SourceEnumerator for WaylandSourceEnumerator {
         max_height: u32,
     ) -> Result<Vec<u8>, SourceError> {
         let id = id.to_owned();
-        tokio::task::spawn_blocking(move || {
-            crate::wayland_thumb::window_png(&id, max_width, max_height)
-        })
-        .await
-        .map_err(|e| SourceError::Backend(format!("join: {e}")))?
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("ferricast-wl-thumb".into())
+            .spawn(move || {
+                let _ = tx.send(crate::wayland_thumb::window_png(&id, max_width, max_height));
+            })
+            .map_err(|e| SourceError::Backend(format!("spawn: {e}")))?;
+        rx.await
+            .map_err(|_| SourceError::Backend("thumbnail thread hung up".into()))?
     }
 
     fn subscribe(&self) -> broadcast::Receiver<SourceChange> {
