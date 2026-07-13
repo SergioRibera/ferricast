@@ -68,6 +68,21 @@ pub async fn bind_in_range(start: u16, end: u16) -> Result<TcpListener> {
     )))
 }
 
+/// Bind a tokio `UdpSocket` to the first free port in `start..=end` on
+/// `0.0.0.0`. Mirror of [`bind_in_range`] for UDP senders (Cast Streaming
+/// RTP/RTCP socket, future QUIC, …).
+pub async fn bind_udp_in_range(start: u16, end: u16) -> Result<tokio::net::UdpSocket> {
+    for port in start..=end {
+        match tokio::net::UdpSocket::bind(format!("0.0.0.0:{port}")).await {
+            Ok(s) => return Ok(s),
+            Err(_) => continue,
+        }
+    }
+    Err(FerricastError::Other(format!(
+        "no free UDP port in range {start}–{end}"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

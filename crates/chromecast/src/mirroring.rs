@@ -25,7 +25,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use ferricast_core::{
     AudioCodec, AudioFrame, CastSession, Codec, Device, EncodedFrame, FerricastError, Result,
-    StreamConfig,
+    StreamConfig, bind_udp_in_range,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -452,9 +452,14 @@ impl CastSession for ChromecastMirrorSession {
 
         let peer_udp = SocketAddr::new(state.peer_ip, answer.udp_port);
 
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| FerricastError::Connection(format!("bind cast streaming UDP: {e}")))?;
+        let socket = match self.cfg.as_ref().and_then(|c| c.port_range) {
+            Some((start, end)) => bind_udp_in_range(start, end).await.map_err(|e| {
+                FerricastError::Connection(format!("bind cast streaming UDP in range: {e}"))
+            })?,
+            None => UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
+                FerricastError::Connection(format!("bind cast streaming UDP: {e}"))
+            })?,
+        };
         socket
             .connect(peer_udp)
             .await
