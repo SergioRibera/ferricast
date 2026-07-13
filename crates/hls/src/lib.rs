@@ -229,7 +229,12 @@ impl HlsServer {
             }
         });
 
-        ring::wait_for_first_segment(&ring).await;
+        if !ring::wait_for_first_segment(&ring).await {
+            segmenter.abort();
+            return Err(FerricastError::Hls(
+                "HLS segmenter did not produce any output within 30s; encoder likely failed".into(),
+            ));
+        }
 
         info!(
             listen = %local,
@@ -461,24 +466,22 @@ impl HlsFrameSink {
     /// Wait until at least one segment has been pushed to the ring.
     /// Cheap polling — segments emit within `segment_target_secs +
     /// keyframe_lag` so this resolves in under a second on typical
-    /// streams.
-    pub async fn wait_first_segment(&self) {
-        ring::wait_for_first_segment(&self.ring).await;
+    /// streams. Returns `false` if the 30-second deadline passes
+    /// without any segment (encoder/capture pipeline failed).
+    pub async fn wait_first_segment(&self) -> bool {
+        ring::wait_for_first_segment(&self.ring).await
     }
 
-    /// Owned future that resolves when the first segment lands.
+    /// Owned future that resolves when the first segment lands (or
+    /// after the 30-second deadline if the encoder never produces one).
     ///
-    /// Same semantics as [`Self::wait_first_segment`] but doesn't
-    /// borrow `self`, so it can be awaited from a `tokio::spawn`
-    /// task that doesn't hold a reference to the sink. Used by
-    /// receiver protocols (Chromecast `LOAD`, …) that need to delay
-    /// a signaling message until the playlist is actually playable
-    /// without blocking the frame-feeding code path.
-    pub fn first_segment_ready(&self) -> impl Future<Output = ()> + Send + 'static {
+    /// Doesn't borrow `self`, so it can be awaited from a `tokio::spawn`
+    /// task. Used by receiver protocols (Chromecast `LOAD`, …) that
+    /// need to delay a signaling message until the playlist is actually
+    /// playable without blocking the frame-feeding code path.
+    pub fn first_segment_ready(&self) -> impl Future<Output = bool> + Send + 'static {
         let ring = self.ring.clone();
-        async move {
-            ring::wait_for_first_segment(&ring).await;
-        }
+        async move { ring::wait_for_first_segment(&ring).await }
     }
 }
 

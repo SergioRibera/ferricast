@@ -318,11 +318,27 @@ impl SegmentRing {
 }
 
 /// Poll the ring until the segmenter has pushed at least one segment.
-pub async fn wait_for_first_segment(ring: &Arc<RwLock<SegmentRing>>) {
+///
+/// Returns `true` when a segment lands, `false` after the 30-second
+/// deadline — which indicates the encoder/capture pipeline has failed
+/// and is never going to produce output.
+pub async fn wait_for_first_segment(ring: &Arc<RwLock<SegmentRing>>) -> bool {
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + TIMEOUT;
     loop {
         if !ring.read().await.is_empty() {
-            return;
+            return true;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            tracing::warn!(
+                "HLS: timed out after 30s waiting for first segment; \
+                 encoder or capture pipeline likely failed"
+            );
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50).min(remaining)).await;
     }
 }

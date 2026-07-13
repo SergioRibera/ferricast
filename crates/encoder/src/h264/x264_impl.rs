@@ -168,9 +168,20 @@ impl VideoEncoder for X264Encoder {
                 })?;
             }
             PixelFormat::Nv12 => {
-                return Err(FerricastError::Encoding(
-                    "Nv12 is not supported".to_string(),
-                ));
+                // NV12: Y plane (W×H) then interleaved UV (U0V0 U1V1…, W×H/2 bytes).
+                // Deinterleave into the I420 scratch: Y as-is, UV split into U and V planes.
+                let y_size = (frame.width * frame.height) as usize;
+                planar
+                    .y_plane
+                    .borrow_mut()
+                    .copy_from_slice(&frame.data[..y_size]);
+                let uv = &frame.data[y_size..];
+                let u_dst = planar.u_plane.borrow_mut();
+                let v_dst = planar.v_plane.borrow_mut();
+                for (i, chunk) in uv.chunks_exact(2).enumerate() {
+                    u_dst[i] = chunk[0];
+                    v_dst[i] = chunk[1];
+                }
             }
             PixelFormat::I420 => {}
         };

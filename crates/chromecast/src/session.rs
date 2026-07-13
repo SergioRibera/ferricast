@@ -586,7 +586,13 @@ impl ChromecastSession {
         let probe_port = local_addr.port();
         let probe_scheme = scheme;
         let load_task = tokio::spawn(async move {
-            ready.await;
+            if !ready.await {
+                tracing::error!(
+                    "HLS segmenter timed out — encoder failed to produce output; \
+                     aborting LOAD"
+                );
+                return;
+            }
 
             // Self-test: try fetching the playlist over loopback
             // before pointing the receiver at it. If we can't reach
