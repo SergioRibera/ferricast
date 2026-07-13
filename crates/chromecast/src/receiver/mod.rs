@@ -137,6 +137,7 @@ impl ReceiverProtocol for ChromecastReceiver {
                 max_h265_profile: Some(H265Profile::Main10),
                 supported_codecs: vec![Codec::H264, Codec::H265],
                 supports_low_latency_hls: false,
+                supports_cast_streaming: false,
             },
             device_id: self.inner.device_id.clone(),
             icon: bytes::Bytes::new(),

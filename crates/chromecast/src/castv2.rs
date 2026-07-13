@@ -113,6 +113,9 @@ pub mod namespace {
     pub const HEARTBEAT: &str = "urn:x-cast:com.google.cast.tp.heartbeat";
     pub const RECEIVER: &str = "urn:x-cast:com.google.cast.receiver";
     pub const MEDIA: &str = "urn:x-cast:com.google.cast.media";
+    /// Cast Streaming (RTP/UDP mirroring) control namespace. Used for
+    /// the OFFER/ANSWER handshake with the Mirroring Receiver app.
+    pub const WEBRTC: &str = "urn:x-cast:com.google.cast.webrtc";
 }
 
 // ---------------------------------------------------------------------------

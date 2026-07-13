@@ -75,6 +75,16 @@ pub struct DeviceCapabilities {
     /// device class in `capabilities_for_model` only where it's
     /// been field-tested.
     pub supports_low_latency_hls: bool,
+    /// Whether this device supports Cast Streaming (the RTP/UDP
+    /// mirroring protocol on `urn:x-cast:com.google.cast.webrtc`).
+    /// When `true`, the manager may select [`ChromecastMirrorSession`]
+    /// for sub-200 ms latency instead of the HLS path.
+    ///
+    /// Conservative default: `false`. Enabled for 3rd-gen+ Chromecast,
+    /// Ultra, Google TV, and unknown models (optimistic). Disabled for
+    /// 1st/2nd-gen (`md=Chromecast`) — older firmware may refuse OFFER
+    /// from non-Chrome senders; fall back to HLS for those.
+    pub supports_cast_streaming: bool,
 }
 
 /// H.264 profile constraint. Used by [`DeviceCapabilities`] and

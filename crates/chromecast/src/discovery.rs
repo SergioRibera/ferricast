@@ -297,6 +297,8 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         // model branches below override to `true` only where it's
         // been verified to actually work.
         supports_low_latency_hls: false,
+        // 1st/2nd-gen firmware may reject OFFER from non-Chrome senders.
+        supports_cast_streaming: false,
     };
 
     // Lowercased once so each branch can use cheap `contains`.
@@ -319,6 +321,7 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         // Ultra firmware (CAF receiver) handles EXT-X-VERSION:6 +
         // EXT-X-PART-INF. Cuts glass-to-glass from ~6 s to ~1-2 s.
         caps.supports_low_latency_hls = true;
+        caps.supports_cast_streaming = true;
     } else if md_lc.contains("google tv") || md_lc.contains("android tv") {
         // Cast-built-in on Google / Android TV. Decoder is the
         // TV's hardware codec — uniformly capable of 1080p @ 60
@@ -332,8 +335,9 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         // taking advantage cuts bitrate ~40% vs H.264 at equal
         // perceptual quality.
         caps.max_h265_profile = Some(H265Profile::Main10);
-        // Modern CAF receiver ships LL-HLS support.
+        // Modern CAF receiver ships LL-HLS + Cast Streaming support.
         caps.supports_low_latency_hls = true;
+        caps.supports_cast_streaming = true;
     } else if md_lc == "chromecast audio" {
         // No display.
         caps.supports_video = false;
@@ -365,6 +369,9 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         // EXT-X-VERSION:6 + LL-HLS parts. Falls back gracefully —
         // if the device locks up on LOADING, disable per-device.
         caps.supports_low_latency_hls = true;
+        // Unknown devices are likely modern CAF builds; try Cast
+        // Streaming. If OFFER is refused, fall back to HLS.
+        caps.supports_cast_streaming = true;
     }
 
     caps

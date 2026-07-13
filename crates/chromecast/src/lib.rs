@@ -1,5 +1,6 @@
 pub mod castv2;
 pub mod discovery;
+pub mod mirroring;
 pub mod receiver;
 pub(crate) mod self_filter;
 pub mod session;
@@ -10,6 +11,7 @@ pub use castv2::{
     namespace as cast_namespace,
 };
 pub use discovery::ChromecastDiscovery;
+pub use mirroring::ChromecastMirrorSession;
 pub use receiver::{ChromecastReceiver, ChromecastReceiverAdvertiser, ChromecastReceiverControl};
 pub use session::ChromecastSession;
 
