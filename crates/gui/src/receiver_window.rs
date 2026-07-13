@@ -220,11 +220,14 @@ impl App for ReceiverWindowApp {
         let counters = self.counters.clone();
 
         // Shared video slot: the drain task writes the most recent
-        // frame, the canvas closure reads it and draws. `StdMutex`
-        // (not tokio) because the canvas closure runs sync on the
-        // Freya render thread and we don't want to wait on a tokio
-        // lock there.
-        let video_slot: Arc<StdMutex<Option<VideoFrame>>> = Arc::new(StdMutex::new(None));
+        // frame, the canvas closure reads it and draws. Stored in
+        // `use_hook` so the same Arc is returned on every render
+        // pass — if we allocate a fresh slot each render the task
+        // keeps writing to the first-render slot while the canvas
+        // reads from the current-render slot (always None).
+        // `StdMutex` because the canvas closure runs sync on the
+        // Freya render thread.
+        let video_slot = use_hook(|| Arc::new(StdMutex::new(None::<VideoFrame>)));
 
         // Tick signal: drain task increments per video frame. The
         // render() body reads it so Freya schedules a redraw on
@@ -290,6 +293,16 @@ impl App for ReceiverWindowApp {
                     // Keep `stream` alive: drop = device closed.
                     let _stream_keepalive = stream;
                     while let Some(buf) = rx.recv().await {
+                        // Drop frames when the sink queue is too deep
+                        // (~2 s worth). Rodio's internal queue is
+                        // unbounded; if playback stalls (PipeWire
+                        // disconnect, device switch) the queue grows
+                        // without limit. 100 × ~20 ms ≈ 2 s headroom
+                        // is enough to absorb startup latency without
+                        // accumulating an ever-growing backlog.
+                        if sink.len() > 100 {
+                            continue;
+                        }
                         let source = rodio::buffer::SamplesBuffer::new(
                             buf.channels,
                             buf.sample_rate,
