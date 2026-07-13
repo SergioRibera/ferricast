@@ -43,6 +43,7 @@ trait ErasedSession: Send + Sync {
     fn send_audio_frame<'a>(&'a mut self, frame: &'a AudioFrame) -> BoxFut<'a, Result<()>>;
     fn stop(&mut self) -> BoxFut<'_, Result<()>>;
     fn is_alive(&self) -> bool;
+    fn poll_keyframe_request(&mut self) -> bool;
 }
 
 impl<T: CastSession> ErasedSession for T {
@@ -63,6 +64,9 @@ impl<T: CastSession> ErasedSession for T {
     }
     fn is_alive(&self) -> bool {
         CastSession::is_alive(self)
+    }
+    fn poll_keyframe_request(&mut self) -> bool {
+        CastSession::poll_keyframe_request(self)
     }
 }
 
@@ -1220,6 +1224,14 @@ impl StreamManager {
                                                 fatal_error = Some(e.to_string());
                                                 let _ = session.stop().await;
                                                 break 'supervisor;
+                                            }
+                                            // PLI from receiver (e.g. Cast
+                                            // Streaming RTCP feedback on
+                                            // packet loss): request an IDR
+                                            // so the receiver can resync.
+                                            if session.poll_keyframe_request() {
+                                                tracing::debug!(?did, "PLI received — requesting keyframe");
+                                                encoder.request_keyframe();
                                             }
                                             // Receiver-side liveness: when
                                             // the chromecast app dies it

@@ -137,4 +137,14 @@ pub trait CastSession: Send + Sync {
 
     fn stop(&mut self) -> impl Future<Output = Result<()>> + Send;
     fn is_alive(&self) -> bool;
+
+    /// Returns `true` (and clears the flag) if the receiver sent a PLI
+    /// requesting a keyframe. The manager calls this after each `send_frame`
+    /// and forwards the signal to the encoder via `request_keyframe()`.
+    ///
+    /// Default returns `false` — protocols that don't implement RTCP PLI
+    /// (HLS, future AirPlay) continue working unchanged.
+    fn poll_keyframe_request(&mut self) -> bool {
+        false
+    }
 }

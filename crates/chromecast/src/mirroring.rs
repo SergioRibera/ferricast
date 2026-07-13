@@ -49,6 +49,12 @@ const AUDIO_CLOCK_RATE: u32 = 48_000;
 const OFFER_SEQ_NUM: u32 = 1;
 /// Milliseconds of buffering headroom suggested to the receiver.
 const TARGET_DELAY_MS: u32 = 400;
+/// How often to send RTCP Sender Reports (RFC 3550 §6.4.1).
+const RTCP_INTERVAL: Duration = Duration::from_secs(1);
+/// RTCP payload type for Sender Report.
+const RTCP_PT_SR: u8 = 200;
+/// RTCP payload type for Payload-Specific Feedback (PSFB). PLI uses FMT=1.
+const RTCP_PT_PSFB: u8 = 206;
 
 // ── OFFER / ANSWER types ──────────────────────────────────────────────────────
 
@@ -183,9 +189,11 @@ struct ConnectedState {
 }
 
 struct MirrorStreamState {
-    /// UDP socket bound locally and connected to `peer_udp`.
-    socket: UdpSocket,
-    /// Chromecast's RTP receive endpoint (IP from discovery, port from ANSWER).
+    /// UDP socket (connected, so `send` needs no address). Wrapped in `Arc`
+    /// so the RTCP recv task can hold a clone and call `recv_from` while
+    /// this side calls `send` — both take `&self` in tokio so no data race.
+    socket: Arc<UdpSocket>,
+    /// Chromecast's RTP/RTCP receive endpoint (IP from discovery, port from ANSWER).
     peer_udp: SocketAddr,
     video_ssrc: u32,
     audio_ssrc: Option<u32>,
@@ -197,6 +205,22 @@ struct MirrorStreamState {
     video_frame_id: u32,
     audio_seq: u16,
     audio_frame_id: u32,
+    // ── RTCP Sender Report stats ──────────────────────────────────────────────
+    video_pkt_count: u32,
+    video_byte_count: u32,
+    audio_pkt_count: u32,
+    audio_byte_count: u32,
+    last_video_rtp_ts: u32,
+    last_audio_rtp_ts: u32,
+    last_rtcp_at: std::time::Instant,
+    // ── PLI signaling ─────────────────────────────────────────────────────────
+    /// Set to `true` by the RTCP receive task on incoming PLI. Cleared by
+    /// [`CastSession::poll_keyframe_request`] so the manager can call
+    /// `encoder.request_keyframe()` on the next video frame.
+    keyframe_requested: Arc<AtomicBool>,
+    /// Background task that listens on the UDP recv half for RTCP from the
+    /// Chromecast (primarily PLI, but also RR). Aborted in `stop()`.
+    rtcp_handle: JoinHandle<()>,
 }
 
 // ── CastSession implementation ────────────────────────────────────────────────
@@ -436,6 +460,14 @@ impl CastSession for ChromecastMirrorSession {
             .await
             .map_err(|e| FerricastError::Connection(format!("connect cast streaming UDP: {e}")))?;
 
+        let socket = Arc::new(socket);
+        let keyframe_requested = Arc::new(AtomicBool::new(false));
+        let rtcp_handle = tokio::spawn(rtcp_recv_task(
+            socket.clone(),
+            video_ssrc,
+            keyframe_requested.clone(),
+        ));
+
         self.stream = Some(MirrorStreamState {
             socket,
             peer_udp,
@@ -449,6 +481,15 @@ impl CastSession for ChromecastMirrorSession {
             video_frame_id: 0,
             audio_seq: 0,
             audio_frame_id: 0,
+            video_pkt_count: 0,
+            video_byte_count: 0,
+            audio_pkt_count: 0,
+            audio_byte_count: 0,
+            last_video_rtp_ts: 0,
+            last_audio_rtp_ts: 0,
+            last_rtcp_at: std::time::Instant::now(),
+            keyframe_requested,
+            rtcp_handle,
         });
         info!(peer_udp = %peer_udp, video_ssrc, "Cast Streaming UDP socket ready");
         Ok(())
@@ -497,9 +538,13 @@ impl CastSession for ChromecastMirrorSession {
                     &iv,
                     first_pkt_of_frame,
                 );
+                let pkt_len = pkt.len();
                 if let Err(e) = stream.socket.send(&pkt).await {
                     debug!(%e, "mirror: video NAL UDP send dropped");
                 }
+                stream.video_pkt_count = stream.video_pkt_count.wrapping_add(1);
+                stream.video_byte_count =
+                    stream.video_byte_count.wrapping_add(pkt_len as u32);
                 stream.video_seq = stream.video_seq.wrapping_add(1);
             } else {
                 // RFC 6184 FU-A fragmentation. Skip the NAL header byte from
@@ -531,14 +576,20 @@ impl CastSession for ChromecastMirrorSession {
                         &iv,
                         first_pkt_of_frame && fi == 0,
                     );
+                    let pkt_len = pkt.len();
                     if let Err(e) = stream.socket.send(&pkt).await {
                         debug!(%e, "mirror: FU-A UDP send dropped");
                     }
+                    stream.video_pkt_count = stream.video_pkt_count.wrapping_add(1);
+                    stream.video_byte_count =
+                        stream.video_byte_count.wrapping_add(pkt_len as u32);
                     stream.video_seq = stream.video_seq.wrapping_add(1);
                 }
             }
         }
+        stream.last_video_rtp_ts = ts;
         stream.video_frame_id = stream.video_frame_id.wrapping_add(1);
+        maybe_send_rtcp_sr(stream).await;
         Ok(())
     }
 
@@ -579,16 +630,25 @@ impl CastSession for ChromecastMirrorSession {
         pkt.extend_from_slice(&ext);
         pkt.extend_from_slice(&payload);
 
+        let pkt_len = pkt.len();
         if let Err(e) = stream.socket.send(&pkt).await {
             debug!(%e, "mirror: audio UDP send dropped");
         }
+        stream.audio_pkt_count = stream.audio_pkt_count.wrapping_add(1);
+        stream.audio_byte_count = stream.audio_byte_count.wrapping_add(pkt_len as u32);
+        stream.last_audio_rtp_ts = ts;
         stream.audio_seq = stream.audio_seq.wrapping_add(1);
         stream.audio_frame_id = stream.audio_frame_id.wrapping_add(1);
+        maybe_send_rtcp_sr(stream).await;
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<()> {
-        self.stream.take();
+        if let Some(stream) = self.stream.take() {
+            let MirrorStreamState { rtcp_handle, .. } = stream;
+            rtcp_handle.abort();
+            let _ = rtcp_handle.await;
+        }
         let Some(state) = self.state.take() else {
             return Ok(());
         };
@@ -617,6 +677,13 @@ impl CastSession for ChromecastMirrorSession {
         self.state
             .as_ref()
             .map(|s| s.alive.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    fn poll_keyframe_request(&mut self) -> bool {
+        self.stream
+            .as_ref()
+            .map(|s| s.keyframe_requested.swap(false, Ordering::Relaxed))
             .unwrap_or(false)
     }
 }
@@ -963,6 +1030,124 @@ fn rtp_fua(
     }
     pkt.extend_from_slice(&payload);
     pkt
+}
+
+// ── RTCP helpers ─────────────────────────────────────────────────────────────
+
+/// Return the current wall-clock time as a 64-bit NTP timestamp.
+///
+/// NTP epoch is 1900-01-01; UNIX epoch is 1970-01-01 (offset = 70 years =
+/// 2 208 988 800 s). The 32-bit fraction is `subsec_nanos * 2^32 / 10^9`.
+fn system_time_ntp() -> (u32, u32) {
+    const NTP_UNIX_OFFSET_S: u64 = 2_208_988_800;
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let ntp_sec = (dur.as_secs() + NTP_UNIX_OFFSET_S) as u32;
+    let ntp_frac = ((dur.subsec_nanos() as u64) << 32) / 1_000_000_000;
+    (ntp_sec, ntp_frac as u32)
+}
+
+/// Build a 28-byte RTCP Sender Report (RFC 3550 §6.4.1).
+///
+/// No reception-report blocks (RC=0) — we're the sender.
+fn rtcp_sr(
+    ssrc: u32,
+    ntp_sec: u32,
+    ntp_frac: u32,
+    rtp_ts: u32,
+    pkt_count: u32,
+    byte_count: u32,
+) -> [u8; 28] {
+    let mut pkt = [0u8; 28];
+    // V=2, P=0, RC=0 → 0x80
+    pkt[0] = 0x80;
+    pkt[1] = RTCP_PT_SR;
+    // length = (28 / 4) - 1 = 6
+    pkt[2] = 0x00;
+    pkt[3] = 0x06;
+    pkt[4..8].copy_from_slice(&ssrc.to_be_bytes());
+    pkt[8..12].copy_from_slice(&ntp_sec.to_be_bytes());
+    pkt[12..16].copy_from_slice(&ntp_frac.to_be_bytes());
+    pkt[16..20].copy_from_slice(&rtp_ts.to_be_bytes());
+    pkt[20..24].copy_from_slice(&pkt_count.to_be_bytes());
+    pkt[24..28].copy_from_slice(&byte_count.to_be_bytes());
+    pkt
+}
+
+/// Send RTCP SRs for active streams if [`RTCP_INTERVAL`] has elapsed.
+///
+/// Called at the end of `send_frame` and `send_audio_frame` so the interval
+/// is driven by media throughput — avoids spawning a separate timer task.
+async fn maybe_send_rtcp_sr(stream: &mut MirrorStreamState) {
+    if stream.last_rtcp_at.elapsed() < RTCP_INTERVAL {
+        return;
+    }
+    stream.last_rtcp_at = std::time::Instant::now();
+    let (ntp_sec, ntp_frac) = system_time_ntp();
+
+    let video_sr = rtcp_sr(
+        stream.video_ssrc,
+        ntp_sec,
+        ntp_frac,
+        stream.last_video_rtp_ts,
+        stream.video_pkt_count,
+        stream.video_byte_count,
+    );
+    if let Err(e) = stream.socket.send(&video_sr).await {
+        debug!(%e, "mirror: RTCP video SR send dropped");
+    }
+
+    if let Some(ssrc) = stream.audio_ssrc {
+        let audio_sr = rtcp_sr(
+            ssrc,
+            ntp_sec,
+            ntp_frac,
+            stream.last_audio_rtp_ts,
+            stream.audio_pkt_count,
+            stream.audio_byte_count,
+        );
+        if let Err(e) = stream.socket.send(&audio_sr).await {
+            debug!(%e, "mirror: RTCP audio SR send dropped");
+        }
+    }
+}
+
+/// Returns `true` if `pkt` is an RTCP PLI for our video SSRC.
+///
+/// PLI: V=2 P=0 FMT=1 PT=206, 12 bytes, media SSRC in bytes 8..12.
+fn is_rtcp_pli(pkt: &[u8], video_ssrc: u32) -> bool {
+    pkt.len() >= 12
+        && (pkt[0] & 0xE0) == 0x80   // V=2, P=0
+        && (pkt[0] & 0x1F) == 1       // FMT=1
+        && pkt[1] == RTCP_PT_PSFB     // PT=206
+        && u32::from_be_bytes(pkt[8..12].try_into().unwrap()) == video_ssrc
+}
+
+/// Background task: receive RTCP packets from the Chromecast and set
+/// `keyframe_requested` on PLI. Holds a clone of the `Arc<UdpSocket>`;
+/// exits when the socket is dropped (Arc count reaches 0 on session stop)
+/// or on a fatal receive error.
+async fn rtcp_recv_task(
+    socket: Arc<UdpSocket>,
+    video_ssrc: u32,
+    keyframe_requested: Arc<AtomicBool>,
+) {
+    let mut buf = [0u8; 1500];
+    loop {
+        match socket.recv_from(&mut buf).await {
+            Ok((n, _src)) => {
+                if is_rtcp_pli(&buf[..n], video_ssrc) {
+                    debug!("mirror: PLI received — flagging keyframe request");
+                    keyframe_requested.store(true, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                debug!(%e, "mirror: RTCP recv loop exiting");
+                break;
+            }
+        }
+    }
 }
 
 /// Split an H.264 Annex-B bitstream into NAL unit byte slices (no start codes).
