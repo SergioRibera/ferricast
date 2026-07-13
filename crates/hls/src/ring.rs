@@ -2,6 +2,7 @@
 //! parts (LL-HLS). Producer (segmenter) pushes; consumers (HTTP
 //! handlers) read by sequence number / (segment, part) index.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,7 +59,7 @@ pub struct Segment {
 
 pub struct SegmentRing {
     capacity: usize,
-    segments: Vec<Segment>,
+    segments: VecDeque<Segment>,
     next_seq: u64,
     /// Increments every time the segmenter has to start over (encoder
     /// restart, capture re-opened, …). Players advertise the latest
@@ -85,7 +86,7 @@ impl SegmentRing {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            segments: Vec::with_capacity(capacity),
+            segments: VecDeque::with_capacity(capacity),
             next_seq: 0,
             discontinuity_seq: 0,
             pending_parts: Vec::new(),
@@ -155,7 +156,7 @@ impl SegmentRing {
         }
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.segments.push(Segment {
+        self.segments.push_back(Segment {
             seq,
             duration_secs,
             discontinuity,
@@ -164,7 +165,7 @@ impl SegmentRing {
             parts,
         });
         while self.segments.len() > self.capacity {
-            self.segments.remove(0);
+            self.segments.pop_front();
         }
         // Pending parts are now part of the just-finished segment.
         // Clear so the next one can accumulate.
@@ -228,7 +229,7 @@ impl SegmentRing {
         // msn is past next_seq (client is ahead of us) — not reached.
         // msn is before first seg (already evicted) — treat as reached
         // so the client immediately gets the current playlist.
-        if let Some(first) = self.segments.first() {
+        if let Some(first) = self.segments.front() {
             msn < first.seq
         } else {
             false
@@ -250,7 +251,7 @@ impl SegmentRing {
         };
         let target = min_target_duration.max(observed_ceil).max(1);
 
-        let first_seq = self.segments.first().map(|s| s.seq).unwrap_or(0);
+        let first_seq = self.segments.front().map(|s| s.seq).unwrap_or(0);
 
         // Bump playlist version to 6 when LL-HLS is in play — Apple's
         // spec requires >= 6 for EXT-X-PART. Classic HLS sticks to 3.
