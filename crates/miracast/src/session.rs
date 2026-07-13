@@ -1,4 +1,5 @@
 use ferricast_core::{CastSession, Device, EncodedFrame, Result, StreamConfig};
+use zbus::Connection;
 
 /// A Miracast (Wi-Fi Display) streaming session.
 #[derive(Default)]
@@ -6,6 +7,10 @@ pub struct MiracastSession;
 
 impl CastSession for MiracastSession {
     async fn connect(&mut self, device: &Device) -> Result<()> {
+        //let connection = Connection::system().await.map_err(||);
+        //println!("{:?}", device.metadata.get("path").unwrap());
+
+
         Ok(())
     }
 

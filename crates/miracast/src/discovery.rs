@@ -7,7 +7,9 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use ferricast_core::{Device, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError, Result};
 use uuid::Uuid;
 use zbus::Connection;
-use zvariant::OwnedObjectPath;
+
+use crate::dbus::{DeviceProxy, NetworkManagerProxy, P2pPeerProxy, WifiP2pProxy};
+
 
 const MIRACAST_ICON: Bytes = Bytes::from_static(include_bytes!("../../../assets/miracast.svg"));
 
@@ -87,7 +89,7 @@ impl Discovery for MiracastDiscovery {
                         FerricastError::Discovery("Invalid signal".to_string())
                     })?;
 
-                    let peer = P2pPeerProxy::new(&connection, args.path).await.map_err(|_| {
+                    let peer = P2pPeerProxy::new(&connection, args.path.clone()).await.map_err(|_| {
                         FerricastError::Discovery("Cannot create P2P Peer".to_string())
                     })?; 
 
@@ -119,6 +121,9 @@ impl Discovery for MiracastDiscovery {
                     // TODO: PARSE WFD IES
                 
 
+                    let mut metadata = HashMap::new();
+                    metadata.insert("path".to_string(), args.path().to_string());
+
                     tx.send(DiscoveryEvent::DeviceFound(Device {
                         id: Uuid::new_v4(),
                         name,
@@ -130,7 +135,7 @@ impl Discovery for MiracastDiscovery {
                         capabilities: DeviceCapabilities {
                             ..Default::default()
                         },
-                        metadata: HashMap::new(),
+                        metadata,
                     })).await.map_err(|_| {
                         FerricastError::Discovery("Cannot send miracast device".to_string())
                     })?; 
@@ -198,69 +203,6 @@ pub fn parse_wfd_rtsp_port(wfd_ies: &[u8]) -> u16 {
     7236
 }
 
-#[zbus::proxy(
-    interface = "org.freedesktop.NetworkManager",
-    default_service = "org.freedesktop.NetworkManager",
-    default_path = "/org/freedesktop/NetworkManager"    
-)]
-trait NetworkManager {
-    async fn get_devices(&self) -> zbus::Result<Vec<zvariant::OwnedObjectPath>>;
-}
-
-#[zbus::proxy(
-    interface = "org.freedesktop.NetworkManager.WifiP2PPeer",
-    default_service = "org.freedesktop.NetworkManager"
-)]
-trait P2pPeer {
-    #[zbus(property)]
-    fn flags(&self) -> zbus::Result<u32>;
-    #[zbus(property)]
-    fn hw_address(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn manufacturer(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn model(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn model_number(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn serial(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    #[allow(non_snake_case)]
-    fn WfdIEs(&self) -> zbus::Result<Vec<u8>>;
-    #[zbus(property)]
-    fn name(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn last_seen(&self) -> zbus::Result<i64>;
-}
-
-#[zbus::proxy(
-    interface = "org.freedesktop.NetworkManager.Device",
-    default_service = "org.freedesktop.NetworkManager"
-)]
-trait Device {
-    #[zbus(property)]
-    fn device_type(&self) -> zbus::Result<u32>;
-
-    #[zbus(property)]
-    fn interface(&self) -> zbus::Result<String>;
-}
-
-#[zbus::proxy(
-    interface = "org.freedesktop.NetworkManager.Device.WifiP2P",
-    default_service = "org.freedesktop.NetworkManager",
-)]
-trait WifiP2p {
-    async fn start_find(&self, args: HashMap<&str, zbus::zvariant::Value<'_>>) -> zbus::Result<()>;
-
-    async fn stop_find(&self) -> zbus::Result<()>;
-
-    #[zbus(property)]
-    fn peers(&self) -> zbus::Result<Vec<zvariant::OwnedObjectPath>>;
-
-    #[zbus(signal)]
-    async fn peer_added(&self, path: zvariant::OwnedObjectPath);
-
-}
 
 fn is_miracast_sink(wfd_ies: &[u8]) -> bool {
     if wfd_ies.is_empty() {
