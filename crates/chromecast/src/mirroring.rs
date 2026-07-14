@@ -538,6 +538,8 @@ impl CastSession for ChromecastMirrorSession {
                 packet_id,
             );
 
+            let reference_frame_id = (!frame.is_keyframe)
+                .then(|| stream.video_frame_id.wrapping_sub(1));
             let pkt = cast_rtp_video_packet(
                 stream.video_seq,
                 ts,
@@ -547,10 +549,10 @@ impl CastSession for ChromecastMirrorSession {
                 stream.video_frame_id,
                 packet_id,
                 max_packet_id,
+                reference_frame_id,
                 chunk,
                 &stream.video_aes_key,
                 &iv,
-                packet_id_usize == 0,
             );
             let pkt_len = pkt.len();
             if let Err(e) = stream.socket.send(&pkt).await {
@@ -936,21 +938,18 @@ fn aes_ctr_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) {
 
 /// Build one Cast Streaming video RTP packet.
 ///
-/// Cast Streaming does NOT use RFC 6184 packetization. Instead the raw Annex-B
-/// bitstream is chunked and each chunk is preceded by an unencrypted 9-byte
-/// Cast payload header that carries the frame and packet identity. Only the
-/// data chunk is encrypted (AES-128-CTR); the Cast header is sent in clear.
-///
 /// Cast payload header layout (openscreen `rtp_packet_builder.cc`):
 /// ```text
-/// Byte 0:      0x80 for key frame, 0x00 for non-key frame
+/// Byte 0:      flags — 0x80 key frame | 0x40 has_reference_frame_id
 /// Bytes 1–4:   frame_id (BE u32)
 /// Bytes 5–6:   packet_id (BE u16, 0-based index within the frame)
 /// Bytes 7–8:   max_packet_id (BE u16, total_packets − 1)
+/// [Bytes 9-12: reference_frame_id (BE u32) — present iff has_reference_frame_id]
 /// ```
 ///
-/// `with_ext = true` on the first packet of each frame to include the
-/// 8-byte abs-send-time RTP extension (RFC 5285 profile 0xBEDE).
+/// Key frames → 9-byte header, byte0=0x80, no reference field.
+/// P-frames → 13-byte header, byte0=0x40, 4-byte reference_frame_id appended.
+/// The abs-send-time extension is included on every packet (matches openscreen).
 #[allow(clippy::too_many_arguments)]
 fn cast_rtp_video_packet(
     seq: u16,
@@ -961,30 +960,38 @@ fn cast_rtp_video_packet(
     frame_id: u32,
     packet_id: u16,
     max_packet_id: u16,
+    // None for key frames; Some(prev_frame_id) for P-frames.
+    reference_frame_id: Option<u32>,
     chunk: &[u8],
     key: &[u8; 16],
     iv: &[u8; 16],
-    with_ext: bool,
 ) -> Vec<u8> {
-    let ext_block = with_ext.then(|| cast_rtp_extension(abs_send_time_90khz()));
-    let ext_len = if with_ext { 8 } else { 0 };
-    let hdr = rtp_header(VIDEO_RTP_PAYLOAD_TYPE, seq, ts, ssrc, marker, with_ext);
+    // abs-send-time extension on every video packet (openscreen behaviour).
+    let ext_block = cast_rtp_extension(abs_send_time_90khz());
+    let hdr = rtp_header(VIDEO_RTP_PAYLOAD_TYPE, seq, ts, ssrc, marker, true);
 
-    // 9-byte Cast payload header (unencrypted).
-    let mut cast_hdr = [0u8; 9];
-    cast_hdr[0] = if is_key_frame { 0x80 } else { 0x00 };
-    cast_hdr[1..5].copy_from_slice(&frame_id.to_be_bytes());
-    cast_hdr[5..7].copy_from_slice(&packet_id.to_be_bytes());
-    cast_hdr[7..9].copy_from_slice(&max_packet_id.to_be_bytes());
+    // Cast payload header: 9 bytes for key frames, 13 for P-frames.
+    let cast_hdr_len = if is_key_frame { 9 } else { 13 };
+    let mut cast_hdr = Vec::with_capacity(cast_hdr_len);
+    if is_key_frame {
+        cast_hdr.push(0x80u8);
+    } else {
+        cast_hdr.push(0x40u8); // has_reference_frame_id
+    }
+    cast_hdr.extend_from_slice(&frame_id.to_be_bytes());
+    cast_hdr.extend_from_slice(&packet_id.to_be_bytes());
+    cast_hdr.extend_from_slice(&max_packet_id.to_be_bytes());
+    if !is_key_frame {
+        let ref_id = reference_frame_id.unwrap_or_else(|| frame_id.wrapping_sub(1));
+        cast_hdr.extend_from_slice(&ref_id.to_be_bytes());
+    }
 
     let mut payload = chunk.to_vec();
     aes_ctr_encrypt(key, iv, &mut payload);
 
-    let mut pkt = Vec::with_capacity(12 + ext_len + 9 + payload.len());
+    let mut pkt = Vec::with_capacity(12 + 8 + cast_hdr_len + payload.len());
     pkt.extend_from_slice(&hdr);
-    if let Some(ext) = ext_block {
-        pkt.extend_from_slice(&ext);
-    }
+    pkt.extend_from_slice(&ext_block);
     pkt.extend_from_slice(&cast_hdr);
     pkt.extend_from_slice(&payload);
     pkt
