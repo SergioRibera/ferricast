@@ -27,9 +27,9 @@
           # gdk-pixbuf
           # libsoup_3
           # xdotool
-          xorg.libX11
-	  xorg.libXi
-          xorg.libxcb
+          libx11
+	  libxi
+          libxcb
           libxkbcommon
 	  x264.dev
 
@@ -44,7 +44,7 @@
           # alsa-lib regardless.
           alsa-lib
           alsa-lib.dev
-	  xorg.libXcursor
+	  libxcursor
 
           # Fraunhofer FDK AAC encoder. Used by the audio side of
           # the streaming pipeline (`crates/encoder/src/aac`) to
@@ -104,7 +104,7 @@
           LD_LIBRARY_PATH = "/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath libraries}";
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
-  	  BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include -I${pkgs.libclang.lib}/lib/clang/${pkgs.clang.version}/include";
+          BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include -I${pkgs.libclang.lib}/lib/clang/${pkgs.clang.version}/include";
         };
       });
 }
