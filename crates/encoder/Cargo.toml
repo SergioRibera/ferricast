@@ -26,7 +26,7 @@ edition = "2024"
 # Disable any one you can't build on a particular host. Typical
 # fix for cros-libva ABI mismatches:
 #   ferricast = { default-features = false, features = ["x264", "nvenc", "fdk-aac"] }
-default = ["x264", "vaapi", "nvenc", "fdk-aac"]
+default = ["x264", "vaapi", "nvenc", "fdk-aac", "opus-rs"]
 x264 = ["dep:x264"]
 vaapi = ["dep:cros-libva"]
 nvenc = ["dep:shiguredo_nvcodec"]
@@ -55,6 +55,7 @@ fdk-aac = ["dep:fdk-aac"]
 # points `shiguredo_nvcodec` at a fork that publishes the two
 # methods.
 nvenc-zero-copy = ["nvenc"]
+opus-rs = ["dep:opus-rs"]
 
 [dependencies]
 ferricast-core.workspace = true
@@ -98,3 +99,4 @@ shiguredo_nvcodec = { version = "2026.1.0", optional = true }
 fdk-aac = { version = "0.8", optional = true }
 x264 = { version = "0.5.0", optional = true }
 yuv = "0.8.16"
+opus-rs = { version = "0.1.23", optional = true }

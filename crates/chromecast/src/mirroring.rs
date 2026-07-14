@@ -162,7 +162,8 @@ struct AnswerEnvelope {
 struct AnswerBody {
     udp_port: u16,
     send_indexes: Vec<u32>,
-    ssrcs: Vec<u32>,
+    // JSON has no unsigned type; Chromecast sends SSRCs as signed 32-bit
+    ssrcs: Vec<i64>,
 }
 
 // ── Session structs ───────────────────────────────────────────────────────────
@@ -513,84 +514,51 @@ impl CastSession for ChromecastMirrorSession {
             .ok_or_else(|| FerricastError::Streaming("mirror stream not initialised".into()))?;
 
         let ts = video_rtp_ts(frame.timestamp_us);
-        let nals = annexb_nal_units(&frame.data);
-        let n_nals = nals.len();
+        let data = &frame.data;
 
-        for (ni, nal) in nals.iter().enumerate() {
-            if nal.is_empty() {
-                continue;
-            }
-            let is_last_nal = ni + 1 == n_nals;
-            // Extension only on the very first RTP packet of the frame so the
-            // receiver can latch the abs-send-time once per frame without paying
-            // 8 extra bytes on every fragment.
-            let first_pkt_of_frame = ni == 0;
+        // Cast Streaming splits the raw Annex-B bitstream into MAX_RTP_PAYLOAD
+        // chunks. Each chunk gets a 9-byte Cast payload header (unencrypted)
+        // followed by the AES-128-CTR encrypted data. No RFC 6184 FU-A
+        // wrapping — the Cast header's packet_id/max_packet_id carries the
+        // reassembly state.
+        let chunks: Vec<&[u8]> = data.chunks(MAX_RTP_PAYLOAD).collect();
+        let n_pkts = chunks.len();
+        let max_packet_id = (n_pkts.saturating_sub(1)) as u16;
 
-            if nal.len() <= MAX_RTP_PAYLOAD {
-                let iv = cast_iv(
-                    &stream.video_aes_iv_mask,
-                    stream.video_ssrc,
-                    stream.video_frame_id,
-                    0,
-                );
-                let pkt = rtp_single_nal(
-                    stream.video_seq,
-                    ts,
-                    stream.video_ssrc,
-                    is_last_nal,
-                    nal,
-                    &stream.video_aes_key,
-                    &iv,
-                    first_pkt_of_frame,
-                );
-                let pkt_len = pkt.len();
-                if let Err(e) = stream.socket.send(&pkt).await {
-                    debug!(%e, "mirror: video NAL UDP send dropped");
-                }
-                stream.video_pkt_count = stream.video_pkt_count.wrapping_add(1);
-                stream.video_byte_count =
-                    stream.video_byte_count.wrapping_add(pkt_len as u32);
-                stream.video_seq = stream.video_seq.wrapping_add(1);
-            } else {
-                // RFC 6184 FU-A fragmentation. Skip the NAL header byte from
-                // the body — it's reconstructed by the receiver from the FU
-                // indicator + FU header pair.
-                let nal_hdr = nal[0];
-                let body = &nal[1..];
-                let frags: Vec<&[u8]> = body.chunks(MAX_RTP_PAYLOAD - 2).collect();
-                let n_frags = frags.len();
-                for (fi, frag) in frags.iter().enumerate() {
-                    let is_last_frag = fi + 1 == n_frags;
-                    let marker = is_last_frag && is_last_nal;
-                    let iv = cast_iv(
-                        &stream.video_aes_iv_mask,
-                        stream.video_ssrc,
-                        stream.video_frame_id,
-                        fi as u16,
-                    );
-                    let pkt = rtp_fua(
-                        stream.video_seq,
-                        ts,
-                        stream.video_ssrc,
-                        marker,
-                        nal_hdr,
-                        frag,
-                        fi == 0,
-                        is_last_frag,
-                        &stream.video_aes_key,
-                        &iv,
-                        first_pkt_of_frame && fi == 0,
-                    );
-                    let pkt_len = pkt.len();
-                    if let Err(e) = stream.socket.send(&pkt).await {
-                        debug!(%e, "mirror: FU-A UDP send dropped");
-                    }
-                    stream.video_pkt_count = stream.video_pkt_count.wrapping_add(1);
-                    stream.video_byte_count =
-                        stream.video_byte_count.wrapping_add(pkt_len as u32);
-                    stream.video_seq = stream.video_seq.wrapping_add(1);
-                }
+        debug!(frame_id = stream.video_frame_id, n_pkts, data_len = data.len(), keyframe = frame.is_keyframe, "mirror: send_frame");
+
+        for (packet_id_usize, chunk) in chunks.iter().enumerate() {
+            let packet_id = packet_id_usize as u16;
+            let is_last = packet_id_usize + 1 == n_pkts;
+
+            let iv = cast_iv(
+                &stream.video_aes_iv_mask,
+                stream.video_ssrc,
+                stream.video_frame_id,
+                packet_id,
+            );
+
+            let pkt = cast_rtp_video_packet(
+                stream.video_seq,
+                ts,
+                stream.video_ssrc,
+                is_last,
+                frame.is_keyframe,
+                stream.video_frame_id,
+                packet_id,
+                max_packet_id,
+                chunk,
+                &stream.video_aes_key,
+                &iv,
+                packet_id_usize == 0,
+            );
+            let pkt_len = pkt.len();
+            if let Err(e) = stream.socket.send(&pkt).await {
+                debug!(%e, "mirror: video UDP send dropped");
             }
+            stream.video_pkt_count = stream.video_pkt_count.wrapping_add(1);
+            stream.video_byte_count = stream.video_byte_count.wrapping_add(pkt_len as u32);
+            stream.video_seq = stream.video_seq.wrapping_add(1);
         }
         stream.last_video_rtp_ts = ts;
         stream.video_frame_id = stream.video_frame_id.wrapping_add(1);
@@ -621,19 +589,17 @@ impl CastSession for ChromecastMirrorSession {
 
         let ts = audio_rtp_ts(frame.timestamp_us);
         let iv = cast_iv(iv_mask, ssrc, stream.audio_frame_id, 0);
-        // Extension on every audio packet — there is exactly one RTP packet per
-        // Opus frame (RFC 7587, no fragmentation), so this is also the first.
-        let hdr = rtp_header(AUDIO_RTP_PAYLOAD_TYPE, stream.audio_seq, ts, ssrc, true, true);
-        let ext = cast_rtp_extension(abs_send_time_90khz());
 
-        // RFC 7587: one Opus frame per RTP packet, no fragmentation.
-        let mut payload = frame.data.to_vec();
-        aes_ctr_encrypt(key, &iv, &mut payload);
-
-        let mut pkt = Vec::with_capacity(12 + 8 + payload.len());
-        pkt.extend_from_slice(&hdr);
-        pkt.extend_from_slice(&ext);
-        pkt.extend_from_slice(&payload);
+        // One Opus frame per RTP packet — packet_id=0, max_packet_id=0.
+        let pkt = cast_rtp_audio_packet(
+            stream.audio_seq,
+            ts,
+            ssrc,
+            stream.audio_frame_id,
+            &frame.data,
+            key,
+            &iv,
+        );
 
         let pkt_len = pkt.len();
         if let Err(e) = stream.socket.send(&pkt).await {
@@ -699,6 +665,9 @@ impl Drop for ChromecastMirrorSession {
             state.alive.store(false, Ordering::Relaxed);
             state.read_handle.abort();
             state.heartbeat_handle.abort();
+        }
+        if let Some(stream) = self.stream.as_ref() {
+            stream.rtcp_handle.abort();
         }
     }
 }
@@ -935,22 +904,21 @@ fn abs_send_time_90khz() -> u32 {
 
 /// Derive the AES-128-CTR IV for one Cast Streaming RTP packet.
 ///
-/// Counter block layout (16 bytes, all big-endian):
+/// Counter block layout (16 bytes, all big-endian), matching openscreen
+/// `frame_crypto.cc` (`CreateNewIv`):
 /// ```text
 /// [0..4]   SSRC
-/// [4..8]   zeros
-/// [8..12]  frame_id
-/// [12..14] packet_id (fragment index within the frame)
-/// [14..16] zeros
+/// [4..8]   frame_id
+/// [8..10]  packet_id (fragment index within the frame, 2 bytes)
+/// [10..16] zeros
 /// ```
 /// Final IV = `aes_iv_mask XOR counter_block`.
 fn cast_iv(iv_mask: &[u8; 16], ssrc: u32, frame_id: u32, packet_id: u16) -> [u8; 16] {
     let mut counter = [0u8; 16];
     counter[0..4].copy_from_slice(&ssrc.to_be_bytes());
-    // [4..8] zeros — already zero
-    counter[8..12].copy_from_slice(&frame_id.to_be_bytes());
-    counter[12..14].copy_from_slice(&packet_id.to_be_bytes());
-    // [14..16] zeros — already zero
+    counter[4..8].copy_from_slice(&frame_id.to_be_bytes());
+    counter[8..10].copy_from_slice(&packet_id.to_be_bytes());
+    // [10..16] zeros — already zero
     let mut iv = [0u8; 16];
     for (i, b) in iv.iter_mut().enumerate() {
         *b = iv_mask[i] ^ counter[i];
@@ -966,18 +934,34 @@ fn aes_ctr_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) {
     Ctr128BE::<Aes128>::new(key.into(), iv.into()).apply_keystream(data);
 }
 
-/// Build an RTP packet carrying a single H.264 NAL unit (RFC 6184 §5.6).
+/// Build one Cast Streaming video RTP packet.
 ///
-/// `with_ext` appends the 8-byte Cast abs-send-time extension block (RFC 5285
-/// one-byte header, profile 0xBEDE) immediately after the 12-byte RTP header,
-/// before the encrypted payload. Should be `true` on the first packet of each
-/// video frame.
-fn rtp_single_nal(
+/// Cast Streaming does NOT use RFC 6184 packetization. Instead the raw Annex-B
+/// bitstream is chunked and each chunk is preceded by an unencrypted 9-byte
+/// Cast payload header that carries the frame and packet identity. Only the
+/// data chunk is encrypted (AES-128-CTR); the Cast header is sent in clear.
+///
+/// Cast payload header layout (openscreen `rtp_packet_builder.cc`):
+/// ```text
+/// Byte 0:      0x80 for key frame, 0x00 for non-key frame
+/// Bytes 1–4:   frame_id (BE u32)
+/// Bytes 5–6:   packet_id (BE u16, 0-based index within the frame)
+/// Bytes 7–8:   max_packet_id (BE u16, total_packets − 1)
+/// ```
+///
+/// `with_ext = true` on the first packet of each frame to include the
+/// 8-byte abs-send-time RTP extension (RFC 5285 profile 0xBEDE).
+#[allow(clippy::too_many_arguments)]
+fn cast_rtp_video_packet(
     seq: u16,
     ts: u32,
     ssrc: u32,
     marker: bool,
-    nal: &[u8],
+    is_key_frame: bool,
+    frame_id: u32,
+    packet_id: u16,
+    max_packet_id: u16,
+    chunk: &[u8],
     key: &[u8; 16],
     iv: &[u8; 16],
     with_ext: bool,
@@ -985,54 +969,54 @@ fn rtp_single_nal(
     let ext_block = with_ext.then(|| cast_rtp_extension(abs_send_time_90khz()));
     let ext_len = if with_ext { 8 } else { 0 };
     let hdr = rtp_header(VIDEO_RTP_PAYLOAD_TYPE, seq, ts, ssrc, marker, with_ext);
-    let mut payload = nal.to_vec();
+
+    // 9-byte Cast payload header (unencrypted).
+    let mut cast_hdr = [0u8; 9];
+    cast_hdr[0] = if is_key_frame { 0x80 } else { 0x00 };
+    cast_hdr[1..5].copy_from_slice(&frame_id.to_be_bytes());
+    cast_hdr[5..7].copy_from_slice(&packet_id.to_be_bytes());
+    cast_hdr[7..9].copy_from_slice(&max_packet_id.to_be_bytes());
+
+    let mut payload = chunk.to_vec();
     aes_ctr_encrypt(key, iv, &mut payload);
-    let mut pkt = Vec::with_capacity(12 + ext_len + payload.len());
+
+    let mut pkt = Vec::with_capacity(12 + ext_len + 9 + payload.len());
     pkt.extend_from_slice(&hdr);
     if let Some(ext) = ext_block {
         pkt.extend_from_slice(&ext);
     }
+    pkt.extend_from_slice(&cast_hdr);
     pkt.extend_from_slice(&payload);
     pkt
 }
 
-/// Build one FU-A fragment packet (RFC 6184 §5.8).
-///
-/// `nal_hdr` is the first byte of the original NAL unit (before fragmentation).
-/// `fragment` is a slice of the original NAL unit body (i.e. NAL[1..] chunked).
-/// `with_ext` appends the Cast abs-send-time extension; pass `true` only on
-/// the first fragment of the first NAL of each video frame.
-#[allow(clippy::too_many_arguments)]
-fn rtp_fua(
+/// Build one Cast Streaming audio RTP packet (single Opus frame, no fragmentation).
+fn cast_rtp_audio_packet(
     seq: u16,
     ts: u32,
     ssrc: u32,
-    marker: bool,
-    nal_hdr: u8,
-    fragment: &[u8],
-    start: bool,
-    end: bool,
+    frame_id: u32,
+    data: &[u8],
     key: &[u8; 16],
     iv: &[u8; 16],
-    with_ext: bool,
 ) -> Vec<u8> {
-    let ext_block = with_ext.then(|| cast_rtp_extension(abs_send_time_90khz()));
-    let ext_len = if with_ext { 8 } else { 0 };
-    let hdr = rtp_header(VIDEO_RTP_PAYLOAD_TYPE, seq, ts, ssrc, marker, with_ext);
-    // FU indicator: preserve NRI bits [5:6] from original NAL header, set type=28
-    let fu_indicator = (nal_hdr & 0x60) | 28;
-    // FU header: S=start, E=end, R=0, then original NAL type bits [0:4]
-    let fu_header = (u8::from(start) << 7) | (u8::from(end) << 6) | (nal_hdr & 0x1F);
-    let mut payload = Vec::with_capacity(2 + fragment.len());
-    payload.push(fu_indicator);
-    payload.push(fu_header);
-    payload.extend_from_slice(fragment);
+    // abs-send-time extension on every audio packet.
+    let hdr = rtp_header(AUDIO_RTP_PAYLOAD_TYPE, seq, ts, ssrc, true, true);
+    let ext = cast_rtp_extension(abs_send_time_90khz());
+
+    // 9-byte Cast payload header: audio has no key-frame concept → 0x00.
+    // packet_id = 0, max_packet_id = 0 (one packet per Opus frame).
+    let mut cast_hdr = [0u8; 9];
+    cast_hdr[1..5].copy_from_slice(&frame_id.to_be_bytes());
+    // bytes 5-8 remain zero: packet_id=0, max_packet_id=0
+
+    let mut payload = data.to_vec();
     aes_ctr_encrypt(key, iv, &mut payload);
-    let mut pkt = Vec::with_capacity(12 + ext_len + payload.len());
+
+    let mut pkt = Vec::with_capacity(12 + 8 + 9 + payload.len());
     pkt.extend_from_slice(&hdr);
-    if let Some(ext) = ext_block {
-        pkt.extend_from_slice(&ext);
-    }
+    pkt.extend_from_slice(&ext);
+    pkt.extend_from_slice(&cast_hdr);
     pkt.extend_from_slice(&payload);
     pkt
 }
@@ -1155,50 +1139,3 @@ async fn rtcp_recv_task(
     }
 }
 
-/// Split an H.264 Annex-B bitstream into NAL unit byte slices (no start codes).
-///
-/// Handles both 3-byte (`00 00 01`) and 4-byte (`00 00 00 01`) start codes.
-/// Trailing zero bytes before each start code are stripped — they are part of
-/// the start code prefix, not the preceding NAL's RBSP content.
-fn annexb_nal_units(data: &[u8]) -> Vec<&[u8]> {
-    let len = data.len();
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let mut nal_start: Option<usize> = None;
-
-    while i + 2 < len {
-        if data[i] == 0 && data[i + 1] == 0 {
-            let (is_sc, sc_len) = if i + 3 < len && data[i + 2] == 0 && data[i + 3] == 1 {
-                (true, 4usize)
-            } else if data[i + 2] == 1 {
-                (true, 3usize)
-            } else {
-                (false, 0usize)
-            };
-
-            if is_sc {
-                if let Some(ns) = nal_start {
-                    // Strip trailing zeros that are part of the next start code.
-                    let mut end = i;
-                    while end > ns && data[end - 1] == 0 {
-                        end -= 1;
-                    }
-                    if end > ns {
-                        out.push(&data[ns..end]);
-                    }
-                }
-                nal_start = Some(i + sc_len);
-                i += sc_len;
-                continue;
-            }
-        }
-        i += 1;
-    }
-
-    if let Some(ns) = nal_start {
-        if ns < len {
-            out.push(&data[ns..]);
-        }
-    }
-    out
-}

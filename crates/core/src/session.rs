@@ -147,4 +147,12 @@ pub trait CastSession: Send + Sync {
     fn poll_keyframe_request(&mut self) -> bool {
         false
     }
+
+    /// Codec this session expects for audio frames. The manager reads
+    /// this after `setup_stream` completes (the variant may have
+    /// changed due to fallback) and configures the audio pipeline
+    /// accordingly. Default is AAC to match every HLS-based session.
+    fn preferred_audio_codec(&self) -> AudioCodec {
+        AudioCodec::Aac
+    }
 }

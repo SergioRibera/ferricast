@@ -16,8 +16,8 @@ pub use receiver::{ChromecastReceiver, ChromecastReceiverAdvertiser, ChromecastR
 pub use session::ChromecastSession;
 
 use ferricast_core::{
-    AudioFrame, CastSession, Codec, Device, EncodedFrame, FerricastError, ProtocolHandler, Result,
-    StreamConfig,
+    AudioCodec, AudioFrame, CastSession, Codec, Device, EncodedFrame, FerricastError,
+    ProtocolHandler, Result, StreamConfig,
 };
 
 /// Wraps either the HLS session or the Cast Streaming (RTP/UDP) mirror
@@ -118,6 +118,13 @@ impl CastSession for ChromecastEitherSession {
         match self {
             Self::Hls(s) => s.poll_keyframe_request(),
             Self::Mirror { session, .. } => session.poll_keyframe_request(),
+        }
+    }
+
+    fn preferred_audio_codec(&self) -> AudioCodec {
+        match self {
+            Self::Mirror { .. } => AudioCodec::Opus,
+            Self::Hls(_) => AudioCodec::Aac,
         }
     }
 }

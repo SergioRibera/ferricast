@@ -33,7 +33,7 @@ tracing = "0.1"
 thiserror = "2"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
-zbus = "5"
+zbus = { version = "5", features = ["tokio"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 async-trait = "0.1"
@@ -58,6 +58,7 @@ default = [
     "nvenc",
     "aac",
     "fdk-aac",
+    "opus-rs",
 ]
 chromecast = ["dep:ferricast-chromecast"]
 # Capture backends — re-exported from `ferricast-capture`. At least
@@ -88,6 +89,9 @@ aac = ["ferricast-decoder/aac"]
 # `AacEncoder: no backend compiled in` — video keeps streaming,
 # the silent-AAC fallback fills the audio PID so playback continues.
 fdk-aac = ["ferricast-encoder/fdk-aac"]
+# Pure-Rust Opus encoder for Cast Streaming (RTP mirror path).
+# No system-library dependency — opus-rs is 100% Rust.
+opus-rs = ["ferricast-encoder/opus-rs"]
 # Wayland source enumeration (foreign-toplevel + xdg-output).
 # Orthogonal to `pipewire`: that's for *capture* on Wayland; this is
 # for *picking the source to capture* via an in-process picker

@@ -22,6 +22,7 @@ default = [
     "nvenc",
     "aac",
     "fdk-aac",
+    "opus-rs",
 ]
 chromecast = ["ferricast/chromecast"]
 pipewire = ["ferricast/pipewire"]
@@ -39,6 +40,8 @@ aac = ["ferricast/aac"]
 # `StreamManager` panics on first PCM with `AacEncoder: no backend
 # compiled in` — video keeps working but audio is silent fallback.
 fdk-aac = ["ferricast/fdk-aac"]
+# Pure-Rust Opus encoder for Cast Streaming (RTP mirror path).
+opus-rs = ["ferricast/opus-rs"]
 nvenc-zero-copy = ["ferricast/nvenc-zero-copy", "nvenc"]
 # Wayland source enumeration. Defaults on so `ferricast-gui windows`
 # works out of the box on every modern compositor that exposes

@@ -19,6 +19,8 @@ use ferricast_core::{
     VideoEncoder,
 };
 use ferricast_encoder::aac::AacEncoder;
+#[cfg(feature = "opus-rs")]
+use ferricast_encoder::opus::OpusEncoder;
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -44,6 +46,7 @@ trait ErasedSession: Send + Sync {
     fn stop(&mut self) -> BoxFut<'_, Result<()>>;
     fn is_alive(&self) -> bool;
     fn poll_keyframe_request(&mut self) -> bool;
+    fn preferred_audio_codec(&self) -> AudioCodec;
 }
 
 impl<T: CastSession> ErasedSession for T {
@@ -67,6 +70,9 @@ impl<T: CastSession> ErasedSession for T {
     }
     fn poll_keyframe_request(&mut self) -> bool {
         CastSession::poll_keyframe_request(self)
+    }
+    fn preferred_audio_codec(&self) -> AudioCodec {
+        CastSession::preferred_audio_codec(self)
     }
 }
 
@@ -866,26 +872,24 @@ impl StreamManager {
         // even when we're really only producing 30, and audio
         // (whose PTS tracks wall clock through the audio capture
         // path) drifts ahead of video on the receiver.
-        let session_config = StreamConfig {
+        let mut session = (proto.create_session)(&device)?;
+        session.connect(&device).await?;
+
+        // Set the codec in session_config *before* setup_stream so that
+        // protocol-level validation (e.g. mirror requires Opus) sees the
+        // correct value. After setup_stream the session may have fallen
+        // back from Mirror to Hls, so we re-read preferred_audio_codec()
+        // below when spawning the encoder task.
+        let mut session_config = StreamConfig {
             adaptive: Some(adaptive.clone()),
             fps: effective_fps,
             bitrate_kbps: effective_bitrate_kbps,
             ..config.clone()
         };
+        if let Some(ref mut audio) = session_config.audio {
+            audio.codec = session.preferred_audio_codec();
+        }
 
-        // Audio pipeline. Spawned as its own tokio task so PipeWire
-        // audio capture (which blocks on its main loop thread) and
-        // AAC encoding don't share the supervisor's hot path with
-        // video. The task pushes encoded AAC frames into
-        // `audio_frame_rx`; the supervisor then forwards them via
-        // `session.send_audio_frame`. Aborted on stream stop.
-        //
-        // When `config.audio` is `None` (caller didn't opt in), we
-        // skip the whole thing — the chromecast HLS pipeline falls
-        // back to the silent-AAC injection for receivers that
-        // require it.
-        let mut session = (proto.create_session)(&device)?;
-        session.connect(&device).await?;
         session.setup_stream(&session_config).await?;
 
         // Audio pipeline. Spawned *after* `session.connect()` finishes
@@ -904,7 +908,8 @@ impl StreamManager {
         // back to the silent-AAC injection for receivers that
         // require it.
         let (audio_task, audio_frame_rx, audio_mute) = match config.audio.clone() {
-            Some(audio_cfg) => {
+            Some(mut audio_cfg) => {
+                audio_cfg.codec = session.preferred_audio_codec();
                 let (tx, rx) = mpsc::channel::<AudioFrame>(64);
                 let mute = audio_cfg.mute.clone();
                 let mute_for_task = mute.clone();
@@ -1783,16 +1788,30 @@ async fn recv_audio_frame(chan: &mut Option<mpsc::Receiver<AudioFrame>>) -> Opti
     }
 }
 
-/// Run the PipeWire audio capture → AAC encoder pipeline forever.
+/// Dispatch to the right encoder backend based on `audio_cfg.codec`.
+async fn run_audio_pipeline(
+    audio_cfg: ferricast_core::AudioStreamConfig,
+    mute: ferricast_core::AudioMuteHandle,
+    tx: mpsc::Sender<AudioFrame>,
+) -> Result<()> {
+    match audio_cfg.codec {
+        #[cfg(feature = "opus-rs")]
+        AudioCodec::Opus => {
+            run_audio_pipeline_with(OpusEncoder::new(), audio_cfg, mute, tx).await
+        }
+        _ => run_audio_pipeline_with(AacEncoder::new(), audio_cfg, mute, tx).await,
+    }
+}
+
+/// Run the PipeWire audio capture → encoder pipeline forever.
 /// Lives in its own task so the blocking PipeWire main-loop thread
 /// doesn't interfere with the supervisor's video hot path.
 ///
-/// The encoder is configured with the same sample rate / channel
-/// layout PipeWire negotiated, so resampling is the audio graph's
-/// job (not ours). Encoded AAC frames go out through `tx`; dropping
-/// the supervisor's receiver makes `tx.send` fail and we exit
-/// cleanly.
-async fn run_audio_pipeline(
+/// The encoder is configured lazily on the first PCM chunk using
+/// whatever rate / channels PipeWire actually negotiated, so we
+/// never drive the codec at the wrong sample-rate index.
+async fn run_audio_pipeline_with<E: AudioEncoder>(
+    mut encoder: E,
     audio_cfg: ferricast_core::AudioStreamConfig,
     mute: ferricast_core::AudioMuteHandle,
     tx: mpsc::Sender<AudioFrame>,
@@ -1809,18 +1828,10 @@ async fn run_audio_pipeline(
         requested_sample_rate = audio_cfg.sample_rate,
         requested_channels = audio_cfg.channels,
         bitrate_kbps = audio_cfg.bitrate_kbps,
+        codec = ?audio_cfg.codec,
         "audio capture started; encoder will be configured on first PCM chunk"
     );
 
-    // Lazy AAC encoder construction: the encoder is configured the
-    // first time PCM arrives, using whatever rate / channels
-    // PipeWire actually negotiated. Without this, a sink that
-    // delivers samples at, say, 44.1 kHz against our 48 kHz
-    // request would have us writing AAC frames with the wrong
-    // ADTS sample-rate index, and the chromecast would play
-    // them at the wrong pitch ("audio raro" / "mal procesado"
-    // even though the bitstream itself parses fine).
-    let mut encoder = AacEncoder::new();
     let mut encoder_configured = false;
 
     loop {
@@ -1842,16 +1853,17 @@ async fn run_audio_pipeline(
                 sample_rate = pcm.sample_rate,
                 channels = pcm.channels,
                 bitrate_kbps = audio_cfg.bitrate_kbps,
-                "AAC encoder configured against PipeWire's negotiated format"
+                codec = ?audio_cfg.codec,
+                "audio encoder configured against PipeWire's negotiated format"
             );
             encoder_configured = true;
         }
         if let Err(e) = encoder.encode(&pcm) {
-            tracing::warn!(%e, "AAC encode failed; dropping audio chunk");
+            tracing::warn!(%e, "audio encode failed; dropping chunk");
             continue;
         }
-        for aac in encoder.take_output() {
-            if tx.send(aac).await.is_err() {
+        for frame in encoder.take_output() {
+            if tx.send(frame).await.is_err() {
                 tracing::info!("audio supervisor dropped receiver; exiting pipeline");
                 let _ = capture.stop().await;
                 return Ok(());
