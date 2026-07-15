@@ -362,8 +362,12 @@ impl CastSession for ChromecastMirrorSession {
             max_frame_rate: format!("{}/1", config.fps),
             max_bit_rate: config.bitrate_kbps * 1_000,
             video_codec_params: VideoCodecParams {
-                profile: "main".into(),
-                level: "4".into(),
+                // profile_idc as hex string (openscreen/Chrome format).
+                // NVENC defaults to Main (0x4d=77) when no profile cap
+                // is set from device capabilities.
+                profile: "4d".into(),
+                // level_idc as decimal string: 40 = Level 4.0 (1080p60).
+                level: "40".into(),
                 avc: AvcParams {
                     packetization_mode: 1,
                 },
@@ -424,6 +428,11 @@ impl CastSession for ChromecastMirrorSession {
         let (answer_tx, answer_rx) = oneshot::channel::<Result<AnswerBody>>();
         *state.answer_slot.lock().await = Some(answer_tx);
 
+        {
+            let json = serde_json::to_string(&envelope)
+                .unwrap_or_else(|e| format!("<serialize error: {e}>"));
+            debug!(offer_json = %json, "Cast Streaming OFFER body");
+        }
         wire::send(&state.writer, &offer_msg).await?;
         info!(transport_id = %state.transport_id, "sent Cast Streaming OFFER");
 
@@ -526,6 +535,13 @@ impl CastSession for ChromecastMirrorSession {
         let max_packet_id = (n_pkts.saturating_sub(1)) as u16;
 
         debug!(frame_id = stream.video_frame_id, n_pkts, data_len = data.len(), keyframe = frame.is_keyframe, "mirror: send_frame");
+        if frame.is_keyframe && stream.video_frame_id == 0 {
+            let preview: String = data.iter().take(32)
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            debug!(first32 = %preview, "mirror: keyframe[0] raw bytes (pre-encrypt)");
+        }
 
         for (packet_id_usize, chunk) in chunks.iter().enumerate() {
             let packet_id = packet_id_usize as u16;
@@ -1011,9 +1027,12 @@ fn cast_rtp_audio_packet(
     let hdr = rtp_header(AUDIO_RTP_PAYLOAD_TYPE, seq, ts, ssrc, true, true);
     let ext = cast_rtp_extension(abs_send_time_90khz());
 
-    // 9-byte Cast payload header: audio has no key-frame concept → 0x00.
-    // packet_id = 0, max_packet_id = 0 (one packet per Opus frame).
+    // Every Opus frame is independently decodable → always is_key_frame.
+    // Cast receivers wait for an audio "keyframe" before starting A/V
+    // render; without 0x80, audio never starts and video is also held.
+    // packet_id = 0, max_packet_id = 0 (one Opus packet per Cast frame).
     let mut cast_hdr = [0u8; 9];
+    cast_hdr[0] = 0x80; // is_key_frame
     cast_hdr[1..5].copy_from_slice(&frame_id.to_be_bytes());
     // bytes 5-8 remain zero: packet_id=0, max_packet_id=0
 
@@ -1132,8 +1151,14 @@ async fn rtcp_recv_task(
     let mut buf = [0u8; 1500];
     loop {
         match socket.recv_from(&mut buf).await {
-            Ok((n, _src)) => {
-                if is_rtcp_pli(&buf[..n], video_ssrc) {
+            Ok((n, src)) => {
+                let pkt = &buf[..n];
+                let hex_preview: String = pkt.iter().take(16)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                debug!(n, %src, first_bytes = %hex_preview, "mirror: UDP recv from Chromecast");
+                if is_rtcp_pli(pkt, video_ssrc) {
                     debug!("mirror: PLI received — flagging keyframe request");
                     keyframe_requested.store(true, Ordering::Relaxed);
                 }
