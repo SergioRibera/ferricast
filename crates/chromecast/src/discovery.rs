@@ -369,9 +369,10 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         // EXT-X-VERSION:6 + LL-HLS parts. Falls back gracefully —
         // if the device locks up on LOADING, disable per-device.
         caps.supports_low_latency_hls = true;
-        // Unknown devices are likely modern CAF builds; try Cast
-        // Streaming. If OFFER is refused, fall back to HLS.
-        caps.supports_cast_streaming = true;
+        // Cast Streaming is disabled for unknown devices until we have
+        // confirmed correct decryption on a wider set of firmware builds.
+        // HLS is reliable; enable Cast Streaming only for known models.
+        caps.supports_cast_streaming = false;
     }
 
     caps
