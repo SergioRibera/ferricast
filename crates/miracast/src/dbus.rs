@@ -1,35 +1,35 @@
 use std::collections::HashMap;
 
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
+
+// NM device type 30 = NM_DEVICE_TYPE_WIFI_P2P
+pub const NM_DEVICE_TYPE_WIFI_P2P: u32 = 30;
+
+// org.freedesktop.NetworkManager.Connection.Active.State
+pub const NM_ACTIVE_CONNECTION_STATE_ACTIVATED: u32 = 2;
+pub const NM_ACTIVE_CONNECTION_STATE_DEACTIVATED: u32 = 4;
 
 #[zbus::proxy(
     interface = "org.freedesktop.NetworkManager",
     default_service = "org.freedesktop.NetworkManager",
-    default_path = "/org/freedesktop/NetworkManager"    
+    default_path = "/org/freedesktop/NetworkManager"
 )]
 pub trait NetworkManager {
-    async fn get_devices(&self) -> zbus::Result<Vec<zvariant::OwnedObjectPath>>;
+    async fn get_devices(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
 
+    /// Adds and immediately activates a Wi-Fi P2P (or any) connection.
+    /// Returns `(settings_path, active_connection_path, result)`.
     async fn add_and_activate_connection2(
         &self,
-        connection: HashMap<&str, HashMap<&str, zvariant::Value<'_>>>,
-        device: zvariant::ObjectPath<'_>,
-        specific_object: zvariant::ObjectPath<'_>,
-        options: HashMap<&str, zvariant::Value<'_>>,
-    ) -> zbus::Result<(
-        zvariant::OwnedObjectPath,
-        zvariant::OwnedObjectPath,
-        HashMap<String, zvariant::OwnedValue>,
-    )>;
-}
+        connection: HashMap<String, HashMap<String, OwnedValue>>,
+        device: OwnedObjectPath,
+        specific_object: OwnedObjectPath,
+        options: HashMap<String, OwnedValue>,
+    ) -> zbus::Result<(OwnedObjectPath, OwnedObjectPath, HashMap<String, OwnedValue>)>;
 
-#[zbus::proxy(
-    interface = "fi.w1.wpa_supplicant1",
-    default_service = "fi.w1.wpa_supplicant1",
-    default_path = "/f1/w1/wpa_supplicant1"
-)]
-pub trait WpaSupplicant {
-    #[zbus(property, name="Interface")]
-    fn interfaces(&self) -> zbus::Result<Vec<zvariant::OwnedObjectPath>>;
+    /// Deactivates an active connection by its object path.
+    async fn deactivate_connection(&self, active_connection: OwnedObjectPath)
+        -> zbus::Result<()>;
 }
 
 #[zbus::proxy(
@@ -72,17 +72,53 @@ pub trait Device {
 
 #[zbus::proxy(
     interface = "org.freedesktop.NetworkManager.Device.WifiP2P",
-    default_service = "org.freedesktop.NetworkManager",
+    default_service = "org.freedesktop.NetworkManager"
 )]
 pub trait WifiP2p {
-    async fn start_find(&self, args: HashMap<&str, zbus::zvariant::Value<'_>>) -> zbus::Result<()>;
+    async fn start_find(
+        &self,
+        options: HashMap<String, OwnedValue>,
+    ) -> zbus::Result<()>;
 
     async fn stop_find(&self) -> zbus::Result<()>;
 
     #[zbus(property)]
-    fn peers(&self) -> zbus::Result<Vec<zvariant::OwnedObjectPath>>;
+    fn peers(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
 
     #[zbus(signal)]
-    async fn peer_added(&self, path: zvariant::OwnedObjectPath);
+    fn peer_added(&self, path: OwnedObjectPath) -> zbus::Result<()>;
 
+    #[zbus(signal)]
+    fn peer_removed(&self, path: OwnedObjectPath) -> zbus::Result<()>;
+}
+
+/// `org.freedesktop.NetworkManager.Connection.Active`
+#[zbus::proxy(
+    interface = "org.freedesktop.NetworkManager.Connection.Active",
+    default_service = "org.freedesktop.NetworkManager"
+)]
+pub trait ActiveConnection {
+    /// 0=Unknown, 1=Activating, 2=Activated, 3=Deactivating, 4=Deactivated
+    #[zbus(property)]
+    fn state(&self) -> zbus::Result<u32>;
+
+    #[zbus(property)]
+    fn ip4_config(&self) -> zbus::Result<OwnedObjectPath>;
+
+    #[zbus(property)]
+    fn devices(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+}
+
+/// `org.freedesktop.NetworkManager.IP4Config`
+#[zbus::proxy(
+    interface = "org.freedesktop.NetworkManager.IP4Config",
+    default_service = "org.freedesktop.NetworkManager"
+)]
+pub trait Ip4Config {
+    /// Each entry: `{"address": s, "prefix": u}`.
+    #[zbus(property)]
+    fn address_data(&self) -> zbus::Result<Vec<HashMap<String, OwnedValue>>>;
+
+    #[zbus(property)]
+    fn gateway(&self) -> zbus::Result<String>;
 }
