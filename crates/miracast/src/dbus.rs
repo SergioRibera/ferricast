@@ -8,6 +8,28 @@ use std::collections::HashMap;
 )]
 pub trait NetworkManager {
     async fn get_devices(&self) -> zbus::Result<Vec<zvariant::OwnedObjectPath>>;
+
+    async fn add_and_activate_connection2(
+        &self,
+        connection: HashMap<&str, HashMap<&str, zvariant::Value<'_>>>,
+        device: zvariant::ObjectPath<'_>,
+        specific_object: zvariant::ObjectPath<'_>,
+        options: HashMap<&str, zvariant::Value<'_>>,
+    ) -> zbus::Result<(
+        zvariant::OwnedObjectPath,
+        zvariant::OwnedObjectPath,
+        HashMap<String, zvariant::OwnedValue>,
+    )>;
+}
+
+#[zbus::proxy(
+    interface = "fi.w1.wpa_supplicant1",
+    default_service = "fi.w1.wpa_supplicant1",
+    default_path = "/f1/w1/wpa_supplicant1"
+)]
+pub trait WpaSupplicant {
+    #[zbus(property, name="Interface")]
+    fn interfaces(&self) -> zbus::Result<Vec<zvariant::OwnedObjectPath>>;
 }
 
 #[zbus::proxy(
