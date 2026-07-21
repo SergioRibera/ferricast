@@ -6,7 +6,7 @@ description = "Miracast (Wi-Fi Display) protocol for ferricast"
 
 [dependencies]
 ferricast-core.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "sync", "process", "time"] }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "process", "time", "fs"] }
 tracing.workspace = true
 thiserror.workspace = true
 bytes.workspace = true

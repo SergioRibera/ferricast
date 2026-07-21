@@ -2,12 +2,18 @@ use std::collections::HashMap;
 
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
-// NM device type 30 = NM_DEVICE_TYPE_WIFI_P2P
-pub const NM_DEVICE_TYPE_WIFI_P2P: u32 = 30;
+// ── NetworkManager constants ──────────────────────────────────────────────────
 
-// org.freedesktop.NetworkManager.Connection.Active.State
+pub const NM_DEVICE_TYPE_WIFI_P2P: u32 = 30;
 pub const NM_ACTIVE_CONNECTION_STATE_ACTIVATED: u32 = 2;
 pub const NM_ACTIVE_CONNECTION_STATE_DEACTIVATED: u32 = 4;
+
+// ── iwd constants ─────────────────────────────────────────────────────────────
+
+pub const IWD_P2P_PEER_IFACE: &str = "net.connman.iwd.p2p.Peer";
+pub const IWD_P2P_DEVICE_IFACE: &str = "net.connman.iwd.p2p.Device";
+
+// ── NetworkManager proxies ────────────────────────────────────────────────────
 
 #[zbus::proxy(
     interface = "org.freedesktop.NetworkManager",
@@ -17,7 +23,6 @@ pub const NM_ACTIVE_CONNECTION_STATE_DEACTIVATED: u32 = 4;
 pub trait NetworkManager {
     async fn get_devices(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
 
-    /// Adds and immediately activates a Wi-Fi P2P (or any) connection.
     /// Returns `(settings_path, active_connection_path, result)`.
     async fn add_and_activate_connection2(
         &self,
@@ -27,7 +32,6 @@ pub trait NetworkManager {
         options: HashMap<String, OwnedValue>,
     ) -> zbus::Result<(OwnedObjectPath, OwnedObjectPath, HashMap<String, OwnedValue>)>;
 
-    /// Deactivates an active connection by its object path.
     async fn deactivate_connection(&self, active_connection: OwnedObjectPath)
         -> zbus::Result<()>;
 }
@@ -65,7 +69,6 @@ pub trait P2pPeer {
 pub trait Device {
     #[zbus(property)]
     fn device_type(&self) -> zbus::Result<u32>;
-
     #[zbus(property)]
     fn interface(&self) -> zbus::Result<String>;
 }
@@ -75,11 +78,7 @@ pub trait Device {
     default_service = "org.freedesktop.NetworkManager"
 )]
 pub trait WifiP2p {
-    async fn start_find(
-        &self,
-        options: HashMap<String, OwnedValue>,
-    ) -> zbus::Result<()>;
-
+    async fn start_find(&self, options: HashMap<String, OwnedValue>) -> zbus::Result<()>;
     async fn stop_find(&self) -> zbus::Result<()>;
 
     #[zbus(property)]
@@ -87,12 +86,10 @@ pub trait WifiP2p {
 
     #[zbus(signal)]
     fn peer_added(&self, path: OwnedObjectPath) -> zbus::Result<()>;
-
     #[zbus(signal)]
     fn peer_removed(&self, path: OwnedObjectPath) -> zbus::Result<()>;
 }
 
-/// `org.freedesktop.NetworkManager.Connection.Active`
 #[zbus::proxy(
     interface = "org.freedesktop.NetworkManager.Connection.Active",
     default_service = "org.freedesktop.NetworkManager"
@@ -101,24 +98,100 @@ pub trait ActiveConnection {
     /// 0=Unknown, 1=Activating, 2=Activated, 3=Deactivating, 4=Deactivated
     #[zbus(property)]
     fn state(&self) -> zbus::Result<u32>;
-
     #[zbus(property)]
     fn ip4_config(&self) -> zbus::Result<OwnedObjectPath>;
-
     #[zbus(property)]
     fn devices(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
 }
 
-/// `org.freedesktop.NetworkManager.IP4Config`
 #[zbus::proxy(
     interface = "org.freedesktop.NetworkManager.IP4Config",
     default_service = "org.freedesktop.NetworkManager"
 )]
 pub trait Ip4Config {
-    /// Each entry: `{"address": s, "prefix": u}`.
     #[zbus(property)]
     fn address_data(&self) -> zbus::Result<Vec<HashMap<String, OwnedValue>>>;
-
     #[zbus(property)]
     fn gateway(&self) -> zbus::Result<String>;
+}
+
+// ── iwd proxies ───────────────────────────────────────────────────────────────
+
+/// Standard D-Bus ObjectManager on iwd's service root.
+///
+/// Used to enumerate all current objects and watch for peers appearing
+/// (`InterfacesAdded`) and disappearing (`InterfacesRemoved`).
+#[zbus::proxy(
+    interface = "org.freedesktop.DBus.ObjectManager",
+    default_service = "net.connman.iwd",
+    default_path = "/"
+)]
+pub trait IwdObjectManager {
+    async fn get_managed_objects(
+        &self,
+    ) -> zbus::Result<
+        HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>,
+    >;
+
+    #[zbus(signal)]
+    fn interfaces_added(
+        &self,
+        path: OwnedObjectPath,
+        interfaces: HashMap<String, HashMap<String, OwnedValue>>,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    fn interfaces_removed(
+        &self,
+        path: OwnedObjectPath,
+        interfaces: Vec<String>,
+    ) -> zbus::Result<()>;
+}
+
+/// iwd P2P device — lives on the same object path as the Wi-Fi adapter
+/// (e.g. `/net/connman/iwd/0`).
+#[zbus::proxy(
+    interface = "net.connman.iwd.p2p.Device",
+    default_service = "net.connman.iwd"
+)]
+pub trait IwdP2pDevice {
+    /// Start P2P peer scanning. Call `ReleaseDiscovery` when done.
+    async fn request_discovery(&self) -> zbus::Result<()>;
+    async fn release_discovery(&self) -> zbus::Result<()>;
+
+    /// Returns `(peer_path, signal_level_dBm)` pairs for currently visible peers.
+    async fn get_peers(&self) -> zbus::Result<Vec<(OwnedObjectPath, i16)>>;
+
+    #[zbus(property)]
+    fn enabled(&self) -> zbus::Result<bool>;
+    #[zbus(property)]
+    fn set_enabled(&self, value: bool) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn name(&self) -> zbus::Result<String>;
+}
+
+/// iwd P2P peer — appears as a D-Bus object when a peer is discovered.
+#[zbus::proxy(
+    interface = "net.connman.iwd.p2p.Peer",
+    default_service = "net.connman.iwd"
+)]
+pub trait IwdP2pPeer {
+    /// Connects to this peer (P2P group formation + IP assignment).
+    /// Blocks until the connection is fully established or fails.
+    async fn connect(&self) -> zbus::Result<()>;
+    async fn disconnect(&self) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn name(&self) -> zbus::Result<String>;
+    #[zbus(property)]
+    fn device(&self) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(property)]
+    fn device_address(&self) -> zbus::Result<String>;
+    #[zbus(property)]
+    fn connected(&self) -> zbus::Result<bool>;
+
+    /// Wi-Fi Display Information Elements. Only present on WFD-capable peers.
+    #[zbus(property)]
+    #[allow(non_snake_case)]
+    fn WFDElements(&self) -> zbus::Result<Vec<u8>>;
 }

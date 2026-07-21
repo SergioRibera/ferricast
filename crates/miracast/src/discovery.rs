@@ -9,14 +9,34 @@ use zbus::{Connection, zvariant::OwnedObjectPath};
 use ferricast_core::{Device, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError, Result};
 use uuid::Uuid;
 
-use crate::dbus::{DeviceProxy, NM_DEVICE_TYPE_WIFI_P2P, NetworkManagerProxy, P2pPeerProxy, WifiP2pProxy};
+use crate::dbus::{
+    DeviceProxy, IWD_P2P_DEVICE_IFACE, IWD_P2P_PEER_IFACE,
+    IwdObjectManagerProxy, IwdP2pDeviceProxy, NM_DEVICE_TYPE_WIFI_P2P, NetworkManagerProxy,
+    P2pPeerProxy, WifiP2pProxy,
+};
 
 const MIRACAST_ICON: Bytes = Bytes::from_static(include_bytes!("../../../assets/miracast.svg"));
 
+// ── backend discriminator ─────────────────────────────────────────────────────
+
+/// Which D-Bus backend is backing the current discovery session.
+/// Stored so `stop()` can call the right cleanup method.
+enum ActiveBackend {
+    Nm {
+        conn: Connection,
+        device_path: OwnedObjectPath,
+    },
+    Iwd {
+        conn: Connection,
+        device_path: OwnedObjectPath,
+    },
+}
+
+// ── public type ───────────────────────────────────────────────────────────────
+
 pub struct MiracastDiscovery {
     handle: Option<JoinHandle<()>>,
-    /// Stored so `stop()` can call `StopFind` without re-querying NM.
-    p2p_device: Option<(Connection, OwnedObjectPath)>,
+    backend: Option<ActiveBackend>,
     running: bool,
 }
 
@@ -24,161 +44,34 @@ impl Default for MiracastDiscovery {
     fn default() -> Self {
         Self {
             handle: None,
-            p2p_device: None,
+            backend: None,
             running: false,
         }
     }
 }
 
+// ── Discovery impl ────────────────────────────────────────────────────────────
+
 impl Discovery for MiracastDiscovery {
     const PROTOCOL: &'static str = "miracast";
 
     async fn start(&mut self, tx: mpsc::Sender<DiscoveryEvent>) -> Result<()> {
-        let connection = Connection::system().await.map_err(|e| {
-            FerricastError::Discovery(format!("Cannot connect to D-Bus system bus: {e}"))
+        let conn = Connection::system().await.map_err(|e| {
+            FerricastError::Discovery(format!("D-Bus system bus unavailable: {e}"))
         })?;
 
-        let nm = NetworkManagerProxy::new(&connection).await.map_err(|e| {
-            FerricastError::Discovery(format!("Cannot reach NetworkManager on D-Bus: {e}"))
-        })?;
-
-        let devices = nm.get_devices().await.map_err(|e| {
-            FerricastError::Discovery(format!("NetworkManager.GetDevices failed: {e}"))
-        })?;
-
-        let mut p2p_device_path: Option<OwnedObjectPath> = None;
-
-        for device_path in devices {
-            let device = DeviceProxy::new(&connection, device_path.clone())
-                .await
-                .map_err(|e| {
-                    FerricastError::Discovery(format!("Cannot create Device proxy: {e}"))
-                })?;
-
-            let device_type = device.device_type().await.map_err(|e| {
-                FerricastError::Discovery(format!("Cannot read Device.DeviceType: {e}"))
-            })?;
-
-            if device_type != NM_DEVICE_TYPE_WIFI_P2P {
-                continue;
-            }
-
-            let iface = device.interface().await.unwrap_or_default();
-            tracing::info!(iface, path = %device_path, "found Wi-Fi P2P device");
-            p2p_device_path = Some(device_path);
-            break;
+        // Try iwd first (the user's backend), then fall back to NM/wpa_supplicant.
+        if let Some(device_path) = find_iwd_p2p_device(&conn).await {
+            self.start_iwd(conn, device_path, tx).await
+        } else if let Some(device_path) = find_nm_p2p_device(&conn).await? {
+            self.start_nm(conn, device_path, tx).await
+        } else {
+            Err(FerricastError::Discovery(
+                "No Wi-Fi P2P device found via iwd or NetworkManager. \
+                 Check your adapter, drivers, and that iwd or NetworkManager is running."
+                    .into(),
+            ))
         }
-
-        let device_path = p2p_device_path.ok_or_else(|| {
-            FerricastError::Discovery(
-                "No Wi-Fi P2P device found. Check your adapter and drivers.".into(),
-            )
-        })?;
-
-        let p2p = WifiP2pProxy::new(&connection, device_path.clone())
-            .await
-            .map_err(|e| {
-                FerricastError::Discovery(format!("Cannot create WifiP2P proxy: {e}"))
-            })?;
-
-        p2p.start_find(HashMap::new()).await.map_err(|e| {
-            FerricastError::Discovery(format!("WifiP2P.StartFind failed: {e}"))
-        })?;
-
-        let mut peer_added = p2p.receive_peer_added().await.map_err(|e| {
-            FerricastError::Discovery(format!("Cannot subscribe to PeerAdded signal: {e}"))
-        })?;
-
-        // Clone so both the task and self.p2p_device can own one.
-        let conn_for_task = connection.clone();
-        let device_path_str = device_path.to_string();
-
-        let handle = tokio::task::spawn(async move {
-            tracing::info!("Miracast discovery started");
-
-            while let Some(signal) = peer_added.next().await {
-                let result: Result<()> = async {
-                    let args = signal.args().map_err(|e| {
-                        FerricastError::Discovery(format!("Invalid PeerAdded signal args: {e}"))
-                    })?;
-
-                    let peer_path = args.path.clone();
-
-                    let peer = P2pPeerProxy::new(&conn_for_task, peer_path.clone())
-                        .await
-                        .map_err(|e| {
-                            FerricastError::Discovery(format!("Cannot create P2pPeer proxy: {e}"))
-                        })?;
-
-                    let name = peer.name().await.map_err(|e| {
-                        FerricastError::Discovery(format!("P2pPeer.Name failed: {e}"))
-                    })?;
-
-                    let hw_address = peer.hw_address().await.map_err(|e| {
-                        FerricastError::Discovery(format!("P2pPeer.HwAddress failed: {e}"))
-                    })?;
-
-                    let wfd_ies = peer.WfdIEs().await.unwrap_or_default();
-
-                    tracing::debug!(
-                        name,
-                        hw_address,
-                        wfd_ie_len = wfd_ies.len(),
-                        wfd_ies = ?wfd_ies.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>(),
-                        "P2P peer discovered"
-                    );
-
-                    if !is_miracast_sink(&wfd_ies) {
-                        tracing::debug!(name, "peer is not a Miracast sink, skipping");
-                        return Ok(());
-                    }
-
-                    let wfd_port = parse_wfd_rtsp_port(&wfd_ies);
-                    let model = peer.model().await.ok();
-
-                    let mut metadata = HashMap::new();
-                    metadata.insert("path".to_string(), peer_path.to_string());
-                    metadata.insert("device_path".to_string(), device_path_str.clone());
-                    metadata.insert("hw_address".to_string(), hw_address.clone());
-
-                    tx.send(DiscoveryEvent::DeviceFound(Device {
-                        id: Uuid::new_v4(),
-                        name,
-                        protocol: "miracast",
-                        protocol_icon: MIRACAST_ICON,
-                        // IP is unknown until P2P connection is established.
-                        addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                        port: wfd_port,
-                        model,
-                        capabilities: DeviceCapabilities {
-                            supports_video: true,
-                            supports_screen_mirror: true,
-                            ..Default::default()
-                        },
-                        metadata,
-                    }))
-                    .await
-                    .map_err(|_| {
-                        FerricastError::Discovery("DiscoveryEvent channel closed".into())
-                    })?;
-
-                    Ok(())
-                }
-                .await;
-
-                if let Err(err) = result {
-                    tracing::error!(%err, "Miracast peer handling error");
-                }
-            }
-
-            tracing::warn!("Miracast PeerAdded signal stream ended");
-        });
-
-        self.handle = Some(handle);
-        self.p2p_device = Some((connection, device_path));
-        self.running = true;
-
-        Ok(())
     }
 
     async fn stop(&mut self) -> Result<()> {
@@ -186,17 +79,30 @@ impl Discovery for MiracastDiscovery {
             return Ok(());
         }
 
-        if let Some((conn, device_path)) = self.p2p_device.take() {
-            let p2p = WifiP2pProxy::new(&conn, device_path).await.map_err(|e| {
-                FerricastError::Discovery(format!("Cannot create WifiP2P proxy for stop: {e}"))
-            })?;
-            p2p.stop_find().await.map_err(|e| {
-                FerricastError::Discovery(format!("WifiP2P.StopFind failed: {e}"))
-            })?;
+        match self.backend.take() {
+            Some(ActiveBackend::Nm { conn, device_path }) => {
+                let p2p = WifiP2pProxy::new(&conn, device_path).await.map_err(|e| {
+                    FerricastError::Discovery(format!("WifiP2P proxy for stop: {e}"))
+                })?;
+                p2p.stop_find().await.map_err(|e| {
+                    FerricastError::Discovery(format!("NM WifiP2P.StopFind: {e}"))
+                })?;
+            }
+            Some(ActiveBackend::Iwd { conn, device_path }) => {
+                let dev = IwdP2pDeviceProxy::new(&conn, device_path)
+                    .await
+                    .map_err(|e| {
+                        FerricastError::Discovery(format!("iwd P2P device proxy for stop: {e}"))
+                    })?;
+                dev.release_discovery().await.map_err(|e| {
+                    FerricastError::Discovery(format!("iwd ReleaseDiscovery: {e}"))
+                })?;
+            }
+            None => {}
         }
 
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
+        if let Some(h) = self.handle.take() {
+            h.abort();
         }
 
         self.running = false;
@@ -208,61 +114,330 @@ impl Discovery for MiracastDiscovery {
     }
 }
 
-/// Parses the WFD RTSP port from WFD IE bytes (WFD subelement 0x00 = WFD Device Information).
+// ── backend startup ───────────────────────────────────────────────────────────
+
+impl MiracastDiscovery {
+    async fn start_nm(
+        &mut self,
+        conn: Connection,
+        device_path: OwnedObjectPath,
+        tx: mpsc::Sender<DiscoveryEvent>,
+    ) -> Result<()> {
+        let p2p = WifiP2pProxy::new(&conn, device_path.clone())
+            .await
+            .map_err(|e| FerricastError::Discovery(format!("WifiP2P proxy: {e}")))?;
+
+        p2p.start_find(HashMap::new()).await.map_err(|e| {
+            FerricastError::Discovery(format!("NM WifiP2P.StartFind: {e}"))
+        })?;
+
+        let mut peer_added = p2p.receive_peer_added().await.map_err(|e| {
+            FerricastError::Discovery(format!("Subscribe to PeerAdded: {e}"))
+        })?;
+
+        let conn_task = conn.clone();
+        let device_path_str = device_path.to_string();
+
+        let handle = tokio::spawn(async move {
+            tracing::info!("Miracast discovery started (NM backend)");
+            while let Some(sig) = peer_added.next().await {
+                let result: Result<()> = async {
+                    let peer_path = sig
+                        .args()
+                        .map_err(|e| FerricastError::Discovery(format!("PeerAdded args: {e}")))?
+                        .path
+                        .clone();
+
+                    let proxy = P2pPeerProxy::new(&conn_task, peer_path.clone())
+                        .await
+                        .map_err(|e| {
+                            FerricastError::Discovery(format!("P2pPeer proxy: {e}"))
+                        })?;
+
+                    let name = proxy.name().await.map_err(|e| {
+                        FerricastError::Discovery(format!("P2pPeer.Name: {e}"))
+                    })?;
+                    let hw_address = proxy.hw_address().await.map_err(|e| {
+                        FerricastError::Discovery(format!("P2pPeer.HwAddress: {e}"))
+                    })?;
+                    let wfd_ies = proxy.WfdIEs().await.unwrap_or_default();
+
+                    if !is_miracast_sink(&wfd_ies) {
+                        return Ok(());
+                    }
+
+                    let model = proxy.model().await.ok();
+                    let mut metadata = HashMap::new();
+                    metadata.insert("path".into(), peer_path.to_string());
+                    metadata.insert("device_path".into(), device_path_str.clone());
+                    metadata.insert("hw_address".into(), hw_address);
+                    metadata.insert("backend".into(), "nm".into());
+
+                    tx.send(DiscoveryEvent::DeviceFound(make_device(
+                        name,
+                        model,
+                        parse_wfd_rtsp_port(&wfd_ies),
+                        metadata,
+                    )))
+                    .await
+                    .map_err(|_| {
+                        FerricastError::Discovery("DiscoveryEvent channel closed".into())
+                    })
+                }
+                .await;
+
+                if let Err(e) = result {
+                    tracing::error!(%e, "NM peer handling error");
+                }
+            }
+            tracing::warn!("NM PeerAdded stream ended");
+        });
+
+        self.handle = Some(handle);
+        self.backend = Some(ActiveBackend::Nm { conn, device_path });
+        self.running = true;
+        Ok(())
+    }
+
+    async fn start_iwd(
+        &mut self,
+        conn: Connection,
+        device_path: OwnedObjectPath,
+        tx: mpsc::Sender<DiscoveryEvent>,
+    ) -> Result<()> {
+        let dev = IwdP2pDeviceProxy::new(&conn, device_path.clone())
+            .await
+            .map_err(|e| FerricastError::Discovery(format!("iwd P2P device proxy: {e}")))?;
+
+        dev.request_discovery().await.map_err(|e| {
+            FerricastError::Discovery(format!("iwd RequestDiscovery: {e}"))
+        })?;
+
+        let om = IwdObjectManagerProxy::new(&conn)
+            .await
+            .map_err(|e| FerricastError::Discovery(format!("iwd ObjectManager proxy: {e}")))?;
+
+        // Emit any peers already visible at startup.
+        let existing = om.get_managed_objects().await.map_err(|e| {
+            FerricastError::Discovery(format!("iwd GetManagedObjects: {e}"))
+        })?;
+        for (path, ifaces) in &existing {
+            if let Some(props) = ifaces.get(IWD_P2P_PEER_IFACE) {
+                if let Some(ev) = peer_event_from_iwd_props(path, props) {
+                    let _ = tx.send(ev).await;
+                }
+            }
+        }
+
+        let mut ifaces_added = om.receive_interfaces_added().await.map_err(|e| {
+            FerricastError::Discovery(format!("Subscribe to InterfacesAdded: {e}"))
+        })?;
+
+        let handle = tokio::spawn(async move {
+            tracing::info!("Miracast discovery started (iwd backend)");
+            while let Some(sig) = ifaces_added.next().await {
+                let result: Result<()> = async {
+                    let args = sig.args().map_err(|e| {
+                        FerricastError::Discovery(format!("InterfacesAdded args: {e}"))
+                    })?;
+
+                    let props = match args.interfaces.get(IWD_P2P_PEER_IFACE) {
+                        Some(p) => p,
+                        None => return Ok(()),
+                    };
+
+                    if let Some(ev) = peer_event_from_iwd_props(&args.path, props) {
+                        tx.send(ev).await.map_err(|_| {
+                            FerricastError::Discovery("DiscoveryEvent channel closed".into())
+                        })?;
+                    }
+                    Ok(())
+                }
+                .await;
+
+                if let Err(e) = result {
+                    tracing::error!(%e, "iwd peer handling error");
+                }
+            }
+            tracing::warn!("iwd InterfacesAdded stream ended");
+        });
+
+        self.handle = Some(handle);
+        self.backend = Some(ActiveBackend::Iwd { conn, device_path });
+        self.running = true;
+        Ok(())
+    }
+}
+
+// ── backend detection ─────────────────────────────────────────────────────────
+
+/// Returns the iwd adapter path that exposes `net.connman.iwd.p2p.Device`,
+/// or `None` if iwd is not running or has no P2P-capable adapter.
+async fn find_iwd_p2p_device(conn: &Connection) -> Option<OwnedObjectPath> {
+    // Quick check: is iwd even on the bus?
+    let om = IwdObjectManagerProxy::new(conn).await.ok()?;
+    let objects = om.get_managed_objects().await.ok()?;
+    objects
+        .into_iter()
+        .find(|(_, ifaces)| ifaces.contains_key(IWD_P2P_DEVICE_IFACE))
+        .map(|(path, _)| path)
+}
+
+/// Returns the NM device object path with type `NM_DEVICE_TYPE_WIFI_P2P`,
+/// or `None` if NM is not reachable or has no P2P device.
+async fn find_nm_p2p_device(conn: &Connection) -> Result<Option<OwnedObjectPath>> {
+    let nm = match NetworkManagerProxy::new(conn).await {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    let devices = match nm.get_devices().await {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+
+    for path in devices {
+        let dev = DeviceProxy::new(conn, path.clone()).await.map_err(|e| {
+            FerricastError::Discovery(format!("NM Device proxy: {e}"))
+        })?;
+        if dev.device_type().await.unwrap_or(0) == NM_DEVICE_TYPE_WIFI_P2P {
+            let iface = dev.interface().await.unwrap_or_default();
+            tracing::info!(iface, %path, "found NM Wi-Fi P2P device");
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+// ── iwd peer parsing ──────────────────────────────────────────────────────────
+
+/// Extracts a `DiscoveryEvent::DeviceFound` from an iwd peer's property dict
+/// (from `InterfacesAdded` or `GetManagedObjects`).
 ///
-/// The WFD IE layout (Wi-Fi Display spec §5.1.2):
-/// `[subelement_id(1)] [length(2)] [device_info(2)] [session_mgmt_ctrl_port(2)] [throughput(2)]`
+/// Returns `None` when the peer is not a Miracast sink.
+fn peer_event_from_iwd_props(
+    path: &OwnedObjectPath,
+    props: &HashMap<String, zbus::zvariant::OwnedValue>,
+) -> Option<DiscoveryEvent> {
+    let wfd_ies: Vec<u8> = props
+        .get("WFDElements")
+        .and_then(|v| {
+            if let zbus::zvariant::Value::Array(arr) = &**v {
+                Some(
+                    arr.iter()
+                        .filter_map(|e| {
+                            if let zbus::zvariant::Value::U8(b) = e {
+                                Some(*b)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    if !is_miracast_sink(&wfd_ies) {
+        return None;
+    }
+
+    let name: String = props
+        .get("Name")
+        .and_then(|v| {
+            if let zbus::zvariant::Value::Str(s) = &**v {
+                Some(s.as_str().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let hw_address: String = props
+        .get("DeviceAddress")
+        .and_then(|v| {
+            if let zbus::zvariant::Value::Str(s) = &**v {
+                Some(s.as_str().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    tracing::debug!(name, hw_address, wfd_ie_len = wfd_ies.len(), "iwd Miracast sink found");
+
+    let wfd_port = parse_wfd_rtsp_port(&wfd_ies);
+
+    let mut metadata = HashMap::new();
+    metadata.insert("path".into(), path.to_string());
+    metadata.insert("hw_address".into(), hw_address);
+    metadata.insert("backend".into(), "iwd".into());
+
+    Some(DiscoveryEvent::DeviceFound(make_device(
+        name, None, wfd_port, metadata,
+    )))
+}
+
+// ── shared helpers ────────────────────────────────────────────────────────────
+
+fn make_device(
+    name: String,
+    model: Option<String>,
+    wfd_port: u16,
+    metadata: HashMap<String, String>,
+) -> Device {
+    Device {
+        id: Uuid::new_v4(),
+        name,
+        protocol: "miracast",
+        protocol_icon: MIRACAST_ICON,
+        addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        port: wfd_port,
+        model,
+        capabilities: DeviceCapabilities {
+            supports_video: true,
+            supports_screen_mirror: true,
+            ..Default::default()
+        },
+        metadata,
+    }
+}
+
+/// Parses the WFD RTSP port from WFD IE bytes (WFD subelement 0x00).
 pub fn parse_wfd_rtsp_port(wfd_ies: &[u8]) -> u16 {
-    // Full subelement format: ID(1) + len(2) + device_info(2) + port(2) + throughput(2) = 9 bytes minimum
     if wfd_ies.len() >= 9 && wfd_ies[0] == 0x00 {
         let subelement_len = u16::from_be_bytes([wfd_ies[1], wfd_ies[2]]);
         if subelement_len >= 6 {
             return u16::from_be_bytes([wfd_ies[5], wfd_ies[6]]);
         }
     }
-    // Abbreviated form without subelement wrapper (some devices omit the outer IE header)
     if wfd_ies.len() >= 6 && wfd_ies[0] == 0x00 {
         return u16::from_be_bytes([wfd_ies[4], wfd_ies[5]]);
     }
-    // Bare 3-byte form
     if wfd_ies.len() >= 3 {
         return u16::from_be_bytes([wfd_ies[1], wfd_ies[2]]);
     }
-    // WFD default port (Wi-Fi Display spec §6.5)
     7236
 }
 
-/// Returns `true` when the WFD IEs indicate a Miracast sink (not a source or dual-role).
-///
-/// Checks the `Device Type` bits in WFD Device Information subelement (bits [1:0]):
-/// - 0 = Source
-/// - 1 = Primary Sink  ← what we want
-/// - 2 = Secondary Sink
-/// - 3 = Dual Role
+/// Returns `true` when WFD IEs indicate a Miracast sink (device type ≠ Source).
 fn is_miracast_sink(wfd_ies: &[u8]) -> bool {
     if wfd_ies.is_empty() {
         return false;
     }
-
-    // WFD Vendor-Specific IE wrapping (0xDD OUI 50:6F:9A:0A)
+    // Vendor-Specific IE wrapper (0xDD OUI 50:6F:9A:0A)
     if wfd_ies[0] == 0xdd && wfd_ies.len() >= 7 {
-        // bytes: DD len 50 6F 9A 0A [subelements...]
-        let payload = &wfd_ies[6..];
-        return is_miracast_sink(payload);
+        return is_miracast_sink(&wfd_ies[6..]);
     }
-
-    // WFD Device Information subelement (ID=0x00)
+    // WFD Device Information subelement (ID=0x00): bits [1:0] = device type
+    // 0=Source, 1=Primary Sink, 2=Secondary Sink, 3=Dual Role
     if wfd_ies[0] == 0x00 && wfd_ies.len() >= 5 {
-        // device_info is bytes [3..5] (after ID + 2-byte length)
         let device_info = u16::from_be_bytes([wfd_ies[3], wfd_ies[4]]);
         let device_type = device_info & 0x0003;
-        // 1 = Primary Sink, 2 = Secondary Sink, 3 = Dual Role
         tracing::debug!(device_type, device_info, "WFD Device Information");
         return device_type != 0;
     }
-
-    // Fallback: accept any non-empty WFD IE (permissive for unknown formats)
-    let first = wfd_ies[0];
-    first == 0x00 || first == 0x01 || first == 0x06 || first == 0x07
+    // Permissive fallback for unknown IE formats
+    matches!(wfd_ies[0], 0x00 | 0x01 | 0x06 | 0x07)
 }
-

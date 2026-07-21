@@ -10,8 +10,9 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use ferricast_core::{CastSession, Device, EncodedFrame, FerricastError, Result, StreamConfig};
 
 use crate::dbus::{
-    ActiveConnectionProxy, Ip4ConfigProxy, NM_ACTIVE_CONNECTION_STATE_ACTIVATED,
-    NM_ACTIVE_CONNECTION_STATE_DEACTIVATED, NetworkManagerProxy,
+    ActiveConnectionProxy, Ip4ConfigProxy, IwdP2pPeerProxy,
+    NM_ACTIVE_CONNECTION_STATE_ACTIVATED, NM_ACTIVE_CONNECTION_STATE_DEACTIVATED,
+    NetworkManagerProxy,
 };
 
 // ── constants ─────────────────────────────────────────────────────────────────
@@ -35,6 +36,13 @@ const PID_VIDEO: u16 = 0x0100;
 const STREAM_TYPE_H264: u8 = 0x1B;
 const PES_STREAM_ID_VIDEO: u8 = 0xE0;
 
+// ── active connection discriminator ──────────────────────────────────────────
+
+enum ActiveConnection {
+    Nm(OwnedObjectPath),
+    Iwd(OwnedObjectPath),
+}
+
 // ── session state ─────────────────────────────────────────────────────────────
 
 /// Miracast (Wi-Fi Display) streaming session.
@@ -42,7 +50,7 @@ const PES_STREAM_ID_VIDEO: u8 = 0xE0;
 /// Lifecycle: `Default` → `connect()` → `setup_stream()` → `send_frame()` loop → `stop()`.
 pub struct MiracastSession {
     dbus: Option<Connection>,
-    active_nm_path: Option<OwnedObjectPath>,
+    active_connection: Option<ActiveConnection>,
     rtsp: Option<BufReader<TcpStream>>,
     rtp: Option<UdpSocket>,
     sink_rtp_addr: Option<SocketAddr>,
@@ -73,7 +81,7 @@ impl Default for MiracastSession {
     fn default() -> Self {
         Self {
             dbus: None,
-            active_nm_path: None,
+            active_connection: None,
             rtsp: None,
             rtp: None,
             sink_rtp_addr: None,
@@ -90,89 +98,11 @@ impl Default for MiracastSession {
 }
 
 impl CastSession for MiracastSession {
-    /// Establishes the Wi-Fi P2P connection via NetworkManager (no sudo required —
-    /// NM handles privilege escalation through PolicyKit) and opens the WFD RTSP
-    /// control channel to the sink.
     async fn connect(&mut self, device: &Device) -> Result<()> {
-        let peer_dbus_path = device
-            .metadata
-            .get("path")
-            .ok_or_else(|| FerricastError::Connection("Missing 'path' in device metadata".into()))
-            .and_then(|s| {
-                OwnedObjectPath::try_from(s.as_str())
-                    .map_err(|e| FerricastError::Connection(format!("Invalid peer D-Bus path: {e}")))
-            })?;
-
-        let p2p_device_path = device
-            .metadata
-            .get("device_path")
-            .ok_or_else(|| {
-                FerricastError::Connection("Missing 'device_path' in device metadata".into())
-            })
-            .and_then(|s| {
-                OwnedObjectPath::try_from(s.as_str())
-                    .map_err(|e| FerricastError::Connection(format!("Invalid device D-Bus path: {e}")))
-            })?;
-
-        let hw_address = device
-            .metadata
-            .get("hw_address")
-            .ok_or_else(|| {
-                FerricastError::Connection("Missing 'hw_address' in device metadata".into())
-            })?
-            .clone();
-
-        let conn = Connection::system().await.map_err(|e| {
-            FerricastError::Connection(format!("D-Bus system bus unavailable: {e}"))
-        })?;
-
-        let nm = NetworkManagerProxy::new(&conn).await.map_err(|e| {
-            FerricastError::Connection(format!("Cannot reach NetworkManager: {e}"))
-        })?;
-
-        // Build the NM connection dict for a Wi-Fi P2P connection.
-        let connection_dict = build_p2p_connection_dict(&hw_address)?;
-
-        let (_, active_path, _) = nm
-            .add_and_activate_connection2(
-                connection_dict,
-                p2p_device_path,
-                peer_dbus_path,
-                HashMap::new(),
-            )
-            .await
-            .map_err(|e| {
-                FerricastError::Connection(format!("NM.AddAndActivateConnection2 failed: {e}"))
-            })?;
-
-        tracing::info!(%active_path, "P2P connection activating");
-
-        // Wait for ACTIVATED (or failure) with a timeout.
-        let sink_ip = wait_for_ip(&conn, &active_path).await?;
-        tracing::info!(%sink_ip, "P2P connection activated");
-
-        let wfd_port = if device.port == 0 {
-            WFD_DEFAULT_PORT
-        } else {
-            device.port
-        };
-
-        let sink_addr = SocketAddr::new(IpAddr::V4(sink_ip), wfd_port);
-        tracing::info!(%sink_addr, "Connecting RTSP to Miracast sink");
-
-        let tcp = tokio::time::timeout(
-            Duration::from_secs(10),
-            TcpStream::connect(sink_addr),
-        )
-        .await
-        .map_err(|_| FerricastError::Connection("RTSP TCP connect timed out".into()))?
-        .map_err(|e| FerricastError::Connection(format!("RTSP TCP connect failed: {e}")))?;
-
-        self.dbus = Some(conn);
-        self.active_nm_path = Some(active_path);
-        self.rtsp = Some(BufReader::new(tcp));
-        self.alive = true;
-        Ok(())
+        match device.metadata.get("backend").map(String::as_str) {
+            Some("iwd") => self.connect_iwd(device).await,
+            _ => self.connect_nm(device).await,
+        }
     }
 
     /// Runs the WFD RTSP M1–M7 handshake and binds the RTP sender socket.
@@ -392,12 +322,26 @@ impl CastSession for MiracastSession {
         self.rtsp = None;
         self.rtp = None;
 
-        // Deactivate the NM P2P connection.
-        if let (Some(conn), Some(path)) = (self.dbus.take(), self.active_nm_path.take()) {
-            if let Ok(nm) = NetworkManagerProxy::new(&conn).await {
-                if let Err(e) = nm.deactivate_connection(path).await {
-                    tracing::warn!("NM.DeactivateConnection failed: {e}");
+        if let Some(conn) = self.dbus.take() {
+            match self.active_connection.take() {
+                Some(ActiveConnection::Nm(path)) => {
+                    if let Ok(nm) = NetworkManagerProxy::new(&conn).await {
+                        if let Err(e) = nm.deactivate_connection(path).await {
+                            tracing::warn!("NM.DeactivateConnection failed: {e}");
+                        }
+                    }
                 }
+                Some(ActiveConnection::Iwd(peer_path)) => {
+                    match IwdP2pPeerProxy::new(&conn, peer_path).await {
+                        Ok(peer) => {
+                            if let Err(e) = peer.disconnect().await {
+                                tracing::warn!("iwd P2P disconnect failed: {e}");
+                            }
+                        }
+                        Err(e) => tracing::warn!("iwd peer proxy for disconnect: {e}"),
+                    }
+                }
+                None => {}
             }
         }
 
@@ -406,6 +350,135 @@ impl CastSession for MiracastSession {
 
     fn is_alive(&self) -> bool {
         self.alive
+    }
+}
+
+// ── backend connect helpers ───────────────────────────────────────────────────
+
+impl MiracastSession {
+    async fn connect_nm(&mut self, device: &Device) -> Result<()> {
+        let peer_dbus_path = device
+            .metadata
+            .get("path")
+            .ok_or_else(|| FerricastError::Connection("Missing 'path' in device metadata".into()))
+            .and_then(|s| {
+                OwnedObjectPath::try_from(s.as_str())
+                    .map_err(|e| FerricastError::Connection(format!("Invalid peer D-Bus path: {e}")))
+            })?;
+
+        let p2p_device_path = device
+            .metadata
+            .get("device_path")
+            .ok_or_else(|| {
+                FerricastError::Connection("Missing 'device_path' in device metadata".into())
+            })
+            .and_then(|s| {
+                OwnedObjectPath::try_from(s.as_str())
+                    .map_err(|e| FerricastError::Connection(format!("Invalid device D-Bus path: {e}")))
+            })?;
+
+        let hw_address = device
+            .metadata
+            .get("hw_address")
+            .ok_or_else(|| {
+                FerricastError::Connection("Missing 'hw_address' in device metadata".into())
+            })?
+            .clone();
+
+        let conn = Connection::system().await.map_err(|e| {
+            FerricastError::Connection(format!("D-Bus system bus unavailable: {e}"))
+        })?;
+
+        let nm = NetworkManagerProxy::new(&conn).await.map_err(|e| {
+            FerricastError::Connection(format!("Cannot reach NetworkManager: {e}"))
+        })?;
+
+        let connection_dict = build_p2p_connection_dict(&hw_address)?;
+
+        let (_, active_path, _) = nm
+            .add_and_activate_connection2(
+                connection_dict,
+                p2p_device_path,
+                peer_dbus_path,
+                HashMap::new(),
+            )
+            .await
+            .map_err(|e| {
+                FerricastError::Connection(format!("NM.AddAndActivateConnection2 failed: {e}"))
+            })?;
+
+        tracing::info!(%active_path, "P2P connection activating (NM)");
+
+        let sink_ip = wait_for_ip(&conn, &active_path).await?;
+        tracing::info!(%sink_ip, "P2P connection activated");
+
+        let wfd_port = if device.port == 0 { WFD_DEFAULT_PORT } else { device.port };
+        let sink_addr = SocketAddr::new(IpAddr::V4(sink_ip), wfd_port);
+        tracing::info!(%sink_addr, "Connecting RTSP to Miracast sink (NM)");
+
+        let tcp = tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(sink_addr),
+        )
+        .await
+        .map_err(|_| FerricastError::Connection("RTSP TCP connect timed out".into()))?
+        .map_err(|e| FerricastError::Connection(format!("RTSP TCP connect failed: {e}")))?;
+
+        self.dbus = Some(conn);
+        self.active_connection = Some(ActiveConnection::Nm(active_path));
+        self.rtsp = Some(BufReader::new(tcp));
+        self.alive = true;
+        Ok(())
+    }
+
+    async fn connect_iwd(&mut self, device: &Device) -> Result<()> {
+        let peer_path = device
+            .metadata
+            .get("path")
+            .ok_or_else(|| FerricastError::Connection("Missing 'path' in device metadata".into()))
+            .and_then(|s| {
+                OwnedObjectPath::try_from(s.as_str())
+                    .map_err(|e| FerricastError::Connection(format!("Invalid peer D-Bus path: {e}")))
+            })?;
+
+        let conn = Connection::system().await.map_err(|e| {
+            FerricastError::Connection(format!("D-Bus system bus unavailable: {e}"))
+        })?;
+
+        let peer = IwdP2pPeerProxy::new(&conn, peer_path.clone())
+            .await
+            .map_err(|e| FerricastError::Connection(format!("iwd P2P peer proxy: {e}")))?;
+
+        tracing::info!(%peer_path, "Connecting iwd P2P peer (group formation + DHCP)");
+
+        // iwd's connect() blocks until P2P group formation and DHCP are complete.
+        tokio::time::timeout(Duration::from_secs(45), peer.connect())
+            .await
+            .map_err(|_| FerricastError::Connection("iwd P2P connect timed out after 45s".into()))?
+            .map_err(|e| FerricastError::Connection(format!("iwd P2P connect: {e}")))?;
+
+        tracing::info!("iwd P2P group formed — resolving peer IP from ARP cache");
+
+        let sink_ip = find_p2p_peer_ip().await?;
+        tracing::info!(%sink_ip, "P2P peer IP resolved");
+
+        let wfd_port = if device.port == 0 { WFD_DEFAULT_PORT } else { device.port };
+        let sink_addr = SocketAddr::new(IpAddr::V4(sink_ip), wfd_port);
+        tracing::info!(%sink_addr, "Connecting RTSP to Miracast sink (iwd)");
+
+        let tcp = tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(sink_addr),
+        )
+        .await
+        .map_err(|_| FerricastError::Connection("RTSP TCP connect timed out".into()))?
+        .map_err(|e| FerricastError::Connection(format!("RTSP TCP connect failed: {e}")))?;
+
+        self.dbus = Some(conn);
+        self.active_connection = Some(ActiveConnection::Iwd(peer_path));
+        self.rtsp = Some(BufReader::new(tcp));
+        self.alive = true;
+        Ok(())
     }
 }
 
@@ -499,6 +572,46 @@ async fn extract_gateway(
     gateway.parse::<Ipv4Addr>().map_err(|e| {
         FerricastError::Connection(format!("Cannot parse gateway IP '{gateway}': {e}"))
     })
+}
+
+// ── iwd helpers ──────────────────────────────────────────────────────────────
+
+/// Polls `/proc/net/arp` until a complete ARP entry appears on a `p2p-*` interface.
+///
+/// iwd populates the ARP cache after DHCP completes; this may take a few
+/// hundred milliseconds after `IwdP2pPeer.connect()` returns.
+async fn find_p2p_peer_ip() -> Result<Ipv4Addr> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let content = tokio::fs::read_to_string("/proc/net/arp")
+            .await
+            .map_err(|e| FerricastError::Connection(format!("Cannot read /proc/net/arp: {e}")))?;
+
+        // /proc/net/arp columns: IP address, HW type, Flags, HW address, Mask, Device
+        // Flags 0x0 = incomplete; 0x2 = complete; 0x6 = published+complete.
+        for line in content.lines().skip(1) {
+            let mut cols = line.split_whitespace();
+            let ip_str = cols.next().unwrap_or("");
+            let _ = cols.next(); // HW type
+            let flags = cols.next().unwrap_or("0x0");
+            let _ = cols.next(); // HW address
+            let _ = cols.next(); // Mask
+            let dev = cols.next().unwrap_or("");
+
+            if dev.starts_with("p2p-") && flags != "0x0" {
+                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                    return Ok(ip);
+                }
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(FerricastError::Connection(
+                "Timed out waiting for P2P peer IP in ARP cache (p2p-* interface)".into(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 // ── RTSP helpers ─────────────────────────────────────────────────────────────
