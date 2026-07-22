@@ -28,7 +28,12 @@ const TS_PACKET: usize = 188;
 /// TS packets per RTP packet — keeps payload ≤ 1316 bytes.
 const TS_PER_RTP: usize = 7;
 /// How long to wait for the P2P connection to reach ACTIVATED.
-const P2P_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// wpa_supplicant re-scans all P2P channels after P2P_CONNECT to locate
+/// the peer (up to ~30 s on busy spectrum), then GO negotiation, WPS PBC
+/// exchange, and DHCP each add 5-15 s.  120 s gives the full chain room
+/// to complete even on congested 2.4 GHz.
+const P2P_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 
 const PID_PAT: u16 = 0x0000;
 const PID_PMT: u16 = 0x1000;
@@ -395,12 +400,23 @@ impl MiracastSession {
 
         let connection_dict = build_p2p_connection_dict(&hw_address)?;
 
+        // "volatile" — NM discards this profile as soon as it deactivates,
+        // so failed P2P attempts don't accumulate stale profiles in NM's
+        // settings storage across reconnect attempts.
+        let mut activate_opts: HashMap<String, OwnedValue> = HashMap::new();
+        activate_opts.insert(
+            "persist".into(),
+            OwnedValue::try_from(Value::from("volatile")).map_err(|e| {
+                FerricastError::Connection(format!("zvariant: {e}"))
+            })?,
+        );
+
         let (_, active_path, _) = nm
             .add_and_activate_connection2(
                 connection_dict,
                 p2p_device_path,
                 peer_dbus_path,
-                HashMap::new(),
+                activate_opts,
             )
             .await
             .map_err(|e| {
