@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use ferricast_core::{
-    AudioCodec, AudioFrame, CastSession, Codec, Device, EncodedFrame, FerricastError, Result,
-    StreamConfig, bind_udp_in_range,
+    AudioCodec, AudioFrame, CastSession, Codec, Device, EncodedFrame, FerricastError, H264Profile,
+    Result, StreamConfig, bind_udp_in_range,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -173,6 +173,11 @@ pub struct ChromecastMirrorSession {
     state: Option<ConnectedState>,
     stream: Option<MirrorStreamState>,
     cfg: Option<StreamConfig>,
+    /// H.264 profile the encoder will use, captured from device caps during
+    /// `connect` so `setup_stream` can advertise the matching profile_idc in
+    /// the OFFER. Mismatching profile (e.g. advertising Main while sending
+    /// High) causes receivers to mis-configure their decoder → black video.
+    h264_profile: Option<H264Profile>,
 }
 
 struct ConnectedState {
@@ -222,6 +227,36 @@ struct MirrorStreamState {
     /// Background task that listens on the UDP recv half for RTCP from the
     /// Chromecast (primarily PLI, but also RR). Aborted in `stop()`.
     rtcp_handle: JoinHandle<()>,
+}
+
+// ── Codec parameter helpers ───────────────────────────────────────────────────
+
+/// Map `H264Profile` → profile_idc hex string used in the Cast OFFER.
+fn h264_profile_hex(profile: Option<H264Profile>) -> &'static str {
+    match profile {
+        Some(H264Profile::High) => "64",
+        Some(H264Profile::Baseline) => "42",
+        Some(H264Profile::Main) | None => "4d",
+    }
+}
+
+/// Derive the minimum H.264 level_idc that covers the given resolution and
+/// frame rate.  Returns the decimal level_idc value (e.g. 42 = Level 4.2).
+/// Based on the MaxMBsPerSec limits in the H.264 spec Table A-1.
+fn h264_level_idc(width: u32, height: u32, fps: u32) -> u32 {
+    // Macro-blocks per second (each MB = 16×16 luma samples).
+    let mbs_per_sec = ((width + 15) / 16) * ((height + 15) / 16) * fps;
+    match mbs_per_sec {
+        ..=40_500 => 30,
+        ..=108_000 => 31,
+        ..=216_000 => 32,
+        ..=245_760 => 40,
+        ..=522_240 => 42,
+        ..=589_824 => 50,
+        ..=983_040 => 51,
+        ..=2_073_600 => 52,
+        _ => 52,
+    }
 }
 
 // ── CastSession implementation ────────────────────────────────────────────────
@@ -315,6 +350,7 @@ impl CastSession for ChromecastMirrorSession {
         let heartbeat_handle =
             tokio::spawn(mirror_heartbeat_loop(writer.clone(), alive.clone()));
 
+        self.h264_profile = device.capabilities.max_h264_profile;
         self.state = Some(ConnectedState {
             writer,
             transport_id,
@@ -362,12 +398,8 @@ impl CastSession for ChromecastMirrorSession {
             max_frame_rate: format!("{}/1", config.fps),
             max_bit_rate: config.bitrate_kbps * 1_000,
             video_codec_params: VideoCodecParams {
-                // profile_idc as hex string (openscreen/Chrome format).
-                // NVENC defaults to Main (0x4d=77) when no profile cap
-                // is set from device capabilities.
-                profile: "4d".into(),
-                // level_idc as decimal string: 40 = Level 4.0 (1080p60).
-                level: "40".into(),
+                profile: h264_profile_hex(self.h264_profile).into(),
+                level: h264_level_idc(config.width, config.height, config.fps).to_string(),
                 avc: AvcParams {
                     packetization_mode: 1,
                 },

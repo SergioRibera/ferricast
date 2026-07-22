@@ -482,9 +482,6 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
             FerricastError::Encoder(format!("NVENC ({}): get_sequence_params: {e}", C::NAME))
         });
 
-        // TEMP CHANGE
-        println!("nvenc sps/pps {:?}", a);
-
         a
     }
 }
