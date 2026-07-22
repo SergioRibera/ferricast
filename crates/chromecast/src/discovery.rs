@@ -352,27 +352,35 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         // point of the unit.
         caps.max_audio_bitrate_kbps = Some(320);
     } else if md_lc == "chromecast" {
-        // Matches the conservative defaults above explicitly so
-        // this branch documents the floor.
+        // Generic "Chromecast" — covers 1st, 2nd, and 3rd gen.  3rd gen
+        // firmware (1.36+) supports Cast Streaming; older hardware times
+        // out on OFFER and the manager falls back to HLS automatically,
+        // so enabling it here is safe for all three generations.
+        caps.supports_cast_streaming = true;
+    } else if md_lc.contains("chromecast hd") {
+        // Chromecast with Google TV HD (2022).  The mDNS md field is
+        // "Chromecast HD", which does not match the "google tv" branch
+        // above but is fully capable hardware.
+        caps.max_fps = Some(60);
+        caps.max_bitrate_kbps = Some(15_000);
+        caps.max_audio_bitrate_kbps = Some(256);
+        caps.requires_audio = false;
+        caps.max_h264_profile = Some(H264Profile::High);
+        caps.max_h265_profile = Some(H265Profile::Main10);
+        caps.supports_low_latency_hls = true;
+        caps.supports_cast_streaming = true;
     } else {
-        // Unknown model. Most third-party Cast-built-in devices
-        // (smart speakers with screens, soundbars, TVs that
-        // identify by SKU like "TV-BD5") have decoders at least
-        // on par with Google TV. Bias slightly above floor but
-        // below Ultra to be safe.
+        // Unknown model — third-party Cast-built-in devices (smart TVs,
+        // soundbars, etc.).  Bias above the floor but below Ultra.
+        // Cast Streaming is enabled: if the device rejects the OFFER the
+        // manager falls back to HLS within 10 s.
         caps.max_fps = Some(60);
         caps.max_bitrate_kbps = Some(10_000);
         caps.max_audio_bitrate_kbps = Some(192);
         caps.requires_audio = false;
         caps.max_h264_profile = Some(H264Profile::High);
-        // Optimistic: most modern Cast-built-in firmware handles
-        // EXT-X-VERSION:6 + LL-HLS parts. Falls back gracefully —
-        // if the device locks up on LOADING, disable per-device.
         caps.supports_low_latency_hls = true;
-        // Cast Streaming is disabled for unknown devices until we have
-        // confirmed correct decryption on a wider set of firmware builds.
-        // HLS is reliable; enable Cast Streaming only for known models.
-        caps.supports_cast_streaming = false;
+        caps.supports_cast_streaming = true;
     }
 
     caps

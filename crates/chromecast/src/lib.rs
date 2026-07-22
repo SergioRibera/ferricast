@@ -72,6 +72,21 @@ impl CastSession for ChromecastEitherSession {
                         let _ = session.stop().await;
                         dev
                     }
+                    // Receiver explicitly rejected our OFFER (ANSWER result != "ok")
+                    // or sent a malformed ANSWER we couldn't parse.  Non-fatal:
+                    // the device understands Cast Streaming but won't accept our
+                    // parameters (old firmware, restricted sender policy).
+                    // Fall back to HLS.
+                    Err(FerricastError::Protocol(ref msg)) if msg.contains("ANSWER") =>
+                    {
+                        tracing::warn!(
+                            %msg,
+                            "Cast Streaming OFFER rejected by receiver — falling back to HLS"
+                        );
+                        let dev = connected_device.take();
+                        let _ = session.stop().await;
+                        dev
+                    }
                     Err(e) => return Err(e),
                 }
             }
