@@ -6,6 +6,7 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 pub const NM_DEVICE_TYPE_WIFI_P2P: u32 = 30;
 pub const NM_ACTIVE_CONNECTION_STATE_ACTIVATED: u32 = 2;
+pub const NM_ACTIVE_CONNECTION_STATE_DEACTIVATING: u32 = 3;
 pub const NM_ACTIVE_CONNECTION_STATE_DEACTIVATED: u32 = 4;
 
 // ── iwd constants ─────────────────────────────────────────────────────────────

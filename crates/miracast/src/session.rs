@@ -12,7 +12,7 @@ use ferricast_core::{CastSession, Device, EncodedFrame, FerricastError, Result, 
 use crate::dbus::{
     ActiveConnectionProxy, Ip4ConfigProxy, IwdP2pPeerProxy,
     NM_ACTIVE_CONNECTION_STATE_ACTIVATED, NM_ACTIVE_CONNECTION_STATE_DEACTIVATED,
-    NetworkManagerProxy,
+    NM_ACTIVE_CONNECTION_STATE_DEACTIVATING, NetworkManagerProxy,
 };
 
 // ── constants ─────────────────────────────────────────────────────────────────
@@ -509,6 +509,33 @@ fn build_p2p_connection_dict(
             FerricastError::Connection(format!("zvariant: {e}"))
         })?,
     );
+    // Push-Button Configuration — the standard WPS method for Miracast.
+    // NM_SETTING_WIFI_P2P_WPS_METHOD_PUSH_BUTTON = 1.
+    p2p_settings.insert(
+        "wps-method".into(),
+        OwnedValue::try_from(Value::from(1u32)).map_err(|e| {
+            FerricastError::Connection(format!("zvariant: {e}"))
+        })?,
+    );
+    // WFD Source Device Information subelement (ID=0, length=6):
+    //   device type  = 0x00 (WFD Source)
+    //   session avail = 0x01 at bits[5:4] → byte = 0x10
+    //   RTSP port    = 7236 (0x1C44)
+    //   max throughput = 50 Mbps (0x0032)
+    // Without this, some TVs filter P2P peers by WFD source capability
+    // during GO negotiation and silently ignore our connection request.
+    let wfd_ies: Vec<u8> = vec![
+        0x00, 0x00, 0x06, // subelement ID=0, length=6 (big-endian)
+        0x00, 0x10,       // WFD device info: source, session available
+        0x1C, 0x44,       // RTSP port 7236
+        0x00, 0x32,       // max throughput 50 Mbps
+    ];
+    p2p_settings.insert(
+        "wfd-ies".into(),
+        OwnedValue::try_from(Value::from(wfd_ies)).map_err(|e| {
+            FerricastError::Connection(format!("zvariant: {e}"))
+        })?,
+    );
 
     let mut dict = HashMap::new();
     dict.insert("connection".into(), connection_settings);
@@ -529,16 +556,31 @@ async fn wait_for_ip(conn: &Connection, active_path: &OwnedObjectPath) -> Result
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         loop {
             interval.tick().await;
-            match active.state().await.unwrap_or(0) {
-                NM_ACTIVE_CONNECTION_STATE_ACTIVATED => {
+            match active.state().await {
+                Ok(NM_ACTIVE_CONNECTION_STATE_ACTIVATED) => {
                     return extract_gateway(conn, &active).await;
                 }
-                NM_ACTIVE_CONNECTION_STATE_DEACTIVATED => {
+                Ok(NM_ACTIVE_CONNECTION_STATE_DEACTIVATED) => {
                     return Err(FerricastError::Connection(
                         "P2P connection deactivated before reaching IP assignment".into(),
                     ));
                 }
-                state => {
+                // NM is tearing the connection down — GO negotiation or WPS
+                // failed; wpa_supplicant will finish deactivating momentarily.
+                // Bail immediately rather than burning the full timeout.
+                Ok(NM_ACTIVE_CONNECTION_STATE_DEACTIVATING) => {
+                    return Err(FerricastError::Connection(
+                        "P2P connection deactivating — GO negotiation or WPS failed".into(),
+                    ));
+                }
+                // NM removed the ActiveConnection object (connection failed and
+                // was cleaned up before we polled).  Treat as fatal.
+                Err(e) => {
+                    return Err(FerricastError::Connection(format!(
+                        "P2P active-connection proxy error (NM removed the object?): {e}"
+                    )));
+                }
+                Ok(state) => {
                     tracing::debug!(state, "waiting for P2P activation");
                 }
             }
