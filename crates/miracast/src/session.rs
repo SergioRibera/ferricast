@@ -509,14 +509,6 @@ fn build_p2p_connection_dict(
             FerricastError::Connection(format!("zvariant: {e}"))
         })?,
     );
-    // Push-Button Configuration — the standard WPS method for Miracast.
-    // NM_SETTING_WIFI_P2P_WPS_METHOD_PUSH_BUTTON = 1.
-    p2p_settings.insert(
-        "wps-method".into(),
-        OwnedValue::try_from(Value::from(1u32)).map_err(|e| {
-            FerricastError::Connection(format!("zvariant: {e}"))
-        })?,
-    );
     // WFD Source Device Information subelement (ID=0, length=6):
     //   device type  = 0x00 (WFD Source)
     //   session avail = 0x01 at bits[5:4] → byte = 0x10
