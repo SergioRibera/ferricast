@@ -538,20 +538,7 @@ fn build_p2p_connection_dict(
             FerricastError::Connection(format!("zvariant: {e}"))
         })?,
     );
-    // WFD Source Device Information subelement (ID=0, length=6):
-    //   device type  = 0x00 (WFD Source)
-    //   session avail = 0x01 at bits[5:4] → byte = 0x10
-    //   RTSP port    = 7236 (0x1C44)
-    //   max throughput = 50 Mbps (0x0032)
-    // Without this, some TVs filter P2P peers by WFD source capability
-    // during GO negotiation and silently ignore our connection request.
-          let wfd_ies: Vec<u8> = vec![
-            0x00, // Subelement ID: WFD Device Information
-            0x00, 0x06, // Length: 6 bytes
-            0x00, 0x90, // Device Info: GNOME-compatible source capabilities
-            0x1C, 0x44, // RTSP Port: 7236 (big-endian)
-            0x00, 0xC8, // Max Throughput: 200 Mbps
-        ];
+    let wfd_ies = wfd_source_ies();
 
     p2p_settings.insert(
         "wfd-ies".into(),
@@ -663,6 +650,25 @@ async fn extract_gateway(
     // Sink's IP is in the ARP cache on the p2p-* interface.
     tracing::debug!("NM IP4Config.Gateway empty — we are GO; falling back to ARP lookup");
     find_p2p_peer_ip().await
+}
+
+// ── WFD source IEs ───────────────────────────────────────────────────────────
+
+/// WFD Device Information subelement (ID=0, length=6) for a Miracast source:
+///   bits[1:0]  = 0b00  (WFD Source)
+///   bits[5:4]  = 0b01  (Session Available)
+///   → device_info = 0x0010
+///
+/// 0x0090 (used previously) additionally sets bit 7 (Tunneled TDLS Support)
+/// which is not required and causes some TVs to reject the connection.
+pub(crate) fn wfd_source_ies() -> Vec<u8> {
+    vec![
+        0x00,       // Subelement ID: WFD Device Information
+        0x00, 0x06, // Length: 6 bytes
+        0x00, 0x10, // Device Info: Source, session available
+        0x1C, 0x44, // RTSP port: 7236 (big-endian)
+        0x00, 0x32, // Max throughput: 50 Mbps
+    ]
 }
 
 // ── iwd helpers ──────────────────────────────────────────────────────────────

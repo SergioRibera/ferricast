@@ -14,6 +14,7 @@ use crate::dbus::{
     IwdObjectManagerProxy, IwdP2pDeviceProxy, NM_DEVICE_TYPE_WIFI_P2P, NetworkManagerProxy,
     P2pPeerProxy, WifiP2pProxy,
 };
+use crate::session::wfd_source_ies;
 
 const MIRACAST_ICON: Bytes = Bytes::from_static(include_bytes!("../../../assets/miracast.svg"));
 
@@ -131,6 +132,19 @@ impl MiracastDiscovery {
             FerricastError::Discovery(format!("NM WifiP2P.StartFind: {e}"))
         })?;
 
+        // NM with iwd backend: iwd manages the P2P device underneath.
+        // Set WFD source IEs on the iwd device so probe responses include
+        // our capabilities — TVs filter on these during screen-mirror scan.
+        if let Some(iwd_path) = find_iwd_p2p_device(&conn).await {
+            if let Ok(iwd_dev) = IwdP2pDeviceProxy::new(&conn, iwd_path).await {
+                if let Err(e) = iwd_dev.set_WFDElements(wfd_source_ies()).await {
+                    tracing::debug!("iwd WFDElements via NM path not settable (non-fatal): {e}");
+                } else {
+                    tracing::debug!("WFD source IEs set on iwd device (NM discovery path)");
+                }
+            }
+        }
+
         let mut peer_added = p2p.receive_peer_added().await.map_err(|e| {
             FerricastError::Discovery(format!("Subscribe to PeerAdded: {e}"))
         })?;
@@ -208,6 +222,15 @@ impl MiracastDiscovery {
         let dev = IwdP2pDeviceProxy::new(&conn, device_path.clone())
             .await
             .map_err(|e| FerricastError::Discovery(format!("iwd P2P device proxy: {e}")))?;
+
+        // Advertise ourselves as a WFD Source in P2P probe responses so TVs
+        // in screen-mirror mode can identify us during their scan.
+        // Non-fatal: iwd only supports this when compiled with WFD support.
+        if let Err(e) = dev.set_WFDElements(wfd_source_ies()).await {
+            tracing::debug!("iwd WFDElements not settable (non-fatal): {e}");
+        } else {
+            tracing::debug!("WFD source IEs set on iwd P2P device");
+        }
 
         dev.request_discovery().await.map_err(|e| {
             FerricastError::Discovery(format!("iwd RequestDiscovery: {e}"))

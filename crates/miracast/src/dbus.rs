@@ -169,6 +169,16 @@ pub trait IwdP2pDevice {
     fn set_enabled(&self, value: bool) -> zbus::Result<()>;
     #[zbus(property)]
     fn name(&self) -> zbus::Result<String>;
+
+    /// WFD source IEs broadcast in P2P probe responses so sinks recognise us
+    /// as a Miracast source during their scan.  Only present when iwd is built
+    /// with WFD support; setting it is non-fatal.
+    #[zbus(property)]
+    #[allow(non_snake_case)]
+    fn WFDElements(&self) -> zbus::Result<Vec<u8>>;
+    #[zbus(property)]
+    #[allow(non_snake_case)]
+    fn set_WFDElements(&self, value: Vec<u8>) -> zbus::Result<()>;
 }
 
 /// iwd P2P peer — appears as a D-Bus object when a peer is discovered.
