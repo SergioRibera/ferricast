@@ -50,3 +50,5 @@ ctr = "0.9"
 # connect fine. The self-signed cert is regenerated per-launch and
 # embedded in the TLS handshake; nothing persists to disk.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rsa = "0.9"
+rand = "0.8"
