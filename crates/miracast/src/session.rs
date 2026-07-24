@@ -653,9 +653,16 @@ async fn extract_gateway(
         FerricastError::Connection(format!("IP4Config.Gateway: {e}"))
     })?;
 
-    gateway.parse::<Ipv4Addr>().map_err(|e| {
-        FerricastError::Connection(format!("Cannot parse gateway IP '{gateway}': {e}"))
-    })
+    if !gateway.is_empty() {
+        return gateway.parse::<Ipv4Addr>().map_err(|e| {
+            FerricastError::Connection(format!("Cannot parse gateway IP '{gateway}': {e}"))
+        });
+    }
+
+    // Gateway is empty → our machine is the P2P Group Owner.
+    // Sink's IP is in the ARP cache on the p2p-* interface.
+    tracing::debug!("NM IP4Config.Gateway empty — we are GO; falling back to ARP lookup");
+    find_p2p_peer_ip().await
 }
 
 // ── iwd helpers ──────────────────────────────────────────────────────────────
