@@ -582,35 +582,38 @@ async fn wait_for_ip(conn: &Connection, active_path: &OwnedObjectPath) -> Result
 
     tokio::time::timeout(P2P_CONNECT_TIMEOUT, async {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
+        let mut last_state = u32::MAX;
         loop {
-                interval.tick().await;
-        
-                match active.state().await {
+            interval.tick().await;
+
+            match active.state().await {
                 Ok(NM_ACTIVE_CONNECTION_STATE_ACTIVATED) => {
+                    tracing::info!("P2P connection ACTIVATED");
                     return extract_gateway(conn, &active).await;
                 }
                 Ok(NM_ACTIVE_CONNECTION_STATE_DEACTIVATED) => {
                     return Err(FerricastError::Connection(
-                        "P2P connection deactivated before reaching IP assignment".into(),
+                        "P2P connection deactivated before IP assignment".into(),
                     ));
                 }
                 // NM is tearing the connection down — GO negotiation or WPS
                 // failed; wpa_supplicant will finish deactivating momentarily.
-                // Bail immediately rather than burning the full timeout.
                 Ok(NM_ACTIVE_CONNECTION_STATE_DEACTIVATING) => {
                     return Err(FerricastError::Connection(
                         "P2P connection deactivating — GO negotiation or WPS failed".into(),
                     ));
                 }
-                // NM removed the ActiveConnection object (connection failed and
-                // was cleaned up before we polled).  Treat as fatal.
+                // NM removed the ActiveConnection object before we polled.
                 Err(e) => {
                     return Err(FerricastError::Connection(format!(
-                        "P2P active-connection proxy error (NM removed the object?): {e}"
+                        "P2P active-connection proxy gone (NM cleaned up?): {e}"
                     )));
                 }
                 Ok(state) => {
-                    tracing::debug!(state, "waiting for P2P activation");
+                    if state != last_state {
+                        last_state = state;
+                        tracing::info!(state, "P2P NM connection state changed");
+                    }
                 }
             }
         }

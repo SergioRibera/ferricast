@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::dbus::{
     DeviceProxy, IWD_P2P_DEVICE_IFACE, IWD_P2P_PEER_IFACE,
     IwdObjectManagerProxy, IwdP2pDeviceProxy, NM_DEVICE_TYPE_WIFI_P2P, NetworkManagerProxy,
-    P2pPeerProxy, WifiP2pProxy,
+    P2pPeerProxy, WifiP2pProxy, WpaInterfaceProxy, WpaSupplicantProxy,
 };
 use crate::session::wfd_source_ies;
 
@@ -128,13 +128,19 @@ impl MiracastDiscovery {
             .await
             .map_err(|e| FerricastError::Discovery(format!("WifiP2P proxy: {e}")))?;
 
-        p2p.start_find(HashMap::new()).await.map_err(|e| {
-            FerricastError::Discovery(format!("NM WifiP2P.StartFind: {e}"))
-        })?;
-
-        // NM with iwd backend: iwd manages the P2P device underneath.
-        // Set WFD source IEs on the iwd device so probe responses include
-        // our capabilities — TVs filter on these during screen-mirror scan.
+        // Set WFD source IEs so P2P probe responses identify our device as a
+        // WFD source.  TVs in screen-mirror mode filter on these before
+        // accepting GO negotiation — without them the TV ignores our connect
+        // attempt and we time out at 45-46 s.
+        //
+        // Two paths depending on what's actually driving the Wi-Fi radio:
+        //   wpa_supplicant backend: set WFDIEs on the wpa_supplicant interface
+        //   iwd backend under NM:   set WFDElements on the iwd P2P device
+        if let Ok(dev) = DeviceProxy::new(&conn, device_path.clone()).await {
+            if let Ok(ifname) = dev.interface().await {
+                set_wpa_supplicant_wfd_ies(&conn, &ifname).await;
+            }
+        }
         if let Some(iwd_path) = find_iwd_p2p_device(&conn).await {
             if let Ok(iwd_dev) = IwdP2pDeviceProxy::new(&conn, iwd_path).await {
                 if let Err(e) = iwd_dev.set_WFDElements(wfd_source_ies()).await {
@@ -144,6 +150,10 @@ impl MiracastDiscovery {
                 }
             }
         }
+
+        p2p.start_find(HashMap::new()).await.map_err(|e| {
+            FerricastError::Discovery(format!("NM WifiP2P.StartFind: {e}"))
+        })?;
 
         let mut peer_added = p2p.receive_peer_added().await.map_err(|e| {
             FerricastError::Discovery(format!("Subscribe to PeerAdded: {e}"))
@@ -289,6 +299,37 @@ impl MiracastDiscovery {
         self.backend = Some(ActiveBackend::Iwd { conn, device_path });
         self.running = true;
         Ok(())
+    }
+}
+
+// ── wpa_supplicant WFD IE helper ─────────────────────────────────────────────
+
+/// Finds the wpa_supplicant interface matching `ifname` and sets our WFD source
+/// IEs on it.  These IEs end up in P2P probe responses so WFD sinks see us as
+/// a WFD source during their scan.
+///
+/// Non-fatal: wpa_supplicant may not be running (iwd system), or may be an
+/// older version without the `WFDIEs` property.  All failures are logged at
+/// DEBUG and silently ignored.
+async fn set_wpa_supplicant_wfd_ies(conn: &Connection, ifname: &str) {
+    let Ok(wpa) = WpaSupplicantProxy::new(conn).await else {
+        tracing::debug!("wpa_supplicant not on D-Bus — skipping WFD IE setup for NM path");
+        return;
+    };
+    let Ok(iface_paths) = wpa.interfaces().await else { return; };
+    for path in iface_paths {
+        let Ok(iface) = WpaInterfaceProxy::new(conn, path).await else { continue; };
+        if iface.ifname().await.ok().as_deref() != Some(ifname) {
+            continue;
+        }
+        match iface.set_WFDIEs(wfd_source_ies()).await {
+            Ok(()) => tracing::info!(ifname, "WFD source IEs set on wpa_supplicant interface"),
+            Err(e) => tracing::debug!(
+                ifname,
+                "wpa_supplicant WFDIEs property not settable (non-fatal): {e}"
+            ),
+        }
+        break;
     }
 }
 

@@ -116,6 +116,42 @@ pub trait Ip4Config {
     fn gateway(&self) -> zbus::Result<String>;
 }
 
+// ── wpa_supplicant proxies ────────────────────────────────────────────────────
+
+/// Root wpa_supplicant object — used to enumerate managed network interfaces.
+#[zbus::proxy(
+    interface = "fi.w1.wpa_supplicant1",
+    default_service = "fi.w1.wpa_supplicant1",
+    default_path = "/fi/w1/wpa_supplicant1"
+)]
+pub trait WpaSupplicant {
+    /// D-Bus object paths of all managed network interfaces.
+    #[zbus(property)]
+    fn interfaces(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+}
+
+/// Per-interface wpa_supplicant object.
+///
+/// `WFDIEs` (available in wpa_supplicant ≥ 2.10) is a byte array of raw
+/// WFD subelements.  When set, wpa_supplicant includes these IEs in P2P
+/// probe responses so WFD sinks can identify our device as a source during
+/// their scan.
+#[zbus::proxy(
+    interface = "fi.w1.wpa_supplicant1.Interface",
+    default_service = "fi.w1.wpa_supplicant1"
+)]
+pub trait WpaInterface {
+    #[zbus(property)]
+    fn ifname(&self) -> zbus::Result<String>;
+
+    #[zbus(property, name = "WFDIEs")]
+    #[allow(non_snake_case)]
+    fn WFDIEs(&self) -> zbus::Result<Vec<u8>>;
+    #[zbus(property, name = "WFDIEs")]
+    #[allow(non_snake_case)]
+    fn set_WFDIEs(&self, value: Vec<u8>) -> zbus::Result<()>;
+}
+
 // ── iwd proxies ───────────────────────────────────────────────────────────────
 
 /// Standard D-Bus ObjectManager on iwd's service root.
