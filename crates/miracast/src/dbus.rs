@@ -30,7 +30,7 @@ pub trait NetworkManager {
         connection: HashMap<String, HashMap<String, OwnedValue>>,
         device: OwnedObjectPath,
         specific_object: OwnedObjectPath,
-        options: HashMap<String, OwnedValue>,
+        options: HashMap<String, zvariant::Value<'_>>,
     ) -> zbus::Result<(OwnedObjectPath, OwnedObjectPath, HashMap<String, OwnedValue>)>;
 
     async fn deactivate_connection(&self, active_connection: OwnedObjectPath)

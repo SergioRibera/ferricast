@@ -390,6 +390,7 @@ impl MiracastSession {
             })?
             .clone();
 
+
         let conn = Connection::system().await.map_err(|e| {
             FerricastError::Connection(format!("D-Bus system bus unavailable: {e}"))
         })?;
@@ -403,12 +404,15 @@ impl MiracastSession {
         // "volatile" — NM discards this profile as soon as it deactivates,
         // so failed P2P attempts don't accumulate stale profiles in NM's
         // settings storage across reconnect attempts.
-        let mut activate_opts: HashMap<String, OwnedValue> = HashMap::new();
+        let mut activate_opts: HashMap<String, Value> = HashMap::new();
         activate_opts.insert(
             "persist".into(),
-            OwnedValue::try_from(Value::from("volatile")).map_err(|e| {
-                FerricastError::Connection(format!("zvariant: {e}"))
-            })?,
+            Value::from("volatile"),
+        );
+
+        activate_opts.insert(
+            "bind-activation".into(),
+            zvariant::Value::Str(zvariant::Str::from("none")),
         );
 
         let (_, active_path, _) = nm
@@ -422,6 +426,8 @@ impl MiracastSession {
             .map_err(|e| {
                 FerricastError::Connection(format!("NM.AddAndActivateConnection2 failed: {e}"))
             })?;
+
+
 
         tracing::info!(%active_path, "P2P connection activating (NM)");
 
@@ -517,6 +523,13 @@ fn build_p2p_connection_dict(
             FerricastError::Connection(format!("zvariant: {e}"))
         })?,
     );
+    
+    connection_settings.insert(
+        "autoconnect".to_string(),
+        OwnedValue::try_from(Value::Bool(false))
+            .map_err(|e| {FerricastError::Connection(format!("zvariant: {e}"))})?
+    );
+
 
     let mut p2p_settings: HashMap<String, OwnedValue> = HashMap::new();
     p2p_settings.insert(
@@ -532,12 +545,14 @@ fn build_p2p_connection_dict(
     //   max throughput = 50 Mbps (0x0032)
     // Without this, some TVs filter P2P peers by WFD source capability
     // during GO negotiation and silently ignore our connection request.
-    let wfd_ies: Vec<u8> = vec![
-        0x00, 0x00, 0x06, // subelement ID=0, length=6 (big-endian)
-        0x00, 0x10,       // WFD device info: source, session available
-        0x1C, 0x44,       // RTSP port 7236
-        0x00, 0x32,       // max throughput 50 Mbps
-    ];
+          let wfd_ies: Vec<u8> = vec![
+            0x00, // Subelement ID: WFD Device Information
+            0x00, 0x06, // Length: 6 bytes
+            0x00, 0x90, // Device Info: GNOME-compatible source capabilities
+            0x1C, 0x44, // RTSP Port: 7236 (big-endian)
+            0x00, 0xC8, // Max Throughput: 200 Mbps
+        ];
+
     p2p_settings.insert(
         "wfd-ies".into(),
         OwnedValue::try_from(Value::from(wfd_ies)).map_err(|e| {
@@ -545,9 +560,27 @@ fn build_p2p_connection_dict(
         })?,
     );
 
+    let mut ipv4_props: HashMap<String, OwnedValue> = HashMap::new();
+    ipv4_props.insert("method".into(), OwnedValue::try_from(zvariant::Value::Str(zvariant::Str::from("auto"))).map_err(|e| FerricastError::Connection(format!("zvariant {e}")))?);
+
+    ipv4_props.insert("never-default".into(), OwnedValue::try_from(zvariant::Value::Bool(true)).map_err(|e| FerricastError::Connection(format!("zvariant {e}")))?);
+
+    
+    let mut ipv6_props: HashMap<String, OwnedValue> = HashMap::new();
+    ipv6_props.insert("method".into(), OwnedValue::try_from(zvariant::Value::Str(zvariant::Str::from("auto"))).map_err(|e| FerricastError::Connection(format!("zvariant {e}")))?);
+
+    ipv6_props.insert("never-default".into(), OwnedValue::try_from(zvariant::Value::Bool(true)).map_err(|e| FerricastError::Connection(format!("zvariant {e}")))?);
+
+        ipv6_props.insert("may-fail".into(), OwnedValue::try_from(zvariant::Value::Bool(true)).map_err(|e| FerricastError::Connection(format!("zvariant {e}")))?);
+
+ 
+
     let mut dict = HashMap::new();
     dict.insert("connection".into(), connection_settings);
     dict.insert("wifi-p2p".into(), p2p_settings);
+    dict.insert("ipv4".into(), ipv4_props);
+    dict.insert("ipv6".into(), ipv6_props);
+
     Ok(dict)
 }
 
@@ -563,8 +596,9 @@ async fn wait_for_ip(conn: &Connection, active_path: &OwnedObjectPath) -> Result
     tokio::time::timeout(P2P_CONNECT_TIMEOUT, async {
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         loop {
-            interval.tick().await;
-            match active.state().await {
+                interval.tick().await;
+        
+                match active.state().await {
                 Ok(NM_ACTIVE_CONNECTION_STATE_ACTIVATED) => {
                     return extract_gateway(conn, &active).await;
                 }
