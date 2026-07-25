@@ -612,7 +612,15 @@ async fn wait_for_ip(conn: &Connection, active_path: &OwnedObjectPath) -> Result
                 Ok(state) => {
                     if state != last_state {
                         last_state = state;
-                        tracing::info!(state, "P2P NM connection state changed");
+                        let state_text = match state {
+                            1 => "NM_ACTIVE_CONNECTION_STATE_ACTIVATING",
+                            2 => "NM_ACTIVE_CONNECTION_STATE_ACTIVATED",
+                            3 => "NM_ACTIVE_CONNECTION_STATE_DEACTIVATING",
+                            4 => "NM_ACTIVE_CONNECTION_STATE_DEACTIVATED",
+                            _ => "NM_ACTIVE_CONNECTION_STATE_UNKNOWN",
+                        };
+
+                        tracing::info!(state_text, "P2P NM connection state changed");
                     }
                 }
             }
