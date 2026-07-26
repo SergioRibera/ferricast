@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_lite::StreamExt;
@@ -162,59 +163,77 @@ impl MiracastDiscovery {
         let conn_task = conn.clone();
         let device_path_str = device_path.to_string();
 
+        // wpa_supplicant's P2P find expires after ~120 s.  Restart it
+        // periodically so new sinks remain discoverable during long sessions.
+        let mut restart_interval = tokio::time::interval(Duration::from_secs(120));
+        restart_interval.tick().await; // skip the immediate first tick
+
         let handle = tokio::spawn(async move {
             tracing::info!("Miracast discovery started (NM backend)");
-            while let Some(sig) = peer_added.next().await {
-                let result: Result<()> = async {
-                    let peer_path = sig
-                        .args()
-                        .map_err(|e| FerricastError::Discovery(format!("PeerAdded args: {e}")))?
-                        .path
-                        .clone();
+            loop {
+                tokio::select! {
+                    sig = peer_added.next() => {
+                        let Some(sig) = sig else {
+                            tracing::warn!("NM PeerAdded stream ended");
+                            break;
+                        };
 
-                    let proxy = P2pPeerProxy::new(&conn_task, peer_path.clone())
-                        .await
-                        .map_err(|e| {
-                            FerricastError::Discovery(format!("P2pPeer proxy: {e}"))
-                        })?;
+                        let result: Result<()> = async {
+                            let peer_path = sig
+                                .args()
+                                .map_err(|e| FerricastError::Discovery(format!("PeerAdded args: {e}")))?
+                                .path
+                                .clone();
 
-                    let name = proxy.name().await.map_err(|e| {
-                        FerricastError::Discovery(format!("P2pPeer.Name: {e}"))
-                    })?;
-                    let hw_address = proxy.hw_address().await.map_err(|e| {
-                        FerricastError::Discovery(format!("P2pPeer.HwAddress: {e}"))
-                    })?;
-                    let wfd_ies = proxy.WfdIEs().await.unwrap_or_default();
+                            let proxy = P2pPeerProxy::new(&conn_task, peer_path.clone())
+                                .await
+                                .map_err(|e| FerricastError::Discovery(format!("P2pPeer proxy: {e}")))?;
 
-                    if !is_miracast_sink(&wfd_ies) {
-                        return Ok(());
+                            let name = proxy.name().await.map_err(|e| {
+                                FerricastError::Discovery(format!("P2pPeer.Name: {e}"))
+                            })?;
+                            let hw_address = proxy.hw_address().await.map_err(|e| {
+                                FerricastError::Discovery(format!("P2pPeer.HwAddress: {e}"))
+                            })?;
+                            let wfd_ies = proxy.WfdIEs().await.unwrap_or_default();
+
+                            if !is_miracast_sink(&wfd_ies) {
+                                return Ok(());
+                            }
+
+                            let model = proxy.model().await.ok();
+                            let mut metadata = HashMap::new();
+                            metadata.insert("path".into(), peer_path.to_string());
+                            metadata.insert("device_path".into(), device_path_str.clone());
+                            metadata.insert("hw_address".into(), hw_address);
+                            metadata.insert("backend".into(), "nm".into());
+
+                            tx.send(DiscoveryEvent::DeviceFound(make_device(
+                                name,
+                                model,
+                                parse_wfd_rtsp_port(&wfd_ies),
+                                metadata,
+                            )))
+                            .await
+                            .map_err(|_| {
+                                FerricastError::Discovery("DiscoveryEvent channel closed".into())
+                            })
+                        }
+                        .await;
+
+                        if let Err(e) = result {
+                            tracing::error!(%e, "NM peer handling error");
+                        }
                     }
 
-                    let model = proxy.model().await.ok();
-                    let mut metadata = HashMap::new();
-                    metadata.insert("path".into(), peer_path.to_string());
-                    metadata.insert("device_path".into(), device_path_str.clone());
-                    metadata.insert("hw_address".into(), hw_address);
-                    metadata.insert("backend".into(), "nm".into());
-
-                    tx.send(DiscoveryEvent::DeviceFound(make_device(
-                        name,
-                        model,
-                        parse_wfd_rtsp_port(&wfd_ies),
-                        metadata,
-                    )))
-                    .await
-                    .map_err(|_| {
-                        FerricastError::Discovery("DiscoveryEvent channel closed".into())
-                    })
-                }
-                .await;
-
-                if let Err(e) = result {
-                    tracing::error!(%e, "NM peer handling error");
+                    _ = restart_interval.tick() => {
+                        tracing::debug!("Restarting NM P2P discovery (periodic refresh)");
+                        if let Err(e) = p2p.start_find(HashMap::new()).await {
+                            tracing::warn!("NM WifiP2P.StartFind restart failed: {e}");
+                        }
+                    }
                 }
             }
-            tracing::warn!("NM PeerAdded stream ended");
         });
 
         self.handle = Some(handle);

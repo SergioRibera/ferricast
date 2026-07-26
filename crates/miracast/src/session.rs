@@ -1,16 +1,16 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use zbus::Connection;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use ferricast_core::{CastSession, Device, EncodedFrame, FerricastError, Result, StreamConfig};
 
 use crate::dbus::{
-    ActiveConnectionProxy, Ip4ConfigProxy, IwdP2pPeerProxy,
+    ActiveConnectionProxy, IwdP2pPeerProxy,
     NM_ACTIVE_CONNECTION_STATE_ACTIVATED, NM_ACTIVE_CONNECTION_STATE_DEACTIVATED,
     NM_ACTIVE_CONNECTION_STATE_DEACTIVATING, NetworkManagerProxy,
 };
@@ -18,6 +18,7 @@ use crate::dbus::{
 // ── constants ─────────────────────────────────────────────────────────────────
 
 /// WFD default RTSP port (Wi-Fi Display spec §6.5).
+/// The WFD Source listens on this port; the Sink connects to it.
 const WFD_DEFAULT_PORT: u16 = 7236;
 /// RTP payload type for MPEG-TS (RFC 2250).
 const RTP_PT_MP2T: u8 = 33;
@@ -28,12 +29,9 @@ const TS_PACKET: usize = 188;
 /// TS packets per RTP packet — keeps payload ≤ 1316 bytes.
 const TS_PER_RTP: usize = 7;
 /// How long to wait for the P2P connection to reach ACTIVATED.
-///
-/// wpa_supplicant re-scans all P2P channels after P2P_CONNECT to locate
-/// the peer (up to ~30 s on busy spectrum), then GO negotiation, WPS PBC
-/// exchange, and DHCP each add 5-15 s.  120 s gives the full chain room
-/// to complete even on congested 2.4 GHz.
 const P2P_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long to wait for the sink to connect to our RTSP server after P2P.
+const RTSP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 const PID_PAT: u16 = 0x0000;
 const PID_PMT: u16 = 0x1000;
@@ -53,9 +51,16 @@ enum ActiveConnection {
 /// Miracast (Wi-Fi Display) streaming session.
 ///
 /// Lifecycle: `Default` → `connect()` → `setup_stream()` → `send_frame()` loop → `stop()`.
+///
+/// The WFD Source (us) listens on TCP port 7236.  After P2P group formation
+/// and DHCP, the WFD Sink (TV) connects to port 7236 and the M1–M7 RTSP
+/// handshake runs over that accepted connection.
 pub struct MiracastSession {
     dbus: Option<Connection>,
     active_connection: Option<ActiveConnection>,
+    /// TCP listener on the WFD RTSP port.  Created in `connect()`, consumed
+    /// (accepted) in `setup_stream()`.
+    listener: Option<TcpListener>,
     rtsp: Option<BufReader<TcpStream>>,
     rtp: Option<UdpSocket>,
     sink_rtp_addr: Option<SocketAddr>,
@@ -87,6 +92,7 @@ impl Default for MiracastSession {
         Self {
             dbus: None,
             active_connection: None,
+            listener: None,
             rtsp: None,
             rtp: None,
             sink_rtp_addr: None,
@@ -110,43 +116,14 @@ impl CastSession for MiracastSession {
         }
     }
 
-    /// Runs the WFD RTSP M1–M7 handshake and binds the RTP sender socket.
+    /// Runs the WFD RTSP M1–M7 handshake over the accepted sink connection
+    /// and binds the RTP sender socket.
+    ///
+    /// The WFD Source (us) listens on port 7236.  The Sink (TV) connects to
+    /// us after P2P and DHCP complete.  We then initiate M1 (OPTIONS) and
+    /// drive the handshake through M7 (PLAY).
     async fn setup_stream(&mut self, _config: &StreamConfig) -> Result<()> {
-        let rtsp = self.rtsp.as_mut().ok_or(FerricastError::NoActiveSession)?;
-
-        // M1: we send OPTIONS, sink acknowledges.
-        send_rtsp(
-            rtsp,
-            &format!(
-                "OPTIONS * RTSP/1.0\r\nCSeq: {}\r\nRequire: org.wfa.wfd1.0\r\n\r\n",
-                self.src_cseq
-            ),
-        )
-        .await?;
-        let m1_resp = recv_rtsp(rtsp).await?;
-        ensure_200(&m1_resp, self.src_cseq)?;
-        self.src_cseq += 1;
-
-        // M2: sink sends OPTIONS to us; we reply.
-        let m2_req = recv_rtsp(rtsp).await?;
-        let sink_cseq = header_value(&m2_req.headers, "cseq")
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(100);
-        send_rtsp(
-            rtsp,
-            &format!(
-                "RTSP/1.0 200 OK\r\nCSeq: {sink_cseq}\r\nPublic: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER, SETUP, PLAY, PAUSE, TEARDOWN\r\n\r\n"
-            ),
-        )
-        .await?;
-
-        // M3: sink sends GET_PARAMETER querying our capabilities.
-        let m3_req = recv_rtsp(rtsp).await?;
-        let m3_cseq = header_value(&m3_req.headers, "cseq")
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(sink_cseq + 1);
-
-        // Bind our RTP socket now so we can advertise the port.
+        // Bind the RTP socket before accepting so we can advertise the port.
         let rtp_sock = UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(|e| FerricastError::Connection(format!("Cannot bind RTP socket: {e}")))?;
@@ -155,28 +132,100 @@ impl CastSession for MiracastSession {
             .map_err(|e| FerricastError::Connection(format!("RTP local_addr: {e}")))?
             .port();
 
-        let caps_body = wfd_capabilities(our_rtp_port);
+        // Accept the sink's incoming TCP connection.  The sink connects to our
+        // RTSP port (7236) after it obtains an IP via DHCP on the P2P link.
+        let listener = self.listener.take().ok_or(FerricastError::NoActiveSession)?;
+        let (tcp, peer_addr) = tokio::time::timeout(RTSP_ACCEPT_TIMEOUT, listener.accept())
+            .await
+            .map_err(|_| {
+                FerricastError::Connection(format!(
+                    "Sink did not connect within {}s — check firewall on port {WFD_DEFAULT_PORT}",
+                    RTSP_ACCEPT_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|e| FerricastError::Connection(format!("RTSP accept failed: {e}")))?;
+
+        // The local address of the accepted socket is our P2P interface IP,
+        // which is what goes into the presentation URL we send to the sink.
+        let our_p2p_ip = tcp
+            .local_addr()
+            .map_err(|e| FerricastError::Connection(format!("RTSP socket local_addr: {e}")))?
+            .ip();
+
+        tracing::info!(%peer_addr, %our_p2p_ip, "Sink connected — starting WFD M1–M7 handshake");
+
+        let mut rtsp = BufReader::new(tcp);
+
+        // M1: Source → Sink: OPTIONS (announce WFD requirement)
         send_rtsp(
-            rtsp,
+            &mut rtsp,
             &format!(
-                "RTSP/1.0 200 OK\r\nCSeq: {m3_cseq}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{caps_body}",
-                caps_body.len()
+                "OPTIONS * RTSP/1.0\r\nCSeq: {}\r\nRequire: org.wfa.wfd1.0\r\n\r\n",
+                self.src_cseq
             ),
         )
         .await?;
+        let m1_resp = recv_rtsp(&mut rtsp).await?;
+        ensure_200(&m1_resp, self.src_cseq)?;
+        self.src_cseq += 1;
 
-        // M4: we send SET_PARAMETER with chosen parameters.
-        let our_ip = rtp_sock
-            .local_addr()
-            .map(|a| a.ip())
-            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        // M2 / alt-M3: read the sink's next message.
+        //
+        // Per spec the sink sends OPTIONS (M2).  Some sinks deviate and send
+        // GET_PARAMETER first asking for source capabilities (alt-M3 flow).
+        // Handle both.
+        let next = recv_rtsp(&mut rtsp).await?;
+        let next_cseq = header_value(&next.headers, "cseq")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(100);
 
-        let presentation_url =
-            format!("rtsp://{our_ip}/wfd1.0/streamid=0");
+        if next.start_line.starts_with("GET_PARAMETER") {
+            // Alt-M3: sink is querying source capabilities first.
+            let caps = wfd_capabilities(our_rtp_port);
+            send_rtsp(
+                &mut rtsp,
+                &format!(
+                    "RTSP/1.0 200 OK\r\nCSeq: {next_cseq}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{caps}",
+                    caps.len()
+                ),
+            )
+            .await?;
+            // M3 handled; proceed directly to M4.
+        } else {
+            // Normal M2: sink sends OPTIONS.
+            send_rtsp(
+                &mut rtsp,
+                &format!(
+                    "RTSP/1.0 200 OK\r\nCSeq: {next_cseq}\r\nPublic: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER, SETUP, PLAY, PAUSE, TEARDOWN\r\n\r\n"
+                ),
+            )
+            .await?;
 
+            // M3: Source → Sink: GET_PARAMETER (query sink WFD capabilities)
+            let m3_body =
+                "wfd_video_formats: \r\nwfd_audio_codecs: \r\nwfd_client_rtp_ports: \r\n";
+            send_rtsp(
+                &mut rtsp,
+                &format!(
+                    "GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: {}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{m3_body}",
+                    self.src_cseq,
+                    m3_body.len()
+                ),
+            )
+            .await?;
+            // We ignore sink caps and use hardcoded values in M4.
+            let _m3_resp = recv_rtsp(&mut rtsp).await?;
+            self.src_cseq += 1;
+        }
+
+        // M4: Source → Sink: SET_PARAMETER (announce chosen streaming params)
+        let presentation_url = format!(
+            "rtsp://{}:{WFD_DEFAULT_PORT}/wfd1.0/streamid=0",
+            our_p2p_ip
+        );
         let m4_body = wfd_set_parameter(&presentation_url, our_rtp_port);
         send_rtsp(
-            rtsp,
+            &mut rtsp,
             &format!(
                 "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: {}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{m4_body}",
                 self.src_cseq,
@@ -184,14 +233,14 @@ impl CastSession for MiracastSession {
             ),
         )
         .await?;
-        let m4_resp = recv_rtsp(rtsp).await?;
+        let m4_resp = recv_rtsp(&mut rtsp).await?;
         ensure_200(&m4_resp, self.src_cseq)?;
         self.src_cseq += 1;
 
-        // M5: trigger SETUP from the sink.
+        // M5: Source → Sink: SET_PARAMETER wfd_trigger_method: SETUP
         let trigger_body = "wfd_trigger_method: SETUP\r\n";
         send_rtsp(
-            rtsp,
+            &mut rtsp,
             &format!(
                 "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: {}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{trigger_body}",
                 self.src_cseq,
@@ -199,45 +248,39 @@ impl CastSession for MiracastSession {
             ),
         )
         .await?;
-        let m5_resp = recv_rtsp(rtsp).await?;
+        let m5_resp = recv_rtsp(&mut rtsp).await?;
         ensure_200(&m5_resp, self.src_cseq)?;
         self.src_cseq += 1;
 
-        // M6: sink sends SETUP; we respond with transport details.
-        let m6_req = recv_rtsp(rtsp).await?;
+        // M6: Sink → Source: SETUP (negotiate RTP transport)
+        let m6_req = recv_rtsp(&mut rtsp).await?;
         let m6_cseq = header_value(&m6_req.headers, "cseq")
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(m3_cseq + 2);
+            .unwrap_or(200);
 
-        // Parse sink's client_port from Transport header.
+        // The sink's Transport header tells us which UDP port to send RTP to.
         let sink_rtp_port = parse_client_port(
-            header_value(&m6_req.headers, "transport").as_deref().unwrap_or(""),
+            header_value(&m6_req.headers, "transport").unwrap_or(""),
         )
         .unwrap_or(1028);
-
-        // The sink's IP is the remote TCP address.
-        let sink_tcp_addr = rtsp
-            .get_ref()
-            .peer_addr()
-            .map_err(|e| FerricastError::Connection(format!("Cannot get sink TCP addr: {e}")))?;
-        let sink_rtp_addr = SocketAddr::new(sink_tcp_addr.ip(), sink_rtp_port);
+        let sink_rtp_addr = SocketAddr::new(peer_addr.ip(), sink_rtp_port);
 
         let session_id = format!("{:016x}", rand::random::<u64>());
         send_rtsp(
-            rtsp,
+            &mut rtsp,
             &format!(
                 "RTSP/1.0 200 OK\r\nCSeq: {m6_cseq}\r\nSession: {session_id};timeout=60\r\nTransport: RTP/AVP/UDP;unicast;client_port={sink_rtp_port};server_port={our_rtp_port}\r\n\r\n"
             ),
         )
         .await?;
 
-        // M7: sink sends PLAY; we respond and streaming begins.
-        let m7_req = recv_rtsp(rtsp).await?;
+        // M7: Sink → Source: PLAY (streaming begins)
+        let m7_req = recv_rtsp(&mut rtsp).await?;
         let m7_cseq = header_value(&m7_req.headers, "cseq")
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(m6_cseq + 1);
         send_rtsp(
-            rtsp,
+            &mut rtsp,
             &format!(
                 "RTSP/1.0 200 OK\r\nCSeq: {m7_cseq}\r\nSession: {session_id}\r\n\r\n"
             ),
@@ -255,15 +298,13 @@ impl CastSession for MiracastSession {
         self.sink_rtp_addr = Some(sink_rtp_addr);
         self.session_id = Some(session_id);
         self.presentation_url = Some(presentation_url);
+        self.rtsp = Some(rtsp);
         Ok(())
     }
 
     /// Packetizes one video frame into MPEG-TS and sends it over RTP/UDP.
     async fn send_frame(&mut self, frame: &EncodedFrame) -> Result<()> {
-        let sock = self
-            .rtp
-            .as_ref()
-            .ok_or(FerricastError::NoActiveSession)?;
+        let sock = self.rtp.as_ref().ok_or(FerricastError::NoActiveSession)?;
         let sink = self.sink_rtp_addr.ok_or(FerricastError::NoActiveSession)?;
 
         // Advance RTP timestamp from the frame's microsecond PTS.
@@ -272,25 +313,20 @@ impl CastSession for MiracastSession {
 
         let mut ts_packets: Vec<u8> = Vec::new();
 
-        // Emit PAT + PMT once at stream start (or on every keyframe for robustness).
+        // Emit PAT + PMT once at stream start (and on every keyframe for robustness).
         if !self.ts.psi_sent || frame.is_keyframe {
             ts_packets.extend_from_slice(&build_pat(&mut self.ts.cc_pat));
             ts_packets.extend_from_slice(&build_pmt(&mut self.ts.cc_pmt));
             self.ts.psi_sent = true;
         }
 
-        // Wrap the H.264 Annex-B data in a PES packet, then TS-packetize it.
+        // Wrap H.264 Annex-B data in a PES packet, then TS-packetize it.
         let pes = build_pes(&frame.data, frame.pts_dts);
         packetize_pes_into_ts(&pes, PID_VIDEO, &mut self.ts.cc_video, &mut ts_packets);
 
         // Send TS packets grouped into RTP packets (≤ 7 per packet).
         for chunk in ts_packets.chunks(TS_PER_RTP * TS_PACKET) {
-            let pkt = build_rtp_packet(
-                self.rtp_seq,
-                rtp_ts,
-                self.ssrc,
-                chunk,
-            );
+            let pkt = build_rtp_packet(self.rtp_seq, rtp_ts, self.ssrc, chunk);
             sock.send_to(&pkt, sink).await.map_err(|e| {
                 FerricastError::Streaming(format!("RTP send failed: {e}"))
             })?;
@@ -306,7 +342,7 @@ impl CastSession for MiracastSession {
         }
         self.alive = false;
 
-        // Send RTSP TEARDOWN if we have a session.
+        // Send RTSP TEARDOWN if we have a live session.
         if let (Some(rtsp), Some(session_id)) =
             (self.rtsp.as_mut(), self.session_id.as_deref())
         {
@@ -326,6 +362,7 @@ impl CastSession for MiracastSession {
 
         self.rtsp = None;
         self.rtp = None;
+        self.listener = None;
 
         if let Some(conn) = self.dbus.take() {
             match self.active_connection.take() {
@@ -365,10 +402,13 @@ impl MiracastSession {
         let peer_dbus_path = device
             .metadata
             .get("path")
-            .ok_or_else(|| FerricastError::Connection("Missing 'path' in device metadata".into()))
+            .ok_or_else(|| {
+                FerricastError::Connection("Missing 'path' in device metadata".into())
+            })
             .and_then(|s| {
-                OwnedObjectPath::try_from(s.as_str())
-                    .map_err(|e| FerricastError::Connection(format!("Invalid peer D-Bus path: {e}")))
+                OwnedObjectPath::try_from(s.as_str()).map_err(|e| {
+                    FerricastError::Connection(format!("Invalid peer D-Bus path: {e}"))
+                })
             })?;
 
         let p2p_device_path = device
@@ -378,8 +418,9 @@ impl MiracastSession {
                 FerricastError::Connection("Missing 'device_path' in device metadata".into())
             })
             .and_then(|s| {
-                OwnedObjectPath::try_from(s.as_str())
-                    .map_err(|e| FerricastError::Connection(format!("Invalid device D-Bus path: {e}")))
+                OwnedObjectPath::try_from(s.as_str()).map_err(|e| {
+                    FerricastError::Connection(format!("Invalid device D-Bus path: {e}"))
+                })
             })?;
 
         let hw_address = device
@@ -390,29 +431,34 @@ impl MiracastSession {
             })?
             .clone();
 
+        // Bind the RTSP listener BEFORE starting P2P so the sink can connect
+        // immediately after DHCP without racing against our bind.
+        let wfd_port = if device.port == 0 { WFD_DEFAULT_PORT } else { device.port };
+        let listener = TcpListener::bind(format!("0.0.0.0:{wfd_port}"))
+            .await
+            .map_err(|e| {
+                FerricastError::Connection(format!(
+                    "Cannot bind RTSP port {wfd_port} (another process may own it): {e}"
+                ))
+            })?;
+        tracing::info!(port = wfd_port, "RTSP listener bound — waiting for sink");
 
         let conn = Connection::system().await.map_err(|e| {
             FerricastError::Connection(format!("D-Bus system bus unavailable: {e}"))
         })?;
-
         let nm = NetworkManagerProxy::new(&conn).await.map_err(|e| {
             FerricastError::Connection(format!("Cannot reach NetworkManager: {e}"))
         })?;
 
         let connection_dict = build_p2p_connection_dict(&hw_address)?;
 
-        // "volatile" — NM discards this profile as soon as it deactivates,
-        // so failed P2P attempts don't accumulate stale profiles in NM's
-        // settings storage across reconnect attempts.
         let mut activate_opts: HashMap<String, Value> = HashMap::new();
-        activate_opts.insert(
-            "persist".into(),
-            Value::from("volatile"),
-        );
-
+        activate_opts.insert("persist".into(), Value::from("volatile"));
+        // dbus-client: NM drops the connection when our D-Bus client exits,
+        // preventing stale P2P groups if ferricast crashes or is killed.
         activate_opts.insert(
             "bind-activation".into(),
-            zvariant::Value::Str(zvariant::Str::from("none")),
+            Value::Str(zvariant::Str::from("dbus-client")),
         );
 
         let (_, active_path, _) = nm
@@ -427,28 +473,13 @@ impl MiracastSession {
                 FerricastError::Connection(format!("NM.AddAndActivateConnection2 failed: {e}"))
             })?;
 
-
-
         tracing::info!(%active_path, "P2P connection activating (NM)");
-
-        let sink_ip = wait_for_ip(&conn, &active_path).await?;
-        tracing::info!(%sink_ip, "P2P connection activated");
-
-        let wfd_port = if device.port == 0 { WFD_DEFAULT_PORT } else { device.port };
-        let sink_addr = SocketAddr::new(IpAddr::V4(sink_ip), wfd_port);
-        tracing::info!(%sink_addr, "Connecting RTSP to Miracast sink (NM)");
-
-        let tcp = tokio::time::timeout(
-            Duration::from_secs(10),
-            TcpStream::connect(sink_addr),
-        )
-        .await
-        .map_err(|_| FerricastError::Connection("RTSP TCP connect timed out".into()))?
-        .map_err(|e| FerricastError::Connection(format!("RTSP TCP connect failed: {e}")))?;
+        wait_for_activation(&conn, &active_path).await?;
+        tracing::info!("P2P DHCP complete — sink should connect to port {wfd_port} shortly");
 
         self.dbus = Some(conn);
         self.active_connection = Some(ActiveConnection::Nm(active_path));
-        self.rtsp = Some(BufReader::new(tcp));
+        self.listener = Some(listener);
         self.alive = true;
         Ok(())
     }
@@ -457,48 +488,48 @@ impl MiracastSession {
         let peer_path = device
             .metadata
             .get("path")
-            .ok_or_else(|| FerricastError::Connection("Missing 'path' in device metadata".into()))
+            .ok_or_else(|| {
+                FerricastError::Connection("Missing 'path' in device metadata".into())
+            })
             .and_then(|s| {
-                OwnedObjectPath::try_from(s.as_str())
-                    .map_err(|e| FerricastError::Connection(format!("Invalid peer D-Bus path: {e}")))
+                OwnedObjectPath::try_from(s.as_str()).map_err(|e| {
+                    FerricastError::Connection(format!("Invalid peer D-Bus path: {e}"))
+                })
             })?;
+
+        // Bind the RTSP listener BEFORE P2P so we don't miss the sink's connect.
+        let wfd_port = if device.port == 0 { WFD_DEFAULT_PORT } else { device.port };
+        let listener = TcpListener::bind(format!("0.0.0.0:{wfd_port}"))
+            .await
+            .map_err(|e| {
+                FerricastError::Connection(format!(
+                    "Cannot bind RTSP port {wfd_port}: {e}"
+                ))
+            })?;
+        tracing::info!(port = wfd_port, "RTSP listener bound — waiting for sink");
 
         let conn = Connection::system().await.map_err(|e| {
             FerricastError::Connection(format!("D-Bus system bus unavailable: {e}"))
         })?;
-
         let peer = IwdP2pPeerProxy::new(&conn, peer_path.clone())
             .await
             .map_err(|e| FerricastError::Connection(format!("iwd P2P peer proxy: {e}")))?;
 
         tracing::info!(%peer_path, "Connecting iwd P2P peer (group formation + DHCP)");
 
-        // iwd's connect() blocks until P2P group formation and DHCP are complete.
+        // iwd's connect() blocks until P2P group formation and DHCP complete.
         tokio::time::timeout(Duration::from_secs(45), peer.connect())
             .await
-            .map_err(|_| FerricastError::Connection("iwd P2P connect timed out after 45s".into()))?
+            .map_err(|_| {
+                FerricastError::Connection("iwd P2P connect timed out after 45s".into())
+            })?
             .map_err(|e| FerricastError::Connection(format!("iwd P2P connect: {e}")))?;
 
-        tracing::info!("iwd P2P group formed — resolving peer IP from ARP cache");
-
-        let sink_ip = find_p2p_peer_ip().await?;
-        tracing::info!(%sink_ip, "P2P peer IP resolved");
-
-        let wfd_port = if device.port == 0 { WFD_DEFAULT_PORT } else { device.port };
-        let sink_addr = SocketAddr::new(IpAddr::V4(sink_ip), wfd_port);
-        tracing::info!(%sink_addr, "Connecting RTSP to Miracast sink (iwd)");
-
-        let tcp = tokio::time::timeout(
-            Duration::from_secs(10),
-            TcpStream::connect(sink_addr),
-        )
-        .await
-        .map_err(|_| FerricastError::Connection("RTSP TCP connect timed out".into()))?
-        .map_err(|e| FerricastError::Connection(format!("RTSP TCP connect failed: {e}")))?;
+        tracing::info!("iwd P2P group formed — sink should connect to port {wfd_port} shortly");
 
         self.dbus = Some(conn);
         self.active_connection = Some(ActiveConnection::Iwd(peer_path));
-        self.rtsp = Some(BufReader::new(tcp));
+        self.listener = Some(listener);
         self.alive = true;
         Ok(())
     }
@@ -513,67 +544,74 @@ fn build_p2p_connection_dict(
     let mut connection_settings: HashMap<String, OwnedValue> = HashMap::new();
     connection_settings.insert(
         "type".into(),
-        OwnedValue::try_from(Value::from("wifi-p2p")).map_err(|e| {
-            FerricastError::Connection(format!("zvariant: {e}"))
-        })?,
+        OwnedValue::try_from(Value::from("wifi-p2p"))
+            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))?,
     );
     connection_settings.insert(
         "id".into(),
-        OwnedValue::try_from(Value::from("Ferricast Miracast")).map_err(|e| {
-            FerricastError::Connection(format!("zvariant: {e}"))
-        })?,
+        OwnedValue::try_from(Value::from("Ferricast Miracast"))
+            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))?,
     );
-    
     connection_settings.insert(
-        "autoconnect".to_string(),
+        "autoconnect".into(),
         OwnedValue::try_from(Value::Bool(false))
-            .map_err(|e| {FerricastError::Connection(format!("zvariant: {e}"))})?
+            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))?,
     );
-
 
     let mut p2p_settings: HashMap<String, OwnedValue> = HashMap::new();
     p2p_settings.insert(
         "peer".into(),
-        OwnedValue::try_from(Value::from(peer_hw_address)).map_err(|e| {
-            FerricastError::Connection(format!("zvariant: {e}"))
-        })?,
+        OwnedValue::try_from(Value::from(peer_hw_address))
+            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))?,
     );
-    let wfd_ies = wfd_source_ies();
-
     p2p_settings.insert(
         "wfd-ies".into(),
-        OwnedValue::try_from(Value::from(wfd_ies)).map_err(|e| {
-            FerricastError::Connection(format!("zvariant: {e}"))
-        })?,
+        OwnedValue::try_from(Value::from(wfd_source_ies()))
+            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))?,
     );
 
     let mut ipv4_props: HashMap<String, OwnedValue> = HashMap::new();
-    ipv4_props.insert("method".into(), OwnedValue::try_from(zvariant::Value::Str(zvariant::Str::from("auto"))).map_err(|e| FerricastError::Connection(format!("zvariant {e}")))?);
+    ipv4_props.insert(
+        "method".into(),
+        OwnedValue::try_from(zvariant::Value::Str(zvariant::Str::from("auto")))
+            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))?,
+    );
+    ipv4_props.insert(
+        "never-default".into(),
+        OwnedValue::try_from(zvariant::Value::Bool(true))
+            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))?,
+    );
 
-    ipv4_props.insert("never-default".into(), OwnedValue::try_from(zvariant::Value::Bool(true)).map_err(|e| FerricastError::Connection(format!("zvariant {e}")))?);
-
-    
     let mut ipv6_props: HashMap<String, OwnedValue> = HashMap::new();
-    ipv6_props.insert("method".into(), OwnedValue::try_from(zvariant::Value::Str(zvariant::Str::from("auto"))).map_err(|e| FerricastError::Connection(format!("zvariant {e}")))?);
-
-    ipv6_props.insert("never-default".into(), OwnedValue::try_from(zvariant::Value::Bool(true)).map_err(|e| FerricastError::Connection(format!("zvariant {e}")))?);
-
-        ipv6_props.insert("may-fail".into(), OwnedValue::try_from(zvariant::Value::Bool(true)).map_err(|e| FerricastError::Connection(format!("zvariant {e}")))?);
-
- 
+    ipv6_props.insert(
+        "method".into(),
+        OwnedValue::try_from(zvariant::Value::Str(zvariant::Str::from("auto")))
+            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))?,
+    );
+    ipv6_props.insert(
+        "never-default".into(),
+        OwnedValue::try_from(zvariant::Value::Bool(true))
+            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))?,
+    );
+    ipv6_props.insert(
+        "may-fail".into(),
+        OwnedValue::try_from(zvariant::Value::Bool(true))
+            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))?,
+    );
 
     let mut dict = HashMap::new();
     dict.insert("connection".into(), connection_settings);
     dict.insert("wifi-p2p".into(), p2p_settings);
     dict.insert("ipv4".into(), ipv4_props);
     dict.insert("ipv6".into(), ipv6_props);
-
     Ok(dict)
 }
 
-/// Polls the NM active connection state until ACTIVATED, then returns the
-/// sink's IP address (the P2P group owner's address, our gateway).
-async fn wait_for_ip(conn: &Connection, active_path: &OwnedObjectPath) -> Result<Ipv4Addr> {
+/// Polls the NM active connection state until ACTIVATED.
+async fn wait_for_activation(
+    conn: &Connection,
+    active_path: &OwnedObjectPath,
+) -> Result<()> {
     let active = ActiveConnectionProxy::new(conn, active_path.clone())
         .await
         .map_err(|e| {
@@ -589,21 +627,18 @@ async fn wait_for_ip(conn: &Connection, active_path: &OwnedObjectPath) -> Result
             match active.state().await {
                 Ok(NM_ACTIVE_CONNECTION_STATE_ACTIVATED) => {
                     tracing::info!("P2P connection ACTIVATED");
-                    return extract_gateway(conn, &active).await;
+                    return Ok(());
                 }
                 Ok(NM_ACTIVE_CONNECTION_STATE_DEACTIVATED) => {
                     return Err(FerricastError::Connection(
-                        "P2P connection deactivated before IP assignment".into(),
+                        "P2P connection deactivated before DHCP assignment".into(),
                     ));
                 }
-                // NM is tearing the connection down — GO negotiation or WPS
-                // failed; wpa_supplicant will finish deactivating momentarily.
                 Ok(NM_ACTIVE_CONNECTION_STATE_DEACTIVATING) => {
                     return Err(FerricastError::Connection(
                         "P2P connection deactivating — GO negotiation or WPS failed".into(),
                     ));
                 }
-                // NM removed the ActiveConnection object before we polled.
                 Err(e) => {
                     return Err(FerricastError::Connection(format!(
                         "P2P active-connection proxy gone (NM cleaned up?): {e}"
@@ -635,34 +670,6 @@ async fn wait_for_ip(conn: &Connection, active_path: &OwnedObjectPath) -> Result
     })?
 }
 
-async fn extract_gateway(
-    conn: &Connection,
-    active: &ActiveConnectionProxy<'_>,
-) -> Result<Ipv4Addr> {
-    let ip4_path = active.ip4_config().await.map_err(|e| {
-        FerricastError::Connection(format!("ActiveConnection.Ip4Config: {e}"))
-    })?;
-
-    let ip4 = Ip4ConfigProxy::new(conn, ip4_path).await.map_err(|e| {
-        FerricastError::Connection(format!("Cannot create Ip4Config proxy: {e}"))
-    })?;
-
-    let gateway = ip4.gateway().await.map_err(|e| {
-        FerricastError::Connection(format!("IP4Config.Gateway: {e}"))
-    })?;
-
-    if !gateway.is_empty() {
-        return gateway.parse::<Ipv4Addr>().map_err(|e| {
-            FerricastError::Connection(format!("Cannot parse gateway IP '{gateway}': {e}"))
-        });
-    }
-
-    // Gateway is empty → our machine is the P2P Group Owner.
-    // Sink's IP is in the ARP cache on the p2p-* interface.
-    tracing::debug!("NM IP4Config.Gateway empty — we are GO; falling back to ARP lookup");
-    find_p2p_peer_ip().await
-}
-
 // ── WFD source IEs ───────────────────────────────────────────────────────────
 
 /// WFD Device Information subelement (ID=0, length=6) for a Miracast source:
@@ -670,56 +677,16 @@ async fn extract_gateway(
 ///   bits[5:4]  = 0b01  (Session Available)
 ///   → device_info = 0x0010
 ///
-/// 0x0090 (used previously) additionally sets bit 7 (Tunneled TDLS Support)
-/// which is not required and causes some TVs to reject the connection.
+/// 0x0090 additionally sets bit 7 (WFD Content Protection / HDCP) which
+/// is optional and causes some TVs to reject the connection.
 pub(crate) fn wfd_source_ies() -> Vec<u8> {
     vec![
         0x00,       // Subelement ID: WFD Device Information
         0x00, 0x06, // Length: 6 bytes
-        0x00, 0x10, // Device Info: Source, session available
+        0x00, 0x10, // Device Info: Source, session available (0x0010)
         0x1C, 0x44, // RTSP port: 7236 (big-endian)
-        0x00, 0x32, // Max throughput: 50 Mbps
+        0x00, 0xC8, // Max throughput: 200 Mbps
     ]
-}
-
-// ── iwd helpers ──────────────────────────────────────────────────────────────
-
-/// Polls `/proc/net/arp` until a complete ARP entry appears on a `p2p-*` interface.
-///
-/// iwd populates the ARP cache after DHCP completes; this may take a few
-/// hundred milliseconds after `IwdP2pPeer.connect()` returns.
-async fn find_p2p_peer_ip() -> Result<Ipv4Addr> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let content = tokio::fs::read_to_string("/proc/net/arp")
-            .await
-            .map_err(|e| FerricastError::Connection(format!("Cannot read /proc/net/arp: {e}")))?;
-
-        // /proc/net/arp columns: IP address, HW type, Flags, HW address, Mask, Device
-        // Flags 0x0 = incomplete; 0x2 = complete; 0x6 = published+complete.
-        for line in content.lines().skip(1) {
-            let mut cols = line.split_whitespace();
-            let ip_str = cols.next().unwrap_or("");
-            let _ = cols.next(); // HW type
-            let flags = cols.next().unwrap_or("0x0");
-            let _ = cols.next(); // HW address
-            let _ = cols.next(); // Mask
-            let dev = cols.next().unwrap_or("");
-
-            if dev.starts_with("p2p-") && flags != "0x0" {
-                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                    return Ok(ip);
-                }
-            }
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return Err(FerricastError::Connection(
-                "Timed out waiting for P2P peer IP in ARP cache (p2p-* interface)".into(),
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
 }
 
 // ── RTSP helpers ─────────────────────────────────────────────────────────────
@@ -728,7 +695,6 @@ struct RtspMessage {
     start_line: String,
     headers: HashMap<String, String>,
     /// Body bytes, populated when Content-Length is present.
-    /// Used for M3 GET_PARAMETER and other body-carrying messages.
     #[allow(dead_code)]
     body: String,
 }
@@ -758,10 +724,7 @@ async fn recv_rtsp(stream: &mut BufReader<TcpStream>) -> Result<RtspMessage> {
         header_lines.push(trimmed);
     }
 
-    let start_line = header_lines
-        .first()
-        .cloned()
-        .unwrap_or_default();
+    let start_line = header_lines.first().cloned().unwrap_or_default();
 
     let mut headers: HashMap<String, String> = HashMap::new();
     for line in header_lines.iter().skip(1) {
@@ -799,10 +762,7 @@ fn ensure_200(msg: &RtspMessage, cseq: u32) -> Result<()> {
     }
 }
 
-fn header_value<'m>(
-    headers: &'m HashMap<String, String>,
-    key: &str,
-) -> Option<&'m str> {
+fn header_value<'m>(headers: &'m HashMap<String, String>, key: &str) -> Option<&'m str> {
     headers.get(key).map(String::as_str)
 }
 
@@ -822,19 +782,10 @@ fn parse_client_port(transport: &str) -> Option<u16> {
 
 /// Builds the WFD GET_PARAMETER response body advertising our capabilities.
 ///
+/// Used in the alt-M3 flow when the sink asks for source capabilities first.
 /// Video: H.264 CBP Level 3.2, 1920×1080p@30 (CEA mode 7 = bit 7 = 0x80).
 /// Audio: LPCM stereo 44.1/48 kHz.
-/// RTP:   UDP, port `rtp_port`.
 fn wfd_capabilities(rtp_port: u16) -> String {
-    // wfd_video_formats field layout (WFD spec §Table 27):
-    // native | preferred_display_mode_supported |
-    // <profile> <level> <CEA-bitmask> <VESA-bitmask> <HH-bitmask>
-    // <latency> <min_slice_size> <slice_enc_params> <frame_rate_control>
-    // [max_hres max_vres]
-    //
-    // Profile byte: bit0=CBP, bit1=CHP
-    // Level byte: bit0=3.1, bit1=3.2, bit2=4, bit3=4.1, bit4=4.2
-    // CEA bit 7 = 1920×1080p@30
     format!(
         "wfd_video_formats: 00 00 01 02 00000080 00000000 00000000 00 0000 0000 00 none none\r\n\
          wfd_audio_codecs: LPCM 00000003 00\r\n\
@@ -866,10 +817,8 @@ fn build_pat(cc: &mut u8) -> [u8; TS_PACKET] {
     pkt[3] = 0x10 | (*cc & 0x0F); // no AFC, payload only
     *cc = cc.wrapping_add(1) & 0x0F;
 
-    // Pointer field
-    pkt[4] = 0x00;
+    pkt[4] = 0x00; // pointer field
 
-    // PAT section
     let pat = &mut pkt[5..];
     pat[0] = 0x00; // table_id = PAT
     pat[1] = 0xB0; // section_syntax_indicator=1, length high nibble=0
@@ -943,18 +892,15 @@ fn build_pes(payload: &[u8], (pts_us, dts_us): (u64, u64)) -> Vec<u8> {
     let dts_90k = dts_us * 90_000 / 1_000_000;
     let pts_dts_differ = pts_90k != dts_90k;
 
-    // PES optional header: flags + pts [+ dts]
     let pts_dts_flags: u8 = if pts_dts_differ { 0xC0 } else { 0x80 };
     let header_data_len: u8 = if pts_dts_differ { 10 } else { 5 };
 
-    let mut pes: Vec<u8> = Vec::with_capacity(9 + header_data_len as usize + payload.len());
-    // start code prefix
+    let mut pes: Vec<u8> =
+        Vec::with_capacity(9 + header_data_len as usize + payload.len());
     pes.extend_from_slice(&[0x00, 0x00, 0x01]);
     pes.push(PES_STREAM_ID_VIDEO);
-    // PES packet length = 0 (unbounded for video)
     pes.push(0x00);
     pes.push(0x00);
-    // PES header flags
     pes.push(0x80); // marker bits
     pes.push(pts_dts_flags);
     pes.push(header_data_len);
@@ -982,7 +928,7 @@ fn build_pes(payload: &[u8], (pts_us, dts_us): (u64, u64)) -> Vec<u8> {
 
 /// Fragments a PES packet into 188-byte TS packets on `pid`.
 fn packetize_pes_into_ts(pes: &[u8], pid: u16, cc: &mut u8, out: &mut Vec<u8>) {
-    let pid_hi = 0xE0 | ((pid >> 8) as u8); // no error, payload start, priority
+    let pid_hi = 0xE0 | ((pid >> 8) as u8);
     let pid_lo = pid as u8;
 
     let mut first = true;
@@ -991,15 +937,14 @@ fn packetize_pes_into_ts(pes: &[u8], pid: u16, cc: &mut u8, out: &mut Vec<u8>) {
     while !remaining.is_empty() {
         let mut pkt = [0xFFu8; TS_PACKET];
         pkt[0] = 0x47;
-        pkt[1] = if first { pid_hi | 0x40 } else { pid_hi & !0x40 }; // PUSI
+        pkt[1] = if first { pid_hi | 0x40 } else { pid_hi & !0x40 };
         pkt[2] = pid_lo;
-        pkt[3] = 0x10 | (*cc & 0x0F); // payload only
+        pkt[3] = 0x10 | (*cc & 0x0F);
         *cc = cc.wrapping_add(1) & 0x0F;
 
         let payload_space = TS_PACKET - 4;
         let chunk_len = remaining.len().min(payload_space);
         pkt[4..4 + chunk_len].copy_from_slice(&remaining[..chunk_len]);
-        // Stuffing bytes (0xFF) already filled from the array initialiser.
 
         out.extend_from_slice(&pkt);
         remaining = &remaining[chunk_len..];
