@@ -2,8 +2,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use zbus::Connection;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
@@ -39,6 +42,15 @@ const PID_VIDEO: u16 = 0x0100;
 const STREAM_TYPE_H264: u8 = 0x1B;
 const PES_STREAM_ID_VIDEO: u8 = 0xE0;
 
+// ── RTSP event (sink → source during streaming) ───────────────────────────────
+
+enum RtspEvent {
+    /// Sink requested a keyframe via `SET_PARAMETER wfd_idr_request`.
+    IdrRequest,
+    /// Sink sent TEARDOWN — session is ending.
+    Teardown,
+}
+
 // ── active connection discriminator ──────────────────────────────────────────
 
 enum ActiveConnection {
@@ -61,7 +73,13 @@ pub struct MiracastSession {
     /// TCP listener on the WFD RTSP port.  Created in `connect()`, consumed
     /// (accepted) in `setup_stream()`.
     listener: Option<TcpListener>,
-    rtsp: Option<BufReader<TcpStream>>,
+    /// Write half of the RTSP TCP connection, used for keep-alive and TEARDOWN.
+    rtsp_writer: Option<OwnedWriteHalf>,
+    /// Incoming events from the sink (IDR requests, TEARDOWN) read by the
+    /// background reader task.
+    rtsp_events: Option<mpsc::Receiver<RtspEvent>>,
+    /// Background task that owns the read half and pumps sink messages.
+    rtsp_task: Option<JoinHandle<()>>,
     rtp: Option<UdpSocket>,
     sink_rtp_addr: Option<SocketAddr>,
     session_id: Option<String>,
@@ -93,7 +111,9 @@ impl Default for MiracastSession {
             dbus: None,
             active_connection: None,
             listener: None,
-            rtsp: None,
+            rtsp_writer: None,
+            rtsp_events: None,
+            rtsp_task: None,
             rtp: None,
             sink_rtp_addr: None,
             session_id: None,
@@ -158,7 +178,7 @@ impl CastSession for MiracastSession {
 
         // M1: Source → Sink: OPTIONS (announce WFD requirement)
         send_rtsp(
-            &mut rtsp,
+            rtsp.get_mut(),
             &format!(
                 "OPTIONS * RTSP/1.0\r\nCSeq: {}\r\nRequire: org.wfa.wfd1.0\r\n\r\n",
                 self.src_cseq
@@ -185,7 +205,7 @@ impl CastSession for MiracastSession {
                 // Alt-M3: sink is querying source capabilities first.
                 let caps = wfd_capabilities(our_rtp_port);
                 send_rtsp(
-                    &mut rtsp,
+                    rtsp.get_mut(),
                     &format!(
                         "RTSP/1.0 200 OK\r\nCSeq: {next_cseq}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{caps}",
                         caps.len()
@@ -197,7 +217,7 @@ impl CastSession for MiracastSession {
             } else {
                 // Normal M2: sink sends OPTIONS.
                 send_rtsp(
-                    &mut rtsp,
+                    rtsp.get_mut(),
                     &format!(
                         "RTSP/1.0 200 OK\r\nCSeq: {next_cseq}\r\nPublic: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER, SETUP, PLAY, PAUSE, TEARDOWN\r\n\r\n"
                     ),
@@ -213,7 +233,7 @@ impl CastSession for MiracastSession {
                                wfd_idr_request_capability\r\n\
                                microsoft_cursor\r\n";
                 send_rtsp(
-                    &mut rtsp,
+                    rtsp.get_mut(),
                     &format!(
                         "GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: {}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{m3_body}",
                         self.src_cseq,
@@ -233,7 +253,7 @@ impl CastSession for MiracastSession {
         );
         let m4_body = wfd_set_parameter(&presentation_url, sink_primary_rtp, sink_secondary_rtp);
         send_rtsp(
-            &mut rtsp,
+            rtsp.get_mut(),
             &format!(
                 "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: {}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{m4_body}",
                 self.src_cseq,
@@ -248,7 +268,7 @@ impl CastSession for MiracastSession {
         // M5: Source → Sink: SET_PARAMETER wfd_trigger_method: SETUP
         let trigger_body = "wfd_trigger_method: SETUP\r\n";
         send_rtsp(
-            &mut rtsp,
+            rtsp.get_mut(),
             &format!(
                 "SET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: {}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{trigger_body}",
                 self.src_cseq,
@@ -276,7 +296,7 @@ impl CastSession for MiracastSession {
 
         let session_id = format!("{:016x}", rand::random::<u64>());
         send_rtsp(
-            &mut rtsp,
+            rtsp.get_mut(),
             &format!(
                 "RTSP/1.0 200 OK\r\nCSeq: {m6_cseq}\r\nSession: {session_id};timeout=60\r\nTransport: RTP/AVP/UDP;unicast;client_port={sink_rtp_port};server_port={our_rtp_port}\r\n\r\n"
             ),
@@ -289,7 +309,7 @@ impl CastSession for MiracastSession {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(m6_cseq + 1);
         send_rtsp(
-            &mut rtsp,
+            rtsp.get_mut(),
             &format!(
                 "RTSP/1.0 200 OK\r\nCSeq: {m7_cseq}\r\nSession: {session_id}\r\n\r\n"
             ),
@@ -303,28 +323,53 @@ impl CastSession for MiracastSession {
             "WFD RTSP handshake complete — streaming"
         );
 
+        // Split the TCP connection: write half stays here for keep-alive / TEARDOWN;
+        // read half goes to a background task that pumps incoming sink messages.
+        let (read_half, write_half) = rtsp.into_inner().into_split();
+        let (event_tx, event_rx) = mpsc::channel::<RtspEvent>(8);
+        let task = tokio::spawn(rtsp_reader_task(BufReader::new(read_half), event_tx));
+
         self.rtp = Some(rtp_sock);
         self.sink_rtp_addr = Some(sink_rtp_addr);
         self.session_id = Some(session_id);
         self.presentation_url = Some(presentation_url);
         self.last_keepalive = Some(Instant::now());
-        self.rtsp = Some(rtsp);
+        self.rtsp_writer = Some(write_half);
+        self.rtsp_events = Some(event_rx);
+        self.rtsp_task = Some(task);
         Ok(())
     }
 
     /// Packetizes one video frame into MPEG-TS and sends it over RTP/UDP.
     async fn send_frame(&mut self, frame: &EncodedFrame) -> Result<()> {
-        // Keep-alive: send GET_PARAMETER every 25 s while streaming (GNOME uses 25 s).
+        // Drain any events from the background RTSP reader (IDR requests, TEARDOWN).
+        if let Some(events) = self.rtsp_events.as_mut() {
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    RtspEvent::IdrRequest => {
+                        tracing::debug!("Sink requested IDR keyframe");
+                        // TODO: signal encoder to emit keyframe
+                    }
+                    RtspEvent::Teardown => {
+                        tracing::info!("Sink sent TEARDOWN — stopping session");
+                        self.alive = false;
+                    }
+                }
+            }
+        }
+
+        // Keep-alive: send GET_PARAMETER every 25 s (GNOME interval).
+        // The background reader task will consume the sink's 200 OK response.
         if self
             .last_keepalive
             .map(|t| t.elapsed() >= Duration::from_secs(25))
             .unwrap_or(false)
         {
-            if let (Some(rtsp), Some(session_id)) =
-                (self.rtsp.as_mut(), self.session_id.as_deref())
+            if let (Some(writer), Some(session_id)) =
+                (self.rtsp_writer.as_mut(), self.session_id.as_deref())
             {
                 let _ = send_rtsp(
-                    rtsp,
+                    writer,
                     &format!(
                         "GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: {}\r\nSession: {session_id}\r\n\r\n",
                         self.src_cseq
@@ -373,15 +418,15 @@ impl CastSession for MiracastSession {
         self.alive = false;
 
         // Send RTSP TEARDOWN if we have a live session.
-        if let (Some(rtsp), Some(session_id)) =
-            (self.rtsp.as_mut(), self.session_id.as_deref())
+        if let (Some(writer), Some(session_id)) =
+            (self.rtsp_writer.as_mut(), self.session_id.as_deref())
         {
             let url = self
                 .presentation_url
                 .as_deref()
                 .unwrap_or("rtsp://localhost/wfd1.0/streamid=0");
             let _ = send_rtsp(
-                rtsp,
+                writer,
                 &format!(
                     "TEARDOWN {url} RTSP/1.0\r\nCSeq: {}\r\nSession: {session_id}\r\n\r\n",
                     self.src_cseq
@@ -390,7 +435,12 @@ impl CastSession for MiracastSession {
             .await;
         }
 
-        self.rtsp = None;
+        // Abort the background reader task and release all RTSP state.
+        if let Some(task) = self.rtsp_task.take() {
+            task.abort();
+        }
+        self.rtsp_writer = None;
+        self.rtsp_events = None;
         self.rtp = None;
         self.listener = None;
 
@@ -724,21 +774,24 @@ pub(crate) fn wfd_source_ies() -> Vec<u8> {
 struct RtspMessage {
     start_line: String,
     headers: HashMap<String, String>,
-    /// Body bytes, populated when Content-Length is present.
-    #[allow(dead_code)]
     body: String,
 }
 
-async fn send_rtsp(stream: &mut BufReader<TcpStream>, msg: &str) -> Result<()> {
+async fn send_rtsp<W>(writer: &mut W, msg: &str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     tracing::trace!(msg = msg.trim_end(), "RTSP →");
-    stream
-        .get_mut()
+    writer
         .write_all(msg.as_bytes())
         .await
         .map_err(|e| FerricastError::Protocol(format!("RTSP write: {e}")))
 }
 
-async fn recv_rtsp(stream: &mut BufReader<TcpStream>) -> Result<RtspMessage> {
+async fn recv_rtsp<R>(stream: &mut R) -> Result<RtspMessage>
+where
+    R: AsyncBufRead + AsyncRead + Unpin,
+{
     let mut header_lines: Vec<String> = Vec::new();
 
     loop {
@@ -779,6 +832,41 @@ async fn recv_rtsp(stream: &mut BufReader<TcpStream>) -> Result<RtspMessage> {
 
     tracing::trace!(start_line, "RTSP ←");
     Ok(RtspMessage { start_line, headers, body })
+}
+
+/// Background task: owns the read half of the RTSP TCP connection and converts
+/// incoming sink messages to `RtspEvent`s.
+///
+/// 200 OK responses to our keep-alive GET_PARAMETER are silently discarded.
+/// SET_PARAMETER with `wfd_idr_request` → `RtspEvent::IdrRequest`.
+/// TEARDOWN → `RtspEvent::Teardown`, then task exits.
+async fn rtsp_reader_task(
+    mut reader: BufReader<OwnedReadHalf>,
+    tx: mpsc::Sender<RtspEvent>,
+) {
+    loop {
+        match recv_rtsp(&mut reader).await {
+            Ok(msg) => {
+                if msg.start_line.starts_with("RTSP/1.0") {
+                    // Response to our keep-alive GET_PARAMETER — discard.
+                    tracing::trace!(status = msg.start_line, "keep-alive ACK");
+                } else if msg.start_line.starts_with("SET_PARAMETER")
+                    && msg.body.contains("wfd_idr_request")
+                {
+                    if tx.send(RtspEvent::IdrRequest).await.is_err() {
+                        break;
+                    }
+                } else if msg.start_line.starts_with("TEARDOWN") {
+                    let _ = tx.send(RtspEvent::Teardown).await;
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::debug!("RTSP reader closed: {e}");
+                break;
+            }
+        }
+    }
 }
 
 fn ensure_200(msg: &RtspMessage, cseq: u32) -> Result<()> {
