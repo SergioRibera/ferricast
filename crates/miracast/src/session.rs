@@ -203,7 +203,7 @@ impl CastSession for MiracastSession {
         let (sink_primary_rtp, sink_secondary_rtp) =
             if next.start_line.starts_with("GET_PARAMETER") {
                 // Alt-M3: sink is querying source capabilities first.
-                let caps = wfd_capabilities(our_rtp_port);
+                let caps = wfd_capabilities();
                 send_rtsp(
                     rtsp.get_mut(),
                     &format!(
@@ -412,27 +412,29 @@ impl CastSession for MiracastSession {
     }
 
     async fn stop(&mut self) -> Result<()> {
-        if !self.alive {
-            return Ok(());
-        }
+        // Send TEARDOWN only if we were streaming; always clean up resources
+        // so that sink-initiated TEARDOWN (which sets alive=false) doesn't
+        // skip task abort and resource release.
+        let was_alive = self.alive;
         self.alive = false;
 
-        // Send RTSP TEARDOWN if we have a live session.
-        if let (Some(writer), Some(session_id)) =
-            (self.rtsp_writer.as_mut(), self.session_id.as_deref())
-        {
-            let url = self
-                .presentation_url
-                .as_deref()
-                .unwrap_or("rtsp://localhost/wfd1.0/streamid=0");
-            let _ = send_rtsp(
-                writer,
-                &format!(
-                    "TEARDOWN {url} RTSP/1.0\r\nCSeq: {}\r\nSession: {session_id}\r\n\r\n",
-                    self.src_cseq
-                ),
-            )
-            .await;
+        if was_alive {
+            if let (Some(writer), Some(session_id)) =
+                (self.rtsp_writer.as_mut(), self.session_id.as_deref())
+            {
+                let url = self
+                    .presentation_url
+                    .as_deref()
+                    .unwrap_or("rtsp://localhost/wfd1.0/streamid=0");
+                let _ = send_rtsp(
+                    writer,
+                    &format!(
+                        "TEARDOWN {url} RTSP/1.0\r\nCSeq: {}\r\nSession: {session_id}\r\n\r\n",
+                        self.src_cseq
+                    ),
+                )
+                .await;
+            }
         }
 
         // Abort the background reader task and release all RTSP state.
@@ -796,10 +798,13 @@ where
 
     loop {
         let mut line = String::new();
-        stream
+        let n = stream
             .read_line(&mut line)
             .await
             .map_err(|e| FerricastError::Protocol(format!("RTSP read: {e}")))?;
+        if n == 0 {
+            return Err(FerricastError::Protocol("RTSP connection closed".into()));
+        }
         let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
         if trimmed.is_empty() {
             break;
@@ -903,14 +908,15 @@ fn parse_client_port(transport: &str) -> Option<u16> {
 /// Used in the alt-M3 flow when the sink asks for source capabilities first.
 /// Video: H.264 CBP Level 3.2, 1920×1080p@30 (CEA mode 7 = bit 7 = 0x80).
 /// Audio: LPCM stereo 44.1/48 kHz.
-fn wfd_capabilities(rtp_port: u16) -> String {
-    format!(
-        "wfd_video_formats: 00 00 01 02 00000080 00000000 00000000 00 0000 0000 00 none none\r\n\
-         wfd_audio_codecs: LPCM 00000003 00\r\n\
-         wfd_client_rtp_ports: RTP/AVP/UDP;unicast {rtp_port} 0 mode=play\r\n\
-         wfd_uibc_capability: none\r\n\
-         wfd_standby_resume_capability: none\r\n"
-    )
+///
+/// `wfd_client_rtp_ports` is intentionally omitted — that field describes the
+/// sink's preferred receive port, not a source capability.
+fn wfd_capabilities() -> String {
+    "wfd_video_formats: 00 00 01 02 00000080 00000000 00000000 00 0000 0000 00 none none\r\n\
+     wfd_audio_codecs: LPCM 00000003 00\r\n\
+     wfd_uibc_capability: none\r\n\
+     wfd_standby_resume_capability: none\r\n"
+        .to_string()
 }
 
 /// Builds the WFD SET_PARAMETER (M4) body selecting parameters to use.
