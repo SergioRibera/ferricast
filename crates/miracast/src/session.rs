@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -76,6 +76,8 @@ pub struct MiracastSession {
     ssrc: u32,
     /// MPEG-TS continuity counters.
     ts: TsState,
+    /// Timestamp of last keep-alive GET_PARAMETER sent to the sink.
+    last_keepalive: Option<Instant>,
     alive: bool,
 }
 
@@ -103,6 +105,7 @@ impl Default for MiracastSession {
             rtp_ts: 0,
             ssrc: rand::random(),
             ts: TsState::default(),
+            last_keepalive: None,
             alive: false,
         }
     }
@@ -179,51 +182,59 @@ impl CastSession for MiracastSession {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(100);
 
-        if next.start_line.starts_with("GET_PARAMETER") {
-            // Alt-M3: sink is querying source capabilities first.
-            let caps = wfd_capabilities(our_rtp_port);
-            send_rtsp(
-                &mut rtsp,
-                &format!(
-                    "RTSP/1.0 200 OK\r\nCSeq: {next_cseq}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{caps}",
-                    caps.len()
-                ),
-            )
-            .await?;
-            // M3 handled; proceed directly to M4.
-        } else {
-            // Normal M2: sink sends OPTIONS.
-            send_rtsp(
-                &mut rtsp,
-                &format!(
-                    "RTSP/1.0 200 OK\r\nCSeq: {next_cseq}\r\nPublic: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER, SETUP, PLAY, PAUSE, TEARDOWN\r\n\r\n"
-                ),
-            )
-            .await?;
+        // Returns (sink_primary_rtp, sink_secondary_rtp) for use in M4.
+        let (sink_primary_rtp, sink_secondary_rtp) =
+            if next.start_line.starts_with("GET_PARAMETER") {
+                // Alt-M3: sink is querying source capabilities first.
+                let caps = wfd_capabilities(our_rtp_port);
+                send_rtsp(
+                    &mut rtsp,
+                    &format!(
+                        "RTSP/1.0 200 OK\r\nCSeq: {next_cseq}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{caps}",
+                        caps.len()
+                    ),
+                )
+                .await?;
+                // Skip normal M3; sink's port will be confirmed in M6.
+                (16384, 16385)
+            } else {
+                // Normal M2: sink sends OPTIONS.
+                send_rtsp(
+                    &mut rtsp,
+                    &format!(
+                        "RTSP/1.0 200 OK\r\nCSeq: {next_cseq}\r\nPublic: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER, SETUP, PLAY, PAUSE, TEARDOWN\r\n\r\n"
+                    ),
+                )
+                .await?;
 
-            // M3: Source → Sink: GET_PARAMETER (query sink WFD capabilities)
-            let m3_body =
-                "wfd_video_formats: \r\nwfd_audio_codecs: \r\nwfd_client_rtp_ports: \r\n";
-            send_rtsp(
-                &mut rtsp,
-                &format!(
-                    "GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: {}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{m3_body}",
-                    self.src_cseq,
-                    m3_body.len()
-                ),
-            )
-            .await?;
-            // We ignore sink caps and use hardcoded values in M4.
-            let _m3_resp = recv_rtsp(&mut rtsp).await?;
-            self.src_cseq += 1;
-        }
+                // M3: Source → Sink: GET_PARAMETER (query sink WFD capabilities)
+                // Body is bare parameter names — no colon/value — per WFD spec §6.8.
+                let m3_body = "wfd_client_rtp_ports\r\n\
+                               wfd_audio_codecs\r\n\
+                               wfd_video_formats\r\n\
+                               wfd_display_edid\r\n\
+                               wfd_idr_request_capability\r\n\
+                               microsoft_cursor\r\n";
+                send_rtsp(
+                    &mut rtsp,
+                    &format!(
+                        "GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: {}\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{m3_body}",
+                        self.src_cseq,
+                        m3_body.len()
+                    ),
+                )
+                .await?;
+                let m3_resp = recv_rtsp(&mut rtsp).await?;
+                self.src_cseq += 1;
+                parse_sink_rtp_ports(&m3_resp.body)
+            };
 
         // M4: Source → Sink: SET_PARAMETER (announce chosen streaming params)
         let presentation_url = format!(
             "rtsp://{}:{WFD_DEFAULT_PORT}/wfd1.0/streamid=0",
             our_p2p_ip
         );
-        let m4_body = wfd_set_parameter(&presentation_url, our_rtp_port);
+        let m4_body = wfd_set_parameter(&presentation_url, sink_primary_rtp, sink_secondary_rtp);
         send_rtsp(
             &mut rtsp,
             &format!(
@@ -298,12 +309,35 @@ impl CastSession for MiracastSession {
         self.sink_rtp_addr = Some(sink_rtp_addr);
         self.session_id = Some(session_id);
         self.presentation_url = Some(presentation_url);
+        self.last_keepalive = Some(Instant::now());
         self.rtsp = Some(rtsp);
         Ok(())
     }
 
     /// Packetizes one video frame into MPEG-TS and sends it over RTP/UDP.
     async fn send_frame(&mut self, frame: &EncodedFrame) -> Result<()> {
+        // Keep-alive: send GET_PARAMETER every 25 s while streaming (GNOME uses 25 s).
+        if self
+            .last_keepalive
+            .map(|t| t.elapsed() >= Duration::from_secs(25))
+            .unwrap_or(false)
+        {
+            if let (Some(rtsp), Some(session_id)) =
+                (self.rtsp.as_mut(), self.session_id.as_deref())
+            {
+                let _ = send_rtsp(
+                    rtsp,
+                    &format!(
+                        "GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: {}\r\nSession: {session_id}\r\n\r\n",
+                        self.src_cseq
+                    ),
+                )
+                .await;
+                self.src_cseq += 1;
+            }
+            self.last_keepalive = Some(Instant::now());
+        }
+
         let sock = self.rtp.as_ref().ok_or(FerricastError::NoActiveSession)?;
         let sink = self.sink_rtp_addr.ok_or(FerricastError::NoActiveSession)?;
 
@@ -796,13 +830,49 @@ fn wfd_capabilities(rtp_port: u16) -> String {
 }
 
 /// Builds the WFD SET_PARAMETER (M4) body selecting parameters to use.
-fn wfd_set_parameter(presentation_url: &str, rtp_port: u16) -> String {
+///
+/// `sink_primary_rtp` / `sink_secondary_rtp` are the sink's preferred RTP receive
+/// ports (advertised by the sink in the M3 GET_PARAMETER response).
+fn wfd_set_parameter(
+    presentation_url: &str,
+    sink_primary_rtp: u16,
+    sink_secondary_rtp: u16,
+) -> String {
     format!(
         "wfd_video_formats: 00 00 01 02 00000080 00000000 00000000 00 0000 0000 00 none none\r\n\
          wfd_audio_codecs: LPCM 00000003 00\r\n\
          wfd_presentation_URL: {presentation_url} none\r\n\
-         wfd_client_rtp_ports: RTP/AVP/UDP;unicast {rtp_port} 0 mode=play\r\n"
+         wfd_client_rtp_ports: RTP/AVP/UDP;unicast {sink_primary_rtp} {sink_secondary_rtp} mode=play\r\n"
     )
+}
+
+/// Parses `wfd_client_rtp_ports` from the sink's M3 GET_PARAMETER response body.
+///
+/// Expected format: `wfd_client_rtp_ports: RTP/AVP/UDP;unicast 16384 16385 mode=play`
+///
+/// Defaults (from GNOME Network Displays wfd-params.c):
+///   primary  = 16384 if missing or 0
+///   secondary = primary + 1 if 0
+fn parse_sink_rtp_ports(body: &str) -> (u16, u16) {
+    for line in body.lines() {
+        if let Some(val) = line.strip_prefix("wfd_client_rtp_ports:") {
+            if let Some(rest) = val.trim().strip_prefix("RTP/AVP/UDP;unicast ") {
+                let mut parts = rest.split_whitespace();
+                let primary: u16 = parts
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(0);
+                let secondary: u16 = parts
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(0);
+                let primary = if primary == 0 { 16384 } else { primary };
+                let secondary = if secondary == 0 { primary + 1 } else { secondary };
+                return (primary, secondary);
+            }
+        }
+    }
+    (16384, 16385)
 }
 
 // ── MPEG-TS inline packetizer ─────────────────────────────────────────────────
