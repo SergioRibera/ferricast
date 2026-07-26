@@ -70,8 +70,6 @@ pub struct MiracastSession {
     src_cseq: u32,
     /// RTP sequence number.
     rtp_seq: u16,
-    /// RTP timestamp (90 kHz).
-    rtp_ts: u32,
     /// RTP SSRC (random, fixed per session).
     ssrc: u32,
     /// MPEG-TS continuity counters.
@@ -102,7 +100,6 @@ impl Default for MiracastSession {
             presentation_url: None,
             src_cseq: 1,
             rtp_seq: 0,
-            rtp_ts: 0,
             ssrc: rand::random(),
             ts: TsState::default(),
             last_keepalive: None,
@@ -270,10 +267,11 @@ impl CastSession for MiracastSession {
             .unwrap_or(200);
 
         // The sink's Transport header tells us which UDP port to send RTP to.
+        // Fall back to the port negotiated in M3/M4 if the header is absent.
         let sink_rtp_port = parse_client_port(
             header_value(&m6_req.headers, "transport").unwrap_or(""),
         )
-        .unwrap_or(1028);
+        .unwrap_or(sink_primary_rtp);
         let sink_rtp_addr = SocketAddr::new(peer_addr.ip(), sink_rtp_port);
 
         let session_id = format!("{:016x}", rand::random::<u64>());
@@ -341,9 +339,7 @@ impl CastSession for MiracastSession {
         let sock = self.rtp.as_ref().ok_or(FerricastError::NoActiveSession)?;
         let sink = self.sink_rtp_addr.ok_or(FerricastError::NoActiveSession)?;
 
-        // Advance RTP timestamp from the frame's microsecond PTS.
         let rtp_ts = (frame.timestamp_us * CLOCK_90K / 1_000_000) as u32;
-        self.rtp_ts = rtp_ts;
 
         let mut ts_packets: Vec<u8> = Vec::new();
 
