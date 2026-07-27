@@ -903,25 +903,27 @@ async fn rtsp_reader_task(
                 if msg.start_line.starts_with("RTSP/1.0") {
                     // Response to our keep-alive GET_PARAMETER — discard.
                     tracing::trace!(status = msg.start_line, "keep-alive ACK");
-                } else if msg.start_line.starts_with("SET_PARAMETER")
-                    && msg.body.contains("wfd_idr_request")
-                {
-                    tracing::debug!("Sink requested IDR keyframe");
-                    keyframe_requested.store(true, Ordering::Relaxed);
-                } else if msg.start_line.starts_with("PAUSE")
-                    || msg.start_line.starts_with("PLAY")
-                {
+                } else if msg.start_line.starts_with("TEARDOWN") {
+                    let _ = tx.send(RtspEvent::Teardown).await;
+                    break;
+                } else {
+                    // Any request from the sink requires a 200 OK.
                     let cseq = header_value(&msg.headers, "cseq")
                         .and_then(|v| v.parse::<u32>().ok())
                         .unwrap_or(0);
+
+                    if msg.start_line.starts_with("SET_PARAMETER")
+                        && msg.body.contains("wfd_idr_request")
+                    {
+                        tracing::debug!("Sink requested IDR keyframe");
+                        keyframe_requested.store(true, Ordering::Relaxed);
+                    }
+
                     let response = format!(
                         "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nSession: {session_id}\r\n\r\n"
                     );
                     let mut w = writer.lock().await;
                     let _ = send_rtsp(&mut *w, &response).await;
-                } else if msg.start_line.starts_with("TEARDOWN") {
-                    let _ = tx.send(RtspEvent::Teardown).await;
-                    break;
                 }
             }
             Err(e) => {
