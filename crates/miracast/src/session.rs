@@ -15,9 +15,10 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use ferricast_core::{AudioFrame, CastSession, Device, EncodedFrame, FerricastError, Result, StreamConfig};
 
 use crate::dbus::{
-    ActiveConnectionProxy, IwdP2pPeerProxy, IwdSimpleConfigurationProxy,
+    ActiveConnectionProxy, DeviceProxy, IwdP2pPeerProxy, IwdSimpleConfigurationProxy,
     NM_ACTIVE_CONNECTION_STATE_ACTIVATED, NM_ACTIVE_CONNECTION_STATE_DEACTIVATED,
-    NM_ACTIVE_CONNECTION_STATE_DEACTIVATING, NetworkManagerProxy,
+    NM_ACTIVE_CONNECTION_STATE_DEACTIVATING, NM_DEVICE_TYPE_WIFI_P2P, NetworkManagerProxy,
+    P2pPeerProxy, WifiP2pProxy,
 };
 
 // ── constants ─────────────────────────────────────────────────────────────────
@@ -684,37 +685,20 @@ impl MiracastSession {
     }
 
     async fn connect_nm_wifi(&mut self, device: &Device) -> Result<()> {
+        // DIRECT- networks are P2P Groups, not regular APs.  Infrastructure
+        // WPS-PBC does not work — the sink immediately deactivates before DHCP.
+        // Instead: look up the peer's BSSID in NM's P2P peer list and connect
+        // via the proper P2P path (same as connect_nm).
+        let bssid = device
+            .metadata
+            .get("bssid")
+            .ok_or_else(|| FerricastError::Connection("Missing 'bssid' in nm_wifi metadata".into()))?
+            .clone();
         let ssid = device
             .metadata
             .get("ssid")
-            .ok_or_else(|| FerricastError::Connection("Missing 'ssid' in device metadata".into()))?
-            .clone();
-
-        let ap_path = device
-            .metadata
-            .get("ap_path")
-            .ok_or_else(|| FerricastError::Connection("Missing 'ap_path' in device metadata".into()))
-            .and_then(|s| {
-                OwnedObjectPath::try_from(s.as_str())
-                    .map_err(|e| FerricastError::Connection(format!("Invalid AP path: {e}")))
-            })?;
-
-        let nm_device_path = device
-            .metadata
-            .get("nm_device_path")
-            .ok_or_else(|| FerricastError::Connection("Missing 'nm_device_path' in device metadata".into()))
-            .and_then(|s| {
-                OwnedObjectPath::try_from(s.as_str())
-                    .map_err(|e| FerricastError::Connection(format!("Invalid NM device path: {e}")))
-            })?;
-
-        let wfd_port = if device.port == 0 { WFD_DEFAULT_PORT } else { device.port };
-        let listener = TcpListener::bind(format!("0.0.0.0:{wfd_port}"))
-            .await
-            .map_err(|e| {
-                FerricastError::Connection(format!("Cannot bind RTSP port {wfd_port}: {e}"))
-            })?;
-        tracing::info!(port = wfd_port, "RTSP listener bound — waiting for sink");
+            .cloned()
+            .unwrap_or_default();
 
         let conn = Connection::system().await.map_err(|e| {
             FerricastError::Connection(format!("D-Bus system bus unavailable: {e}"))
@@ -722,39 +706,42 @@ impl MiracastSession {
         let nm = NetworkManagerProxy::new(&conn).await.map_err(|e| {
             FerricastError::Connection(format!("Cannot reach NetworkManager: {e}"))
         })?;
+        let devices = nm.get_devices().await.map_err(|e| {
+            FerricastError::Connection(format!("NM GetDevices: {e}"))
+        })?;
 
-        let connection_dict = build_wifi_connection_dict(&ssid)?;
-
-        let mut activate_opts: HashMap<String, Value> = HashMap::new();
-        activate_opts.insert("persist".into(), Value::from("volatile"));
-        activate_opts.insert(
-            "bind-activation".into(),
-            Value::Str(zvariant::Str::from("dbus-client")),
-        );
-
-        tracing::info!(ssid, "connecting to DIRECT- network via NM WPS-PBC");
-
-        let (_, active_path, _) = nm
-            .add_and_activate_connection2(
-                connection_dict,
-                nm_device_path,
-                ap_path,
-                activate_opts,
-            )
-            .await
-            .map_err(|e| {
-                FerricastError::Connection(format!("NM.AddAndActivateConnection2 failed: {e}"))
+        for dev_path in &devices {
+            let dev = DeviceProxy::new(&conn, dev_path.clone()).await.map_err(|e| {
+                FerricastError::Connection(format!("NM Device proxy: {e}"))
             })?;
+            if dev.device_type().await.unwrap_or(0) != NM_DEVICE_TYPE_WIFI_P2P {
+                continue;
+            }
+            let p2p = WifiP2pProxy::new(&conn, dev_path.clone()).await.map_err(|e| {
+                FerricastError::Connection(format!("WifiP2P proxy: {e}"))
+            })?;
+            for peer_path in p2p.peers().await.unwrap_or_default() {
+                let pp = P2pPeerProxy::new(&conn, peer_path.clone()).await.map_err(|e| {
+                    FerricastError::Connection(format!("P2pPeer proxy: {e}"))
+                })?;
+                let hw = pp.hw_address().await.unwrap_or_default();
+                if !hw.eq_ignore_ascii_case(&bssid) {
+                    continue;
+                }
+                tracing::info!(bssid, %peer_path, ssid, "DIRECT- AP matched to NM P2P peer — connecting via P2P");
+                let mut p2p_device = device.clone();
+                p2p_device.metadata.insert("path".into(), peer_path.to_string());
+                p2p_device.metadata.insert("device_path".into(), dev_path.to_string());
+                p2p_device.metadata.insert("hw_address".into(), hw);
+                p2p_device.metadata.insert("backend".into(), "nm".into());
+                return self.connect_nm(&p2p_device).await;
+            }
+        }
 
-        tracing::info!(%active_path, "Wi-Fi connection activating (WPS-PBC)");
-        wait_for_activation(&conn, &active_path).await?;
-        tracing::info!("WPS-PBC complete — sink should connect to port {wfd_port} shortly");
-
-        self.dbus = Some(conn);
-        self.active_connection = Some(ActiveConnection::Nm(active_path));
-        self.listener = Some(listener);
-        self.alive = true;
-        Ok(())
+        Err(FerricastError::Connection(format!(
+            "DIRECT- network '{ssid}' (BSSID {bssid}) not yet visible as a P2P peer. \
+             Wait a moment for P2P discovery and retry."
+        )))
     }
 
     async fn connect_tcp_scan(&mut self, device: &Device) -> Result<()> {
@@ -842,64 +829,6 @@ fn build_p2p_connection_dict(
     let mut dict = HashMap::new();
     dict.insert("connection".into(), connection_settings);
     dict.insert("wifi-p2p".into(), p2p_settings);
-    dict.insert("ipv4".into(), ipv4_props);
-    dict.insert("ipv6".into(), ipv6_props);
-    Ok(dict)
-}
-
-/// Builds a `a{sa{sv}}` NM connection dict for connecting to a DIRECT-
-/// Wi-Fi Group Owner (e.g. Windows Connect) via WPS-PBC.
-fn build_wifi_connection_dict(
-    ssid: &str,
-) -> Result<HashMap<String, HashMap<String, OwnedValue>>> {
-    let s = |v: &str| {
-        OwnedValue::try_from(Value::from(v))
-            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))
-    };
-    let b = |v: bool| {
-        OwnedValue::try_from(Value::Bool(v))
-            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))
-    };
-
-    let mut connection_settings: HashMap<String, OwnedValue> = HashMap::new();
-    connection_settings.insert("type".into(), s("802-11-wireless")?);
-    connection_settings.insert("id".into(), s("Ferricast Miracast WFD")?);
-    connection_settings.insert("autoconnect".into(), b(false)?);
-
-    let ssid_bytes: Vec<u8> = ssid.as_bytes().to_vec();
-    let mut wifi_settings: HashMap<String, OwnedValue> = HashMap::new();
-    wifi_settings.insert(
-        "ssid".into(),
-        OwnedValue::try_from(Value::from(ssid_bytes))
-            .map_err(|e| FerricastError::Connection(format!("zvariant ssid: {e}")))?,
-    );
-    wifi_settings.insert("mode".into(), s("infrastructure")?);
-    wifi_settings.insert("security".into(), s("802-11-wireless-security")?);
-
-    let mut security_settings: HashMap<String, OwnedValue> = HashMap::new();
-    security_settings.insert("key-mgmt".into(), s("wps")?);
-
-    let mut ipv4_props: HashMap<String, OwnedValue> = HashMap::new();
-    ipv4_props.insert(
-        "method".into(),
-        OwnedValue::try_from(zvariant::Value::Str(zvariant::Str::from("auto")))
-            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))?,
-    );
-    ipv4_props.insert("never-default".into(), b(true)?);
-
-    let mut ipv6_props: HashMap<String, OwnedValue> = HashMap::new();
-    ipv6_props.insert(
-        "method".into(),
-        OwnedValue::try_from(zvariant::Value::Str(zvariant::Str::from("auto")))
-            .map_err(|e| FerricastError::Connection(format!("zvariant: {e}")))?,
-    );
-    ipv6_props.insert("never-default".into(), b(true)?);
-    ipv6_props.insert("may-fail".into(), b(true)?);
-
-    let mut dict = HashMap::new();
-    dict.insert("connection".into(), connection_settings);
-    dict.insert("802-11-wireless".into(), wifi_settings);
-    dict.insert("802-11-wireless-security".into(), security_settings);
     dict.insert("ipv4".into(), ipv4_props);
     dict.insert("ipv6".into(), ipv6_props);
     Ok(dict)
