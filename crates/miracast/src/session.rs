@@ -411,8 +411,11 @@ impl CastSession for MiracastSession {
         }
 
         // Wrap H.264 Annex-B data in a PES packet, then TS-packetize it.
+        // PCR is embedded in the first TS packet of every video frame so the
+        // sink can recover the 90 kHz clock and maintain A/V sync.
         let pes = build_pes(&frame.data, frame.pts_dts);
-        packetize_pes_into_ts(&pes, PID_VIDEO, &mut self.ts.cc_video, &mut ts_packets);
+        let pcr_90k = (frame.pts_dts.0 * CLOCK_90K / 1_000_000) & 0x1_FFFF_FFFF;
+        packetize_pes_into_ts(&pes, PID_VIDEO, &mut self.ts.cc_video, Some(pcr_90k), &mut ts_packets);
 
         // Send TS packets grouped into RTP packets (≤ 7 per packet).
         for chunk in ts_packets.chunks(TS_PER_RTP * TS_PACKET) {
@@ -435,7 +438,7 @@ impl CastSession for MiracastSession {
 
         let mut ts_packets: Vec<u8> = Vec::new();
         let pes = build_pes_audio(&frame.data, frame.timestamp_us);
-        packetize_pes_into_ts(&pes, PID_AUDIO, &mut self.ts.cc_audio, &mut ts_packets);
+        packetize_pes_into_ts(&pes, PID_AUDIO, &mut self.ts.cc_audio, None, &mut ts_packets);
 
         for chunk in ts_packets.chunks(TS_PER_RTP * TS_PACKET) {
             let pkt = build_rtp_packet(self.rtp_seq, rtp_ts, self.ssrc, chunk);
@@ -1181,8 +1184,18 @@ fn build_pes_audio(data: &[u8], pts_us: u64) -> Vec<u8> {
 }
 
 /// Fragments a PES packet into 188-byte TS packets on `pid`.
-fn packetize_pes_into_ts(pes: &[u8], pid: u16, cc: &mut u8, out: &mut Vec<u8>) {
-    let pid_hi = 0xE0 | ((pid >> 8) as u8);
+///
+/// When `pcr_90k` is `Some`, the first TS packet carries a PCR in its
+/// adaptation field.  PCR lets the sink's clock recover the source timeline
+/// and is required for proper A/V sync.
+fn packetize_pes_into_ts(
+    pes: &[u8],
+    pid: u16,
+    cc: &mut u8,
+    pcr_90k: Option<u64>,
+    out: &mut Vec<u8>,
+) {
+    let pid_hi = (pid >> 8) as u8; // bits [12:8] of PID (no reserved/flag bits here)
     let pid_lo = pid as u8;
 
     let mut first = true;
@@ -1191,14 +1204,37 @@ fn packetize_pes_into_ts(pes: &[u8], pid: u16, cc: &mut u8, out: &mut Vec<u8>) {
     while !remaining.is_empty() {
         let mut pkt = [0xFFu8; TS_PACKET];
         pkt[0] = 0x47;
-        pkt[1] = if first { pid_hi | 0x40 } else { pid_hi & !0x40 };
         pkt[2] = pid_lo;
-        pkt[3] = 0x10 | (*cc & 0x0F);
-        *cc = cc.wrapping_add(1) & 0x0F;
 
-        let payload_space = TS_PACKET - 4;
+        let payload_offset = if first && pcr_90k.is_some() {
+            // Adaptation field (8 bytes) + payload.
+            // byte 3: adaptation_field_control=0b11 (adapt + payload)
+            pkt[1] = 0x40 | pid_hi; // PUSI=1
+            pkt[3] = 0x30 | (*cc & 0x0F);
+            *cc = cc.wrapping_add(1) & 0x0F;
+
+            let base = pcr_90k.unwrap_or(0) & 0x1_FFFF_FFFF; // 33-bit PCR_base
+            pkt[4] = 7; // adaptation_field_length = 7 (flags + 6 PCR bytes)
+            pkt[5] = 0x10; // PCR_flag=1, all others 0
+            pkt[6] = (base >> 25) as u8;
+            pkt[7] = (base >> 17) as u8;
+            pkt[8] = (base >> 9) as u8;
+            pkt[9] = (base >> 1) as u8;
+            // byte 10: PCR_base[0] | reserved(111111) | PCR_ext[8]=0
+            pkt[10] = ((base & 1) as u8) << 7 | 0x7E;
+            pkt[11] = 0x00; // PCR_ext[7:0] = 0
+            12 // payload starts after 4-byte header + 8-byte adaptation field
+        } else {
+            pkt[1] = if first { 0x40 | pid_hi } else { pid_hi };
+            pkt[3] = 0x10 | (*cc & 0x0F); // payload only
+            *cc = cc.wrapping_add(1) & 0x0F;
+            4
+        };
+
+        let payload_space = TS_PACKET - payload_offset;
         let chunk_len = remaining.len().min(payload_space);
-        pkt[4..4 + chunk_len].copy_from_slice(&remaining[..chunk_len]);
+        pkt[payload_offset..payload_offset + chunk_len]
+            .copy_from_slice(&remaining[..chunk_len]);
 
         out.extend_from_slice(&pkt);
         remaining = &remaining[chunk_len..];
