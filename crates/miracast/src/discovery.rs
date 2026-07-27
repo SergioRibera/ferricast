@@ -16,7 +16,7 @@ use crate::dbus::{
     NM_DEVICE_TYPE_WIFI_P2P, NetworkManagerProxy,
     P2pPeerProxy, WifiP2pProxy, WpaInterfaceProxy, WpaSupplicantProxy,
 };
-use crate::session::wfd_source_ies;
+use crate::session::{WFD_DEFAULT_PORT, wfd_source_ies};
 
 const MIRACAST_ICON: Bytes = Bytes::from_static(include_bytes!("../../../assets/miracast.svg"));
 
@@ -386,7 +386,10 @@ impl MiracastDiscovery {
 // ── iwd WFD registration ──────────────────────────────────────────────────────
 
 /// Calls `net.connman.iwd.p2p.ServiceManager.RegisterDisplayService` so iwd
-/// includes our WFD source subelements in P2P probe responses.
+/// advertises us as a WFD source in P2P probe responses.
+///
+/// iwd's ServiceManager takes structured properties (`Source: bool`, `Port: q`)
+/// and builds the WFD IEs internally — it does NOT accept raw subelement bytes.
 ///
 /// Non-fatal: the ServiceManager interface only exists when iwd is compiled
 /// with `--enable-wfd`.  Failure is logged at WARN with actionable guidance.
@@ -402,25 +405,26 @@ async fn register_iwd_wfd_source(conn: &Connection) {
         }
     };
 
-    let ies = wfd_source_ies();
-    let value = match zbus::zvariant::OwnedValue::try_from(
-        zbus::zvariant::Value::from(ies),
+    let source_val = match zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::from(true)) {
+        Ok(v) => v,
+        Err(e) => { tracing::warn!("WFD Source value encoding failed: {e}"); return; }
+    };
+    let port_val = match zbus::zvariant::OwnedValue::try_from(
+        zbus::zvariant::Value::from(WFD_DEFAULT_PORT),
     ) {
         Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("WFD subelements encoding failed: {e}");
-            return;
-        }
+        Err(e) => { tracing::warn!("WFD Port value encoding failed: {e}"); return; }
     };
 
     let mut props = std::collections::HashMap::new();
-    props.insert("WFDSubelements".to_string(), value);
+    props.insert("Source".to_string(), source_val);
+    props.insert("Port".to_string(), port_val);
 
     match sm.register_display_service(props).await {
-        Ok(()) => tracing::info!("WFD source registered with iwd ServiceManager"),
+        Ok(()) => tracing::info!("WFD source registered with iwd ServiceManager (port {WFD_DEFAULT_PORT})"),
         Err(e) => tracing::warn!(
             "iwd WFD support not available — Miracast sinks may not discover this device. \
-             Rebuild iwd with --enable-wfd (or enable 'wfd' in your iwd package). Error: {e}"
+             Rebuild iwd with --enable-wfd. Error: {e}"
         ),
     }
 }

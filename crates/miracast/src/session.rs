@@ -24,7 +24,7 @@ use crate::dbus::{
 
 /// WFD default RTSP port (Wi-Fi Display spec §6.5).
 /// The WFD Source listens on this port; the Sink connects to it.
-const WFD_DEFAULT_PORT: u16 = 7236;
+pub(crate) const WFD_DEFAULT_PORT: u16 = 7236;
 /// RTP payload type for MPEG-TS (RFC 2250).
 const RTP_PT_MP2T: u8 = 33;
 /// 90 kHz MPEG-TS / RTP clock.

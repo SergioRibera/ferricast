@@ -252,8 +252,11 @@ pub trait IwdP2pPeer {
 pub trait IwdP2pServiceManager {
     /// Register this process as a WFD source.
     ///
-    /// `properties` must contain `"WFDSubelements"` → `ay` (raw WFD
-    /// subelement bytes, without the outer Vendor-Specific IE wrapper).
+    /// `properties` accepts:
+    /// - `"Source"` → `b` — `true` to register as a WFD source
+    /// - `"Port"` → `q` — RTSP TCP port the source listens on (typically 7236)
+    ///
+    /// iwd constructs the WFD IEs from these properties internally.
     async fn register_display_service(
         &self,
         properties: HashMap<String, OwnedValue>,
