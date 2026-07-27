@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -74,8 +74,12 @@ pub struct MiracastSession {
     dbus: Option<Connection>,
     active_connection: Option<ActiveConnection>,
     /// TCP listener on the WFD RTSP port.  Created in `connect()`, consumed
-    /// (accepted) in `setup_stream()`.
+    /// (accepted) in `setup_stream()`.  Used for P2P mode.
     listener: Option<TcpListener>,
+    /// Pre-connected outbound TCP stream for infrastructure Miracast (tcp_scan
+    /// backend).  When set, `setup_stream()` uses this instead of accepting
+    /// from `listener`.
+    direct_conn: Option<TcpStream>,
     /// Write half of the RTSP TCP connection, shared with the reader task so it
     /// can respond to sink-initiated PAUSE/PLAY requests.
     rtsp_writer: Option<Arc<Mutex<OwnedWriteHalf>>>,
@@ -119,6 +123,7 @@ impl Default for MiracastSession {
             dbus: None,
             active_connection: None,
             listener: None,
+            direct_conn: None,
             rtsp_writer: None,
             rtsp_events: None,
             rtsp_task: None,
@@ -142,6 +147,7 @@ impl CastSession for MiracastSession {
         match device.metadata.get("backend").map(String::as_str) {
             Some("iwd") => self.connect_iwd(device).await,
             Some("nm_wifi") => self.connect_nm_wifi(device).await,
+            Some("tcp_scan") => self.connect_tcp_scan(device).await,
             _ => self.connect_nm(device).await,
         }
     }
@@ -162,27 +168,39 @@ impl CastSession for MiracastSession {
             .map_err(|e| FerricastError::Connection(format!("RTP local_addr: {e}")))?
             .port();
 
-        // Accept the sink's incoming TCP connection.  The sink connects to our
-        // RTSP port (7236) after it obtains an IP via DHCP on the P2P link.
-        let listener = self.listener.take().ok_or(FerricastError::NoActiveSession)?;
-        let (tcp, peer_addr) = tokio::time::timeout(RTSP_ACCEPT_TIMEOUT, listener.accept())
-            .await
-            .map_err(|_| {
-                FerricastError::Connection(format!(
-                    "Sink did not connect within {}s — check firewall on port {WFD_DEFAULT_PORT}",
-                    RTSP_ACCEPT_TIMEOUT.as_secs()
-                ))
-            })?
-            .map_err(|e| FerricastError::Connection(format!("RTSP accept failed: {e}")))?;
-
-        // The local address of the accepted socket is our P2P interface IP,
-        // which is what goes into the presentation URL we send to the sink.
-        let our_p2p_ip = tcp
-            .local_addr()
-            .map_err(|e| FerricastError::Connection(format!("RTSP socket local_addr: {e}")))?
-            .ip();
-
-        tracing::info!(%peer_addr, %our_p2p_ip, "Sink connected — starting WFD M1–M7 handshake");
+        // Establish the RTSP TCP connection.
+        //
+        // P2P mode: sink dials our listener after DHCP completes.
+        // Infrastructure mode (tcp_scan): we already connected outbound in
+        // connect_tcp_scan(); retrieve that stream directly.
+        let (tcp, peer_addr, our_p2p_ip) = if let Some(stream) = self.direct_conn.take() {
+            let peer = stream
+                .peer_addr()
+                .map_err(|e| FerricastError::Connection(format!("TCP peer_addr: {e}")))?;
+            let local_ip = stream
+                .local_addr()
+                .map_err(|e| FerricastError::Connection(format!("TCP local_addr: {e}")))?
+                .ip();
+            tracing::info!(%peer, %local_ip, "Infrastructure Miracast — using pre-connected stream");
+            (stream, peer, local_ip)
+        } else {
+            let listener = self.listener.take().ok_or(FerricastError::NoActiveSession)?;
+            let (tcp, addr) = tokio::time::timeout(RTSP_ACCEPT_TIMEOUT, listener.accept())
+                .await
+                .map_err(|_| {
+                    FerricastError::Connection(format!(
+                        "Sink did not connect within {}s — check firewall on port {WFD_DEFAULT_PORT}",
+                        RTSP_ACCEPT_TIMEOUT.as_secs()
+                    ))
+                })?
+                .map_err(|e| FerricastError::Connection(format!("RTSP accept failed: {e}")))?;
+            let p2p_ip = tcp
+                .local_addr()
+                .map_err(|e| FerricastError::Connection(format!("RTSP socket local_addr: {e}")))?
+                .ip();
+            tracing::info!(%addr, %p2p_ip, "Sink connected — starting WFD M1–M7 handshake");
+            (tcp, addr, p2p_ip)
+        };
 
         let mut rtsp = BufReader::new(tcp);
 
@@ -487,6 +505,7 @@ impl CastSession for MiracastSession {
         self.rtsp_events = None;
         self.rtp = None;
         self.listener = None;
+        self.direct_conn = None;
 
         if let Some(conn) = self.dbus.take() {
             match self.active_connection.take() {
@@ -734,6 +753,23 @@ impl MiracastSession {
         self.dbus = Some(conn);
         self.active_connection = Some(ActiveConnection::Nm(active_path));
         self.listener = Some(listener);
+        self.alive = true;
+        Ok(())
+    }
+
+    async fn connect_tcp_scan(&mut self, device: &Device) -> Result<()> {
+        let addr = SocketAddr::new(device.addr, WFD_DEFAULT_PORT);
+        tracing::info!(%addr, "Connecting to Miracast sink (infrastructure LAN mode)");
+        let stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| {
+            FerricastError::Connection(format!("TCP connect to {addr} timed out after 10s"))
+        })?
+        .map_err(|e| FerricastError::Connection(format!("TCP connect to {addr}: {e}")))?;
+        self.direct_conn = Some(stream);
         self.alive = true;
         Ok(())
     }

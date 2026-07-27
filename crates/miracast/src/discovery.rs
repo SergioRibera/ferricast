@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_lite::StreamExt;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{sync::{mpsc, Semaphore}, task::JoinHandle};
 use zbus::{Connection, zvariant::OwnedObjectPath};
 
 use ferricast_core::{Device, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError, Result};
@@ -37,6 +38,10 @@ enum ActiveBackend {
     /// NM regular Wi-Fi scan for DIRECT- Group Owners (Windows Connect on 5 GHz).
     /// No explicit D-Bus stop call needed — task abort is sufficient.
     NmWifi,
+    /// TCP port 7236 scan of the local /24 subnet.
+    /// Finds infrastructure-mode sinks already on the same LAN (e.g. Windows
+    /// Connect "Available everywhere"). No D-Bus involved; task abort is enough.
+    TcpPortScan,
 }
 
 // ── public type ───────────────────────────────────────────────────────────────
@@ -81,17 +86,21 @@ impl Discovery for MiracastDiscovery {
         // NM P2P: last resort when iwd is absent and NM manages P2P natively.
         if self.backends.is_empty() {
             if let Some(device_path) = find_nm_p2p_device(&conn).await? {
-                self.start_nm(conn, device_path, tx).await?;
+                self.start_nm(conn, device_path, tx.clone()).await?;
             }
         }
 
         if self.backends.is_empty() {
-            return Err(FerricastError::Discovery(
-                "No Wi-Fi P2P device found via iwd or NetworkManager. \
+            tracing::warn!(
+                "No Wi-Fi Direct backend found (iwd/NM) — only LAN port scan will run. \
                  Check your adapter, drivers, and that iwd or NetworkManager is running."
-                    .into(),
-            ));
+            );
         }
+
+        // Always scan the local subnet for hosts with port 7236 open.
+        // Catches infrastructure-mode sinks (e.g. Windows Connect "Available
+        // everywhere") that don't need Wi-Fi Direct at all.
+        self.start_tcp_port_scan(tx).await?;
 
         self.running = true;
         Ok(())
@@ -127,7 +136,7 @@ impl Discovery for MiracastDiscovery {
                         FerricastError::Discovery(format!("iwd ReleaseDiscovery: {e}"))
                     })?;
                 }
-                ActiveBackend::NmWifi => {}
+                ActiveBackend::NmWifi | ActiveBackend::TcpPortScan => {}
             }
         }
 
@@ -513,6 +522,48 @@ impl MiracastDiscovery {
         self.backends.push(ActiveBackend::NmWifi);
         Ok(())
     }
+
+    async fn start_tcp_port_scan(
+        &mut self,
+        tx: mpsc::Sender<DiscoveryEvent>,
+    ) -> Result<()> {
+        let handle = tokio::spawn(async move {
+            tracing::info!("Miracast discovery started (TCP port {WFD_DEFAULT_PORT} scan backend)");
+            let mut known: HashMap<Ipv4Addr, Uuid> = HashMap::new();
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await; // fires immediately on first call
+                let found = scan_local_subnet_port(WFD_DEFAULT_PORT).await;
+
+                for &ip in &found {
+                    if !known.contains_key(&ip) {
+                        let device = make_tcp_scan_device(ip);
+                        let id = device.id;
+                        if tx.send(DiscoveryEvent::DeviceFound(device)).await.is_err() {
+                            return;
+                        }
+                        known.insert(ip, id);
+                    }
+                }
+
+                let lost: Vec<Ipv4Addr> = known
+                    .keys()
+                    .filter(|ip| !found.contains(ip))
+                    .copied()
+                    .collect();
+                for ip in lost {
+                    if let Some(id) = known.remove(&ip) {
+                        if tx.send(DiscoveryEvent::DeviceLost(id)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        self.handles.push(handle);
+        self.backends.push(ActiveBackend::TcpPortScan);
+        Ok(())
+    }
 }
 
 // ── iwd WFD registration ──────────────────────────────────────────────────────
@@ -781,6 +832,83 @@ fn peer_event_from_iwd_props(
     Some(DiscoveryEvent::DeviceFound(make_device(
         name, None, WFD_DEFAULT_PORT, metadata,
     )))
+}
+
+// ── TCP port scan helpers ─────────────────────────────────────────────────────
+
+/// Primary outbound IPv4 address via the UDP connect trick (no packets sent).
+fn get_local_ipv4() -> Option<Ipv4Addr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:53").ok()?;
+    match sock.local_addr().ok()?.ip() {
+        IpAddr::V4(v4) if !v4.is_loopback() => Some(v4),
+        _ => None,
+    }
+}
+
+/// Scans all hosts on the local /24 for open TCP `port`.
+/// Up to 50 connections in flight; 300 ms per-host timeout.
+async fn scan_local_subnet_port(port: u16) -> Vec<Ipv4Addr> {
+    let Some(local_ip) = get_local_ipv4() else {
+        tracing::warn!("Cannot determine local IPv4 — skipping TCP port scan");
+        return vec![];
+    };
+    let oct = local_ip.octets();
+    let local_host = oct[3];
+    tracing::debug!(
+        "scanning {}.{}.{}.0/24 for port {port}",
+        oct[0], oct[1], oct[2]
+    );
+
+    let sem = Arc::new(Semaphore::new(50));
+    let tasks: Vec<_> = (1u8..=254)
+        .filter(|&h| h != local_host)
+        .map(|host| {
+            let ip = Ipv4Addr::new(oct[0], oct[1], oct[2], host);
+            let sem = Arc::clone(&sem);
+            tokio::spawn(async move {
+                let _permit = sem.acquire().await.ok()?;
+                tokio::time::timeout(
+                    Duration::from_millis(300),
+                    tokio::net::TcpStream::connect(SocketAddr::from((ip, port))),
+                )
+                .await
+                .ok()?
+                .ok()?;
+                Some(ip)
+            })
+        })
+        .collect();
+
+    let mut found = Vec::new();
+    for task in tasks {
+        if let Ok(Some(ip)) = task.await {
+            tracing::debug!("port {port} open on {ip} — potential Miracast sink");
+            found.push(ip);
+        }
+    }
+    found
+}
+
+fn make_tcp_scan_device(ip: Ipv4Addr) -> Device {
+    let mut metadata = HashMap::new();
+    metadata.insert("ip".into(), ip.to_string());
+    metadata.insert("backend".into(), "tcp_scan".into());
+    Device {
+        id: Uuid::new_v4(),
+        name: format!("Miracast @ {ip}"),
+        protocol: "miracast",
+        protocol_icon: MIRACAST_ICON,
+        addr: IpAddr::V4(ip),
+        port: WFD_DEFAULT_PORT,
+        model: None,
+        capabilities: DeviceCapabilities {
+            supports_video: true,
+            supports_screen_mirror: true,
+            ..Default::default()
+        },
+        metadata,
+    }
 }
 
 // ── shared helpers ────────────────────────────────────────────────────────────
