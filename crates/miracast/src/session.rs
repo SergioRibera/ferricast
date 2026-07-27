@@ -18,7 +18,7 @@ use crate::dbus::{
     ActiveConnectionProxy, DeviceProxy, IwdP2pPeerProxy, IwdSimpleConfigurationProxy,
     NM_ACTIVE_CONNECTION_STATE_ACTIVATED, NM_ACTIVE_CONNECTION_STATE_DEACTIVATED,
     NM_ACTIVE_CONNECTION_STATE_DEACTIVATING, NM_DEVICE_TYPE_WIFI_P2P, NetworkManagerProxy,
-    P2pPeerProxy, WifiP2pProxy, WpaInterfaceProxy, WpaP2pDeviceProxy, WpaSupplicantProxy,
+    P2pPeerProxy, WifiP2pProxy,
 };
 
 // ── constants ─────────────────────────────────────────────────────────────────
@@ -721,15 +721,9 @@ impl MiracastSession {
             }
         }
 
-        // wpa_supplicant's default P2P Find only scans social channels (1/6/11).
-        // Windows Connect may operate its GO on a non-social channel (e.g. ch 2
-        // / 2417 MHz).  Trigger a full-channel scan via the wpa_supplicant D-Bus
-        // P2P interface so the peer appears in NM's peer list.
-        trigger_wpa_full_p2p_scan(&conn).await;
-
         // The NM Wi-Fi scan may have seen the AP before P2P find reported the
-        // peer.  Retry up to ~15 s while the full scan completes.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        // peer.  Retry up to ~10 s.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             for dev_path in &p2p_device_paths {
                 let p2p = WifiP2pProxy::new(&conn, dev_path.clone()).await.map_err(|e| {
@@ -784,46 +778,6 @@ impl MiracastSession {
         self.direct_conn = Some(stream);
         self.alive = true;
         Ok(())
-    }
-}
-
-// ── wpa_supplicant helpers ────────────────────────────────────────────────────
-
-/// Triggers a wpa_supplicant P2P Find with `DiscoveryType=start_with_full`.
-///
-/// The default NM/wpa_supplicant P2P Find only scans social channels 1/6/11.
-/// `start_with_full` performs a full-channel beacon scan first, so P2P Group
-/// Owners on non-social channels (e.g. Windows Connect on channel 2 / 2417 MHz)
-/// become visible as P2P peers in NetworkManager.  Non-fatal — called
-/// opportunistically before the NM peer-lookup retry loop.
-async fn trigger_wpa_full_p2p_scan(conn: &Connection) {
-    let wpa = match WpaSupplicantProxy::new(conn).await {
-        Ok(w) => w,
-        Err(e) => { tracing::debug!("wpa_supplicant not on D-Bus: {e}"); return; }
-    };
-    let iface_paths = match wpa.interfaces().await {
-        Ok(p) => p,
-        Err(e) => { tracing::debug!("wpa_supplicant Interfaces: {e}"); return; }
-    };
-    for path in iface_paths {
-        let Ok(iface) = WpaInterfaceProxy::new(conn, path.clone()).await else { continue; };
-        // Only touch the station interface, not any existing P2P group interfaces.
-        let ifname = iface.ifname().await.unwrap_or_default();
-        if ifname.starts_with("p2p-") || ifname.starts_with("wlan0.") {
-            continue;
-        }
-        let Ok(p2p) = WpaP2pDeviceProxy::new(conn, path).await else { continue; };
-        let mut args = HashMap::new();
-        if let Ok(v) = zbus::zvariant::OwnedValue::try_from(
-            zbus::zvariant::Value::from("start_with_full"),
-        ) {
-            args.insert("DiscoveryType".to_string(), v);
-        }
-        match p2p.find(args).await {
-            Ok(()) => tracing::info!(ifname, "wpa_supplicant P2P Find (start_with_full) triggered"),
-            Err(e) => tracing::debug!(ifname, "wpa_supplicant P2PDevice.Find: {e}"),
-        }
-        break; // one interface is enough
     }
 }
 

@@ -193,28 +193,6 @@ pub trait WpaInterface {
     fn set_WFDIEs(&self, value: Vec<u8>) -> zbus::Result<()>;
 }
 
-/// P2P sub-interface on a wpa_supplicant managed interface.
-///
-/// Lives on the same object path as the `fi.w1.wpa_supplicant1.Interface`
-/// (e.g. `/fi/w1/wpa_supplicant1/Interfaces/0`).
-///
-/// Key use-case: `Find` with `DiscoveryType = "start_with_full"` performs a
-/// full-channel beacon scan first, letting wpa_supplicant find P2P Group
-/// Owners operating on non-social channels (e.g. Windows Connect on ch 2).
-/// The default NM/wpa_supplicant P2P find only scans social channels 1/6/11.
-#[zbus::proxy(
-    interface = "fi.w1.wpa_supplicant1.Interface.P2PDevice",
-    default_service = "fi.w1.wpa_supplicant1"
-)]
-pub trait WpaP2pDevice {
-    /// Start P2P peer discovery.
-    ///
-    /// Relevant `args` keys:
-    /// - `"DiscoveryType"` (s): `"social"` (default) | `"start_with_full"` | `"progressive"`
-    /// - `"Timeout"` (i): seconds; 0 = indefinite
-    async fn find(&self, args: HashMap<String, OwnedValue>) -> zbus::Result<()>;
-    async fn stop_find(&self) -> zbus::Result<()>;
-}
 
 // ── iwd proxies ───────────────────────────────────────────────────────────────
 
