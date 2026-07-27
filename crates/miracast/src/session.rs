@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use zbus::Connection;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
-use ferricast_core::{CastSession, Device, EncodedFrame, FerricastError, Result, StreamConfig};
+use ferricast_core::{AudioFrame, CastSession, Device, EncodedFrame, FerricastError, Result, StreamConfig};
 
 use crate::dbus::{
     ActiveConnectionProxy, IwdP2pPeerProxy,
@@ -41,8 +41,11 @@ const RTSP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 const PID_PAT: u16 = 0x0000;
 const PID_PMT: u16 = 0x1000;
 const PID_VIDEO: u16 = 0x0100;
+const PID_AUDIO: u16 = 0x0101;
 const STREAM_TYPE_H264: u8 = 0x1B;
+const STREAM_TYPE_AAC: u8 = 0x0F; // ISO 13818-7 (MPEG-2 AAC / ADTS)
 const PES_STREAM_ID_VIDEO: u8 = 0xE0;
+const PES_STREAM_ID_AUDIO: u8 = 0xC0;
 
 // ── RTSP event (sink → source during streaming) ───────────────────────────────
 
@@ -106,6 +109,7 @@ struct TsState {
     cc_pat: u8,
     cc_pmt: u8,
     cc_video: u8,
+    cc_audio: u8,
     psi_sent: bool,
 }
 
@@ -415,6 +419,28 @@ impl CastSession for MiracastSession {
             let pkt = build_rtp_packet(self.rtp_seq, rtp_ts, self.ssrc, chunk);
             sock.send_to(&pkt, sink).await.map_err(|e| {
                 FerricastError::Streaming(format!("RTP send failed: {e}"))
+            })?;
+            self.rtp_seq = self.rtp_seq.wrapping_add(1);
+        }
+
+        Ok(())
+    }
+
+    /// Packetizes one AAC audio frame (ADTS-framed) into MPEG-TS and sends it over RTP/UDP.
+    async fn send_audio_frame(&mut self, frame: &AudioFrame) -> Result<()> {
+        let sock = self.rtp.as_ref().ok_or(FerricastError::NoActiveSession)?;
+        let sink = self.sink_rtp_addr.ok_or(FerricastError::NoActiveSession)?;
+
+        let rtp_ts = (frame.timestamp_us * CLOCK_90K / 1_000_000) as u32;
+
+        let mut ts_packets: Vec<u8> = Vec::new();
+        let pes = build_pes_audio(&frame.data, frame.timestamp_us);
+        packetize_pes_into_ts(&pes, PID_AUDIO, &mut self.ts.cc_audio, &mut ts_packets);
+
+        for chunk in ts_packets.chunks(TS_PER_RTP * TS_PACKET) {
+            let pkt = build_rtp_packet(self.rtp_seq, rtp_ts, self.ssrc, chunk);
+            sock.send_to(&pkt, sink).await.map_err(|e| {
+                FerricastError::Streaming(format!("RTP audio send failed: {e}"))
             })?;
             self.rtp_seq = self.rtp_seq.wrapping_add(1);
         }
@@ -942,7 +968,7 @@ fn parse_client_port(transport: &str) -> Option<u16> {
 /// sink's preferred receive port, not a source capability.
 fn wfd_capabilities() -> String {
     "wfd_video_formats: 00 00 01 02 00000080 00000000 00000000 00 0000 0000 00 none none\r\n\
-     wfd_audio_codecs: LPCM 00000003 00\r\n\
+     wfd_audio_codecs: LPCM 00000003 00, AAC 00000001 00\r\n\
      wfd_uibc_capability: none\r\n\
      wfd_standby_resume_capability: none\r\n"
         .to_string()
@@ -959,7 +985,7 @@ fn wfd_set_parameter(
 ) -> String {
     format!(
         "wfd_video_formats: 00 00 01 02 00000080 00000000 00000000 00 0000 0000 00 none none\r\n\
-         wfd_audio_codecs: LPCM 00000003 00\r\n\
+         wfd_audio_codecs: AAC 00000001 00\r\n\
          wfd_presentation_URL: {presentation_url} none\r\n\
          wfd_client_rtp_ports: RTP/AVP/UDP;unicast {sink_primary_rtp} {sink_secondary_rtp} mode=play\r\n"
     )
@@ -1032,7 +1058,7 @@ fn build_pat(cc: &mut u8) -> [u8; TS_PACKET] {
     pkt
 }
 
-/// Builds a 188-byte PMT (Program Map Table) TS packet for one H.264 video stream.
+/// Builds a 188-byte PMT (Program Map Table) TS packet for H.264 video + AAC audio.
 fn build_pmt(cc: &mut u8) -> [u8; TS_PACKET] {
     let mut pkt = [0xFFu8; TS_PACKET];
     pkt[0] = 0x47;
@@ -1046,7 +1072,8 @@ fn build_pmt(cc: &mut u8) -> [u8; TS_PACKET] {
     let pmt = &mut pkt[5..];
     pmt[0] = 0x02; // table_id = PMT
     pmt[1] = 0xB0;
-    pmt[2] = 0x12; // section_length = 18
+    // section_length = 9 (fixed header) + 5 (video ES) + 5 (audio ES) + 4 (CRC) = 23 = 0x17
+    pmt[2] = 0x17;
     pmt[3] = 0x00;
     pmt[4] = 0x01; // program_number
     pmt[5] = 0xC1; // version=0, current=1
@@ -1058,19 +1085,24 @@ fn build_pmt(cc: &mut u8) -> [u8; TS_PACKET] {
     // program_info_length = 0
     pmt[10] = 0xF0;
     pmt[11] = 0x00;
-    // Elementary stream: H.264
+    // Elementary stream: H.264 video
     pmt[12] = STREAM_TYPE_H264;
     pmt[13] = 0xE0 | (PID_VIDEO >> 8) as u8;
     pmt[14] = PID_VIDEO as u8;
-    // ES_info_length = 0
-    pmt[15] = 0xF0;
+    pmt[15] = 0xF0; // ES_info_length = 0
     pmt[16] = 0x00;
-    // CRC32
-    let crc = crc32_mpeg(&pkt[5..5 + 17]);
-    pkt[22] = (crc >> 24) as u8;
-    pkt[23] = (crc >> 16) as u8;
-    pkt[24] = (crc >> 8) as u8;
-    pkt[25] = crc as u8;
+    // Elementary stream: AAC audio (ADTS, ISO 13818-7)
+    pmt[17] = STREAM_TYPE_AAC;
+    pmt[18] = 0xE0 | (PID_AUDIO >> 8) as u8;
+    pmt[19] = PID_AUDIO as u8;
+    pmt[20] = 0xF0; // ES_info_length = 0
+    pmt[21] = 0x00;
+    // CRC32 over table_id through last ES entry (22 bytes)
+    let crc = crc32_mpeg(&pkt[5..5 + 22]);
+    pkt[27] = (crc >> 24) as u8;
+    pkt[28] = (crc >> 16) as u8;
+    pkt[29] = (crc >> 8) as u8;
+    pkt[30] = crc as u8;
 
     pkt
 }
@@ -1112,6 +1144,39 @@ fn build_pes(payload: &[u8], (pts_us, dts_us): (u64, u64)) -> Vec<u8> {
     }
 
     pes.extend_from_slice(payload);
+    pes
+}
+
+/// Builds a PES packet wrapping ADTS-framed AAC audio data.
+///
+/// Audio has no B-frames, so DTS == PTS and only PTS is encoded.
+fn build_pes_audio(data: &[u8], pts_us: u64) -> Vec<u8> {
+    let pts_90k = pts_us * 90_000 / 1_000_000;
+
+    // Fixed PES header: start_code(3) + stream_id(1) + packet_length(2) +
+    //                   flags(2) + header_data_length(1) + PTS(5) = 14 bytes.
+    let packet_length = (3 + 1 + 5 + data.len()) as u16; // bytes after the 6-byte fixed prefix
+    let mut pes = Vec::with_capacity(14 + data.len());
+    pes.extend_from_slice(&[0x00, 0x00, 0x01]);
+    pes.push(PES_STREAM_ID_AUDIO);
+    pes.push((packet_length >> 8) as u8);
+    pes.push(packet_length as u8);
+    pes.push(0x80); // marker=10, no scrambling, no priority, no alignment, no copyright, no original
+    pes.push(0x80); // PTS_DTS_flags=10 (PTS only), no ESCR, no ES_rate
+    pes.push(0x05); // header_data_length = 5 (one PTS field)
+
+    fn encode_pts(ts: u64, prefix: u8) -> [u8; 5] {
+        [
+            prefix | (((ts >> 30) & 0x07) as u8) << 1 | 0x01,
+            ((ts >> 22) & 0xFF) as u8,
+            (((ts >> 15) & 0x7F) as u8) << 1 | 0x01,
+            ((ts >> 7) & 0xFF) as u8,
+            ((ts & 0x7F) as u8) << 1 | 0x01,
+        ]
+    }
+
+    pes.extend_from_slice(&encode_pts(pts_90k, 0x21));
+    pes.extend_from_slice(data);
     pes
 }
 
