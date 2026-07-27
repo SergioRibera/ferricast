@@ -429,7 +429,7 @@ impl MiracastDiscovery {
         let existing = wifi.access_points().await.unwrap_or_default();
         let mut known_aps: HashMap<String, Uuid> = HashMap::new();
         for ap_path in &existing {
-            if let Some(device) = nm_ap_as_miracast_device(&conn, ap_path).await {
+            if let Some(device) = nm_ap_as_miracast_device(&conn, ap_path, &device_path).await {
                 known_aps.insert(ap_path.to_string(), device.id);
                 let _ = tx.send(DiscoveryEvent::DeviceFound(device)).await;
             }
@@ -443,6 +443,7 @@ impl MiracastDiscovery {
         })?;
 
         let conn_task = conn.clone();
+        let device_path_task = device_path.clone();
         let mut rescan_interval = tokio::time::interval(Duration::from_secs(30));
         rescan_interval.tick().await;
 
@@ -462,7 +463,7 @@ impl MiracastDiscovery {
                                 .map_err(|e| FerricastError::Discovery(format!("AccessPointAdded args: {e}")))?
                                 .access_point
                                 .clone();
-                            if let Some(device) = nm_ap_as_miracast_device(&conn_task, &ap_path).await {
+                            if let Some(device) = nm_ap_as_miracast_device(&conn_task, &ap_path, &device_path_task).await {
                                 known_aps.insert(ap_path.to_string(), device.id);
                                 tx.send(DiscoveryEvent::DeviceFound(device))
                                     .await
@@ -662,6 +663,7 @@ async fn find_nm_wifi_device(conn: &Connection) -> Result<Option<OwnedObjectPath
 async fn nm_ap_as_miracast_device(
     conn: &Connection,
     ap_path: &OwnedObjectPath,
+    nm_device_path: &OwnedObjectPath,
 ) -> Option<Device> {
     let ap = NmAccessPointProxy::new(conn, ap_path.clone()).await.ok()?;
     let ssid_bytes = ap.ssid().await.ok()?;
@@ -678,6 +680,7 @@ async fn nm_ap_as_miracast_device(
     metadata.insert("ssid".into(), ssid.clone());
     metadata.insert("bssid".into(), bssid);
     metadata.insert("ap_path".into(), ap_path.to_string());
+    metadata.insert("nm_device_path".into(), nm_device_path.to_string());
     metadata.insert("backend".into(), "nm_wifi".into());
 
     Some(make_device(ssid, None, WFD_DEFAULT_PORT, metadata))
