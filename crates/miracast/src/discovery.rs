@@ -72,25 +72,34 @@ impl Discovery for MiracastDiscovery {
             FerricastError::Discovery(format!("D-Bus system bus unavailable: {e}"))
         })?;
 
-        // iwd P2P: finds 2.4 GHz WFD peers in P2P device discovery mode.
-        if let Some(device_path) = find_iwd_p2p_device(&conn).await {
+        // iwd P2P: finds WFD peers via iwd's P2P device discovery.
+        let iwd_found = if let Some(device_path) = find_iwd_p2p_device(&conn).await {
             self.start_iwd(conn.clone(), device_path, tx.clone()).await?;
-        }
+            true
+        } else {
+            false
+        };
 
-        // NM Wi-Fi station scan: finds DIRECT- Group Owners on 5 GHz (e.g.
-        // Windows Connect app).  Complements iwd P2P — different bands.
+        // NM Wi-Fi station scan: finds DIRECT- Group Owners (e.g. Windows
+        // Connect on 5 GHz).  Runs alongside all other backends.
         if let Some(device_path) = find_nm_wifi_device(&conn).await? {
             self.start_nm_wifi(conn.clone(), device_path, tx.clone()).await?;
         }
 
-        // NM P2P: last resort when iwd is absent and NM manages P2P natively.
-        if self.backends.is_empty() {
+        // NM P2P (wpa_supplicant backend): use when iwd is NOT managing the
+        // adapter.  Complements NM Wi-Fi scan — different discovery mechanism.
+        // Do NOT start alongside iwd: they fight over the same interface.
+        if !iwd_found {
             if let Some(device_path) = find_nm_p2p_device(&conn).await? {
                 self.start_nm(conn, device_path, tx.clone()).await?;
             }
         }
 
-        if self.backends.is_empty() {
+        let p2p_running = self
+            .backends
+            .iter()
+            .any(|b| matches!(b, ActiveBackend::Nm { .. } | ActiveBackend::Iwd { .. }));
+        if !p2p_running {
             tracing::warn!(
                 "No Wi-Fi Direct backend found (iwd/NM) — only LAN port scan will run. \
                  Check your adapter, drivers, and that iwd or NetworkManager is running."
@@ -193,9 +202,9 @@ impl MiracastDiscovery {
         let conn_task = conn.clone();
         let device_path_str = device_path.to_string();
 
-        // wpa_supplicant's P2P find expires after ~120 s.  Restart it
-        // periodically so new sinks remain discoverable during long sessions.
-        let mut restart_interval = tokio::time::interval(Duration::from_secs(120));
+        // wpa_supplicant's P2P find expires after a short window.  Restart
+        // every 20 s (same as GNOME Network Displays) for continuous coverage.
+        let mut restart_interval = tokio::time::interval(Duration::from_secs(20));
         restart_interval.tick().await; // skip the immediate first tick
 
         let handle = tokio::spawn(async move {
