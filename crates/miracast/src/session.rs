@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -45,8 +47,6 @@ const PES_STREAM_ID_VIDEO: u8 = 0xE0;
 // ── RTSP event (sink → source during streaming) ───────────────────────────────
 
 enum RtspEvent {
-    /// Sink requested a keyframe via `SET_PARAMETER wfd_idr_request`.
-    IdrRequest,
     /// Sink sent TEARDOWN — session is ending.
     Teardown,
 }
@@ -94,6 +94,9 @@ pub struct MiracastSession {
     ts: TsState,
     /// Timestamp of last keep-alive GET_PARAMETER sent to the sink.
     last_keepalive: Option<Instant>,
+    /// Set to `true` by the RTSP reader task when the sink sends
+    /// `SET_PARAMETER wfd_idr_request`.  Cleared by `poll_keyframe_request`.
+    keyframe_requested: Arc<AtomicBool>,
     alive: bool,
 }
 
@@ -123,6 +126,7 @@ impl Default for MiracastSession {
             ssrc: rand::random(),
             ts: TsState::default(),
             last_keepalive: None,
+            keyframe_requested: Arc::new(AtomicBool::new(false)),
             alive: false,
         }
     }
@@ -327,7 +331,11 @@ impl CastSession for MiracastSession {
         // read half goes to a background task that pumps incoming sink messages.
         let (read_half, write_half) = rtsp.into_inner().into_split();
         let (event_tx, event_rx) = mpsc::channel::<RtspEvent>(8);
-        let task = tokio::spawn(rtsp_reader_task(BufReader::new(read_half), event_tx));
+        let task = tokio::spawn(rtsp_reader_task(
+            BufReader::new(read_half),
+            event_tx,
+            Arc::clone(&self.keyframe_requested),
+        ));
 
         self.rtp = Some(rtp_sock);
         self.sink_rtp_addr = Some(sink_rtp_addr);
@@ -342,14 +350,12 @@ impl CastSession for MiracastSession {
 
     /// Packetizes one video frame into MPEG-TS and sends it over RTP/UDP.
     async fn send_frame(&mut self, frame: &EncodedFrame) -> Result<()> {
-        // Drain any events from the background RTSP reader (IDR requests, TEARDOWN).
+        // Drain sink events from the background RTSP reader.
+        // IDR requests are handled via `keyframe_requested` AtomicBool (polled
+        // by the manager via `poll_keyframe_request`).
         if let Some(events) = self.rtsp_events.as_mut() {
             while let Ok(event) = events.try_recv() {
                 match event {
-                    RtspEvent::IdrRequest => {
-                        tracing::debug!("Sink requested IDR keyframe");
-                        // TODO: signal encoder to emit keyframe
-                    }
                     RtspEvent::Teardown => {
                         tracing::info!("Sink sent TEARDOWN — stopping session");
                         self.alive = false;
@@ -474,6 +480,10 @@ impl CastSession for MiracastSession {
 
     fn is_alive(&self) -> bool {
         self.alive
+    }
+
+    fn poll_keyframe_request(&mut self) -> bool {
+        self.keyframe_requested.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -839,15 +849,15 @@ where
     Ok(RtspMessage { start_line, headers, body })
 }
 
-/// Background task: owns the read half of the RTSP TCP connection and converts
-/// incoming sink messages to `RtspEvent`s.
+/// Background task: owns the read half of the RTSP TCP connection.
 ///
-/// 200 OK responses to our keep-alive GET_PARAMETER are silently discarded.
-/// SET_PARAMETER with `wfd_idr_request` → `RtspEvent::IdrRequest`.
-/// TEARDOWN → `RtspEvent::Teardown`, then task exits.
+/// - 200 OK to keep-alive GET_PARAMETER → discarded.
+/// - SET_PARAMETER with `wfd_idr_request` body → sets `keyframe_requested`.
+/// - TEARDOWN → sends `RtspEvent::Teardown` and exits.
 async fn rtsp_reader_task(
     mut reader: BufReader<OwnedReadHalf>,
     tx: mpsc::Sender<RtspEvent>,
+    keyframe_requested: Arc<AtomicBool>,
 ) {
     loop {
         match recv_rtsp(&mut reader).await {
@@ -858,9 +868,8 @@ async fn rtsp_reader_task(
                 } else if msg.start_line.starts_with("SET_PARAMETER")
                     && msg.body.contains("wfd_idr_request")
                 {
-                    if tx.send(RtspEvent::IdrRequest).await.is_err() {
-                        break;
-                    }
+                    tracing::debug!("Sink requested IDR keyframe");
+                    keyframe_requested.store(true, Ordering::Relaxed);
                 } else if msg.start_line.starts_with("TEARDOWN") {
                     let _ = tx.send(RtspEvent::Teardown).await;
                     break;
