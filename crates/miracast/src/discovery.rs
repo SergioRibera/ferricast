@@ -279,6 +279,15 @@ impl MiracastDiscovery {
             .await
             .map_err(|e| FerricastError::Discovery(format!("iwd P2P device proxy: {e}")))?;
 
+        // Enable P2P if the adapter has it disabled (e.g. fresh boot / user never
+        // toggled it).  Non-fatal: if it fails we still attempt discovery.
+        if !dev.enabled().await.unwrap_or(true) {
+            match dev.set_enabled(true).await {
+                Ok(()) => tracing::info!("iwd P2P device enabled"),
+                Err(e) => tracing::warn!("Could not enable iwd P2P device: {e}"),
+            }
+        }
+
         // Register as a WFD source via iwd's ServiceManager so iwd includes
         // our subelements in P2P probe responses.  Non-fatal: only present
         // when iwd is compiled with WFD support (--enable-wfd).
@@ -513,13 +522,23 @@ fn peer_event_from_iwd_props(
     path: &OwnedObjectPath,
     ifaces: &HashMap<String, HashMap<String, zbus::zvariant::OwnedValue>>,
 ) -> Option<DiscoveryEvent> {
+    let iface_names: Vec<&str> = ifaces.keys().map(String::as_str).collect();
+    tracing::debug!(?path, ?iface_names, "iwd peer interfaces");
+
     // Require WPS interface — PushButton() is the correct connect method.
     if !ifaces.contains_key(IWD_SIMPLE_CONFIG_IFACE) {
+        tracing::debug!(?path, "iwd peer skipped: no SimpleConfiguration (WSC) interface");
         return None;
     }
 
     // Require WFD Display interface AND Sink == true.
-    let display_props = ifaces.get(IWD_P2P_DISPLAY_IFACE)?;
+    let display_props = match ifaces.get(IWD_P2P_DISPLAY_IFACE) {
+        Some(p) => p,
+        None => {
+            tracing::debug!(?path, "iwd peer skipped: no p2p.Display interface (iwd may not have parsed WFD IEs)");
+            return None;
+        }
+    };
     let is_sink = display_props
         .get("Sink")
         .and_then(|v| {
@@ -531,6 +550,7 @@ fn peer_event_from_iwd_props(
         })
         .unwrap_or(false);
     if !is_sink {
+        tracing::debug!(?path, "iwd peer skipped: Display.Sink == false (peer is WFD source, not sink)");
         return None;
     }
 
