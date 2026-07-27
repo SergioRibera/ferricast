@@ -90,6 +90,9 @@ pub mod hls {
 pub mod protocols {
     #[cfg(feature = "chromecast")]
     pub use ferricast_chromecast::ChromecastHandler as Chromecast;
+
+    #[cfg(feature = "miracast")]
+    pub use ferricast_miracast::MiracastHandler as Miracast;
 }
 
 /// Everything you typically want in scope to talk to Ferricast.

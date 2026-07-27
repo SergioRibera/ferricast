@@ -1685,6 +1685,11 @@ impl StreamManagerBuilder {
         self.register::<ferricast_chromecast::ChromecastHandler>()
     }
 
+    #[cfg(feature = "miracast")]
+    pub fn with_miracast(self) -> Self {
+        self.register::<ferricast_miracast::MiracastHandler>()
+    }
+
     /// Register the Chromecast *receiver* — advertise this process
     /// as a Cast target and accept LOAD / PLAY / PAUSE / SEEK from
     /// senders.

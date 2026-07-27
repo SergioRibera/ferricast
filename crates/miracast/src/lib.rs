@@ -1,5 +1,6 @@
 pub mod discovery;
 pub mod session;
+pub(crate) mod dbus;
 
 pub use discovery::MiracastDiscovery;
 pub use session::MiracastSession;
