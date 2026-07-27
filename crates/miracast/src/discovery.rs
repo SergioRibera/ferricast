@@ -523,11 +523,25 @@ fn peer_event_from_iwd_props(
     ifaces: &HashMap<String, HashMap<String, zbus::zvariant::OwnedValue>>,
 ) -> Option<DiscoveryEvent> {
     let iface_names: Vec<&str> = ifaces.keys().map(String::as_str).collect();
-    tracing::debug!(?path, ?iface_names, "iwd peer interfaces");
+
+    // Extract name early so every skip message identifies the peer.
+    let peer_name: String = ifaces
+        .get(IWD_P2P_PEER_IFACE)
+        .and_then(|p| p.get("Name"))
+        .and_then(|v| {
+            if let zbus::zvariant::Value::Str(s) = &**v {
+                Some(s.as_str().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "<unknown>".to_string());
+
+    tracing::debug!(?path, name = peer_name, ?iface_names, "iwd peer interfaces");
 
     // Require WPS interface — PushButton() is the correct connect method.
     if !ifaces.contains_key(IWD_SIMPLE_CONFIG_IFACE) {
-        tracing::debug!(?path, "iwd peer skipped: no SimpleConfiguration (WSC) interface");
+        tracing::debug!(?path, name = peer_name, "iwd peer skipped: no SimpleConfiguration (WSC) interface");
         return None;
     }
 
@@ -535,7 +549,7 @@ fn peer_event_from_iwd_props(
     let display_props = match ifaces.get(IWD_P2P_DISPLAY_IFACE) {
         Some(p) => p,
         None => {
-            tracing::debug!(?path, "iwd peer skipped: no p2p.Display interface (iwd may not have parsed WFD IEs)");
+            tracing::debug!(?path, name = peer_name, "iwd peer skipped: no p2p.Display interface (iwd may not have parsed WFD IEs)");
             return None;
         }
     };
@@ -550,7 +564,7 @@ fn peer_event_from_iwd_props(
         })
         .unwrap_or(false);
     if !is_sink {
-        tracing::debug!(?path, "iwd peer skipped: Display.Sink == false (peer is WFD source, not sink)");
+        tracing::debug!(?path, name = peer_name, "iwd peer skipped: Display.Sink == false (peer is WFD source, not sink)");
         return None;
     }
 
