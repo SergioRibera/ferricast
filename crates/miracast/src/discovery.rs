@@ -159,6 +159,9 @@ impl MiracastDiscovery {
         let mut peer_added = p2p.receive_peer_added().await.map_err(|e| {
             FerricastError::Discovery(format!("Subscribe to PeerAdded: {e}"))
         })?;
+        let mut peer_removed = p2p.receive_peer_removed().await.map_err(|e| {
+            FerricastError::Discovery(format!("Subscribe to PeerRemoved: {e}"))
+        })?;
 
         let conn_task = conn.clone();
         let device_path_str = device_path.to_string();
@@ -170,6 +173,8 @@ impl MiracastDiscovery {
 
         let handle = tokio::spawn(async move {
             tracing::info!("Miracast discovery started (NM backend)");
+            // peer_path_str → device UUID, for DeviceLost lookup.
+            let mut known_peers: HashMap<String, uuid::Uuid> = HashMap::new();
             loop {
                 tokio::select! {
                     sig = peer_added.next() => {
@@ -208,21 +213,47 @@ impl MiracastDiscovery {
                             metadata.insert("hw_address".into(), hw_address);
                             metadata.insert("backend".into(), "nm".into());
 
-                            tx.send(DiscoveryEvent::DeviceFound(make_device(
+                            let device = make_device(
                                 name,
                                 model,
                                 parse_wfd_rtsp_port(&wfd_ies),
                                 metadata,
-                            )))
-                            .await
-                            .map_err(|_| {
-                                FerricastError::Discovery("DiscoveryEvent channel closed".into())
-                            })
+                            );
+                            known_peers.insert(peer_path.to_string(), device.id);
+                            tx.send(DiscoveryEvent::DeviceFound(device))
+                                .await
+                                .map_err(|_| {
+                                    FerricastError::Discovery("DiscoveryEvent channel closed".into())
+                                })
                         }
                         .await;
 
                         if let Err(e) = result {
                             tracing::error!(%e, "NM peer handling error");
+                        }
+                    }
+
+                    sig = peer_removed.next() => {
+                        let Some(sig) = sig else {
+                            tracing::warn!("NM PeerRemoved stream ended");
+                            break;
+                        };
+                        let result: Result<()> = async {
+                            let peer_path = sig
+                                .args()
+                                .map_err(|e| FerricastError::Discovery(format!("PeerRemoved args: {e}")))?
+                                .path
+                                .clone();
+                            if let Some(uuid) = known_peers.remove(&peer_path.to_string()) {
+                                tx.send(DiscoveryEvent::DeviceLost(uuid))
+                                    .await
+                                    .map_err(|_| FerricastError::Discovery("DiscoveryEvent channel closed".into()))?;
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        if let Err(e) = result {
+                            tracing::error!(%e, "NM peer removal error");
                         }
                     }
 
@@ -273,9 +304,13 @@ impl MiracastDiscovery {
         let existing = om.get_managed_objects().await.map_err(|e| {
             FerricastError::Discovery(format!("iwd GetManagedObjects: {e}"))
         })?;
+        let mut initial_known: HashMap<String, uuid::Uuid> = HashMap::new();
         for (path, ifaces) in &existing {
             if let Some(props) = ifaces.get(IWD_P2P_PEER_IFACE) {
                 if let Some(ev) = peer_event_from_iwd_props(path, props) {
+                    if let DiscoveryEvent::DeviceFound(ref d) = ev {
+                        initial_known.insert(path.to_string(), d.id);
+                    }
                     let _ = tx.send(ev).await;
                 }
             }
@@ -284,34 +319,69 @@ impl MiracastDiscovery {
         let mut ifaces_added = om.receive_interfaces_added().await.map_err(|e| {
             FerricastError::Discovery(format!("Subscribe to InterfacesAdded: {e}"))
         })?;
+        let mut ifaces_removed = om.receive_interfaces_removed().await.map_err(|e| {
+            FerricastError::Discovery(format!("Subscribe to InterfacesRemoved: {e}"))
+        })?;
 
         let handle = tokio::spawn(async move {
             tracing::info!("Miracast discovery started (iwd backend)");
-            while let Some(sig) = ifaces_added.next().await {
-                let result: Result<()> = async {
-                    let args = sig.args().map_err(|e| {
-                        FerricastError::Discovery(format!("InterfacesAdded args: {e}"))
-                    })?;
-
-                    let props = match args.interfaces.get(IWD_P2P_PEER_IFACE) {
-                        Some(p) => p,
-                        None => return Ok(()),
-                    };
-
-                    if let Some(ev) = peer_event_from_iwd_props(&args.path, props) {
-                        tx.send(ev).await.map_err(|_| {
-                            FerricastError::Discovery("DiscoveryEvent channel closed".into())
-                        })?;
+            let mut known_peers = initial_known;
+            loop {
+                tokio::select! {
+                    sig = ifaces_added.next() => {
+                        let Some(sig) = sig else {
+                            tracing::warn!("iwd InterfacesAdded stream ended");
+                            break;
+                        };
+                        let result: Result<()> = async {
+                            let args = sig.args().map_err(|e| {
+                                FerricastError::Discovery(format!("InterfacesAdded args: {e}"))
+                            })?;
+                            let props = match args.interfaces.get(IWD_P2P_PEER_IFACE) {
+                                Some(p) => p,
+                                None => return Ok(()),
+                            };
+                            if let Some(ev) = peer_event_from_iwd_props(&args.path, props) {
+                                if let DiscoveryEvent::DeviceFound(ref d) = ev {
+                                    known_peers.insert(args.path.to_string(), d.id);
+                                }
+                                tx.send(ev).await.map_err(|_| {
+                                    FerricastError::Discovery("DiscoveryEvent channel closed".into())
+                                })?;
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        if let Err(e) = result {
+                            tracing::error!(%e, "iwd peer handling error");
+                        }
                     }
-                    Ok(())
-                }
-                .await;
 
-                if let Err(e) = result {
-                    tracing::error!(%e, "iwd peer handling error");
+                    sig = ifaces_removed.next() => {
+                        let Some(sig) = sig else {
+                            tracing::warn!("iwd InterfacesRemoved stream ended");
+                            break;
+                        };
+                        let result: Result<()> = async {
+                            let args = sig.args().map_err(|e| {
+                                FerricastError::Discovery(format!("InterfacesRemoved args: {e}"))
+                            })?;
+                            if args.interfaces.contains(&IWD_P2P_PEER_IFACE.to_string()) {
+                                if let Some(uuid) = known_peers.remove(&args.path.to_string()) {
+                                    tx.send(DiscoveryEvent::DeviceLost(uuid))
+                                        .await
+                                        .map_err(|_| FerricastError::Discovery("DiscoveryEvent channel closed".into()))?;
+                                }
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        if let Err(e) = result {
+                            tracing::error!(%e, "iwd peer removal error");
+                        }
+                    }
                 }
             }
-            tracing::warn!("iwd InterfacesAdded stream ended");
         });
 
         self.handle = Some(handle);

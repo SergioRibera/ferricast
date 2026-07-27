@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use zbus::Connection;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
@@ -73,8 +73,9 @@ pub struct MiracastSession {
     /// TCP listener on the WFD RTSP port.  Created in `connect()`, consumed
     /// (accepted) in `setup_stream()`.
     listener: Option<TcpListener>,
-    /// Write half of the RTSP TCP connection, used for keep-alive and TEARDOWN.
-    rtsp_writer: Option<OwnedWriteHalf>,
+    /// Write half of the RTSP TCP connection, shared with the reader task so it
+    /// can respond to sink-initiated PAUSE/PLAY requests.
+    rtsp_writer: Option<Arc<Mutex<OwnedWriteHalf>>>,
     /// Incoming events from the sink (IDR requests, TEARDOWN) read by the
     /// background reader task.
     rtsp_events: Option<mpsc::Receiver<RtspEvent>>,
@@ -330,9 +331,12 @@ impl CastSession for MiracastSession {
         // Split the TCP connection: write half stays here for keep-alive / TEARDOWN;
         // read half goes to a background task that pumps incoming sink messages.
         let (read_half, write_half) = rtsp.into_inner().into_split();
+        let writer = Arc::new(Mutex::new(write_half));
         let (event_tx, event_rx) = mpsc::channel::<RtspEvent>(8);
         let task = tokio::spawn(rtsp_reader_task(
             BufReader::new(read_half),
+            Arc::clone(&writer),
+            session_id.clone(),
             event_tx,
             Arc::clone(&self.keyframe_requested),
         ));
@@ -342,7 +346,7 @@ impl CastSession for MiracastSession {
         self.session_id = Some(session_id);
         self.presentation_url = Some(presentation_url);
         self.last_keepalive = Some(Instant::now());
-        self.rtsp_writer = Some(write_half);
+        self.rtsp_writer = Some(writer);
         self.rtsp_events = Some(event_rx);
         self.rtsp_task = Some(task);
         Ok(())
@@ -372,10 +376,11 @@ impl CastSession for MiracastSession {
             .unwrap_or(false)
         {
             if let (Some(writer), Some(session_id)) =
-                (self.rtsp_writer.as_mut(), self.session_id.as_deref())
+                (self.rtsp_writer.as_ref(), self.session_id.as_deref())
             {
+                let mut w = writer.lock().await;
                 let _ = send_rtsp(
-                    writer,
+                    &mut *w,
                     &format!(
                         "GET_PARAMETER rtsp://localhost/wfd1.0 RTSP/1.0\r\nCSeq: {}\r\nSession: {session_id}\r\n\r\n",
                         self.src_cseq
@@ -426,14 +431,15 @@ impl CastSession for MiracastSession {
 
         if was_alive {
             if let (Some(writer), Some(session_id)) =
-                (self.rtsp_writer.as_mut(), self.session_id.as_deref())
+                (self.rtsp_writer.as_ref(), self.session_id.as_deref())
             {
                 let url = self
                     .presentation_url
                     .as_deref()
                     .unwrap_or("rtsp://localhost/wfd1.0/streamid=0");
+                let mut w = writer.lock().await;
                 let _ = send_rtsp(
-                    writer,
+                    &mut *w,
                     &format!(
                         "TEARDOWN {url} RTSP/1.0\r\nCSeq: {}\r\nSession: {session_id}\r\n\r\n",
                         self.src_cseq
@@ -853,9 +859,12 @@ where
 ///
 /// - 200 OK to keep-alive GET_PARAMETER → discarded.
 /// - SET_PARAMETER with `wfd_idr_request` body → sets `keyframe_requested`.
+/// - PAUSE / PLAY (M8/M9) → responds 200 OK via the shared writer.
 /// - TEARDOWN → sends `RtspEvent::Teardown` and exits.
 async fn rtsp_reader_task(
     mut reader: BufReader<OwnedReadHalf>,
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    session_id: String,
     tx: mpsc::Sender<RtspEvent>,
     keyframe_requested: Arc<AtomicBool>,
 ) {
@@ -870,6 +879,17 @@ async fn rtsp_reader_task(
                 {
                     tracing::debug!("Sink requested IDR keyframe");
                     keyframe_requested.store(true, Ordering::Relaxed);
+                } else if msg.start_line.starts_with("PAUSE")
+                    || msg.start_line.starts_with("PLAY")
+                {
+                    let cseq = header_value(&msg.headers, "cseq")
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    let response = format!(
+                        "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nSession: {session_id}\r\n\r\n"
+                    );
+                    let mut w = writer.lock().await;
+                    let _ = send_rtsp(&mut *w, &response).await;
                 } else if msg.start_line.starts_with("TEARDOWN") {
                     let _ = tx.send(RtspEvent::Teardown).await;
                     break;
