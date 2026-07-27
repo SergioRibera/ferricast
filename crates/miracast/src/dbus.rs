@@ -4,6 +4,7 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 // ── NetworkManager constants ──────────────────────────────────────────────────
 
+pub const NM_DEVICE_TYPE_WIFI: u32 = 2;
 pub const NM_DEVICE_TYPE_WIFI_P2P: u32 = 30;
 pub const NM_ACTIVE_CONNECTION_STATE_ACTIVATED: u32 = 2;
 pub const NM_ACTIVE_CONNECTION_STATE_DEACTIVATING: u32 = 3;
@@ -116,6 +117,44 @@ pub trait Ip4Config {
     fn address_data(&self) -> zbus::Result<Vec<HashMap<String, OwnedValue>>>;
     #[zbus(property)]
     fn gateway(&self) -> zbus::Result<String>;
+}
+
+// ── NetworkManager Wi-Fi proxies ──────────────────────────────────────────────
+
+/// NM wireless device — used for regular AP scanning to find DIRECT- Group
+/// Owners (e.g. Windows Connect app) that operate on 5 GHz and don't
+/// appear in iwd P2P device discovery (which only scans 2.4 GHz social
+/// channels per Wi-Fi Direct spec).
+#[zbus::proxy(
+    interface = "org.freedesktop.NetworkManager.Device.Wireless",
+    default_service = "org.freedesktop.NetworkManager"
+)]
+pub trait NmWireless {
+    async fn request_scan(&self, options: HashMap<String, OwnedValue>) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn access_points(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+
+    #[zbus(signal)]
+    fn access_point_added(&self, access_point: OwnedObjectPath) -> zbus::Result<()>;
+    #[zbus(signal)]
+    fn access_point_removed(&self, access_point: OwnedObjectPath) -> zbus::Result<()>;
+}
+
+/// Individual Wi-Fi access point seen by NM.
+#[zbus::proxy(
+    interface = "org.freedesktop.NetworkManager.AccessPoint",
+    default_service = "org.freedesktop.NetworkManager"
+)]
+pub trait NmAccessPoint {
+    #[zbus(property)]
+    fn ssid(&self) -> zbus::Result<Vec<u8>>;
+    #[zbus(property)]
+    fn hw_address(&self) -> zbus::Result<String>;
+    #[zbus(property)]
+    fn frequency(&self) -> zbus::Result<u32>;
+    #[zbus(property)]
+    fn strength(&self) -> zbus::Result<u8>;
 }
 
 // ── wpa_supplicant proxies ────────────────────────────────────────────────────

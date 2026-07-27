@@ -13,7 +13,8 @@ use uuid::Uuid;
 use crate::dbus::{
     DeviceProxy, IWD_P2P_DEVICE_IFACE, IWD_P2P_DISPLAY_IFACE, IWD_P2P_PEER_IFACE,
     IWD_SIMPLE_CONFIG_IFACE, IwdObjectManagerProxy, IwdP2pDeviceProxy, IwdP2pServiceManagerProxy,
-    NM_DEVICE_TYPE_WIFI_P2P, NetworkManagerProxy,
+    NM_DEVICE_TYPE_WIFI, NM_DEVICE_TYPE_WIFI_P2P, NetworkManagerProxy,
+    NmAccessPointProxy, NmWirelessProxy,
     P2pPeerProxy, WifiP2pProxy, WpaInterfaceProxy, WpaSupplicantProxy,
 };
 use crate::session::{WFD_DEFAULT_PORT, wfd_source_ies};
@@ -22,8 +23,8 @@ const MIRACAST_ICON: Bytes = Bytes::from_static(include_bytes!("../../../assets/
 
 // ── backend discriminator ─────────────────────────────────────────────────────
 
-/// Which D-Bus backend is backing the current discovery session.
-/// Stored so `stop()` can call the right cleanup method.
+/// Which D-Bus backend is backing a discovery source.
+/// Multiple backends can run simultaneously (e.g. iwd P2P + NM Wi-Fi scan).
 enum ActiveBackend {
     Nm {
         conn: Connection,
@@ -33,21 +34,24 @@ enum ActiveBackend {
         conn: Connection,
         device_path: OwnedObjectPath,
     },
+    /// NM regular Wi-Fi scan for DIRECT- Group Owners (Windows Connect on 5 GHz).
+    /// No explicit D-Bus stop call needed — task abort is sufficient.
+    NmWifi,
 }
 
 // ── public type ───────────────────────────────────────────────────────────────
 
 pub struct MiracastDiscovery {
-    handle: Option<JoinHandle<()>>,
-    backend: Option<ActiveBackend>,
+    handles: Vec<JoinHandle<()>>,
+    backends: Vec<ActiveBackend>,
     running: bool,
 }
 
 impl Default for MiracastDiscovery {
     fn default() -> Self {
         Self {
-            handle: None,
-            backend: None,
+            handles: Vec::new(),
+            backends: Vec::new(),
             running: false,
         }
     }
@@ -63,18 +67,34 @@ impl Discovery for MiracastDiscovery {
             FerricastError::Discovery(format!("D-Bus system bus unavailable: {e}"))
         })?;
 
-        // Try iwd first (the user's backend), then fall back to NM/wpa_supplicant.
+        // iwd P2P: finds 2.4 GHz WFD peers in P2P device discovery mode.
         if let Some(device_path) = find_iwd_p2p_device(&conn).await {
-            self.start_iwd(conn, device_path, tx).await
-        } else if let Some(device_path) = find_nm_p2p_device(&conn).await? {
-            self.start_nm(conn, device_path, tx).await
-        } else {
-            Err(FerricastError::Discovery(
+            self.start_iwd(conn.clone(), device_path, tx.clone()).await?;
+        }
+
+        // NM Wi-Fi station scan: finds DIRECT- Group Owners on 5 GHz (e.g.
+        // Windows Connect app).  Complements iwd P2P — different bands.
+        if let Some(device_path) = find_nm_wifi_device(&conn).await? {
+            self.start_nm_wifi(conn.clone(), device_path, tx.clone()).await?;
+        }
+
+        // NM P2P: last resort when iwd is absent and NM manages P2P natively.
+        if self.backends.is_empty() {
+            if let Some(device_path) = find_nm_p2p_device(&conn).await? {
+                self.start_nm(conn, device_path, tx).await?;
+            }
+        }
+
+        if self.backends.is_empty() {
+            return Err(FerricastError::Discovery(
                 "No Wi-Fi P2P device found via iwd or NetworkManager. \
                  Check your adapter, drivers, and that iwd or NetworkManager is running."
                     .into(),
-            ))
+            ));
         }
+
+        self.running = true;
+        Ok(())
     }
 
     async fn stop(&mut self) -> Result<()> {
@@ -82,30 +102,33 @@ impl Discovery for MiracastDiscovery {
             return Ok(());
         }
 
-        match self.backend.take() {
-            Some(ActiveBackend::Nm { conn, device_path }) => {
-                let p2p = WifiP2pProxy::new(&conn, device_path).await.map_err(|e| {
-                    FerricastError::Discovery(format!("WifiP2P proxy for stop: {e}"))
-                })?;
-                p2p.stop_find().await.map_err(|e| {
-                    FerricastError::Discovery(format!("NM WifiP2P.StopFind: {e}"))
-                })?;
-            }
-            Some(ActiveBackend::Iwd { conn, device_path }) => {
-                let dev = IwdP2pDeviceProxy::new(&conn, device_path)
-                    .await
-                    .map_err(|e| {
-                        FerricastError::Discovery(format!("iwd P2P device proxy for stop: {e}"))
-                    })?;
-                dev.release_discovery().await.map_err(|e| {
-                    FerricastError::Discovery(format!("iwd ReleaseDiscovery: {e}"))
-                })?;
-            }
-            None => {}
+        // Abort tasks first so D-Bus subscriptions are released.
+        for h in self.handles.drain(..) {
+            h.abort();
         }
 
-        if let Some(h) = self.handle.take() {
-            h.abort();
+        for backend in self.backends.drain(..) {
+            match backend {
+                ActiveBackend::Nm { conn, device_path } => {
+                    let p2p = WifiP2pProxy::new(&conn, device_path).await.map_err(|e| {
+                        FerricastError::Discovery(format!("WifiP2P proxy for stop: {e}"))
+                    })?;
+                    p2p.stop_find().await.map_err(|e| {
+                        FerricastError::Discovery(format!("NM WifiP2P.StopFind: {e}"))
+                    })?;
+                }
+                ActiveBackend::Iwd { conn, device_path } => {
+                    let dev = IwdP2pDeviceProxy::new(&conn, device_path)
+                        .await
+                        .map_err(|e| {
+                            FerricastError::Discovery(format!("iwd P2P device proxy for stop: {e}"))
+                        })?;
+                    dev.release_discovery().await.map_err(|e| {
+                        FerricastError::Discovery(format!("iwd ReleaseDiscovery: {e}"))
+                    })?;
+                }
+                ActiveBackend::NmWifi => {}
+            }
         }
 
         self.running = false;
@@ -263,9 +286,8 @@ impl MiracastDiscovery {
             }
         });
 
-        self.handle = Some(handle);
-        self.backend = Some(ActiveBackend::Nm { conn, device_path });
-        self.running = true;
+        self.handles.push(handle);
+        self.backends.push(ActiveBackend::Nm { conn, device_path });
         Ok(())
     }
 
@@ -384,9 +406,110 @@ impl MiracastDiscovery {
             }
         });
 
-        self.handle = Some(handle);
-        self.backend = Some(ActiveBackend::Iwd { conn, device_path });
-        self.running = true;
+        self.handles.push(handle);
+        self.backends.push(ActiveBackend::Iwd { conn, device_path });
+        Ok(())
+    }
+
+    async fn start_nm_wifi(
+        &mut self,
+        conn: Connection,
+        device_path: OwnedObjectPath,
+        tx: mpsc::Sender<DiscoveryEvent>,
+    ) -> Result<()> {
+        let wifi = NmWirelessProxy::new(&conn, device_path.clone())
+            .await
+            .map_err(|e| FerricastError::Discovery(format!("NM Wireless proxy: {e}")))?;
+
+        if let Err(e) = wifi.request_scan(HashMap::new()).await {
+            tracing::warn!("NM Wi-Fi initial scan failed (non-fatal): {e}");
+        }
+
+        // Emit DIRECT- APs already visible at startup.
+        let existing = wifi.access_points().await.unwrap_or_default();
+        let mut known_aps: HashMap<String, Uuid> = HashMap::new();
+        for ap_path in &existing {
+            if let Some(device) = nm_ap_as_miracast_device(&conn, ap_path).await {
+                known_aps.insert(ap_path.to_string(), device.id);
+                let _ = tx.send(DiscoveryEvent::DeviceFound(device)).await;
+            }
+        }
+
+        let mut ap_added = wifi.receive_access_point_added().await.map_err(|e| {
+            FerricastError::Discovery(format!("Subscribe to AccessPointAdded: {e}"))
+        })?;
+        let mut ap_removed = wifi.receive_access_point_removed().await.map_err(|e| {
+            FerricastError::Discovery(format!("Subscribe to AccessPointRemoved: {e}"))
+        })?;
+
+        let conn_task = conn.clone();
+        let mut rescan_interval = tokio::time::interval(Duration::from_secs(30));
+        rescan_interval.tick().await;
+
+        let handle = tokio::spawn(async move {
+            tracing::info!("Miracast discovery started (NM Wi-Fi scan backend)");
+            let mut known_aps = known_aps;
+            loop {
+                tokio::select! {
+                    sig = ap_added.next() => {
+                        let Some(sig) = sig else {
+                            tracing::warn!("NM AccessPointAdded stream ended");
+                            break;
+                        };
+                        let result: Result<()> = async {
+                            let ap_path = sig
+                                .args()
+                                .map_err(|e| FerricastError::Discovery(format!("AccessPointAdded args: {e}")))?
+                                .access_point
+                                .clone();
+                            if let Some(device) = nm_ap_as_miracast_device(&conn_task, &ap_path).await {
+                                known_aps.insert(ap_path.to_string(), device.id);
+                                tx.send(DiscoveryEvent::DeviceFound(device))
+                                    .await
+                                    .map_err(|_| FerricastError::Discovery("channel closed".into()))?;
+                            }
+                            Ok(())
+                        }.await;
+                        if let Err(e) = result {
+                            tracing::error!(%e, "NM Wi-Fi AP handling error");
+                        }
+                    }
+
+                    sig = ap_removed.next() => {
+                        let Some(sig) = sig else {
+                            tracing::warn!("NM AccessPointRemoved stream ended");
+                            break;
+                        };
+                        let result: Result<()> = async {
+                            let ap_path = sig
+                                .args()
+                                .map_err(|e| FerricastError::Discovery(format!("AccessPointRemoved args: {e}")))?
+                                .access_point
+                                .clone();
+                            if let Some(uuid) = known_aps.remove(&ap_path.to_string()) {
+                                tx.send(DiscoveryEvent::DeviceLost(uuid))
+                                    .await
+                                    .map_err(|_| FerricastError::Discovery("channel closed".into()))?;
+                            }
+                            Ok(())
+                        }.await;
+                        if let Err(e) = result {
+                            tracing::error!(%e, "NM Wi-Fi AP removal error");
+                        }
+                    }
+
+                    _ = rescan_interval.tick() => {
+                        tracing::debug!("Periodic NM Wi-Fi rescan for DIRECT- networks");
+                        if let Err(e) = wifi.request_scan(HashMap::new()).await {
+                            tracing::warn!("NM Wi-Fi rescan failed: {e}");
+                        }
+                    }
+                }
+            }
+        });
+
+        self.handles.push(handle);
+        self.backends.push(ActiveBackend::NmWifi);
         Ok(())
     }
 }
@@ -505,6 +628,59 @@ async fn find_nm_p2p_device(conn: &Connection) -> Result<Option<OwnedObjectPath>
         }
     }
     Ok(None)
+}
+
+/// Returns the NM device object path with type `NM_DEVICE_TYPE_WIFI` (regular
+/// Wi-Fi station), or `None` if NM is not reachable or has no Wi-Fi device.
+/// Used for scanning DIRECT- Group Owners (e.g. Windows Connect on 5 GHz).
+async fn find_nm_wifi_device(conn: &Connection) -> Result<Option<OwnedObjectPath>> {
+    let nm = match NetworkManagerProxy::new(conn).await {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    let devices = match nm.get_devices().await {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+    for path in devices {
+        let dev = DeviceProxy::new(conn, path.clone()).await.map_err(|e| {
+            FerricastError::Discovery(format!("NM Device proxy: {e}"))
+        })?;
+        if dev.device_type().await.unwrap_or(0) == NM_DEVICE_TYPE_WIFI {
+            let iface = dev.interface().await.unwrap_or_default();
+            tracing::info!(iface, %path, "found NM Wi-Fi device for DIRECT- scan");
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+// ── NM Wi-Fi AP filtering ─────────────────────────────────────────────────────
+
+/// Returns a `Device` if `ap_path` is a DIRECT- network (potential Miracast
+/// sink acting as a Wi-Fi Direct Group Owner), `None` otherwise.
+async fn nm_ap_as_miracast_device(
+    conn: &Connection,
+    ap_path: &OwnedObjectPath,
+) -> Option<Device> {
+    let ap = NmAccessPointProxy::new(conn, ap_path.clone()).await.ok()?;
+    let ssid_bytes = ap.ssid().await.ok()?;
+    if !ssid_bytes.starts_with(b"DIRECT-") {
+        return None;
+    }
+    let ssid = String::from_utf8_lossy(&ssid_bytes).into_owned();
+    let bssid = ap.hw_address().await.unwrap_or_default();
+    let freq = ap.frequency().await.unwrap_or(0);
+
+    tracing::debug!(ssid, bssid, freq, "found DIRECT- network (potential Miracast sink)");
+
+    let mut metadata = HashMap::new();
+    metadata.insert("ssid".into(), ssid.clone());
+    metadata.insert("bssid".into(), bssid);
+    metadata.insert("ap_path".into(), ap_path.to_string());
+    metadata.insert("backend".into(), "nm_wifi".into());
+
+    Some(make_device(ssid, None, WFD_DEFAULT_PORT, metadata))
 }
 
 // ── iwd peer parsing ──────────────────────────────────────────────────────────
