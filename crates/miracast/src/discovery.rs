@@ -200,9 +200,10 @@ impl MiracastDiscovery {
                             let hw_address = proxy.hw_address().await.map_err(|e| {
                                 FerricastError::Discovery(format!("P2pPeer.HwAddress: {e}"))
                             })?;
+                            // WfdIEs is empty when NM's iwd backend lacks WFD support.
+                            // Only filter by device type when NM actually provided IEs.
                             let wfd_ies = proxy.WfdIEs().await.unwrap_or_default();
-
-                            if !is_miracast_sink(&wfd_ies) {
+                            if !wfd_ies.is_empty() && !is_miracast_sink(&wfd_ies) {
                                 return Ok(());
                             }
 
@@ -471,8 +472,10 @@ fn peer_event_from_iwd_props(
     path: &OwnedObjectPath,
     props: &HashMap<String, zbus::zvariant::OwnedValue>,
 ) -> Option<DiscoveryEvent> {
-    let wfd_ies: Vec<u8> = props
-        .get("WFDElements")
+    // WFDElements is only present when iwd is compiled with --enable-wfd.
+    // When absent, accept all P2P peers (can't filter by WFD type without the IEs).
+    let wfd_ies_entry = props.get("WFDElements");
+    let wfd_ies: Vec<u8> = wfd_ies_entry
         .and_then(|v| {
             if let zbus::zvariant::Value::Array(arr) = &**v {
                 Some(
@@ -492,7 +495,7 @@ fn peer_event_from_iwd_props(
         })
         .unwrap_or_default();
 
-    if !is_miracast_sink(&wfd_ies) {
+    if wfd_ies_entry.is_some() && !is_miracast_sink(&wfd_ies) {
         return None;
     }
 
