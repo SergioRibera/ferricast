@@ -972,7 +972,9 @@ fn parse_client_port(transport: &str) -> Option<u16> {
 /// `wfd_client_rtp_ports` is intentionally omitted — that field describes the
 /// sink's preferred receive port, not a source capability.
 fn wfd_capabilities() -> String {
-    "wfd_video_formats: 00 00 01 02 00000080 00000000 00000000 00 0000 0000 00 none none\r\n\
+    // profile=01 CBP, level=08 (4.1), CEA: bits5+7 = 720p@30 + 1080p@30,
+    // HH: bit6 = 1080p@60 (for handhelds). Level 4.1 supports 1080p@60.
+    "wfd_video_formats: 00 00 01 08 000000A0 00000000 00000040 00 0000 0000 00 none none\r\n\
      wfd_audio_codecs: LPCM 00000003 00, AAC 00000001 00\r\n\
      wfd_uibc_capability: none\r\n\
      wfd_standby_resume_capability: none\r\n"
@@ -989,7 +991,7 @@ fn wfd_set_parameter(
     sink_secondary_rtp: u16,
 ) -> String {
     format!(
-        "wfd_video_formats: 00 00 01 02 00000080 00000000 00000000 00 0000 0000 00 none none\r\n\
+        "wfd_video_formats: 00 00 01 08 000000A0 00000000 00000040 00 0000 0000 00 none none\r\n\
          wfd_audio_codecs: AAC 00000001 00\r\n\
          wfd_presentation_URL: {presentation_url} none\r\n\
          wfd_client_rtp_ports: RTP/AVP/UDP;unicast {sink_primary_rtp} {sink_secondary_rtp} mode=play\r\n"
