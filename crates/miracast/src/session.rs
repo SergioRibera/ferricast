@@ -710,37 +710,56 @@ impl MiracastSession {
             FerricastError::Connection(format!("NM GetDevices: {e}"))
         })?;
 
+        // Collect P2P device paths once; we'll re-probe peers each iteration.
+        let mut p2p_device_paths: Vec<OwnedObjectPath> = Vec::new();
         for dev_path in &devices {
             let dev = DeviceProxy::new(&conn, dev_path.clone()).await.map_err(|e| {
                 FerricastError::Connection(format!("NM Device proxy: {e}"))
             })?;
-            if dev.device_type().await.unwrap_or(0) != NM_DEVICE_TYPE_WIFI_P2P {
-                continue;
-            }
-            let p2p = WifiP2pProxy::new(&conn, dev_path.clone()).await.map_err(|e| {
-                FerricastError::Connection(format!("WifiP2P proxy: {e}"))
-            })?;
-            for peer_path in p2p.peers().await.unwrap_or_default() {
-                let pp = P2pPeerProxy::new(&conn, peer_path.clone()).await.map_err(|e| {
-                    FerricastError::Connection(format!("P2pPeer proxy: {e}"))
-                })?;
-                let hw = pp.hw_address().await.unwrap_or_default();
-                if !hw.eq_ignore_ascii_case(&bssid) {
-                    continue;
-                }
-                tracing::info!(bssid, %peer_path, ssid, "DIRECT- AP matched to NM P2P peer — connecting via P2P");
-                let mut p2p_device = device.clone();
-                p2p_device.metadata.insert("path".into(), peer_path.to_string());
-                p2p_device.metadata.insert("device_path".into(), dev_path.to_string());
-                p2p_device.metadata.insert("hw_address".into(), hw);
-                p2p_device.metadata.insert("backend".into(), "nm".into());
-                return self.connect_nm(&p2p_device).await;
+            if dev.device_type().await.unwrap_or(0) == NM_DEVICE_TYPE_WIFI_P2P {
+                p2p_device_paths.push(dev_path.clone());
             }
         }
 
+        // The NM Wi-Fi scan may have seen the AP before P2P find reported the
+        // peer.  Kick a fresh P2P find and retry up to ~10 s.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            for dev_path in &p2p_device_paths {
+                let p2p = WifiP2pProxy::new(&conn, dev_path.clone()).await.map_err(|e| {
+                    FerricastError::Connection(format!("WifiP2P proxy: {e}"))
+                })?;
+                for peer_path in p2p.peers().await.unwrap_or_default() {
+                    let pp = P2pPeerProxy::new(&conn, peer_path.clone()).await.map_err(|e| {
+                        FerricastError::Connection(format!("P2pPeer proxy: {e}"))
+                    })?;
+                    let hw = pp.hw_address().await.unwrap_or_default();
+                    if !hw.eq_ignore_ascii_case(&bssid) {
+                        continue;
+                    }
+                    tracing::info!(bssid, %peer_path, ssid, "DIRECT- AP matched to NM P2P peer");
+                    let mut p2p_device = device.clone();
+                    p2p_device.metadata.insert("path".into(), peer_path.to_string());
+                    p2p_device.metadata.insert("device_path".into(), dev_path.to_string());
+                    p2p_device.metadata.insert("hw_address".into(), hw);
+                    p2p_device.metadata.insert("backend".into(), "nm".into());
+                    return self.connect_nm(&p2p_device).await;
+                }
+                // Trigger a fresh P2P find so wpa_supplicant re-scans.
+                let _ = p2p.start_find(HashMap::new()).await;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tracing::debug!(bssid, "DIRECT- peer not in P2P list yet — waiting for P2P scan");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+
         Err(FerricastError::Connection(format!(
-            "DIRECT- network '{ssid}' (BSSID {bssid}) not yet visible as a P2P peer. \
-             Wait a moment for P2P discovery and retry."
+            "DIRECT- network '{ssid}' (BSSID {bssid}) did not appear as a P2P peer \
+             within 10 s. The GO may be on a non-social channel (not 1/6/11); \
+             wpa_supplicant P2P find may not reach it."
         )))
     }
 
