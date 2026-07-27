@@ -12,7 +12,8 @@ use uuid::Uuid;
 
 use crate::dbus::{
     DeviceProxy, IWD_P2P_DEVICE_IFACE, IWD_P2P_PEER_IFACE,
-    IwdObjectManagerProxy, IwdP2pDeviceProxy, NM_DEVICE_TYPE_WIFI_P2P, NetworkManagerProxy,
+    IwdObjectManagerProxy, IwdP2pDeviceProxy, IwdP2pServiceManagerProxy,
+    NM_DEVICE_TYPE_WIFI_P2P, NetworkManagerProxy,
     P2pPeerProxy, WifiP2pProxy, WpaInterfaceProxy, WpaSupplicantProxy,
 };
 use crate::session::wfd_source_ies;
@@ -142,17 +143,8 @@ impl MiracastDiscovery {
                 set_wpa_supplicant_wfd_ies(&conn, &ifname).await;
             }
         }
-        if let Some(iwd_path) = find_iwd_p2p_device(&conn).await {
-            if let Ok(iwd_dev) = IwdP2pDeviceProxy::new(&conn, iwd_path).await {
-                if let Err(e) = iwd_dev.set_WFDElements(wfd_source_ies()).await {
-                    tracing::warn!(
-                        "iwd WFD support not available — Miracast sinks may not discover this device. \
-                         Rebuild iwd with --enable-wfd (or enable 'wfd' in your iwd package). Error: {e}"
-                    );
-                } else {
-                    tracing::info!("WFD source IEs set on iwd device (NM discovery path)");
-                }
-            }
+        if find_iwd_p2p_device(&conn).await.is_some() {
+            register_iwd_wfd_source(&conn).await;
         }
 
         p2p.start_find(HashMap::new()).await.map_err(|e| {
@@ -287,17 +279,10 @@ impl MiracastDiscovery {
             .await
             .map_err(|e| FerricastError::Discovery(format!("iwd P2P device proxy: {e}")))?;
 
-        // Advertise ourselves as a WFD Source in P2P probe responses so TVs
-        // in screen-mirror mode can identify us during their scan.
-        // Non-fatal: iwd only supports this when compiled with WFD support.
-        if let Err(e) = dev.set_WFDElements(wfd_source_ies()).await {
-            tracing::warn!(
-                "iwd WFD support not available — Miracast sinks may not discover this device. \
-                 Rebuild iwd with --enable-wfd (or enable 'wfd' in your iwd package). Error: {e}"
-            );
-        } else {
-            tracing::info!("WFD source IEs set on iwd P2P device");
-        }
+        // Register as a WFD source via iwd's ServiceManager so iwd includes
+        // our subelements in P2P probe responses.  Non-fatal: only present
+        // when iwd is compiled with WFD support (--enable-wfd).
+        register_iwd_wfd_source(&conn).await;
 
         dev.request_discovery().await.map_err(|e| {
             FerricastError::Discovery(format!("iwd RequestDiscovery: {e}"))
@@ -395,6 +380,48 @@ impl MiracastDiscovery {
         self.backend = Some(ActiveBackend::Iwd { conn, device_path });
         self.running = true;
         Ok(())
+    }
+}
+
+// ── iwd WFD registration ──────────────────────────────────────────────────────
+
+/// Calls `net.connman.iwd.p2p.ServiceManager.RegisterDisplayService` so iwd
+/// includes our WFD source subelements in P2P probe responses.
+///
+/// Non-fatal: the ServiceManager interface only exists when iwd is compiled
+/// with `--enable-wfd`.  Failure is logged at WARN with actionable guidance.
+async fn register_iwd_wfd_source(conn: &Connection) {
+    let sm = match IwdP2pServiceManagerProxy::new(conn).await {
+        Ok(sm) => sm,
+        Err(e) => {
+            tracing::warn!(
+                "iwd WFD ServiceManager not reachable — Miracast sinks may not discover this \
+                 device. Rebuild iwd with --enable-wfd. Error: {e}"
+            );
+            return;
+        }
+    };
+
+    let ies = wfd_source_ies();
+    let value = match zbus::zvariant::OwnedValue::try_from(
+        zbus::zvariant::Value::from(ies),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("WFD subelements encoding failed: {e}");
+            return;
+        }
+    };
+
+    let mut props = std::collections::HashMap::new();
+    props.insert("WFDSubelements".to_string(), value);
+
+    match sm.register_display_service(props).await {
+        Ok(()) => tracing::info!("WFD source registered with iwd ServiceManager"),
+        Err(e) => tracing::warn!(
+            "iwd WFD support not available — Miracast sinks may not discover this device. \
+             Rebuild iwd with --enable-wfd (or enable 'wfd' in your iwd package). Error: {e}"
+        ),
     }
 }
 

@@ -206,15 +206,10 @@ pub trait IwdP2pDevice {
     #[zbus(property)]
     fn name(&self) -> zbus::Result<String>;
 
-    /// WFD source IEs broadcast in P2P probe responses so sinks recognise us
-    /// as a Miracast source during their scan.  Only present when iwd is built
-    /// with WFD support; setting it is non-fatal.
+    /// WFD source IEs on peers (read-only, only present when iwd has WFD support).
     #[zbus(property)]
     #[allow(non_snake_case)]
     fn WFDElements(&self) -> zbus::Result<Vec<u8>>;
-    #[zbus(property)]
-    #[allow(non_snake_case)]
-    fn set_WFDElements(&self, value: Vec<u8>) -> zbus::Result<()>;
 }
 
 /// iwd P2P peer — appears as a D-Bus object when a peer is discovered.
@@ -241,4 +236,29 @@ pub trait IwdP2pPeer {
     #[zbus(property)]
     #[allow(non_snake_case)]
     fn WFDElements(&self) -> zbus::Result<Vec<u8>>;
+}
+
+/// iwd P2P Service Manager — registers WFD display services so iwd includes
+/// our WFD source subelements in P2P probe responses.
+///
+/// Lives at the root iwd object path (`/net/connman/iwd`), not on the
+/// per-adapter path.  `RegisterDisplayService` must be called at startup;
+/// iwd automatically unregisters when our D-Bus client connection drops.
+#[zbus::proxy(
+    interface = "net.connman.iwd.p2p.ServiceManager",
+    default_service = "net.connman.iwd",
+    default_path = "/net/connman/iwd"
+)]
+pub trait IwdP2pServiceManager {
+    /// Register this process as a WFD source.
+    ///
+    /// `properties` must contain `"WFDSubelements"` → `ay` (raw WFD
+    /// subelement bytes, without the outer Vendor-Specific IE wrapper).
+    async fn register_display_service(
+        &self,
+        properties: HashMap<String, OwnedValue>,
+    ) -> zbus::Result<()>;
+
+    /// Explicit unregister (iwd also auto-unregisters on D-Bus disconnect).
+    async fn unregister_display_service(&self) -> zbus::Result<()>;
 }
