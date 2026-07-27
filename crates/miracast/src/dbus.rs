@@ -13,6 +13,8 @@ pub const NM_ACTIVE_CONNECTION_STATE_DEACTIVATED: u32 = 4;
 
 pub const IWD_P2P_PEER_IFACE: &str = "net.connman.iwd.p2p.Peer";
 pub const IWD_P2P_DEVICE_IFACE: &str = "net.connman.iwd.p2p.Device";
+pub const IWD_P2P_DISPLAY_IFACE: &str = "net.connman.iwd.p2p.Display";
+pub const IWD_SIMPLE_CONFIG_IFACE: &str = "net.connman.iwd.SimpleConfiguration";
 
 // ── NetworkManager proxies ────────────────────────────────────────────────────
 
@@ -236,6 +238,36 @@ pub trait IwdP2pPeer {
     #[zbus(property)]
     #[allow(non_snake_case)]
     fn WFDElements(&self) -> zbus::Result<Vec<u8>>;
+}
+
+/// iwd P2P Display interface — present on WFD-capable peers.
+/// The `Sink` property is `true` when the peer is a WFD sink (display),
+/// `false` when it is a WFD source.  Only sinks are connectable from our
+/// perspective (we are a source).
+#[zbus::proxy(
+    interface = "net.connman.iwd.p2p.Display",
+    default_service = "net.connman.iwd"
+)]
+pub trait IwdP2pDisplay {
+    /// `true` = peer is a WFD sink (receiver); `false` = peer is a WFD source.
+    #[zbus(property)]
+    fn sink(&self) -> zbus::Result<bool>;
+}
+
+/// iwd Wi-Fi Simple Configuration (WPS) interface on a P2P peer.
+///
+/// `PushButton` initiates WPS-PBC P2P group formation.  This is the correct
+/// way to connect to a WFD sink under iwd — `net.connman.iwd.p2p.Peer.Connect`
+/// does not work for WFD peers.  The call blocks until group formation and
+/// DHCP complete (up to ~120 s).
+#[zbus::proxy(
+    interface = "net.connman.iwd.SimpleConfiguration",
+    default_service = "net.connman.iwd"
+)]
+pub trait IwdSimpleConfiguration {
+    async fn push_button(&self) -> zbus::Result<()>;
+    async fn start_enrollee(&self) -> zbus::Result<()>;
+    async fn cancel(&self) -> zbus::Result<()>;
 }
 
 /// iwd P2P Service Manager — registers WFD display services so iwd includes

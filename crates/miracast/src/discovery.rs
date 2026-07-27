@@ -11,8 +11,8 @@ use ferricast_core::{Device, DeviceCapabilities, Discovery, DiscoveryEvent, Ferr
 use uuid::Uuid;
 
 use crate::dbus::{
-    DeviceProxy, IWD_P2P_DEVICE_IFACE, IWD_P2P_PEER_IFACE,
-    IwdObjectManagerProxy, IwdP2pDeviceProxy, IwdP2pServiceManagerProxy,
+    DeviceProxy, IWD_P2P_DEVICE_IFACE, IWD_P2P_DISPLAY_IFACE, IWD_P2P_PEER_IFACE,
+    IWD_SIMPLE_CONFIG_IFACE, IwdObjectManagerProxy, IwdP2pDeviceProxy, IwdP2pServiceManagerProxy,
     NM_DEVICE_TYPE_WIFI_P2P, NetworkManagerProxy,
     P2pPeerProxy, WifiP2pProxy, WpaInterfaceProxy, WpaSupplicantProxy,
 };
@@ -298,8 +298,8 @@ impl MiracastDiscovery {
         })?;
         let mut initial_known: HashMap<String, uuid::Uuid> = HashMap::new();
         for (path, ifaces) in &existing {
-            if let Some(props) = ifaces.get(IWD_P2P_PEER_IFACE) {
-                if let Some(ev) = peer_event_from_iwd_props(path, props) {
+            if ifaces.contains_key(IWD_P2P_PEER_IFACE) {
+                if let Some(ev) = peer_event_from_iwd_props(path, ifaces) {
                     if let DiscoveryEvent::DeviceFound(ref d) = ev {
                         initial_known.insert(path.to_string(), d.id);
                     }
@@ -329,11 +329,10 @@ impl MiracastDiscovery {
                             let args = sig.args().map_err(|e| {
                                 FerricastError::Discovery(format!("InterfacesAdded args: {e}"))
                             })?;
-                            let props = match args.interfaces.get(IWD_P2P_PEER_IFACE) {
-                                Some(p) => p,
-                                None => return Ok(()),
-                            };
-                            if let Some(ev) = peer_event_from_iwd_props(&args.path, props) {
+                            if !args.interfaces.contains_key(IWD_P2P_PEER_IFACE) {
+                                return Ok(());
+                            }
+                            if let Some(ev) = peer_event_from_iwd_props(&args.path, &args.interfaces) {
                                 if let DiscoveryEvent::DeviceFound(ref d) = ev {
                                     known_peers.insert(args.path.to_string(), d.id);
                                 }
@@ -502,41 +501,42 @@ async fn find_nm_p2p_device(conn: &Connection) -> Result<Option<OwnedObjectPath>
 // ── iwd peer parsing ──────────────────────────────────────────────────────────
 
 /// Extracts a `DiscoveryEvent::DeviceFound` from an iwd peer's property dict
-/// (from `InterfacesAdded` or `GetManagedObjects`).
+/// Examines the full interface map for a single D-Bus object (from
+/// `InterfacesAdded` or `GetManagedObjects`) and returns a `DeviceFound` event
+/// when the object is a connectable WFD sink, or `None` otherwise.
 ///
-/// Returns `None` when the peer is not a Miracast sink.
+/// Conditions (matching iwd's own `wfd-source` reference implementation):
+///   1. Must expose `net.connman.iwd.p2p.Peer` (basic P2P peer)
+///   2. Must expose `net.connman.iwd.p2p.Display` with `Sink == true`
+///   3. Must expose `net.connman.iwd.SimpleConfiguration` (WPS, for PushButton connect)
 fn peer_event_from_iwd_props(
     path: &OwnedObjectPath,
-    props: &HashMap<String, zbus::zvariant::OwnedValue>,
+    ifaces: &HashMap<String, HashMap<String, zbus::zvariant::OwnedValue>>,
 ) -> Option<DiscoveryEvent> {
-    // WFDElements is only present when iwd is compiled with --enable-wfd.
-    // When absent, accept all P2P peers (can't filter by WFD type without the IEs).
-    let wfd_ies_entry = props.get("WFDElements");
-    let wfd_ies: Vec<u8> = wfd_ies_entry
+    // Require WPS interface — PushButton() is the correct connect method.
+    if !ifaces.contains_key(IWD_SIMPLE_CONFIG_IFACE) {
+        return None;
+    }
+
+    // Require WFD Display interface AND Sink == true.
+    let display_props = ifaces.get(IWD_P2P_DISPLAY_IFACE)?;
+    let is_sink = display_props
+        .get("Sink")
         .and_then(|v| {
-            if let zbus::zvariant::Value::Array(arr) = &**v {
-                Some(
-                    arr.iter()
-                        .filter_map(|e| {
-                            if let zbus::zvariant::Value::U8(b) = e {
-                                Some(*b)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect(),
-                )
+            if let zbus::zvariant::Value::Bool(b) = &**v {
+                Some(*b)
             } else {
                 None
             }
         })
-        .unwrap_or_default();
-
-    if wfd_ies_entry.is_some() && !is_miracast_sink(&wfd_ies) {
+        .unwrap_or(false);
+    if !is_sink {
         return None;
     }
 
-    let name: String = props
+    let peer_props = ifaces.get(IWD_P2P_PEER_IFACE)?;
+
+    let name: String = peer_props
         .get("Name")
         .and_then(|v| {
             if let zbus::zvariant::Value::Str(s) = &**v {
@@ -547,7 +547,7 @@ fn peer_event_from_iwd_props(
         })
         .unwrap_or_else(|| "Unknown".to_string());
 
-    let hw_address: String = props
+    let hw_address: String = peer_props
         .get("DeviceAddress")
         .and_then(|v| {
             if let zbus::zvariant::Value::Str(s) = &**v {
@@ -558,9 +558,7 @@ fn peer_event_from_iwd_props(
         })
         .unwrap_or_default();
 
-    tracing::debug!(name, hw_address, wfd_ie_len = wfd_ies.len(), "iwd Miracast sink found");
-
-    let wfd_port = parse_wfd_rtsp_port(&wfd_ies);
+    tracing::debug!(name, hw_address, "iwd WFD sink found");
 
     let mut metadata = HashMap::new();
     metadata.insert("path".into(), path.to_string());
@@ -568,7 +566,7 @@ fn peer_event_from_iwd_props(
     metadata.insert("backend".into(), "iwd".into());
 
     Some(DiscoveryEvent::DeviceFound(make_device(
-        name, None, wfd_port, metadata,
+        name, None, WFD_DEFAULT_PORT, metadata,
     )))
 }
 

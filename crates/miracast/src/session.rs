@@ -15,7 +15,7 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use ferricast_core::{AudioFrame, CastSession, Device, EncodedFrame, FerricastError, Result, StreamConfig};
 
 use crate::dbus::{
-    ActiveConnectionProxy, IwdP2pPeerProxy,
+    ActiveConnectionProxy, IwdP2pPeerProxy, IwdSimpleConfigurationProxy,
     NM_ACTIVE_CONNECTION_STATE_ACTIVATED, NM_ACTIVE_CONNECTION_STATE_DEACTIVATED,
     NM_ACTIVE_CONNECTION_STATE_DEACTIVATING, NetworkManagerProxy,
 };
@@ -638,19 +638,21 @@ impl MiracastSession {
         let conn = Connection::system().await.map_err(|e| {
             FerricastError::Connection(format!("D-Bus system bus unavailable: {e}"))
         })?;
-        let peer = IwdP2pPeerProxy::new(&conn, peer_path.clone())
+        // WFD sinks require WPS-PBC group formation via SimpleConfiguration.PushButton(),
+        // not p2p.Peer.Connect() (which returns NotFound for WFD peers under iwd).
+        let wsc = IwdSimpleConfigurationProxy::new(&conn, peer_path.clone())
             .await
-            .map_err(|e| FerricastError::Connection(format!("iwd P2P peer proxy: {e}")))?;
+            .map_err(|e| FerricastError::Connection(format!("iwd SimpleConfiguration proxy: {e}")))?;
 
-        tracing::info!(%peer_path, "Connecting iwd P2P peer (group formation + DHCP)");
+        tracing::info!(%peer_path, "WPS-PBC connecting to iwd WFD sink (group formation + DHCP)");
 
-        // iwd's connect() blocks until P2P group formation and DHCP complete.
-        tokio::time::timeout(Duration::from_secs(45), peer.connect())
+        // PushButton blocks until P2P group formation and DHCP complete.
+        tokio::time::timeout(Duration::from_secs(120), wsc.push_button())
             .await
             .map_err(|_| {
-                FerricastError::Connection("iwd P2P connect timed out after 45s".into())
+                FerricastError::Connection("iwd WPS-PBC timed out after 120s".into())
             })?
-            .map_err(|e| FerricastError::Connection(format!("iwd P2P connect: {e}")))?;
+            .map_err(|e| FerricastError::Connection(format!("iwd WPS-PBC: {e}")))?;
 
         tracing::info!("iwd P2P group formed — sink should connect to port {wfd_port} shortly");
 
