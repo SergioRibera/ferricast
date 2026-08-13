@@ -21,10 +21,12 @@ default = [
     "vaapi",
     "nvenc",
     "aac",
+    "airplay",
     "fdk-aac",
     "opus-rs",
 ]
 chromecast = ["ferricast/chromecast"]
+airplay = [ "ferricast/airplay" ]
 pipewire = ["ferricast/pipewire"]
 
 # Encoder backends — forwarded through the umbrella to ferricast-encoder.

@@ -1685,6 +1685,11 @@ impl StreamManagerBuilder {
         self.register::<ferricast_chromecast::ChromecastHandler>()
     }
 
+    #[cfg(feature = "airplay")]
+    pub fn with_airplay(self) -> Self {
+        self.register::<ferricast_airplay::AirPlayHandler>()
+    }
+
     /// Register the Chromecast *receiver* — advertise this process
     /// as a Cast target and accept LOAD / PLAY / PAUSE / SEEK from
     /// senders.

@@ -1815,6 +1815,7 @@ dependencies = [
 name = "ferricast"
 version = "0.1.0"
 dependencies = [
+ "ferricast-airplay",
  "ferricast-capture",
  "ferricast-chromecast",
  "ferricast-core",

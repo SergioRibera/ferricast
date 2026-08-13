@@ -27,6 +27,7 @@ ferricast-m3u8 = { path = "crates/m3u8" }
 ferricast-muxer = { path = "crates/muxer" }
 ferricast-hls = { path = "crates/hls" }
 ferricast-dbus = { path = "crates/dbus" }
+ferricast-airplay = { path = "crates/airplay" }
 
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -57,10 +58,14 @@ default = [
     "vaapi",
     "nvenc",
     "aac",
+    "airplay",
     "fdk-aac",
     "opus-rs",
 ]
 chromecast = ["dep:ferricast-chromecast"]
+airplay = ["dep:ferricast-airplay"]
+
+
 # Capture backends — re-exported from `ferricast-capture`. At least
 # one MUST be enabled; the capture crate emits a `compile_error!` if
 # both are turned off.
@@ -119,6 +124,7 @@ ferricast-capture.workspace = true
 ferricast-encoder.workspace = true
 ferricast-decoder.workspace = true
 ferricast-hls.workspace = true
+ferricast-airplay = { workspace = true, optional = true }
 ferricast-chromecast = { workspace = true, optional = true }
 # ferricast-airplay = { workspace = true, optional = true }
 # ferricast-miracast = { workspace = true, optional = true }
