@@ -90,8 +90,7 @@ impl Discovery for AirPlayDiscovery {
                             .map(|p| (p.key().to_string(), p.val_str().to_string()))
                             .collect();
 
-                        let device_uuid = Uuid::parse_str(info.get_fullname())
-                            .unwrap_or_default();
+                        let device_uuid = Uuid::new_v4();
 
                         let addr: std::net::IpAddr = match info.get_addresses_v4().iter().next() {
                             Some(addr) => (*(*addr)).into(),
@@ -144,10 +143,12 @@ impl Discovery for AirPlayDiscovery {
                         let num = ((part2 as u64) << 32) | (part1 as u64);
 
                         let features = Features::from_bits_truncate(num);
+            
+                        let fullname = info.get_fullname();
 
                         let device = Device {
                             id: device_uuid,
-                            name: info.get_fullname().to_string(),
+                            name: fullname.strip_suffix("._airplay._tcp.local.").unwrap_or(fullname).to_string(),
                             protocol: Self::PROTOCOL,
                             protocol_icon: AIRPLAY_ICON,
                             model: txt.get("model").cloned(),
@@ -175,6 +176,7 @@ impl Discovery for AirPlayDiscovery {
                             name = %device.name,
                             addr = %device.addr,
                             port = device.port,
+                            feature = %features,
                             "discovered airplay device"
                         );
 

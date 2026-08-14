@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 bitflags::bitflags! {
      #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
      pub struct Features: u64 {
@@ -17,4 +19,10 @@ bitflags::bitflags! {
 
         // There is other flags but.... who cares?
      }
+}
+
+impl Display for Features {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
