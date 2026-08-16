@@ -17,6 +17,8 @@ bitflags::bitflags! {
         const PHOTO_CACHING = 0x2000;
         const AUTH4 = 0x4000;
 
+        const SUPPORT_LEGACY_PAIRING = (1 << 27);
+
         // There is other flags but.... who cares?
      }
 }

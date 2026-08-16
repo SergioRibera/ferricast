@@ -1,12 +1,24 @@
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ed25519_dalek::SigningKey;
+use rand::Rng;
+use rand::rngs::OsRng;
+use srp::client::SrpClient;
+use srp::groups::G_2048;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use ferricast_core::{
     CastSession, Codec, Device, EncodedFrame, FerricastError, Result, StreamConfig,
 };
+
+const RTSP_OK: &[u8] = b"RTSP/1.0 200 OK";
 
 /// Internal state of the AirPlay session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +92,94 @@ impl CastSession for AirPlaySession {
         if self.state != SessionState::Disconnected {
             return Err(FerricastError::SessionAlreadyActive(device.name.clone()));
         }
+
+
+
+      println!("{}", format!("{:?}:{}", device.addr, device.port));
+
+      let mut socket = TcpStream::connect(format!("{:?}:{}", device.addr, device.port))
+          .await
+          .map_err(|e| FerricastError::Connection(format!("Cannot connect to AirPlay device {e}")))?;
+
+
+        socket.write(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: iTunes/10.6 (Macintosh; Intel Mac OS X 10.7.3) AppleWebKit/535.18.5\r\nClient-Instance: 56B29BB6CB904862\r\nDACP-ID: 56B29BB6CB904862\r\nActive-Remote: 1986535575\r\n\r\n")
+            .await
+            .map_err(|e| FerricastError::Connection(format!("Cannot write to Airplay socket {e}")))?;
+
+        
+
+        let mut buf = vec![0_u8; 4096];
+
+        let n = socket.read(&mut buf).await.unwrap();
+
+        if n < 15 {
+            return Err(FerricastError::Connection("Invalid RTSP response".to_string()));
+        }
+
+        if &buf[..15] != RTSP_OK {
+            return Err(FerricastError::Connection("Device required pairing... but, todo".to_string()));
+        }
+
+
+        info!("Connecting to Airplay device");  
+
+
+        /*
+    
+        socket.write(b"POST /pair-pin-start HTTP/1.0\r\nUser-Agent: Airplay/320.20\r\nConnection: keep-alive\r\n\r\n")
+            .await
+            .map_err(|e| FerricastError::Connection(format!("Cannot write to Airplay device {e}")))?;
+
+        let (client_id, _) = generate_auth_token();
+
+        println!("nice!");
+
+        let mut buf = vec![0_u8; 8096];
+
+        socket.read(&mut buf).await.unwrap();
+
+
+
+        let mut pair_setup_data = HashMap::new();
+        pair_setup_data.insert("method", "pin".to_string());
+        pair_setup_data.insert("user", generate_device_id());
+
+        let mut pair_setup_bin = Vec::new();
+
+        // I hate apple
+        plist::to_writer_binary(&mut pair_setup_bin, &pair_setup_data)
+            .map_err(|e| FerricastError::Connection(format!("Cannot encode plist {e}")))?;
+
+        socket.write(format!("POST /pair-setup-pin HTTP/1.0\r\nUser-Agent: AirPlay/320.20\r\nConnection: keep-alive\r\nContent-Length: {}\r\nContent-Type: application/x-apple-binary-plist\r\n\r\n", pair_setup_bin.len()).as_bytes())
+            .await
+            .map_err(|e| FerricastError::Connection(format!("Cannot write to Airplay device {e}")))?;
+
+        socket.write(&pair_setup_bin)
+            .await
+            .map_err(|e| FerricastError::Connection(format!("Cannot write to Airplay device {e}")))?;
+
+
+        println!("pin:");
+
+        //let mut buffer = vec![0u8; 4];
+
+        //std::io::stdin().read_exact(&mut buffer).unwrap();
+
+        //let pin = String::from_utf8(buffer).unwrap();
+
+        //let srp_client = SrpClient::<sha1::Sha1>::new(&G_2048);
+
+        
+
+             let n = socket.read(&mut buf).await.unwrap();
+
+             
+             let n = socket.read(&mut buf).await.unwrap();
+
+
+
+        println!("{:?}", String::from_utf8_lossy(&buf[..n]));
+        */
 
         Ok(())
     }
@@ -181,4 +281,27 @@ fn generate_device_id() -> String {
         "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
     )
+}
+
+
+fn generate_auth_token() -> (String, String) {
+   let signing_key = SigningKey::generate(&mut OsRng);
+
+   let private_key = signing_key.to_bytes();
+
+   let hex = hex::encode(private_key);
+
+   (random_string(16), hex)
+}
+
+
+fn random_string(len: usize) -> String {
+    let mut string = String::with_capacity(len);
+    let mut rng = rand::thread_rng();
+
+    for i in 0..=len {
+        string.push(rng.gen_range(48..=90) as u8 as char);
+    }
+
+    string
 }

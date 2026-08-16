@@ -90,6 +90,12 @@ impl Discovery for AirPlayDiscovery {
                             .map(|p| (p.key().to_string(), p.val_str().to_string()))
                             .collect();
 
+
+
+                        let pw = txt.get("pw");
+                        println!("{:?}", pw);
+
+
                         let device_uuid = Uuid::new_v4();
 
                         let addr: std::net::IpAddr = match info.get_addresses_v4().iter().next() {
