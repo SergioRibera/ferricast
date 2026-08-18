@@ -18,7 +18,7 @@ use ferricast_core::{
     CastSession, Codec, Device, EncodedFrame, FerricastError, Result, StreamConfig,
 };
 
-const RTSP_OK: &[u8] = b"RTSP/1.0 200 OK";
+
 
 /// Internal state of the AirPlay session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,28 +101,7 @@ impl CastSession for AirPlaySession {
           .await
           .map_err(|e| FerricastError::Connection(format!("Cannot connect to AirPlay device {e}")))?;
 
-
-        socket.write(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: iTunes/10.6 (Macintosh; Intel Mac OS X 10.7.3) AppleWebKit/535.18.5\r\nClient-Instance: 56B29BB6CB904862\r\nDACP-ID: 56B29BB6CB904862\r\nActive-Remote: 1986535575\r\n\r\n")
-            .await
-            .map_err(|e| FerricastError::Connection(format!("Cannot write to Airplay socket {e}")))?;
-
-        
-
-        let mut buf = vec![0_u8; 4096];
-
-        let n = socket.read(&mut buf).await.unwrap();
-
-        if n < 15 {
-            return Err(FerricastError::Connection("Invalid RTSP response".to_string()));
-        }
-
-        if &buf[..15] != RTSP_OK {
-            return Err(FerricastError::Connection("Device required pairing... but, todo".to_string()));
-        }
-
-
         info!("Connecting to Airplay device");  
-
 
         /*
     

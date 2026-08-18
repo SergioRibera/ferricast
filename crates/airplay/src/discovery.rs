@@ -73,7 +73,7 @@ impl Discovery for AirPlayDiscovery {
                         Ok(Ok(ev)) => ev,
                         Ok(Err(_timeout)) => continue,
                         Err(join_err) => {
-                            tracing::error!("mdns browse task panicked: {join_err}");
+                            tracing::error!("mdns browse taContent-Length: 0sk panicked: {join_err}");
                             break;
                         },
                     }
@@ -151,6 +151,13 @@ impl Discovery for AirPlayDiscovery {
                         let features = Features::from_bits_truncate(num);
             
                         let fullname = info.get_fullname();
+
+                        if !features.contains(Features::VIDEO_HTTP_LIVE_STREAM) {
+                            warn!("Skipped airplay device {}", fullname);
+                            continue;
+
+                        }
+
 
                         let device = Device {
                             id: device_uuid,
