@@ -18,6 +18,8 @@ use ferricast_core::{
     CastSession, Codec, Device, EncodedFrame, FerricastError, Result, StreamConfig,
 };
 
+use crate::rtsp::RtspManager;
+
 
 
 /// Internal state of the AirPlay session.
@@ -101,7 +103,24 @@ impl CastSession for AirPlaySession {
           .await
           .map_err(|e| FerricastError::Connection(format!("Cannot connect to AirPlay device {e}")))?;
 
-        info!("Connecting to Airplay device");  
+        info!("Connecting to Airplay device"); 
+
+        let manager = RtspManager::new();
+
+        manager.builder()
+            .path("/pair-pin-start".to_string())
+            .header(("User-Agent".to_string(), "AirPlay/381.13".to_string()))
+            .header(("X-Apple-HKP".to_string(), "3".to_string()))
+            .header(("X-Apple-Client-Name".to_string(), "Ferricast Airplay".to_string()))
+            .write(&mut socket)
+            .await?;
+
+        // IMPROVE PAIRING!
+        //
+        loop {}
+
+
+    
 
         /*
     

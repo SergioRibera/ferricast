@@ -1,0 +1,75 @@
+use std::sync::{Arc, atomic::AtomicU64};
+
+use ferricast_core::FerricastError;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+pub struct RtspManager(AtomicU64);
+
+impl RtspManager {
+    pub fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+    pub fn builder(&self) -> RtspReqBuilder {
+        self.0.fetch_add(0, std::sync::atomic::Ordering::SeqCst);
+
+        RtspReqBuilder::new(self.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+
+pub struct RtspReqBuilder {
+    cseq: u64,
+    method: Method,
+    path: String,
+    body: Vec<u8>,
+    headers: Vec<(String, String)>
+}
+
+impl RtspReqBuilder {
+    fn new(cseq: u64) -> Self {
+        Self {
+            cseq,
+            method: Method::POST,
+            path: String::new(),
+            body: Vec::new(),
+            headers: Vec::new(),
+        } 
+    } 
+    pub fn path(mut self, path: String) -> Self {
+        self.path = path;
+
+        self
+    }
+    pub fn method(mut self, method: Method) -> Self {
+        self.method = method;
+
+        self
+    }
+    pub fn header(mut self, header: (String, String)) -> Self {
+        self.headers.push(header);
+
+        self
+    }
+    pub async fn write<T: AsyncWriteExt + Unpin>(self, writer: &mut T) -> Result<(), FerricastError> {
+        let mut a = format!("{:?} {} RTSP/1.0\r\nCSeq: {}\r\n", self.method, self.path, self.cseq);
+
+        for header in self.headers {
+            a.push_str(format!("{}: {}\r\n", header.0, header.1).as_str());
+        }
+
+        a.push_str("\r\n");
+
+        writer.write(a.as_bytes()).await?;
+
+        if !self.body.is_empty() {
+            writer.write(&self.body).await?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum Method {
+    POST,
+}
