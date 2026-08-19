@@ -109,11 +109,27 @@ impl CastSession for AirPlaySession {
 
         manager.builder()
             .path("/pair-pin-start".to_string())
-            .header(("User-Agent".to_string(), "AirPlay/381.13".to_string()))
-            .header(("X-Apple-HKP".to_string(), "3".to_string()))
-            .header(("X-Apple-Client-Name".to_string(), "Ferricast Airplay".to_string()))
             .write(&mut socket)
             .await?;
+    
+        //let mut buffer = vec![0_u8; 4096];
+
+        //let n = socket.read(&mut buffer).await?;
+
+
+        //println!("{:?}", String::from_utf8(buffer[..n].to_vec());
+
+
+
+
+        /*
+        manager.builder()
+            .path("/pair-setup".to_string())
+            .header(("User-Agent".to_string(), "AirPlay/381.13".to_string()))
+            .header(("X-Apple-HKP".to_string(), "3".to_string()))
+            .header(("X-Apple-Client-Name".to_string(), "Ferricast Airplay".to_string()));
+        */
+
 
         // IMPROVE PAIRING!
         //
