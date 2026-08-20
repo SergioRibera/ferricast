@@ -5,10 +5,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ed25519_dalek::SigningKey;
+use hap_tlv8::Tlv8Writer;
 use rand::Rng;
 use rand::rngs::OsRng;
+use sha2::Sha512;
 use srp::client::SrpClient;
-use srp::groups::G_2048;
+use srp::groups::{G_2048, G_3072};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{info, warn};
@@ -19,6 +21,10 @@ use ferricast_core::{
 };
 
 use crate::rtsp::RtspManager;
+
+const TLV_TYPE_STATE: u8 = 6;
+const TLV_TYPE_METHOD: u8 = 0;
+
 
 
 
@@ -111,15 +117,46 @@ impl CastSession for AirPlaySession {
             .path("/pair-pin-start".to_string())
             .write(&mut socket)
             .await?;
+
+        let mut buffer = vec![0_u8; 4096];
+
+        let n = socket.read(&mut buffer).await?;
+
+
+        println!("{:?}", String::from_utf8(buffer[..n].to_vec()));
+
+
+        let srp = SrpClient::<Sha512>::new(&G_3072);
     
-        //let mut buffer = vec![0_u8; 4096];
+        let mut bytes = Vec::new();
 
-        //let n = socket.read(&mut buffer).await?;
+        let mut w = Tlv8Writer::new(&mut bytes);
+
+        let mut data = [0_u8; 32];
+
+        data[0] = 1;
+
+        w.push(TLV_TYPE_STATE, &data);
+
+        w.push(TLV_TYPE_METHOD, &[0]);
+
+        
+        manager.builder()
+            .path("/pair-setup".to_string())
+            .content_type("application/octet-stream".to_string())
+            .body(bytes)
+            .write(&mut socket)
+            .await?;
+
+                let n = socket.read(&mut buffer).await?;
 
 
-        //println!("{:?}", String::from_utf8(buffer[..n].to_vec());
+        println!("{:?}", String::from_utf8(buffer[..n].to_vec()));
 
 
+
+        
+    
 
 
         /*

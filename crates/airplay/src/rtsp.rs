@@ -10,7 +10,7 @@ impl RtspManager {
         Self(AtomicU64::new(0))
     }
     pub fn builder(&self) -> RtspReqBuilder {
-        self.0.fetch_add(0, std::sync::atomic::Ordering::SeqCst);
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         RtspReqBuilder::new(self.0.load(std::sync::atomic::Ordering::SeqCst))
     }
@@ -21,6 +21,7 @@ pub struct RtspReqBuilder {
     cseq: u64,
     method: Method,
     path: String,
+    content_type: String,
     body: Vec<u8>,
     headers: Vec<(String, String)>
 }
@@ -31,6 +32,7 @@ impl RtspReqBuilder {
             cseq,
             method: Method::POST,
             path: String::new(),
+            content_type: String::new(),
             body: Vec::new(),
             headers: vec![
                ("User-Agent".to_string(), "AirPlay/381.13".to_string()),
@@ -49,6 +51,16 @@ impl RtspReqBuilder {
 
         self
     }
+    pub fn content_type(mut self, content_type: String) -> Self {
+        self.content_type = content_type;
+
+        self
+    }
+    pub fn body(mut self, body: Vec<u8>) -> Self {
+        self.body = body;
+
+        self
+    }
     pub fn header(mut self, header: (String, String)) -> Self {
         self.headers.push(header);
 
@@ -56,6 +68,10 @@ impl RtspReqBuilder {
     }
     pub async fn write<T: AsyncWriteExt + Unpin>(self, writer: &mut T) -> Result<(), FerricastError> {
         let mut a = format!("{:?} {} RTSP/1.0\r\nCSeq: {}\r\n", self.method, self.path, self.cseq);
+
+        if !self.content_type.is_empty() {
+            a.push_str(format!("Content-Type: {}\r\n", self.content_type).as_str());
+        }
 
         for header in self.headers {
             a.push_str(format!("{}: {}\r\n", header.0, header.1).as_str());
