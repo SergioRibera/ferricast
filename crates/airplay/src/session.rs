@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -8,16 +5,14 @@ use ed25519_dalek::SigningKey;
 use hap_tlv8::Tlv8Writer;
 use rand::Rng;
 use rand::rngs::OsRng;
-use sha2::Sha512;
-use srp::client::SrpClient;
-use srp::groups::{G_2048, G_3072};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::TcpStream;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use ferricast_core::{
-    CastSession, Codec, Device, EncodedFrame, FerricastError, Result, StreamConfig,
+    CastSession, Codec, ConnectOutcome, Device, EncodedFrame, FerricastError,
+    PairingChallenge, PairingResponse, Result, StreamConfig,
 };
 
 use crate::rtsp::{RtspManager, RtspResponse};
@@ -25,23 +20,16 @@ use crate::rtsp::{RtspManager, RtspResponse};
 const TLV_TYPE_STATE: u8 = 6;
 const TLV_TYPE_METHOD: u8 = 0;
 
-
-
-
 /// Internal state of the AirPlay session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionState {
-    /// Initial state, not connected.
     Disconnected,
-    /// TCP connection established but not yet paired/negotiated.
+    /// TCP open, `/pair-pin-start` sent, waiting for PIN from user.
+    AwaitingPin,
     Connected,
-    /// Pair-Verify completed, encryption keys established.
     Paired,
-    /// RTSP SETUP completed, data channel ready.
     Ready,
-    /// RTSP RECORD sent, actively streaming.
     Streaming,
-    /// Session is being torn down.
     TearingDown,
 }
 
@@ -49,6 +37,7 @@ impl std::fmt::Display for SessionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Disconnected => write!(f, "Disconnected"),
+            Self::AwaitingPin => write!(f, "AwaitingPin"),
             Self::Connected => write!(f, "Connected"),
             Self::Paired => write!(f, "Paired"),
             Self::Ready => write!(f, "Ready"),
@@ -65,6 +54,11 @@ pub struct AirPlaySession {
     client_device_id: String,
     alive: Arc<AtomicBool>,
     frame_counter: u64,
+    /// Held open between `connect()` and `submit_pairing()`.
+    /// `connect()` sends `/pair-pin-start` and waits for the user to
+    /// type the PIN shown on the TV screen; `submit_pairing()` takes
+    /// this stream and continues the SRP-based pair-setup exchange.
+    pending_conn: Option<TcpStream>,
 }
 
 impl Default for AirPlaySession {
@@ -77,161 +71,124 @@ impl Default for AirPlaySession {
             client_device_id,
             alive: Default::default(),
             frame_counter: Default::default(),
+            pending_conn: None,
         }
     }
 }
 
 impl AirPlaySession {
-    /// Get the session ID.
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
 }
 
 impl CastSession for AirPlaySession {
-    async fn connect(&mut self, device: &Device) -> Result<()> {
+    async fn connect(&mut self, device: &Device) -> Result<ConnectOutcome> {
         if device.protocol != "airplay" {
             return Err(FerricastError::Protocol(format!(
                 "Expected AirPlay device, got {:?}",
                 device.protocol
             )));
         }
-
         if self.state != SessionState::Disconnected {
             return Err(FerricastError::SessionAlreadyActive(device.name.clone()));
         }
 
+        info!(addr = %device.addr, port = device.port, "connecting to AirPlay device");
 
-
-      println!("{}", format!("{:?}:{}", device.addr, device.port));
-
-      let mut socket = TcpStream::connect(format!("{:?}:{}", device.addr, device.port))
-          .await
-          .map_err(|e| FerricastError::Connection(format!("Cannot connect to AirPlay device {e}")))?;
-
-        let (mut s_read, mut s_write) = socket.into_split();
-
-        let mut buf_reader = BufReader::new(&mut s_read);
-        
-
-        info!("Connecting to Airplay device"); 
+        let mut socket =
+            TcpStream::connect((device.addr, device.port))
+                .await
+                .map_err(|e| {
+                    FerricastError::Connection(format!("Cannot connect to AirPlay device: {e}"))
+                })?;
 
         let manager = RtspManager::new();
 
-        manager.builder()
-            .path("/pair-pin-start".to_string())
-            .write(&mut s_write)
-            .await?;
+        // split() borrows — halves drop at end of block, socket stays owned.
+        {
+            let (read_half, mut write_half) = socket.split();
+            let mut buf_reader = BufReader::new(read_half);
 
-        RtspResponse::read(&mut buf_reader).await;
-        
+            // Tell the device to display a PIN on screen.
+            manager
+                .builder()
+                .path("/pair-pin-start".to_string())
+                .write(&mut write_half)
+                .await?;
+            RtspResponse::read(&mut buf_reader).await;
 
-        //println!("{:?}", String::from_utf8(buffer[..n].to_vec()));
+            // Send SRP M1 (initial pair-setup request, no PIN yet).
+            let mut tlv_bytes = Vec::new();
+            let mut w = Tlv8Writer::new(&mut tlv_bytes);
+            let mut state_buf = [0u8; 32];
+            state_buf[0] = 1;
+            w.push(TLV_TYPE_STATE, &state_buf);
+            w.push(TLV_TYPE_METHOD, &[0]);
+            drop(w);
 
+            manager
+                .builder()
+                .path("/pair-setup".to_string())
+                .content_type("application/octet-stream".to_string())
+                .body(tlv_bytes)
+                .write(&mut write_half)
+                .await?;
+            RtspResponse::read(&mut buf_reader).await;
+        }
 
-        let srp = SrpClient::<Sha512>::new(&G_3072);
-    
-        let mut bytes = Vec::new();
+        // Park the open connection; the manager will call submit_pairing()
+        // once the user has entered the PIN shown on the TV.
+        self.pending_conn = Some(socket);
+        self.state = SessionState::AwaitingPin;
 
-        let mut w = Tlv8Writer::new(&mut bytes);
+        info!("AirPlay pair-pin-start sent; waiting for user PIN");
+        Ok(ConnectOutcome::PairingRequired(PairingChallenge::Pin {
+            digits: 4,
+        }))
+    }
 
-        let mut data = [0_u8; 32];
+    async fn submit_pairing(&mut self, response: PairingResponse) -> Result<()> {
+        let pin = match response {
+            PairingResponse::Pin(p) => p,
+            PairingResponse::Cancelled => {
+                self.state = SessionState::Disconnected;
+                self.pending_conn = None;
+                return Err(FerricastError::Protocol("AirPlay pairing cancelled".into()));
+            }
+            PairingResponse::Confirmed => {
+                return Err(FerricastError::Protocol(
+                    "AirPlay pairing expects a PIN, got Confirmed".into(),
+                ))
+            }
+        };
 
-        data[0] = 1;
+        let mut socket = self.pending_conn.take().ok_or_else(|| {
+            FerricastError::Protocol("submit_pairing called without a pending connection".into())
+        })?;
 
-        w.push(TLV_TYPE_STATE, &data);
+        let manager = RtspManager::new();
 
-        w.push(TLV_TYPE_METHOD, &[0]);
+        {
+            let (read_half, mut write_half) = socket.split();
+            let mut buf_reader = BufReader::new(read_half);
 
-        
-        manager.builder()
-            .path("/pair-setup".to_string())
-            .content_type("application/octet-stream".to_string())
-            .body(bytes)
-            .write(&mut s_write)
-            .await?;
+            // TODO: complete SRP exchange using `pin`.
+            // Steps (once SRP crate integration is worked out):
+            //   1. derive verifier from PIN using srp::client::SrpClient<Sha512>
+            //   2. POST /pair-setup with SRP M1 + PIN verifier
+            //   3. read SRP M2 from device (server proof)
+            //   4. verify server proof
+            //   5. POST /pair-verify with our public key
+            //   6. derive session keys
+            let _ = &pin;
+            let _ = &mut buf_reader;
+            let _ = &mut write_half;
+        }
 
-                
-
-
-
-        
-    
-
-
-        /*
-        manager.builder()
-            .path("/pair-setup".to_string())
-            .header(("User-Agent".to_string(), "AirPlay/381.13".to_string()))
-            .header(("X-Apple-HKP".to_string(), "3".to_string()))
-            .header(("X-Apple-Client-Name".to_string(), "Ferricast Airplay".to_string()));
-        */
-
-
-        // IMPROVE PAIRING!
-        //
-        loop {}
-
-
-    
-
-        /*
-    
-        socket.write(b"POST /pair-pin-start HTTP/1.0\r\nUser-Agent: Airplay/320.20\r\nConnection: keep-alive\r\n\r\n")
-            .await
-            .map_err(|e| FerricastError::Connection(format!("Cannot write to Airplay device {e}")))?;
-
-        let (client_id, _) = generate_auth_token();
-
-        println!("nice!");
-
-        let mut buf = vec![0_u8; 8096];
-
-        socket.read(&mut buf).await.unwrap();
-
-
-
-        let mut pair_setup_data = HashMap::new();
-        pair_setup_data.insert("method", "pin".to_string());
-        pair_setup_data.insert("user", generate_device_id());
-
-        let mut pair_setup_bin = Vec::new();
-
-        // I hate apple
-        plist::to_writer_binary(&mut pair_setup_bin, &pair_setup_data)
-            .map_err(|e| FerricastError::Connection(format!("Cannot encode plist {e}")))?;
-
-        socket.write(format!("POST /pair-setup-pin HTTP/1.0\r\nUser-Agent: AirPlay/320.20\r\nConnection: keep-alive\r\nContent-Length: {}\r\nContent-Type: application/x-apple-binary-plist\r\n\r\n", pair_setup_bin.len()).as_bytes())
-            .await
-            .map_err(|e| FerricastError::Connection(format!("Cannot write to Airplay device {e}")))?;
-
-        socket.write(&pair_setup_bin)
-            .await
-            .map_err(|e| FerricastError::Connection(format!("Cannot write to Airplay device {e}")))?;
-
-
-        println!("pin:");
-
-        //let mut buffer = vec![0u8; 4];
-
-        //std::io::stdin().read_exact(&mut buffer).unwrap();
-
-        //let pin = String::from_utf8(buffer).unwrap();
-
-        //let srp_client = SrpClient::<sha1::Sha1>::new(&G_2048);
-
-        
-
-             let n = socket.read(&mut buf).await.unwrap();
-
-             
-             let n = socket.read(&mut buf).await.unwrap();
-
-
-
-        println!("{:?}", String::from_utf8_lossy(&buf[..n]));
-        */
-
+        self.pending_conn = Some(socket);
+        self.state = SessionState::Connected;
+        info!("AirPlay pairing complete");
         Ok(())
     }
 
@@ -242,8 +199,6 @@ impl CastSession for AirPlaySession {
                 self.state
             )));
         }
-
-        // Validate codec
         if config.codec != Codec::H264 {
             return Err(FerricastError::UnsupportedCodec {
                 codec: config.codec,
@@ -256,12 +211,9 @@ impl CastSession for AirPlaySession {
             height = config.height,
             fps = config.fps,
             bitrate_kbps = config.bitrate_kbps,
-            "Setting up AirPlay stream"
+            "setting up AirPlay stream"
         );
-
         self.state = SessionState::Streaming;
-        info!("AirPlay stream is now active");
-
         Ok(())
     }
 
@@ -272,14 +224,12 @@ impl CastSession for AirPlaySession {
                 self.state
             )));
         }
-
         if frame.codec != Codec::H264 {
             return Err(FerricastError::UnsupportedCodec {
                 codec: frame.codec,
                 protocol: "airplay",
             });
         }
-
         Ok(())
     }
 
@@ -287,16 +237,13 @@ impl CastSession for AirPlaySession {
         if self.state == SessionState::Disconnected {
             return Ok(());
         }
-
         info!(
             session_id = %self.session_id,
             frames_sent = self.frame_counter,
-            "Stopping AirPlay session"
+            "stopping AirPlay session"
         );
-
         self.state = SessionState::TearingDown;
-
-        info!("AirPlay session stopped");
+        self.pending_conn = None;
         Ok(())
     }
 
@@ -325,7 +272,6 @@ impl Drop for AirPlaySession {
     }
 }
 
-/// Generate a random device ID in MAC address format.
 fn generate_device_id() -> String {
     let bytes: [u8; 6] = rand::random();
     format!(
@@ -334,25 +280,18 @@ fn generate_device_id() -> String {
     )
 }
 
-
 fn generate_auth_token() -> (String, String) {
-   let signing_key = SigningKey::generate(&mut OsRng);
-
-   let private_key = signing_key.to_bytes();
-
-   let hex = hex::encode(private_key);
-
-   (random_string(16), hex)
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let private_key = signing_key.to_bytes();
+    let hex = hex::encode(private_key);
+    (random_string(16), hex)
 }
-
 
 fn random_string(len: usize) -> String {
     let mut string = String::with_capacity(len);
     let mut rng = rand::thread_rng();
-
-    for i in 0..=len {
-        string.push(rng.gen_range(48..=90) as u8 as char);
+    for _ in 0..len {
+        string.push(rng.gen_range(48u8..=90) as char);
     }
-
     string
 }

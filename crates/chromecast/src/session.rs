@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use ferricast_core::{
-    AudioCodec, AudioFrame, CastSession, Codec, Device, EncodedFrame, FerricastError, Result,
-    StreamConfig, bind_in_range,
+    AudioCodec, AudioFrame, CastSession, Codec, ConnectOutcome, Device, EncodedFrame,
+    FerricastError, Result, StreamConfig, bind_in_range,
 };
 use ferricast_hls::{HlsConfig, HlsFrameSink};
 use tokio::sync::{mpsc, oneshot};
@@ -141,7 +141,7 @@ impl Drop for StreamState {
 }
 
 impl CastSession for ChromecastSession {
-    async fn connect(&mut self, device: &Device) -> Result<()> {
+    async fn connect(&mut self, device: &Device) -> Result<ConnectOutcome> {
         if device.protocol != "chromecast" {
             return Err(FerricastError::Protocol(format!(
                 "ChromecastSession cannot connect to a {:?} device",
@@ -284,7 +284,7 @@ impl CastSession for ChromecastSession {
             read_handle,
             heartbeat_handle,
         });
-        Ok(())
+        Ok(ConnectOutcome::Ready)
     }
 
     async fn setup_stream(&mut self, config: &StreamConfig) -> Result<()> {

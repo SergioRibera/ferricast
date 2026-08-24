@@ -767,6 +767,10 @@ async fn signal_loop(
             | ManagerEvent::ReceiverStateChanged { .. }
             | ManagerEvent::ReceiverStopped { .. }
             | ManagerEvent::ReceiverError { .. } => Ok(()),
+            // Pairing is handled exclusively by the in-process GUI
+            // (the oneshot sender is forwarded via forward_tx).
+            // No D-Bus signal yet — add one when external clients need it.
+            ManagerEvent::PairingRequired { .. } => Ok(()),
         };
         if let Err(e) = r {
             tracing::warn!(%e, "failed to emit D-Bus signal");

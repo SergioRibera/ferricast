@@ -16,8 +16,8 @@ pub use receiver::{ChromecastReceiver, ChromecastReceiverAdvertiser, ChromecastR
 pub use session::ChromecastSession;
 
 use ferricast_core::{
-    AudioCodec, AudioFrame, CastSession, Codec, Device, EncodedFrame, FerricastError,
-    ProtocolHandler, Result, StreamConfig,
+    AudioCodec, AudioFrame, CastSession, Codec, ConnectOutcome, Device, EncodedFrame,
+    FerricastError, ProtocolHandler, Result, StreamConfig,
 };
 
 /// Wraps either the HLS session or the Cast Streaming (RTP/UDP) mirror
@@ -42,7 +42,7 @@ pub enum ChromecastEitherSession {
 }
 
 impl CastSession for ChromecastEitherSession {
-    async fn connect(&mut self, device: &Device) -> Result<()> {
+    async fn connect(&mut self, device: &Device) -> Result<ConnectOutcome> {
         match self {
             Self::Hls(s) => s.connect(device).await,
             Self::Mirror { session, connected_device } => {

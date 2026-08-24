@@ -9,6 +9,7 @@ pub mod encoder;
 pub mod error;
 pub mod frame;
 pub mod net;
+pub mod pairing;
 pub mod protocol;
 pub mod puller;
 pub mod session;
@@ -37,7 +38,8 @@ pub use frame::{
 pub use net::{bind_in_range, bind_udp_in_range, local_addr_for};
 pub use protocol::{Codec, ProtocolHandler, ReceiverProtocol};
 pub use puller::{AudioStreamInfo, MediaInfo, MediaPacket, MediaPuller, PullSpec, VideoStreamInfo};
-pub use session::{AudioStreamConfig, CastSession, StreamConfig};
+pub use pairing::{PairingChallenge, PairingResponse};
+pub use session::{AudioStreamConfig, CastSession, ConnectOutcome, StreamConfig};
 pub use sink::FrameSink;
 pub use source::{
     EnumerationCapability, Geometry, MonitorInfo, SourceChange, SourceEnumerator, SourceError,

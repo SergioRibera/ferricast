@@ -1,12 +1,12 @@
-use ferricast_core::{CastSession, Device, EncodedFrame, Result, StreamConfig};
+use ferricast_core::{CastSession, ConnectOutcome, Device, EncodedFrame, Result, StreamConfig};
 
 /// A Miracast (Wi-Fi Display) streaming session.
 #[derive(Default)]
 pub struct MiracastSession;
 
 impl CastSession for MiracastSession {
-    async fn connect(&mut self, device: &Device) -> Result<()> {
-        Ok(())
+    async fn connect(&mut self, _device: &Device) -> Result<ConnectOutcome> {
+        Ok(ConnectOutcome::Ready)
     }
 
     async fn setup_stream(&mut self, config: &StreamConfig) -> Result<()> {

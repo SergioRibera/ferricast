@@ -5,6 +5,18 @@ use crate::capture::AudioMuteHandle;
 use crate::device::Device;
 use crate::error::Result;
 use crate::frame::{AudioCodec, EncodedFrame};
+use crate::pairing::{PairingChallenge, PairingResponse};
+
+/// Outcome of [`CastSession::connect`].
+#[derive(Debug)]
+pub enum ConnectOutcome {
+    /// Session is ready to proceed to [`CastSession::setup_stream`].
+    Ready,
+    /// Protocol requires user input before streaming can begin.
+    /// The manager will emit [`crate::ManagerEvent::PairingRequired`],
+    /// wait for the response, and call [`CastSession::submit_pairing`].
+    PairingRequired(PairingChallenge),
+}
 
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
@@ -117,7 +129,18 @@ impl Default for StreamConfig {
 }
 
 pub trait CastSession: Send + Sync {
-    fn connect(&mut self, device: &Device) -> impl Future<Output = Result<()>> + Send;
+    fn connect(&mut self, device: &Device) -> impl Future<Output = Result<ConnectOutcome>> + Send;
+
+    /// Submit the user's answer to a [`PairingChallenge`] returned by [`connect`].
+    /// Only called when `connect` returns `ConnectOutcome::PairingRequired`.
+    /// Default impl is a no-op (safe for protocols that never need pairing).
+    fn submit_pairing(
+        &mut self,
+        _response: PairingResponse,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
+
     fn setup_stream(&mut self, config: &StreamConfig) -> impl Future<Output = Result<()>> + Send;
     fn send_frame(&mut self, frame: &EncodedFrame) -> impl Future<Output = Result<()>> + Send;
 
