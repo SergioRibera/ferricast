@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::AtomicU64};
 
 use ferricast_core::FerricastError;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 pub struct RtspManager(AtomicU64);
 
@@ -92,4 +92,74 @@ impl RtspReqBuilder {
 #[derive(Debug)]
 pub enum Method {
     POST,
+}
+
+
+#[derive(Debug, Clone)]
+pub struct RtspResponse {
+    status_line: StatusLine,
+    headers: Vec<(String, String)>,
+}
+
+impl RtspResponse {
+    pub async fn read<T: AsyncReadExt + Unpin>(buf: &mut BufReader<T>) -> Result<Self, FerricastError> {
+        let mut status_line: Option<StatusLine> = None;
+        let mut headers: Vec<(String, String)> = Vec::new();
+
+
+        loop {
+            let mut line = String::new();        
+    
+            match buf.read_line(&mut line).await {
+                Ok(0) => break, 
+                Ok(_) => {
+                    if line == "\r\n" {
+                        break;
+                    }
+
+                    if status_line.is_none() {
+                        status_line = Some(StatusLine::read(&line)?);
+                    }
+
+                    let mut splited = line.split(":");
+
+                    let name = splited.next().ok_or(FerricastError::Rtsp("Invalid header".to_string()))?;
+                    let value = splited.next().ok_or(FerricastError::Rtsp("Invalid header".to_string()))?;
+
+
+                    headers.push((name.to_string(), value.to_string()));
+                },
+                Err(_) => break,
+            }
+        }
+
+        
+
+
+        Ok(Self { status_line: status_line.expect("Ferricast RTSP bug"), headers })
+
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusLine {
+    pub status_code: u16,
+    pub description: String,
+}
+
+impl StatusLine {
+    pub fn read(status_line: &str) -> Result<Self, FerricastError> {
+        let mut splited = status_line.split(" ");
+
+        if splited.next().unwrap_or_default() != "RTSP/1.0" {
+            return Err(FerricastError::Rtsp("Invalid Rtsp version".to_string()));
+        }
+
+        let status_code = splited.next().unwrap_or_default().parse::<u16>()
+            .map_err(|e| FerricastError::Rtsp(format!("Invalid status code, {e}")))?;
+
+        let description = splited.next().unwrap_or_default().to_string();
+
+        Ok(Self { status_code, description })
+    }
 }

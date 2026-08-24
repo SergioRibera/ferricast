@@ -11,7 +11,7 @@ use rand::rngs::OsRng;
 use sha2::Sha512;
 use srp::client::SrpClient;
 use srp::groups::{G_2048, G_3072};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -20,7 +20,7 @@ use ferricast_core::{
     CastSession, Codec, Device, EncodedFrame, FerricastError, Result, StreamConfig,
 };
 
-use crate::rtsp::RtspManager;
+use crate::rtsp::{RtspManager, RtspResponse};
 
 const TLV_TYPE_STATE: u8 = 6;
 const TLV_TYPE_METHOD: u8 = 0;
@@ -109,21 +109,24 @@ impl CastSession for AirPlaySession {
           .await
           .map_err(|e| FerricastError::Connection(format!("Cannot connect to AirPlay device {e}")))?;
 
+        let (mut s_read, mut s_write) = socket.into_split();
+
+        let mut buf_reader = BufReader::new(&mut s_read);
+        
+
         info!("Connecting to Airplay device"); 
 
         let manager = RtspManager::new();
 
         manager.builder()
             .path("/pair-pin-start".to_string())
-            .write(&mut socket)
+            .write(&mut s_write)
             .await?;
 
-        let mut buffer = vec![0_u8; 4096];
+        RtspResponse::read(&mut buf_reader).await;
+        
 
-        let n = socket.read(&mut buffer).await?;
-
-
-        println!("{:?}", String::from_utf8(buffer[..n].to_vec()));
+        //println!("{:?}", String::from_utf8(buffer[..n].to_vec()));
 
 
         let srp = SrpClient::<Sha512>::new(&G_3072);
@@ -145,13 +148,10 @@ impl CastSession for AirPlaySession {
             .path("/pair-setup".to_string())
             .content_type("application/octet-stream".to_string())
             .body(bytes)
-            .write(&mut socket)
+            .write(&mut s_write)
             .await?;
 
-                let n = socket.read(&mut buffer).await?;
-
-
-        println!("{:?}", String::from_utf8(buffer[..n].to_vec()));
+                
 
 
 

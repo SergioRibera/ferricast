@@ -14,6 +14,9 @@ pub enum FerricastError {
     #[error("Encoding error: {0}")]
     Encoding(String),
 
+    #[error("Rtsp error: {0}")]
+    Rtsp(String),
+
     #[error("Capture error: {0}")]
     Capture(String),
 
