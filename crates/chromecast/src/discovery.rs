@@ -374,11 +374,13 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         // soundbars, etc.).  Bias above the floor but below Ultra.
         // Cast Streaming is enabled: if the device rejects the OFFER the
         // manager falls back to HLS within 10 s.
+        // Main profile: unknown devices vary widely; High profile caused
+        // black screens on some receivers in testing. Conservative here.
         caps.max_fps = Some(60);
         caps.max_bitrate_kbps = Some(10_000);
         caps.max_audio_bitrate_kbps = Some(192);
         caps.requires_audio = false;
-        caps.max_h264_profile = Some(H264Profile::High);
+        caps.max_h264_profile = Some(H264Profile::Main);
         caps.supports_low_latency_hls = true;
         caps.supports_cast_streaming = true;
     }
