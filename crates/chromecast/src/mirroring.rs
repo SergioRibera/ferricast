@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use ferricast_core::{
-    AudioCodec, AudioFrame, CastSession, Codec, Device, EncodedFrame, FerricastError, H264Profile,
-    Result, StreamConfig, bind_udp_in_range,
+    AudioCodec, AudioFrame, CastSession, Codec, ConnectOutcome, Device, EncodedFrame,
+    FerricastError, H264Profile, Result, StreamConfig, bind_udp_in_range,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -55,6 +55,8 @@ const RTCP_INTERVAL: Duration = Duration::from_secs(1);
 const RTCP_PT_SR: u8 = 200;
 /// RTCP payload type for Payload-Specific Feedback (PSFB). PLI uses FMT=1.
 const RTCP_PT_PSFB: u8 = 206;
+/// RTCP payload type for Extended Reports (XR, RFC 3611).
+const RTCP_PT_XR: u8 = 207;
 
 // ── OFFER / ANSWER types ──────────────────────────────────────────────────────
 
@@ -262,7 +264,7 @@ fn h264_level_idc(width: u32, height: u32, fps: u32) -> u32 {
 // ── CastSession implementation ────────────────────────────────────────────────
 
 impl CastSession for ChromecastMirrorSession {
-    async fn connect(&mut self, device: &Device) -> Result<()> {
+    async fn connect(&mut self, device: &Device) -> Result<ConnectOutcome> {
         if device.protocol != "chromecast" {
             return Err(FerricastError::Protocol(format!(
                 "ChromecastMirrorSession cannot connect to {:?}",
@@ -362,7 +364,7 @@ impl CastSession for ChromecastMirrorSession {
             read_handle,
             heartbeat_handle,
         });
-        Ok(())
+        Ok(ConnectOutcome::Ready)
     }
 
     async fn setup_stream(&mut self, config: &StreamConfig) -> Result<()> {
@@ -509,9 +511,15 @@ impl CastSession for ChromecastMirrorSession {
 
         let socket = Arc::new(socket);
         let keyframe_requested = Arc::new(AtomicBool::new(false));
+        // Receiver-side SSRCs from the ANSWER — needed to correlate DLRR responses.
+        let video_recv_ssrc = answer.ssrcs.first().copied().unwrap_or(0) as u32;
+        let audio_recv_ssrc = answer.ssrcs.get(1).copied().map(|s| s as u32);
         let rtcp_handle = tokio::spawn(rtcp_recv_task(
             socket.clone(),
             video_ssrc,
+            audio_ssrc_out,
+            video_recv_ssrc,
+            audio_recv_ssrc,
             keyframe_requested.clone(),
         ));
 
@@ -534,7 +542,13 @@ impl CastSession for ChromecastMirrorSession {
             audio_byte_count: 0,
             last_video_rtp_ts: 0,
             last_audio_rtp_ts: 0,
-            last_rtcp_at: std::time::Instant::now(),
+            // Subtract RTCP_INTERVAL so the first call to
+            // maybe_send_rtcp_sr (after the first video frame) fires
+            // immediately. The Chromecast uses the RTCP SR's NTP ↔
+            // RTP-timestamp mapping to schedule A/V output; delaying
+            // it by 1 s means the first second of video arrives with
+            // no clock reference and the receiver may discard it.
+            last_rtcp_at: std::time::Instant::now() - RTCP_INTERVAL,
             keyframe_requested,
             rtcp_handle,
         });
@@ -585,6 +599,31 @@ impl CastSession for ChromecastMirrorSession {
                 stream.video_frame_id,
                 packet_id,
             );
+
+            // Log IV and encrypted payload for the very first packet ever sent.
+            if stream.video_frame_id == 0 && packet_id == 0 {
+                let iv_hex: String = iv.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                let ssrc_le = stream.video_ssrc.to_le_bytes();
+                let ssrc_be = stream.video_ssrc.to_be_bytes();
+                debug!(
+                    ssrc = stream.video_ssrc,
+                    ssrc_le = ?ssrc_le,
+                    ssrc_be = ?ssrc_be,
+                    iv = %iv_hex,
+                    "mirror: AES-CTR IV for first packet (LE bytes = openscreen-compatible)"
+                );
+                // Encrypt a copy to show the encrypted first 16 bytes.
+                let mut sample = chunk.iter().take(16).cloned().collect::<Vec<_>>();
+                if !sample.is_empty() {
+                    use aes::Aes128;
+                    use aes::cipher::{KeyIvInit, StreamCipher};
+                    use ctr::Ctr128BE;
+                    Ctr128BE::<Aes128>::new((&stream.video_aes_key).into(), iv.as_slice().into())
+                        .apply_keystream(&mut sample);
+                    let enc_hex: String = sample.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                    debug!(first16_encrypted = %enc_hex, "mirror: first 16 encrypted bytes of first packet");
+                }
+            }
 
             let reference_frame_id = (!frame.is_keyframe)
                 .then(|| stream.video_frame_id.wrapping_sub(1));
@@ -653,14 +692,33 @@ impl CastSession for ChromecastMirrorSession {
 
         let pkt_len = pkt.len();
         if let Err(e) = stream.socket.send(&pkt).await {
-            debug!(%e, "mirror: audio UDP send dropped");
+            warn!(%e, "mirror: audio UDP send dropped");
         }
+        if stream.audio_pkt_count == 0 {
+            debug!(
+                frame_id = stream.audio_frame_id,
+                ts,
+                ssrc,
+                bytes = pkt_len,
+                "mirror: first Opus frame sent to Chromecast"
+            );
+        }
+        let first_audio = stream.audio_pkt_count == 0;
         stream.audio_pkt_count = stream.audio_pkt_count.wrapping_add(1);
         stream.audio_byte_count = stream.audio_byte_count.wrapping_add(pkt_len as u32);
         stream.last_audio_rtp_ts = ts;
         stream.audio_seq = stream.audio_seq.wrapping_add(1);
         stream.audio_frame_id = stream.audio_frame_id.wrapping_add(1);
-        maybe_send_rtcp_sr(stream).await;
+        if first_audio {
+            // Force an audio SR immediately on the first audio packet,
+            // bypassing the 1-second RTCP throttle. Without this, the
+            // audio SR comes 1 second after the first video SR, which
+            // is too late for the Cast receiver to establish A/V sync
+            // before its jitter buffer begins draining.
+            send_audio_rtcp_sr(stream).await;
+        } else {
+            maybe_send_rtcp_sr(stream).await;
+        }
         Ok(())
     }
 
@@ -782,16 +840,19 @@ async fn mirror_read_loop<R>(
                     }
                 } else if msg.namespace == namespace::WEBRTC {
                     if msg.message_type().as_deref() == Some("ANSWER") {
+                        debug!(payload = ?msg.payload_utf8, "mirror: raw ANSWER payload");
                         let result = parse_answer(&msg);
                         let mut slot = answer_slot.lock().await;
                         if let Some(tx) = slot.take() {
                             let _ = tx.send(result);
                         }
                     } else {
-                        debug!(
+                        // Any post-ANSWER webrtc message (STATUS, error, etc.)
+                        // is unusual — log at WARN so it's visible without -vv.
+                        warn!(
                             ty = ?msg.message_type(),
                             payload = ?msg.payload_utf8,
-                            "mirror: unhandled webrtc message"
+                            "mirror: unexpected webrtc message from Chromecast"
                         );
                     }
                 }
@@ -954,20 +1015,25 @@ fn abs_send_time_90khz() -> u32 {
 
 /// Derive the AES-128-CTR IV for one Cast Streaming RTP packet.
 ///
-/// Counter block layout (16 bytes, all big-endian), matching openscreen
-/// `frame_crypto.cc` (`CreateNewIv`):
+/// Counter block layout (16 bytes), matching openscreen
+/// `frame_crypto.cc` `CreateNewIv`:
 /// ```text
-/// [0..4]   SSRC
-/// [4..8]   frame_id
-/// [8..10]  packet_id (fragment index within the frame, 2 bytes)
+/// [0..4]   SSRC        — little-endian u32
+/// [4..8]   frame_id    — little-endian u32
+/// [8..10]  packet_id   — little-endian u16
 /// [10..16] zeros
 /// ```
 /// Final IV = `aes_iv_mask XOR counter_block`.
+///
+/// openscreen uses `memcpy(&ssrc, ...)` which on every platform the Cast
+/// receiver runs on (x86/ARM/MIPS, all little-endian) stores the integer
+/// in little-endian byte order. Using big-endian here produces a different
+/// keystream → Chromecast decryption fails → black screen.
 fn cast_iv(iv_mask: &[u8; 16], ssrc: u32, frame_id: u32, packet_id: u16) -> [u8; 16] {
     let mut counter = [0u8; 16];
-    counter[0..4].copy_from_slice(&ssrc.to_be_bytes());
-    counter[4..8].copy_from_slice(&frame_id.to_be_bytes());
-    counter[8..10].copy_from_slice(&packet_id.to_be_bytes());
+    counter[0..4].copy_from_slice(&ssrc.to_le_bytes());
+    counter[4..8].copy_from_slice(&frame_id.to_le_bytes());
+    counter[8..10].copy_from_slice(&packet_id.to_le_bytes());
     // [10..16] zeros — already zero
     let mut iv = [0u8; 16];
     for (i, b) in iv.iter_mut().enumerate() {
@@ -1141,23 +1207,111 @@ async fn maybe_send_rtcp_sr(stream: &mut MirrorStreamState) {
         stream.video_pkt_count,
         stream.video_byte_count,
     );
+    debug!(
+        ssrc = stream.video_ssrc,
+        ntp_sec,
+        last_video_rtp_ts = stream.last_video_rtp_ts,
+        pkt_count = stream.video_pkt_count,
+        "mirror: sending RTCP video SR"
+    );
     if let Err(e) = stream.socket.send(&video_sr).await {
         debug!(%e, "mirror: RTCP video SR send dropped");
     }
 
+    // Only send audio SR after we've actually sent audio packets.
+    // Sending SR with last_audio_rtp_ts=0 (before any audio) tells
+    // the Chromecast "audio RTP ts 0 = now", but our audio packets
+    // carry timestamps derived from the UNIX epoch (~84 billion at
+    // 48 kHz). The receiver would schedule those packets ≈490 hours
+    // in the future and wait forever → permanent black screen.
     if let Some(ssrc) = stream.audio_ssrc {
-        let audio_sr = rtcp_sr(
-            ssrc,
-            ntp_sec,
-            ntp_frac,
-            stream.last_audio_rtp_ts,
-            stream.audio_pkt_count,
-            stream.audio_byte_count,
-        );
-        if let Err(e) = stream.socket.send(&audio_sr).await {
-            debug!(%e, "mirror: RTCP audio SR send dropped");
+        if stream.audio_pkt_count > 0 {
+            let audio_sr = rtcp_sr(
+                ssrc,
+                ntp_sec,
+                ntp_frac,
+                stream.last_audio_rtp_ts,
+                stream.audio_pkt_count,
+                stream.audio_byte_count,
+            );
+            if let Err(e) = stream.socket.send(&audio_sr).await {
+                debug!(%e, "mirror: RTCP audio SR send dropped");
+            }
         }
     }
+}
+
+/// Send audio RTCP SR immediately, bypassing the periodic throttle.
+/// Used for the first audio packet so the Cast receiver gets audio
+/// timing before its jitter buffer starts draining.
+async fn send_audio_rtcp_sr(stream: &mut MirrorStreamState) {
+    let Some(ssrc) = stream.audio_ssrc else { return };
+    let (ntp_sec, ntp_frac) = system_time_ntp();
+    let audio_sr = rtcp_sr(
+        ssrc,
+        ntp_sec,
+        ntp_frac,
+        stream.last_audio_rtp_ts,
+        stream.audio_pkt_count,
+        stream.audio_byte_count,
+    );
+    debug!(
+        ssrc,
+        ntp_sec,
+        last_audio_rtp_ts = stream.last_audio_rtp_ts,
+        "mirror: sending immediate RTCP audio SR (first packet)"
+    );
+    if let Err(e) = stream.socket.send(&audio_sr).await {
+        debug!(%e, "mirror: RTCP audio SR send dropped");
+    }
+}
+
+/// Build a 24-byte RTCP XR (RFC 3611) with a single DLRR block (BT=5).
+///
+/// Sent in reply to the receiver's XR BT=4 (Receiver Reference Time) so the
+/// Cast receiver can compute round-trip delay and finish clock synchronisation.
+/// Without this response the receiver cannot lock its render clock and keeps
+/// the video surface black even though it's receiving RTP packets.
+fn rtcp_xr_dlrr(our_ssrc: u32, receiver_ssrc: u32, lrr: u32, dlrr: u32) -> [u8; 24] {
+    let mut pkt = [0u8; 24];
+    pkt[0] = 0x80;        // V=2 P=0 reserved=0
+    pkt[1] = RTCP_PT_XR;  // PT=207
+    pkt[2] = 0;
+    pkt[3] = 5;            // length = (24/4)−1 = 5
+    pkt[4..8].copy_from_slice(&our_ssrc.to_be_bytes());
+    pkt[8] = 5;            // BT=5 (DLRR)
+    pkt[9] = 0;            // reserved
+    pkt[10] = 0;
+    pkt[11] = 3;           // block length = 3 words = 12 bytes (one DLRR sub-block)
+    pkt[12..16].copy_from_slice(&receiver_ssrc.to_be_bytes());
+    pkt[16..20].copy_from_slice(&lrr.to_be_bytes());
+    pkt[20..24].copy_from_slice(&dlrr.to_be_bytes());
+    pkt
+}
+
+/// Parse RTCP XR BT=4 (Receiver Reference Time) from a raw packet.
+/// Returns `(sender_ssrc, ntp_sec, ntp_frac)` on success.
+fn parse_rtcp_xr_rrt(pkt: &[u8]) -> Option<(u32, u32, u32)> {
+    if pkt.len() < 8 || pkt[1] != RTCP_PT_XR {
+        return None;
+    }
+    let sender_ssrc = u32::from_be_bytes(pkt[4..8].try_into().ok()?);
+    let mut offset = 8usize;
+    while offset + 4 <= pkt.len() {
+        let bt = pkt[offset];
+        let block_len = u16::from_be_bytes([pkt[offset + 2], pkt[offset + 3]]) as usize;
+        let block_end = offset + 4 + block_len * 4;
+        if block_end > pkt.len() {
+            break;
+        }
+        if bt == 4 && block_len == 2 {
+            let ntp_sec  = u32::from_be_bytes(pkt[offset+4..offset+8].try_into().ok()?);
+            let ntp_frac = u32::from_be_bytes(pkt[offset+8..offset+12].try_into().ok()?);
+            return Some((sender_ssrc, ntp_sec, ntp_frac));
+        }
+        offset = block_end;
+    }
+    None
 }
 
 /// Returns `true` if `pkt` is an RTCP PLI for our video SSRC.
@@ -1178,6 +1332,9 @@ fn is_rtcp_pli(pkt: &[u8], video_ssrc: u32) -> bool {
 async fn rtcp_recv_task(
     socket: Arc<UdpSocket>,
     video_ssrc: u32,
+    audio_ssrc: Option<u32>,
+    video_recv_ssrc: u32,
+    audio_recv_ssrc: Option<u32>,
     keyframe_requested: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 1500];
@@ -1189,10 +1346,35 @@ async fn rtcp_recv_task(
                     .map(|b| format!("{b:02x}"))
                     .collect::<Vec<_>>()
                     .join(" ");
-                debug!(n, %src, first_bytes = %hex_preview, "mirror: UDP recv from Chromecast");
+                let pt = pkt.get(1).copied().unwrap_or(0);
+                let is_xr_rrt = pkt.len() >= 12 && pt == RTCP_PT_XR && pkt.get(8).copied() == Some(4);
+                if !is_xr_rrt {
+                    debug!(n, pt, %src, first_bytes = %hex_preview, "mirror: RTCP non-XR-RRT from Chromecast");
+                } else {
+                    debug!(n, %src, first_bytes = %hex_preview, "mirror: UDP recv from Chromecast");
+                }
                 if is_rtcp_pli(pkt, video_ssrc) {
                     debug!("mirror: PLI received — flagging keyframe request");
                     keyframe_requested.store(true, Ordering::Relaxed);
+                }
+                // Reply to XR BT=4 (Receiver Reference Time) with BT=5 (DLRR).
+                // The receiver uses DLRR to compute RTT and lock its render clock.
+                if let Some((receiver_ssrc, ntp_sec, ntp_frac)) = parse_rtcp_xr_rrt(pkt) {
+                    let our_ssrc = if receiver_ssrc == video_recv_ssrc {
+                        video_ssrc
+                    } else if Some(receiver_ssrc) == audio_recv_ssrc {
+                        audio_ssrc.unwrap_or(video_ssrc)
+                    } else {
+                        video_ssrc
+                    };
+                    // LRR = middle 32 bits of receiver's NTP timestamp.
+                    let lrr = (ntp_sec << 16) | (ntp_frac >> 16);
+                    let dlrr_pkt = rtcp_xr_dlrr(our_ssrc, receiver_ssrc, lrr, 0);
+                    if let Err(e) = socket.send(&dlrr_pkt).await {
+                        debug!(%e, "mirror: RTCP XR DLRR send failed");
+                    } else {
+                        debug!(our_ssrc, receiver_ssrc, lrr, "mirror: sent RTCP XR DLRR");
+                    }
                 }
             }
             Err(e) => {

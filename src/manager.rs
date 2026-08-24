@@ -12,11 +12,11 @@ use ferricast_capture::PipeWireAudioCapture;
 use ferricast_core::{
     AdvertiseInfo, Advertiser, AudioCapture, AudioCaptureConfig, AudioCodec, AudioDecoder,
     AudioDecoderConfig, AudioEncoder, AudioEncoderConfig, AudioFrame, AudioSource, CaptureConfig,
-    CaptureSource, CapturedFrame, CastSession, Codec, ControlSession, DecodedAudio, DecoderConfig,
-    Device, Discovery, DiscoveryEvent, EncodedFrame, EncoderConfig, FerricastError, FrameSink,
-    MediaCommand, MediaInfo, MediaPacket, MediaPuller, PixelFormat, PlaybackState, ProtocolHandler,
-    PullSpec, ReceiverProtocol, RemoteSender, Result, ScreenCapture, StreamConfig, VideoDecoder,
-    VideoEncoder,
+    CaptureSource, CapturedFrame, CastSession, Codec, ConnectOutcome, ControlSession, DecodedAudio,
+    DecoderConfig, Device, Discovery, DiscoveryEvent, EncodedFrame, EncoderConfig, FerricastError,
+    FrameSink, MediaCommand, MediaInfo, MediaPacket, MediaPuller, PairingChallenge, PairingResponse,
+    PixelFormat, PlaybackState, ProtocolHandler, PullSpec, ReceiverProtocol, RemoteSender, Result,
+    ScreenCapture, StreamConfig, VideoDecoder, VideoEncoder,
 };
 use ferricast_encoder::aac::AacEncoder;
 #[cfg(feature = "opus-rs")]
@@ -39,7 +39,8 @@ impl<T: Discovery> ErasedDiscovery for T {
 }
 
 trait ErasedSession: Send + Sync {
-    fn connect<'a>(&'a mut self, device: &'a Device) -> BoxFut<'a, Result<()>>;
+    fn connect<'a>(&'a mut self, device: &'a Device) -> BoxFut<'a, Result<ConnectOutcome>>;
+    fn submit_pairing(&mut self, response: PairingResponse) -> BoxFut<'_, Result<()>>;
     fn setup_stream<'a>(&'a mut self, config: &'a StreamConfig) -> BoxFut<'a, Result<()>>;
     fn send_frame<'a>(&'a mut self, frame: &'a EncodedFrame) -> BoxFut<'a, Result<()>>;
     fn send_audio_frame<'a>(&'a mut self, frame: &'a AudioFrame) -> BoxFut<'a, Result<()>>;
@@ -50,8 +51,11 @@ trait ErasedSession: Send + Sync {
 }
 
 impl<T: CastSession> ErasedSession for T {
-    fn connect<'a>(&'a mut self, device: &'a Device) -> BoxFut<'a, Result<()>> {
+    fn connect<'a>(&'a mut self, device: &'a Device) -> BoxFut<'a, Result<ConnectOutcome>> {
         Box::pin(CastSession::connect(self, device))
+    }
+    fn submit_pairing(&mut self, response: PairingResponse) -> BoxFut<'_, Result<()>> {
+        Box::pin(CastSession::submit_pairing(self, response))
     }
     fn setup_stream<'a>(&'a mut self, config: &'a StreamConfig) -> BoxFut<'a, Result<()>> {
         Box::pin(CastSession::setup_stream(self, config))
@@ -257,6 +261,23 @@ pub enum ManagerEvent {
     DiscoveryError {
         protocol: &'static str,
         message: String,
+    },
+
+    /// The protocol requires user input before streaming can begin
+    /// (e.g. AirPlay PIN shown on the TV screen). The UI should show
+    /// the appropriate widget and send the response by calling
+    /// `respond.lock().await.take()` and sending through the inner
+    /// sender. `PairingResponse::Cancelled` aborts the stream attempt.
+    ///
+    /// `respond` is wrapped in `Arc<Mutex<Option>>` so the event stays
+    /// `Clone` (needed for the in-process forward channel), while still
+    /// transferring the oneshot sender to exactly one consumer.
+    PairingRequired {
+        device_id: Uuid,
+        challenge: PairingChallenge,
+        respond: std::sync::Arc<
+            tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<PairingResponse>>>,
+        >,
     },
 
     // ── receiver-side events ──────────────────────────────────────
@@ -873,7 +894,26 @@ impl StreamManager {
         // (whose PTS tracks wall clock through the audio capture
         // path) drifts ahead of video on the receiver.
         let mut session = (proto.create_session)(&device)?;
-        session.connect(&device).await?;
+        match session.connect(&device).await? {
+            ConnectOutcome::Ready => {}
+            ConnectOutcome::PairingRequired(challenge) => {
+                let (respond_tx, respond_rx) =
+                    tokio::sync::oneshot::channel::<PairingResponse>();
+                let respond = std::sync::Arc::new(tokio::sync::Mutex::new(Some(respond_tx)));
+                let _ = self
+                    .event_tx
+                    .send(ManagerEvent::PairingRequired {
+                        device_id,
+                        challenge,
+                        respond,
+                    })
+                    .await;
+                let response = respond_rx.await.map_err(|_| {
+                    FerricastError::Protocol("pairing response channel dropped".into())
+                })?;
+                session.submit_pairing(response).await?;
+            }
+        }
 
         // Set the codec in session_config *before* setup_stream so that
         // protocol-level validation (e.g. mirror requires Opus) sees the
@@ -1097,9 +1137,25 @@ impl StreamManager {
                                 continue 'supervisor;
                             }
                         };
-                        if let Err(e) = s.connect(&device_clone).await {
-                            tracing::warn!(%e, "reconnect: session.connect failed");
-                            continue 'supervisor;
+                        match s.connect(&device_clone).await {
+                            Err(e) => {
+                                tracing::warn!(%e, "reconnect: session.connect failed");
+                                continue 'supervisor;
+                            }
+                            Ok(ConnectOutcome::Ready) => {}
+                            Ok(ConnectOutcome::PairingRequired(challenge)) => {
+                                // On reconnect we don't re-ask for pairing —
+                                // the device was already paired this session.
+                                // Surface as a fatal error so the UI can prompt
+                                // the user to start a fresh stream instead.
+                                let msg = format!(
+                                    "reconnect: device requested pairing again ({challenge:?}); \
+                                     giving up"
+                                );
+                                tracing::warn!("{}", msg);
+                                fatal_error = Some(msg);
+                                break 'supervisor;
+                            }
                         }
                         if let Err(e) = s.setup_stream(&session_config).await {
                             tracing::warn!(%e, "reconnect: session.setup_stream failed");
@@ -1165,12 +1221,17 @@ impl StreamManager {
                                     }
                                 }
                                 None => {
-                                    // Audio pipeline exited (clean
-                                    // EOF or fatal error inside the
-                                    // task). Drop the receiver so the
-                                    // `if audio_frame_rx.is_some()`
-                                    // guard disables this arm and
-                                    // the supervisor stops polling.
+                                    // Audio pipeline exited. For Cast
+                                    // Streaming this is a problem: the
+                                    // Chromecast will never get audio
+                                    // → stays black. Log at WARN so
+                                    // the user can see it in field logs.
+                                    tracing::warn!(
+                                        ?did,
+                                        "audio pipeline exited — \
+                                         Cast Streaming receiver may stay black \
+                                         (no audio keyframe will arrive)"
+                                    );
                                     audio_frame_rx = None;
                                 }
                             }
