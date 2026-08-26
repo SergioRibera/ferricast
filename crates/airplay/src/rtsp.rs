@@ -119,15 +119,15 @@ impl RtspResponse {
 
                     if status_line.is_none() {
                         status_line = Some(StatusLine::read(&line)?);
+                        continue;
                     }
 
-                    let mut splited = line.split(":");
+                    if let Some((name, value)) = line.split_once(':') {
+                        headers.push((name.trim().to_string(), value.trim().to_string()));
+                    } else {
+                       return Err(FerricastError::Rtsp("Invalid RTSP header format".to_string())); 
+                    }
 
-                    let name = splited.next().ok_or(FerricastError::Rtsp("Invalid header".to_string()))?;
-                    let value = splited.next().ok_or(FerricastError::Rtsp("Invalid header".to_string()))?;
-
-
-                    headers.push((name.to_string(), value.to_string()));
                 },
                 Err(_) => break,
             }
@@ -151,7 +151,9 @@ impl StatusLine {
     pub fn read(status_line: &str) -> Result<Self, FerricastError> {
         let mut splited = status_line.split(" ");
 
-        if splited.next().unwrap_or_default() != "RTSP/1.0" {
+        let header = splited.next().unwrap_or_default();
+
+        if header != "RTSP/1.0" {
             return Err(FerricastError::Rtsp("Invalid Rtsp version".to_string()));
         }
 

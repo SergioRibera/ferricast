@@ -116,7 +116,8 @@ impl CastSession for AirPlaySession {
                 .path("/pair-pin-start".to_string())
                 .write(&mut write_half)
                 .await?;
-            RtspResponse::read(&mut buf_reader).await;
+
+            println!("{:?}", RtspResponse::read(&mut buf_reader).await?);
 
             // Send SRP M1 (initial pair-setup request, no PIN yet).
             let mut tlv_bytes = Vec::new();
