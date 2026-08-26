@@ -105,21 +105,38 @@ impl CastSession for AirPlaySession {
 
         let manager = RtspManager::new();
 
-        // split() borrows — halves drop at end of block, socket stays owned.
+
+
         {
             let (read_half, mut write_half) = socket.split();
             let mut buf_reader = BufReader::new(read_half);
 
-            // Tell the device to display a PIN on screen.
-            manager
-                .builder()
-                .path("/pair-pin-start".to_string())
+            manager.builder()
+                .path("*".to_string())
+                .options()
+                .header(("Client-Instance".to_string(), "56B29BB6CB904862".to_string()))
+                .header(("DACP-ID".to_string(), "56B29BB6CB904862".to_string()))
+                .header(("Active-Remote".to_string(), "1986535575".to_string()))
                 .write(&mut write_half)
                 .await?;
 
-            println!("{:?}", RtspResponse::read(&mut buf_reader).await?);
+            let res = RtspResponse::read(&mut buf_reader).await?;
 
-            // Send SRP M1 (initial pair-setup request, no PIN yet).
+            let need_pin = !res.is_success();
+
+            if need_pin {
+                manager
+                    .builder()
+                    .path("/pair-pin-start".to_string())
+                    .write(&mut write_half)
+                    .await?;
+
+                RtspResponse::read(&mut buf_reader).await?.is_ok()?;
+
+                info!("Asking for Pin");
+
+            }   
+
             let mut tlv_bytes = Vec::new();
             let mut w = Tlv8Writer::new(&mut tlv_bytes);
             let mut state_buf = [0u8; 32];
@@ -135,11 +152,10 @@ impl CastSession for AirPlaySession {
                 .body(tlv_bytes)
                 .write(&mut write_half)
                 .await?;
-            RtspResponse::read(&mut buf_reader).await;
+        
+            RtspResponse::read(&mut buf_reader).await?.is_ok()?;
         }
 
-        // Park the open connection; the manager will call submit_pairing()
-        // once the user has entered the PIN shown on the TV.
         self.pending_conn = Some(socket);
         self.state = SessionState::AwaitingPin;
 

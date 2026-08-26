@@ -46,8 +46,13 @@ impl RtspReqBuilder {
 
         self
     }
-    pub fn method(mut self, method: Method) -> Self {
-        self.method = method;
+    pub fn post(mut self) -> Self {
+        self.method = Method::POST;
+
+        self
+    }
+    pub fn options(mut self) -> Self {
+        self.method = Method::OPTIONS;
 
         self
     }
@@ -92,6 +97,7 @@ impl RtspReqBuilder {
 #[derive(Debug)]
 pub enum Method {
     POST,
+    OPTIONS,
 }
 
 
@@ -137,7 +143,18 @@ impl RtspResponse {
 
 
         Ok(Self { status_line: status_line.expect("Ferricast RTSP bug"), headers })
+    }
 
+    pub fn is_ok(&self) -> Result<(), FerricastError> {
+        if self.is_success() {
+            return Ok(());
+        }
+
+        Err(FerricastError::Rtsp(format!("RTSP Response failed with code {}", self.status_line.status_code)))
+    }
+
+    pub fn is_success(&self) -> bool {
+        (200..=299).contains(&self.status_line.status_code)
     }
 }
 
