@@ -1,4 +1,4 @@
-use std::sync::{Arc, atomic::AtomicU64};
+use std::{collections::HashMap, sync::{Arc, atomic::AtomicU64}};
 
 use ferricast_core::FerricastError;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -36,7 +36,7 @@ impl RtspReqBuilder {
             body: Vec::new(),
             headers: vec![
                ("User-Agent".to_string(), "AirPlay/381.13".to_string()),
-               ("X-Apple-HKP".to_string(), "3".to_string()),
+               ("X-Apple-HKP".to_string(), "5".to_string()),
                ("X-Apple-Client-Name".to_string(), "Ferricast Airplay".to_string()) 
             ],
         } 
@@ -62,6 +62,9 @@ impl RtspReqBuilder {
         self
     }
     pub fn body(mut self, body: Vec<u8>) -> Self {
+        self.headers.push(("Content-Length".to_string(), body.len().to_string()));
+
+
         self.body = body;
 
         self
@@ -104,13 +107,16 @@ pub enum Method {
 #[derive(Debug, Clone)]
 pub struct RtspResponse {
     status_line: StatusLine,
-    headers: Vec<(String, String)>,
+    headers: HashMap<String, String>,
+    content: Option<Vec<u8>>
 }
 
 impl RtspResponse {
     pub async fn read<T: AsyncReadExt + Unpin>(buf: &mut BufReader<T>) -> Result<Self, FerricastError> {
         let mut status_line: Option<StatusLine> = None;
-        let mut headers: Vec<(String, String)> = Vec::new();
+        let mut headers: HashMap<String, String> = HashMap::new();
+
+        
 
 
         loop {
@@ -129,7 +135,7 @@ impl RtspResponse {
                     }
 
                     if let Some((name, value)) = line.split_once(':') {
-                        headers.push((name.trim().to_string(), value.trim().to_string()));
+                        headers.insert(name.trim().to_string(), value.trim().to_string());
                     } else {
                        return Err(FerricastError::Rtsp("Invalid RTSP header format".to_string())); 
                     }
@@ -139,10 +145,28 @@ impl RtspResponse {
             }
         }
 
+        let content = { 
+            if let Some(v) = headers.get("Content-Length") {
+                let len = v.parse::<usize>()
+                    .map_err(|_| FerricastError::Rtsp("Invalid Content-Length Header".to_string()))?;
+
+
+                
+                let mut content = vec![0_u8; len];
+
+                buf.read(&mut content).await?;
+
+                Some(content)
+            } else {
+                None
+            } 
+        };
+
+
         
+        let status_line = status_line.ok_or(FerricastError::Rtsp("Invalid RTSP Response".to_string()))?;
 
-
-        Ok(Self { status_line: status_line.expect("Ferricast RTSP bug"), headers })
+        Ok(Self { status_line, headers, content })
     }
 
     pub fn is_ok(&self) -> Result<(), FerricastError> {

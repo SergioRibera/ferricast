@@ -19,6 +19,9 @@ use crate::rtsp::{RtspManager, RtspResponse};
 
 const TLV_TYPE_STATE: u8 = 6;
 const TLV_TYPE_METHOD: u8 = 0;
+const TLV_TYPE_FLAGS: u8 = 0x13;
+
+const TLV_FLAGS_TRANSIENT: [u8; 4] = 0x00000010_u32.to_le_bytes();
 
 /// Internal state of the AirPlay session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +114,7 @@ impl CastSession for AirPlaySession {
             let (read_half, mut write_half) = socket.split();
             let mut buf_reader = BufReader::new(read_half);
 
+            /*
             manager.builder()
                 .path("*".to_string())
                 .options()
@@ -136,24 +140,49 @@ impl CastSession for AirPlaySession {
                 info!("Asking for Pin");
 
             }   
+            */
+
+            // Transient pairing
 
             let mut tlv_bytes = Vec::new();
             let mut w = Tlv8Writer::new(&mut tlv_bytes);
-            let mut state_buf = [0u8; 32];
-            state_buf[0] = 1;
-            w.push(TLV_TYPE_STATE, &state_buf);
+ 
             w.push(TLV_TYPE_METHOD, &[0]);
+            w.push(TLV_TYPE_STATE, &[1]);
+            w.push(TLV_TYPE_FLAGS, &TLV_FLAGS_TRANSIENT);
             drop(w);
 
             manager
                 .builder()
                 .path("/pair-setup".to_string())
+                .post()
                 .content_type("application/octet-stream".to_string())
                 .body(tlv_bytes)
                 .write(&mut write_half)
                 .await?;
+
+            let mut csprng = OsRng;
+
+            let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
+
+            let public_key = signing_key.verifying_key().to_bytes();
+
+            /*
+             manager
+                .builder()
+                .path("/pair-setup".to_string())
+                .post()
+                .content_type("application/octet-stream".to_string())
+                .body(public_key.to_vec())
+                .write(&mut write_half)
+                .await?;
+            */
+
+
+            
         
-            RtspResponse::read(&mut buf_reader).await?.is_ok()?;
+           
+            println!("{:?}",  RtspResponse::read(&mut buf_reader).await?);    
         }
 
         self.pending_conn = Some(socket);

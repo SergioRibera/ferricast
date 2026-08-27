@@ -92,7 +92,7 @@ impl Discovery for AirPlayDiscovery {
 
 
 
-                        let pw = txt.get("pw");
+                        let pw = txt.get("flags");
                         println!("{:?}", pw);
 
 
