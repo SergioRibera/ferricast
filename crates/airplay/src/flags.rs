@@ -19,6 +19,25 @@ bitflags::bitflags! {
 
         const SUPPORT_LEGACY_PAIRING = (1 << 27);
 
+        const HAS_UNIFIED_ADVERTISER_INFO = (1 << 26);
+
+        const RAOP = (1 << 30);
+        const SUPPORTS_VOLUME = (1 << 32);
+        const AIRPLAY_VIDEO_PLAY_QUEUE = (1 << 33);
+        const AIRPLAY_FROM_CLOUD = (1 << 34);
+
+        const CORE_UTILS_PAIRING_AND_ENCRYPTION = (1 << 38);
+        const BUFFERED_AUDIO = (1 << 40);
+        const PTP = (1 << 41);
+        const SCREEN_MULTI_CODEC = (1 << 42);
+        const SYSTEM_PAIRING  = (1 << 43);
+
+        const HK_PAIRING_AND_ACCESS_CONTROL = (1 << 46);
+
+        const TRANSIENT_PAIRING = (1 << 48);
+
+        const UNIFIED_PAIR_SETUP_MFI = (1 << 51);
+
         // There is other flags but.... who cares?
      }
 }

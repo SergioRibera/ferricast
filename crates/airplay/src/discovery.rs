@@ -148,6 +148,7 @@ impl Discovery for AirPlayDiscovery {
 
                         let num = ((part2 as u64) << 32) | (part1 as u64);
 
+                  
                         let features = Features::from_bits_truncate(num);
             
                         let fullname = info.get_fullname();
@@ -155,8 +156,24 @@ impl Discovery for AirPlayDiscovery {
                         if !features.contains(Features::VIDEO_HTTP_LIVE_STREAM) {
                             warn!("Skipped airplay device {}", fullname);
                             continue;
-
                         }
+
+
+                        let core_utils = features.contains(Features::CORE_UTILS_PAIRING_AND_ENCRYPTION) || features.contains(Features::SYSTEM_PAIRING) || features.contains(Features::HK_PAIRING_AND_ACCESS_CONTROL) | features.contains(Features::TRANSIENT_PAIRING);
+
+                        let third_party = features.contains(Features::HAS_UNIFIED_ADVERTISER_INFO) | features.contains(Features::UNIFIED_PAIR_SETUP_MFI);
+
+                        let support_modern_pairing = core_utils && !third_party;
+
+                        info!(
+                            support_modern_pair  = support_modern_pairing
+                        );
+
+
+                        let mut metadata = HashMap::new();
+
+                        metadata.insert("modern_pair".to_string(), support_modern_pairing.to_string());
+
 
 
                         let device = Device {

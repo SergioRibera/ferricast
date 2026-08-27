@@ -36,8 +36,8 @@ impl RtspReqBuilder {
             body: Vec::new(),
             headers: vec![
                ("User-Agent".to_string(), "AirPlay/381.13".to_string()),
-               ("X-Apple-HKP".to_string(), "5".to_string()),
-               ("X-Apple-Client-Name".to_string(), "Ferricast Airplay".to_string()) 
+               ("X-Apple-HKP".to_string(), "3".to_string()),
+              // ("X-Apple-Client-Name".to_string(), "Ferricast Airplay".to_string()) 
             ],
         } 
     } 

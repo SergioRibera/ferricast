@@ -167,7 +167,9 @@ impl CastSession for AirPlaySession {
 
             let public_key = signing_key.verifying_key().to_bytes();
 
-            /*
+                   println!("{:?}",  RtspResponse::read(&mut buf_reader).await?);
+
+            
              manager
                 .builder()
                 .path("/pair-setup".to_string())
@@ -176,13 +178,15 @@ impl CastSession for AirPlaySession {
                 .body(public_key.to_vec())
                 .write(&mut write_half)
                 .await?;
-            */
+            
+
+                          println!("{:?}",  RtspResponse::read(&mut buf_reader).await?);
 
 
             
         
            
-            println!("{:?}",  RtspResponse::read(&mut buf_reader).await?);    
+       
         }
 
         self.pending_conn = Some(socket);
