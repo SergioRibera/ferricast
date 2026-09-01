@@ -3,16 +3,18 @@ use std::{collections::HashMap, sync::{Arc, atomic::AtomicU64}};
 use ferricast_core::FerricastError;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-pub struct RtspManager(AtomicU64);
+use crate::session::PairingMode;
+
+pub struct RtspManager(AtomicU64, PairingMode);
 
 impl RtspManager {
-    pub fn new() -> Self {
-        Self(AtomicU64::new(0))
+    pub fn new(mode: PairingMode) -> Self {
+        Self(AtomicU64::new(0), mode)
     }
     pub fn builder(&self) -> RtspReqBuilder {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        RtspReqBuilder::new(self.0.load(std::sync::atomic::Ordering::SeqCst))
+        RtspReqBuilder::new(self.0.load(std::sync::atomic::Ordering::SeqCst), self.1)
     }
 }
 
@@ -26,19 +28,42 @@ pub struct RtspReqBuilder {
     headers: Vec<(String, String)>
 }
 
+fn req_headers(mode: PairingMode) -> Vec<(String, String)> {
+    match mode {
+        PairingMode::Legacy => {
+            vec![
+                ("X-Apple-HKP".to_string(), "3".to_string())
+            ]
+        },
+        PairingMode::Transient => {
+            vec![
+                ("X-Apple-HKP".to_string(), "4".to_string()),
+                ("X-Apple-Client-Name".to_string(), "Ferricast Airplay Client".to_string()),
+                ("X-Apple-SupportedPINLengths".to_string(), "4".to_string()),
+                ("X-Apple-PD".to_string(), "1".to_string())
+            ]
+        },
+        PairingMode::Hap => {
+               vec![
+                ("X-Apple-HKP".to_string(), "5".to_string()),
+                ("X-Apple-Client-Name".to_string(), "Ferricast Airplay Client".to_string()),
+                ("X-Apple-SupportedPINLengths".to_string(), "4".to_string()),
+                ("X-Apple-PD".to_string(), "1".to_string())
+            ]
+
+        },
+    }
+}
+
 impl RtspReqBuilder {
-    fn new(cseq: u64) -> Self {
+    fn new(cseq: u64, mode: PairingMode) -> Self {
         Self {
             cseq,
             method: Method::POST,
             path: String::new(),
             content_type: String::new(),
             body: Vec::new(),
-            headers: vec![
-               ("User-Agent".to_string(), "AirPlay/381.13".to_string()),
-               ("X-Apple-HKP".to_string(), "3".to_string()),
-              // ("X-Apple-Client-Name".to_string(), "Ferricast Airplay".to_string()) 
-            ],
+            headers: req_headers(mode),
         } 
     } 
     pub fn path(mut self, path: String) -> Self {

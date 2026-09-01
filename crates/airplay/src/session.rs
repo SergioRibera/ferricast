@@ -36,6 +36,13 @@ enum SessionState {
     TearingDown,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum PairingMode {
+    Legacy,
+    Hap,
+    Transient
+}
+
 impl std::fmt::Display for SessionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -57,6 +64,7 @@ pub struct AirPlaySession {
     client_device_id: String,
     alive: Arc<AtomicBool>,
     frame_counter: u64,
+    pairing_mode: Option<PairingMode>,
     /// Held open between `connect()` and `submit_pairing()`.
     /// `connect()` sends `/pair-pin-start` and waits for the user to
     /// type the PIN shown on the TV screen; `submit_pairing()` takes
@@ -75,6 +83,7 @@ impl Default for AirPlaySession {
             alive: Default::default(),
             frame_counter: Default::default(),
             pending_conn: None,
+            pairing_mode: None,
         }
     }
 }
@@ -93,6 +102,12 @@ impl CastSession for AirPlaySession {
                 device.protocol
             )));
         }
+
+        let pair_method = match device.metadata.get("pair_method").expect("Ferricast bug in airplay metadata").as_str() {
+            "Transient" => PairingMode::Transient,
+            m => todo!("Invalid method {:?}", m),
+        };
+        
         if self.state != SessionState::Disconnected {
             return Err(FerricastError::SessionAlreadyActive(device.name.clone()));
         }
@@ -106,7 +121,7 @@ impl CastSession for AirPlaySession {
                     FerricastError::Connection(format!("Cannot connect to AirPlay device: {e}"))
                 })?;
 
-        let manager = RtspManager::new();
+        let manager = RtspManager::new(pair_method);
 
 
 
@@ -189,6 +204,7 @@ impl CastSession for AirPlaySession {
        
         }
 
+        self.pairing_mode = Some(pair_method);
         self.pending_conn = Some(socket);
         self.state = SessionState::AwaitingPin;
 
@@ -217,7 +233,9 @@ impl CastSession for AirPlaySession {
             FerricastError::Protocol("submit_pairing called without a pending connection".into())
         })?;
 
-        let manager = RtspManager::new();
+        let manager = RtspManager::new(self.pairing_mode.ok_or_else(|| {
+            FerricastError::Protocol("Invalid pairing mode".into())
+        })?);
 
         {
             let (read_half, mut write_half) = socket.split();

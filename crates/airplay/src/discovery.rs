@@ -6,11 +6,12 @@ use bytes::Bytes;
 use mdns_sd::ServiceDaemon;
 use tokio::sync::mpsc;
 
-use ferricast_core::{Codec, Device, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError, MdnsDiscovery, Result};
+use ferricast_core::{Codec, Device, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError, MdnsDiscovery, PairingChallenge, Result};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::flags::Features;
+use crate::session::PairingMode;
 
 /// The mDNS service type for AirPlay.
 const AIRPLAY_SERVICE_TYPE: &str = "_airplay._tcp.local.";
@@ -159,20 +160,31 @@ impl Discovery for AirPlayDiscovery {
                         }
 
 
-                        let core_utils = features.contains(Features::CORE_UTILS_PAIRING_AND_ENCRYPTION) || features.contains(Features::SYSTEM_PAIRING) || features.contains(Features::HK_PAIRING_AND_ACCESS_CONTROL) | features.contains(Features::TRANSIENT_PAIRING);
+                        let core_utils = features.contains(Features::CORE_UTILS_PAIRING_AND_ENCRYPTION) || features.contains(Features::SYSTEM_PAIRING) || features.contains(Features::HK_PAIRING_AND_ACCESS_CONTROL) || features.contains(Features::TRANSIENT_PAIRING);
 
-                        let third_party = features.contains(Features::HAS_UNIFIED_ADVERTISER_INFO) | features.contains(Features::UNIFIED_PAIR_SETUP_MFI);
+                        let third_party = features.contains(Features::HAS_UNIFIED_ADVERTISER_INFO) || features.contains(Features::UNIFIED_PAIR_SETUP_MFI);
 
                         let support_modern_pairing = core_utils && !third_party;
+                        let transient_support = features.contains(Features::TRANSIENT_PAIRING) || features.contains(Features::SYSTEM_PAIRING);
+ 
+                        let pairing_method = {
+                            if transient_support {
+                                PairingMode::Transient
+                            } else if !support_modern_pairing {
+                                PairingMode::Legacy
+                            } else {
+                                PairingMode::Hap
+                            }
+                        };
 
                         info!(
-                            support_modern_pair  = support_modern_pairing
+                            "Device {:?} pairing mode {:?}", info.get_fullname(), pairing_method
                         );
 
 
                         let mut metadata = HashMap::new();
 
-                        metadata.insert("modern_pair".to_string(), support_modern_pairing.to_string());
+                        metadata.insert("pair_method".to_string(), format!("{:?}", pairing_method));
 
 
 
@@ -184,7 +196,7 @@ impl Discovery for AirPlayDiscovery {
                             model: txt.get("model").cloned(),
                             port,
                             addr,
-                            metadata: txt,
+                            metadata,
                             capabilities: DeviceCapabilities {
                                 supports_audio: features.contains(Features::AUDIO_SUPPORTED),
                                 supports_screen_mirror: features.contains(Features::MIRRORING_SUPPORTED),
