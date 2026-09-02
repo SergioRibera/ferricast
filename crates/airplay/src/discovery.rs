@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
+use ferricast_core::device::{Features, Flags, PairingMode};
 use mdns_sd::ServiceDaemon;
 use tokio::sync::mpsc;
 
@@ -10,8 +11,8 @@ use ferricast_core::{Codec, Device, DeviceCapabilities, Discovery, DiscoveryEven
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::flags::Features;
-use crate::session::PairingMode;
+
+
 
 /// The mDNS service type for AirPlay.
 const AIRPLAY_SERVICE_TYPE: &str = "_airplay._tcp.local.";
@@ -92,11 +93,6 @@ impl Discovery for AirPlayDiscovery {
                             .collect();
 
 
-
-                        let pw = txt.get("flags");
-                        println!("{:?}", pw);
-
-
                         let device_uuid = Uuid::new_v4();
 
                         let addr: std::net::IpAddr = match info.get_addresses_v4().iter().next() {
@@ -147,6 +143,22 @@ impl Discovery for AirPlayDiscovery {
                             },
                         };
 
+                        
+                        let flags = match txt.get("flags") {
+                            Some(v) => match u32::from_str_radix(v.strip_prefix("0x").unwrap_or(v), 16) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!("Invalid airplay flags: {:?}", e);
+                                    continue;
+                                },
+                            },
+                            None => {
+                                warn!("No flags present");
+                                continue;
+                            },
+                        };
+
+                        
                         let num = ((part2 as u64) << 32) | (part1 as u64);
 
                   
@@ -167,7 +179,7 @@ impl Discovery for AirPlayDiscovery {
                         let support_modern_pairing = core_utils && !third_party;
                         let transient_support = features.contains(Features::TRANSIENT_PAIRING) || features.contains(Features::SYSTEM_PAIRING);
  
-                        let pairing_method = {
+                        let mode = {
                             if transient_support {
                                 PairingMode::Transient
                             } else if !support_modern_pairing {
@@ -177,16 +189,15 @@ impl Discovery for AirPlayDiscovery {
                             }
                         };
 
+                        let flags = Flags::from_bits_truncate(flags);
+                        
                         info!(
-                            "Device {:?} pairing mode {:?}", info.get_fullname(), pairing_method
+                            "Device {:?} Flags {:?}", info.get_fullname(), flags,
                         );
 
-
-                        let mut metadata = HashMap::new();
-
-                        metadata.insert("pair_method".to_string(), format!("{:?}", pairing_method));
-
-
+                        info!(
+                            "Device {:?} pairing mode {:?}", info.get_fullname(), mode 
+                        );
 
                         let device = Device {
                             id: device_uuid,
@@ -196,7 +207,7 @@ impl Discovery for AirPlayDiscovery {
                             model: txt.get("model").cloned(),
                             port,
                             addr,
-                            metadata,
+                            metadata: HashMap::new(),
                             capabilities: DeviceCapabilities {
                                 supports_audio: features.contains(Features::AUDIO_SUPPORTED),
                                 supports_screen_mirror: features.contains(Features::MIRRORING_SUPPORTED),
@@ -204,7 +215,7 @@ impl Discovery for AirPlayDiscovery {
                                 requires_audio:  features.contains(Features::AUDIO_SUPPORTED),
                                 supports_low_latency_hls: features.contains(Features::VIDEO_HTTP_LIVE_STREAM),
                                 supported_codecs: vec![Codec::H264],
-
+                                airplay_config: Some(ferricast_core::device::AirplayConfig { features, flags, mode }),
                                 ..Default::default()
                             },
                         };

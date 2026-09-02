@@ -138,6 +138,7 @@ impl ReceiverProtocol for ChromecastReceiver {
                 supported_codecs: vec![Codec::H264, Codec::H265],
                 supports_low_latency_hls: false,
                 supports_cast_streaming: false,
+                airplay_config: None,
             },
             device_id: self.inner.device_id.clone(),
             icon: bytes::Bytes::new(),

@@ -1906,6 +1906,7 @@ name = "ferricast-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bitflags 2.13.1",
  "bytes",
  "thiserror 2.0.18",
  "tokio",

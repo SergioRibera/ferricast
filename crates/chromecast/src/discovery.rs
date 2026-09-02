@@ -299,6 +299,8 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         supports_low_latency_hls: false,
         // 1st/2nd-gen firmware may reject OFFER from non-Chrome senders.
         supports_cast_streaming: false,
+
+        airplay_config: None,
     };
 
     // Lowercased once so each branch can use cheap `contains`.

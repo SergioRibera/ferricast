@@ -47,3 +47,24 @@ impl Display for Features {
         write!(f, "{:?}", self)
     }
 }
+
+bitflags::bitflags! {
+     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+     pub struct Flags: u32 {
+        const PROBLEM_HAS_BEEN_DETECTED = (1 << 0);
+        const DEVICE_IS_NOT_CONFIGURED = (1 << 1);
+        const AUDIO_CABLE = (1 << 2);
+        const PIN_REQUIRED = (1 << 3);
+
+
+        const SUPPORTS_AIRPLAY_FROM_CLOUD= (1 << 6);
+        const PASSWORD_REQUIRED = (1 << 7);
+
+        const ONE_TIME_PAIRING_REQUIRED = (1 << 9);
+        const DEVICE_WAS_SETUP_FOR_HK_ACCESS_CONTROL = (1 << 10);
+        const DEVICE_SUPPORT_RELAY = (1 << 11);
+        const SILENT_PRIMARY = (1 << 12);
+
+        const RECEIVER_SESSION_IS_ACTIVE = (1 << 17);
+    }
+}

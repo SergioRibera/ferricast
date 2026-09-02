@@ -1,9 +1,9 @@
-use std::{collections::HashMap, sync::{Arc, atomic::AtomicU64}};
+use std::{collections::HashMap, sync::{atomic::AtomicU64}};
 
-use ferricast_core::FerricastError;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use ferricast_core::{FerricastError, device::PairingMode};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-use crate::session::PairingMode;
+
 
 pub struct RtspManager(AtomicU64, PairingMode);
 

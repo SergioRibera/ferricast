@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ed25519_dalek::SigningKey;
+use ferricast_core::device::PairingMode;
 use hap_tlv8::Tlv8Writer;
 use rand::Rng;
 use rand::rngs::OsRng;
@@ -34,13 +35,6 @@ enum SessionState {
     Ready,
     Streaming,
     TearingDown,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum PairingMode {
-    Legacy,
-    Hap,
-    Transient
 }
 
 impl std::fmt::Display for SessionState {
@@ -103,10 +97,7 @@ impl CastSession for AirPlaySession {
             )));
         }
 
-        let pair_method = match device.metadata.get("pair_method").expect("Ferricast bug in airplay metadata").as_str() {
-            "Transient" => PairingMode::Transient,
-            m => todo!("Invalid method {:?}", m),
-        };
+        let device_config = device.capabilities.airplay_config.expect("Ferricast airplay discovery bug"); 
         
         if self.state != SessionState::Disconnected {
             return Err(FerricastError::SessionAlreadyActive(device.name.clone()));
@@ -121,7 +112,7 @@ impl CastSession for AirPlaySession {
                     FerricastError::Connection(format!("Cannot connect to AirPlay device: {e}"))
                 })?;
 
-        let manager = RtspManager::new(pair_method);
+        let manager = RtspManager::new(device_config.mode);
 
 
 
@@ -204,7 +195,7 @@ impl CastSession for AirPlaySession {
        
         }
 
-        self.pairing_mode = Some(pair_method);
+        self.pairing_mode = Some(device_config.mode);
         self.pending_conn = Some(socket);
         self.state = SessionState::AwaitingPin;
 

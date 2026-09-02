@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
-
+use std::fmt::Display;
 use bytes::Bytes;
 use uuid::Uuid;
 
@@ -85,6 +85,103 @@ pub struct DeviceCapabilities {
     /// 1st/2nd-gen (`md=Chromecast`) — older firmware may refuse OFFER
     /// from non-Chrome senders; fall back to HLS for those.
     pub supports_cast_streaming: bool,
+    /// This only will have a value if the protocol is cast, other protocols just use None 
+    pub airplay_config: Option<AirplayConfig>,
+}
+
+
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AirplayConfig {
+    /// bitfield of supported features. This was originally a 32 bit value but it has since been expanded to a 64 bit value. To support both these types the mDNS value is encoded as two 32 bit values separated by comma with the comma and second 32 bit value being optional.
+    /// For more information visit <https://openairplay.github.io/airplay-spec/features.html>
+    pub features: Features,
+    /// bitfield of status flags
+    /// For more information visit <https://openairplay.github.io/airplay-spec/status_flags.html>
+    pub flags: Flags,
+    /// Pairing mode that airplay device use
+    /// At the time this doc was writen openairplay does not have good documentation about
+    /// "Pairing" So you should read the source code to know how the pairing works
+    pub mode: PairingMode
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PairingMode {
+    Legacy,
+    Hap,
+    Transient
+}
+
+
+
+bitflags::bitflags! {
+     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+     pub struct Features: u64 {
+        const VIDEO_SUPPORTED = 0x1;
+        const PHOTO_SUPPORTED = 0x2;
+        const VIDEO_FAIRPLAY = 0x4;
+        const VOLUME_CONTROL = 0x8;
+        const VIDEO_HTTP_LIVE_STREAM = 0x10;
+        const SLIDESHOW_SUPPORTED = 0x20;
+        const MIRRORING_SUPPORTED = 0x80;
+        const SCREEN_ROTATE = 0x100;
+        const AUDIO_SUPPORTED = 0x200;
+        const AUDIO_REDUNDANCY_SUPPORTED = 0x800;
+        const FAIRPLAY_SECURE_AUTH_SUPPORTED = 0x1000;
+        const PHOTO_CACHING = 0x2000;
+        const AUTH4 = 0x4000;
+
+        const SUPPORT_LEGACY_PAIRING = (1 << 27);
+
+        const HAS_UNIFIED_ADVERTISER_INFO = (1 << 26);
+
+        const RAOP = (1 << 30);
+        const SUPPORTS_VOLUME = (1 << 32);
+        const AIRPLAY_VIDEO_PLAY_QUEUE = (1 << 33);
+        const AIRPLAY_FROM_CLOUD = (1 << 34);
+
+        const CORE_UTILS_PAIRING_AND_ENCRYPTION = (1 << 38);
+        const BUFFERED_AUDIO = (1 << 40);
+        const PTP = (1 << 41);
+        const SCREEN_MULTI_CODEC = (1 << 42);
+        const SYSTEM_PAIRING  = (1 << 43);
+
+        const HK_PAIRING_AND_ACCESS_CONTROL = (1 << 46);
+
+        const TRANSIENT_PAIRING = (1 << 48);
+
+        const UNIFIED_PAIR_SETUP_MFI = (1 << 51);
+
+        // There is other flags but.... who cares?
+     }
+}
+
+impl Display for Features {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+bitflags::bitflags! {
+     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+     pub struct Flags: u32 {
+        const PROBLEM_HAS_BEEN_DETECTED = (1 << 0);
+        const DEVICE_IS_NOT_CONFIGURED = (1 << 1);
+        const AUDIO_CABLE = (1 << 2);
+        const PIN_REQUIRED = (1 << 3);
+
+
+        const SUPPORTS_AIRPLAY_FROM_CLOUD= (1 << 6);
+        const PASSWORD_REQUIRED = (1 << 7);
+
+        const ONE_TIME_PAIRING_REQUIRED = (1 << 9);
+        const DEVICE_WAS_SETUP_FOR_HK_ACCESS_CONTROL = (1 << 10);
+        const DEVICE_SUPPORT_RELAY = (1 << 11);
+        const SILENT_PRIMARY = (1 << 12);
+
+        const RECEIVER_SESSION_IS_ACTIVE = (1 << 17);
+    }
 }
 
 /// H.264 profile constraint. Used by [`DeviceCapabilities`] and
