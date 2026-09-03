@@ -189,8 +189,10 @@ impl Discovery for AirPlayDiscovery {
                             }
                         };
 
+                        println!("0x{:x}", flags);
+
                         let flags = Flags::from_bits_truncate(flags);
-                        
+
                         info!(
                             "Device {:?} Flags {:?}", info.get_fullname(), flags,
                         );

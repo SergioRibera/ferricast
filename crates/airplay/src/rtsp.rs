@@ -133,7 +133,7 @@ pub enum Method {
 pub struct RtspResponse {
     status_line: StatusLine,
     headers: HashMap<String, String>,
-    content: Option<Vec<u8>>
+    pub content: Option<Vec<u8>>
 }
 
 impl RtspResponse {

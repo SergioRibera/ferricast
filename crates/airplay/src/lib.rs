@@ -1,7 +1,6 @@
 pub(crate) mod rtsp;
 pub mod discovery;
 pub mod session;
-pub mod flags;
 
 pub use discovery::AirPlayDiscovery;
 pub use session::AirPlaySession;

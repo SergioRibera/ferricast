@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ed25519_dalek::SigningKey;
 use ferricast_core::device::PairingMode;
-use hap_tlv8::Tlv8Writer;
+use hap_tlv8::{Tlv8Reader, Tlv8Writer};
 use rand::Rng;
 use rand::rngs::OsRng;
 use tokio::io::BufReader;
@@ -97,10 +97,21 @@ impl CastSession for AirPlaySession {
             )));
         }
 
-        let device_config = device.capabilities.airplay_config.expect("Ferricast airplay discovery bug"); 
-        
         if self.state != SessionState::Disconnected {
             return Err(FerricastError::SessionAlreadyActive(device.name.clone()));
+        }
+
+
+        let device_config = device.capabilities.airplay_config.expect("Ferricast airplay discovery bug"); 
+
+
+        let pair_challange = PairingChallenge::new_airplay(device_config.flags, device_config.mode);
+
+
+        if device_config.mode == PairingMode::Transient {
+             if let PairingChallenge::Pin { digits: 4 } = pair_challange {
+             return Err(FerricastError::Protocol("PIN required in transient".to_string()));
+            }
         }
 
         info!(addr = %device.addr, port = device.port, "connecting to AirPlay device");
@@ -113,6 +124,12 @@ impl CastSession for AirPlaySession {
                 })?;
 
         let manager = RtspManager::new(device_config.mode);
+
+        let mut csprng = OsRng;
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
+
+        let public_key = signing_key.verifying_key().to_bytes();
+
 
 
 
@@ -167,32 +184,25 @@ impl CastSession for AirPlaySession {
                 .write(&mut write_half)
                 .await?;
 
-            let mut csprng = OsRng;
 
-            let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
 
-            let public_key = signing_key.verifying_key().to_bytes();
-
-                   println!("{:?}",  RtspResponse::read(&mut buf_reader).await?);
+            let res = RtspResponse::read(&mut buf_reader).await?;
 
             
-             manager
-                .builder()
-                .path("/pair-setup".to_string())
-                .post()
-                .content_type("application/octet-stream".to_string())
-                .body(public_key.to_vec())
-                .write(&mut write_half)
-                .await?;
+            res.is_ok()?;
+
+
+            let content =  res.content.ok_or(FerricastError::Protocol("Expected content from AirPlay device".to_string()))?;
+
+
+            let tlv = Tlv8Reader::parse(&content).map_err(|_| FerricastError::Protocol("Invalid content from AirPlay Device".to_string()))?;
+
+
+            println!("{:?}", tlv);
+    
             
-
-                          println!("{:?}",  RtspResponse::read(&mut buf_reader).await?);
-
-
-            
-        
+//            println!("{:?}", x.take(1));
            
-       
         }
 
         self.pairing_mode = Some(device_config.mode);
