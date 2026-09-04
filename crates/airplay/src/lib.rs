@@ -1,4 +1,5 @@
 pub(crate) mod rtsp;
+pub(crate) mod tlv;
 pub mod discovery;
 pub mod session;
 

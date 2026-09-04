@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ed25519_dalek::SigningKey;
 use ferricast_core::device::PairingMode;
-use hap_tlv8::{Tlv8Reader, Tlv8Writer};
 use rand::Rng;
 use rand::rngs::OsRng;
 use tokio::io::BufReader;
@@ -17,6 +16,7 @@ use ferricast_core::{
 };
 
 use crate::rtsp::{RtspManager, RtspResponse};
+use crate::tlv;
 
 const TLV_TYPE_STATE: u8 = 6;
 const TLV_TYPE_METHOD: u8 = 0;
@@ -167,14 +167,12 @@ impl CastSession for AirPlaySession {
 
             // Transient pairing
 
-            let mut tlv_bytes = Vec::new();
-            let mut w = Tlv8Writer::new(&mut tlv_bytes);
- 
-            w.push(TLV_TYPE_METHOD, &[0]);
-            w.push(TLV_TYPE_STATE, &[1]);
-            w.push(TLV_TYPE_FLAGS, &TLV_FLAGS_TRANSIENT);
-            drop(w);
-
+            let tlv_bytes = tlv::encode(vec![
+                (TLV_TYPE_METHOD, &[0]),
+                (TLV_TYPE_STATE, &[1]),
+                (TLV_TYPE_FLAGS, &TLV_FLAGS_TRANSIENT),
+            ])?;
+            
             manager
                 .builder()
                 .path("/pair-setup".to_string())
@@ -195,8 +193,7 @@ impl CastSession for AirPlaySession {
             let content =  res.content.ok_or(FerricastError::Protocol("Expected content from AirPlay device".to_string()))?;
 
 
-            let tlv = Tlv8Reader::parse(&content).map_err(|_| FerricastError::Protocol("Invalid content from AirPlay Device".to_string()))?;
-
+            let tlv = tlv::decode(&content);
 
             println!("{:?}", tlv);
     
