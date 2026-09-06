@@ -126,6 +126,33 @@ impl CastSession for AirPlaySession {
             }
         }
 
+        let pin_required = {
+            let pin_var = std::env::var(format!("{}_PIN_REQUIRED", device.name.replace(" ", "_").to_uppercase())).unwrap_or_default();
+
+            let force_pin = match pin_var.as_str() {
+                "y" => {
+                    info!("Forcing a PIN request");
+                    true
+                },
+                "n" => {
+                    info!("Canceling any PIN request");
+                    false
+                },
+                _ => {
+                    info!("PIN Required flag not specified, listening to airplay data");
+                    
+                    if let PairingChallenge::Pin { digits: 4 } = pair_challange {
+                        true
+                    } else {
+                        false
+                    }
+                },
+             };
+
+            
+            force_pin 
+    };
+
         info!(addr = %device.addr, port = device.port, "connecting to AirPlay device");
 
         let mut socket =
@@ -467,9 +494,12 @@ impl CastSession for AirPlaySession {
         self.state = SessionState::AwaitingPin;
 
         info!("AirPlay pair-pin-start sent; waiting for user PIN");
-        Ok(ConnectOutcome::PairingRequired(PairingChallenge::Pin {
+    
+        Ok(ConnectOutcome::Ready)
+        /*Ok(ConnectOutcome::PairingRequired(PairingChallenge::Pin {
             digits: 4,
         }))
+        */
     }
 
     async fn submit_pairing(&mut self, response: PairingResponse) -> Result<()> {
