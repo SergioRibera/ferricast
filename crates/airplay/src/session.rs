@@ -1,10 +1,15 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use easy_srp::ClientStep3Params;
+use easy_srp::groups::{G_2048, SrpGroup};
 use ed25519_dalek::SigningKey;
 use ferricast_core::device::PairingMode;
+use num_bigint::{BigInt, Sign};
+
 use rand::Rng;
 use rand::rngs::OsRng;
+use sha2::{Digest, Sha512};
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
 use tracing::{info, warn};
@@ -21,6 +26,13 @@ use crate::tlv;
 const TLV_TYPE_STATE: u8 = 6;
 const TLV_TYPE_METHOD: u8 = 0;
 const TLV_TYPE_FLAGS: u8 = 0x13;
+
+const TLV_TYPE_SALT: u8 = 0x2;
+const TLV_TYPE_PUBLIC_KEY: u8 = 0x3;
+const TLV_TYPE_PROOF: u8 = 0x04;
+
+const TLV_TYPE_ERROR: u8 = 0x7;
+
 
 const TLV_FLAGS_TRANSIENT: [u8; 4] = 0x00000010_u32.to_le_bytes();
 
@@ -183,6 +195,7 @@ impl CastSession for AirPlaySession {
                 .await?;
 
 
+            
 
             let res = RtspResponse::read(&mut buf_reader).await?;
 
@@ -190,16 +203,263 @@ impl CastSession for AirPlaySession {
             res.is_ok()?;
 
 
-            let content =  res.content.ok_or(FerricastError::Protocol("Expected content from AirPlay device".to_string()))?;
+            let content =  res.content()?;
 
 
             let tlv = tlv::decode(&content);
 
-            println!("{:?}", tlv);
-    
+
+            let server_pub = tlv.get(&TLV_TYPE_PUBLIC_KEY)
+                .ok_or(FerricastError::Protocol("Invalid TLV response from airplay device".to_string()))?;
+
+            let server_salt = tlv.get(&TLV_TYPE_SALT)
+                .ok_or(FerricastError::Protocol("Invalid TLV response from airplay device".to_string()))?;
+
+
+            /*
+            let mut client_wf: easy_srp::ClientAuthenticationWorkflow<Sha512> = easy_srp::ClientAuthenticationWorkflow::new(&G_2048);
+
+
+            let client_a = client_wf.step1()
+                .map_err(|e| FerricastError::Protocol(format!("SRP error {:?}", e)))?;
             
-//            println!("{:?}", x.take(1));
-           
+    
+
+            let step_3 = client_wf.step3(ClientStep3Params {
+                client_a: &client_a.client_public_a,
+                username: String::from("Pair-Setup"),
+                password: String::from("3939"),
+                salt: &server_salt,
+                server_public_b: &server_pub,
+            }).map_err(|e| FerricastError::Protocol(format!("SRP step 3 error {:?}", e)))?;
+
+            let padded_public_key = pad_to(client_a.client_public_a, 384);
+
+    
+            let m1_proof_sha = &step_3.proof();
+
+            let m3 = tlv::encode(vec![
+                (TLV_TYPE_STATE, &[0x03_u8]),
+                (TLV_TYPE_PUBLIC_KEY, padded_public_key.as_slice()),
+                (TLV_TYPE_PROOF, &m1_proof_sha),
+            ])?;
+
+            manager.builder()
+                .post()
+                .content_type("application/octet-stream".to_string())
+                .path("/pair-setup".to_string())
+                .body(m3)
+                .write(&mut write_half)
+                .await?;
+
+            let res = RtspResponse::read(&mut buf_reader).await?;
+
+            res.is_ok()?;
+
+            let m4 = res.content()?;
+            let m4 = tlv::decode(m4);
+
+            println!("{:?}", m4);
+
+
+            */
+
+            // request the pin
+
+             
+            let pin = String::from("3939");
+
+            let inner_hash = sha2::Sha512::digest(format!("Pair-Setup:{pin}").as_bytes());
+
+            let mut x_input = Vec::new();
+            
+            x_input.extend_from_slice(server_salt);
+            x_input.extend_from_slice(&inner_hash);
+
+            let x_hash = sha2::Sha512::digest(&x_input);
+
+            let x = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &x_hash); 
+        
+            let g_2048 = BigInt::new(num_bigint::Sign::Plus, vec![5]);
+
+            let n_2048 = BigInt::new(num_bigint::Sign::Plus, vec![
+                    0xAC6BDB41,
+                    0x324A9A9B,
+                    0xF166DE5E,
+                    0x1389582F,
+                    0xAF72B665,
+                    0x1987EE07,
+                    0xFC319294,
+                    0x3DB56050,
+                    0xA37329CB,
+                    0xB4A099ED,
+                    0x8193E075,
+                    0x7767A13D,
+                    0xD52312AB,
+                    0x4B03310D,
+                    0xCD7F48A9, 
+                    0xDA04FD50,
+                    0xE8083969,
+                    0xEDB767B0,
+                    0xCF609517,
+                    0x9A163AB3,
+                    0x661A05FB,
+                    0xD5FAAAE8, 
+                    0x2918A996,
+                    0x2F0B93B8,
+                    0x55F97993,
+                    0xEC975EEA,
+                    0xA80D740A,
+                    0xDBF4FF74,
+                    0x7359D041,
+                    0xD5C33EA7,
+                    0x1D281E44,
+                    0x6B14773B,
+                    0xCA97B43A,
+                    0x23FB8016,
+                    0x76BD207A,
+                    0x436C6481,
+                    0xF1D2B907,
+                    0x8717461A,
+                    0x5B9D32E6,
+                    0x88F87748,
+                    0x544523B5,
+                    0x24B0D57D,
+                    0x5EA77A27,
+                    0x75D2ECFA,
+                    0x032CFBDB,
+                    0xF52FB378,
+                    0x61602790,
+                    0x04E57AE6,
+                    0xAF874E73,
+                    0x03CE5329, 
+                    0x9CCC041C,
+                    0x7BC308D8,
+                    0x2A5698F3,
+                    0xA8D0C382, 
+                    0x71AE35F8,
+                    0xE9DBFBB6,
+                    0x94B5C803,
+                    0xD89F7AE4,
+                    0x35DE236D,
+                    0x525F5475,
+                    0x9B65E372,
+                    0xFCD68EF2,
+                    0x0FA7111F,
+                    0x9E4AFF73
+            ]);
+
+
+            let pad_n = pad_to(g_2048.to_bytes_be().1, 384);
+            let pad_g = pad_to(n_2048.to_bytes_be().1, 384);
+
+
+            let mut k_input = Vec::new();
+
+            k_input.extend_from_slice(&pad_n);
+            k_input.extend_from_slice(&pad_g);
+
+            let k_hash = sha2::Sha512::digest(&k_input);
+
+            let k = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &k_hash);
+
+            let mut a_bytes = [0_u8; 32];
+
+            rand::thread_rng().fill(&mut a_bytes);
+
+            let mut a = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &a_bytes);
+
+            use num_traits::Zero;
+
+            if a.is_zero() {
+                a = BigInt::from(1u32);   
+            }
+
+            
+            let A = g_2048.modpow(&a, &n_2048);
+
+            let client_public = A.to_bytes_be();
+
+            let B = BigInt::from_bytes_be(Sign::Plus, server_pub);
+
+            if B.sign() == Sign::NoSign || B.sign() == Sign::Minus || B == n_2048 {
+                return Err(FerricastError::Protocol("Invalid server public key".to_string()));
+            }
+
+            let server_public  = B.to_bytes_be().1;
+
+            let mut u_input = Vec::new();
+
+            u_input.extend(pad_to(client_public.1.clone(), 384));
+            u_input.extend(pad_to(server_public, 384));
+
+            let u_hash = Sha512::digest(&u_input);
+            
+            let u = BigInt::from_bytes_be(Sign::Plus, &u_hash);
+
+            let gx = g_2048.modpow(&x, &n_2048);
+
+            let kgx = (k * gx) % n_2048.clone();
+
+            let mut diff = B - kgx;
+
+            if diff.sign() == Sign::Minus {
+                diff += n_2048.clone();
+            }
+
+            let exp = u * x + a;
+
+            let S = diff.modpow(&exp, &n_2048);
+        
+            let K = Sha512::digest(S.to_bytes_be().1);
+
+            let hn_hash = Sha512::digest(n_2048.to_bytes_be().1);
+            let hg_hash = Sha512::digest(g_2048.to_bytes_be().1);
+
+            let mut h_xor = vec![0_u8; 64];
+
+            for i in 0..63 {
+                h_xor[i] = hn_hash[i] ^ hg_hash[i];
+            }
+
+            let hu_hash = Sha512::digest("Pair-Setup");
+
+            let mut proof_input = Vec::new();
+            
+            proof_input.extend(h_xor);
+            proof_input.extend_from_slice(&hu_hash);
+            proof_input.extend_from_slice(server_salt);
+            proof_input.extend_from_slice(&client_public.1);
+            proof_input.extend_from_slice(&server_pub);
+            proof_input.extend_from_slice(&K);
+
+            let m1_proof = Sha512::digest(&proof_input);
+
+            
+            let m3 = tlv::encode(vec![
+                (TLV_TYPE_STATE, &[0x03_u8]),
+                (TLV_TYPE_PUBLIC_KEY, &pad_to(client_public.1, 384)),
+                (TLV_TYPE_PROOF, &m1_proof),
+            ])?;
+
+            manager.builder()
+                .post()
+                .content_type("application/octet-stream".to_string())
+                .path("/pair-setup".to_string())
+                .body(m3)
+                .write(&mut write_half)
+                .await?;
+
+            let res = RtspResponse::read(&mut buf_reader).await?;
+
+            res.is_ok()?;
+
+            let m4 = res.content()?;
+            let m4 = tlv::decode(m4);
+
+            println!("{:?}", m4);
+
+
         }
 
         self.pairing_mode = Some(device_config.mode);
@@ -360,4 +620,17 @@ fn random_string(len: usize) -> String {
         string.push(rng.gen_range(48u8..=90) as char);
     }
     string
+}
+
+
+fn pad_to(data: Vec<u8>, size: usize) -> Vec<u8> {
+    if data.len() >= size {
+        return data;
+    }
+
+    let mut padded = vec![0_u8; size]; 
+
+    padded[size-data.len()..].copy_from_slice(&data);
+
+    padded
 }

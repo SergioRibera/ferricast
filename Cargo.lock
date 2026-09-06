@@ -850,6 +850,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "byteorder-lite"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1555,6 +1561,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "easy-srp"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2cf6d658a5996395b4ed61eb9fba220fb8a879d97f6ccff23d4a69c04f2c6e3"
+dependencies = [
+ "base64",
+ "digest",
+ "getrandom 0.2.17",
+ "serde",
+ "srp",
+]
+
+[[package]]
 name = "ed25519"
 version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1833,19 +1852,21 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bitflags 2.13.1",
+ "byteorder",
  "bytes",
  "chacha20poly1305",
+ "easy-srp",
  "ed25519-dalek",
  "ferricast-core",
- "hap-tlv8",
  "hex",
  "httparse",
  "mdns-sd",
+ "num-bigint 0.5.1",
+ "num-traits",
  "plist",
  "rand 0.8.6",
  "rustls",
  "sha2",
- "srp",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2765,15 +2786,6 @@ dependencies = [
  "cfg-if",
  "crunchy",
  "zerocopy",
-]
-
-[[package]]
-name = "hap-tlv8"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6bb22da40cf9b5d08d3f4b2c05021e412abb2b2ccf366dc7c237a9d7be8fcbc"
-dependencies = [
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3754,6 +3766,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-bigint"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3785,7 +3807,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
 dependencies = [
- "num-bigint",
+ "num-bigint 0.4.6",
  "num-integer",
  "num-traits",
 ]
@@ -5656,7 +5678,7 @@ dependencies = [
  "digest",
  "generic-array",
  "lazy_static",
- "num-bigint",
+ "num-bigint 0.4.6",
  "subtle",
 ]
 

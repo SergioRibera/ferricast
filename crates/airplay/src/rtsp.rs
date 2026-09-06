@@ -193,7 +193,11 @@ impl RtspResponse {
 
         Ok(Self { status_line, headers, content })
     }
-
+    pub fn content(&self) -> Result<&Vec<u8>, FerricastError> {
+        self.content
+            .as_ref()
+            .ok_or(FerricastError::Rtsp("Response does not contains a body".to_string()))
+    }
     pub fn is_ok(&self) -> Result<(), FerricastError> {
         if self.is_success() {
             return Ok(());

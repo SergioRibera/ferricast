@@ -137,11 +137,7 @@ uuid.workspace = true
 # 5-10× slower and starve the audio pipeline.
 [profile.dev.package.x264]
 opt-level = 3
-[profile.dev.package.x264-sys]
-opt-level = 3
 [profile.dev.package.yuv]
 opt-level = 3
 [profile.dev.package.fdk-aac]
-opt-level = 3
-[profile.dev.package.fdk-aac-sys]
 opt-level = 3
