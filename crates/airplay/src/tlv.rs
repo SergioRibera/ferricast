@@ -30,7 +30,7 @@ pub fn encode(items: Vec<(u8, &[u8])>) -> Result<Vec<u8>, FerricastError> {
 }
 
 
-pub fn decode(bytes: &[u8]) -> HashMap<u8, Vec<u8>> {
+pub fn decode(bytes: &[u8]) -> Result<HashMap<u8, Vec<u8>>, FerricastError> {
     let mut result: HashMap<u8, Vec<u8>> = HashMap::new();
     let mut offset = 0;
 
@@ -49,6 +49,10 @@ pub fn decode(bytes: &[u8]) -> HashMap<u8, Vec<u8>> {
         offset += 2 + data_len;
     }
 
-    result
+    if let Some(err_code) = result.get(&7) {
+        return Err(FerricastError::Tlv(format!("Airplay device send error, with code {:?}", err_code)));
+    }
+
+    Ok(result)
 }
 

@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -204,12 +205,33 @@ impl CastSession for AirPlaySession {
             }   
             */
 
+            let mut pin = String::new();
+
+            if pin_required {
+                manager
+                    .builder()
+                    .path("/pair-pin-start".to_string())
+                    .write(&mut write_half).await?;
+
+                RtspResponse::read(&mut buf_reader)
+                    .await?
+                    .is_ok()?;
+
+                // TODO: pretty way to request the pin
+                let mut pin_buffer = vec![0_u8; 4];
+
+                std::io::stdin().read(&mut pin_buffer)?;
+
+                pin = String::from_utf8(pin_buffer)
+                    .map_err(|_| FerricastError::Protocol("Invalid pin".to_string()))?;
+            }
+
             // Transient pairing
 
             let tlv_bytes = tlv::encode(vec![
                 (TLV_TYPE_METHOD, &[0]),
                 (TLV_TYPE_STATE, &[1]),
-                (TLV_TYPE_FLAGS, &TLV_FLAGS_TRANSIENT),
+               // (TLV_TYPE_FLAGS, &TLV_FLAGS_TRANSIENT),
             ])?;
             
             manager
@@ -233,7 +255,7 @@ impl CastSession for AirPlaySession {
             let content =  res.content()?;
 
 
-            let tlv = tlv::decode(&content);
+            let tlv = tlv::decode(&content)?;
 
 
             let server_pub = tlv.get(&TLV_TYPE_PUBLIC_KEY)
@@ -293,9 +315,7 @@ impl CastSession for AirPlaySession {
 
             // request the pin
 
-             
-            let pin = String::from("3939");
-
+            println!("{pin}");
             let inner_hash = sha2::Sha512::digest(format!("Pair-Setup:{pin}").as_bytes());
 
             let mut x_input = Vec::new();
@@ -482,7 +502,7 @@ impl CastSession for AirPlaySession {
             res.is_ok()?;
 
             let m4 = res.content()?;
-            let m4 = tlv::decode(m4);
+            let m4 = tlv::decode(m4)?;
 
             println!("{:?}", m4);
 

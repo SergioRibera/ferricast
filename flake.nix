@@ -77,6 +77,19 @@
           pipewire
           pkg-config
 
+	  # used only for testing
+	  #openh264
+	  #gst_all_1.gstreamer
+	  #gst_all_1.gst-plugins-good
+	  #gst_all_1.gst-plugins-bad
+	  #gst_all_1.gst-libav
+	  #gst_all_1.gst-plugins-base
+
+	  #gst_all_1.gst-plugins-ugly
+
+	  
+
+
           # CUDA runtime stub. The real `libcuda.so.1` from the
           # proprietary NVIDIA driver lives at /run/opengl-driver/lib
           # on hosts with `hardware.nvidia.*` enabled and shadows
