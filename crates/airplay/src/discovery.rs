@@ -3,11 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
-use ferricast_core::device::{Features, Flags, PairingMode};
+use ferricast_core::device::{Features, Flags};
 use mdns_sd::ServiceDaemon;
 use tokio::sync::mpsc;
 
-use ferricast_core::{Codec, Device, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError, MdnsDiscovery, PairingChallenge, Result};
+use ferricast_core::{Codec, Device, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError, MdnsDiscovery, Result};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -172,22 +172,7 @@ impl Discovery for AirPlayDiscovery {
                         }
 
 
-                        let core_utils = features.contains(Features::CORE_UTILS_PAIRING_AND_ENCRYPTION) || features.contains(Features::SYSTEM_PAIRING) || features.contains(Features::HK_PAIRING_AND_ACCESS_CONTROL) || features.contains(Features::TRANSIENT_PAIRING);
-
-                        let third_party = features.contains(Features::HAS_UNIFIED_ADVERTISER_INFO) || features.contains(Features::UNIFIED_PAIR_SETUP_MFI);
-
-                        let support_modern_pairing = core_utils && !third_party;
                         let transient_support = features.contains(Features::TRANSIENT_PAIRING) || features.contains(Features::SYSTEM_PAIRING);
- 
-                        let mode = {
-                            if transient_support {
-                                PairingMode::Transient
-                            } else if !support_modern_pairing {
-                                PairingMode::Legacy
-                            } else {
-                                PairingMode::Hap
-                            }
-                        };
 
                         println!("0x{:x}", flags);
 
@@ -197,9 +182,6 @@ impl Discovery for AirPlayDiscovery {
                             "Device {:?} Flags {:?}", info.get_fullname(), flags,
                         );
 
-                        info!(
-                            "Device {:?} pairing mode {:?}", info.get_fullname(), mode 
-                        );
 
                         let device = Device {
                             id: device_uuid,
@@ -217,7 +199,7 @@ impl Discovery for AirPlayDiscovery {
                                 requires_audio:  features.contains(Features::AUDIO_SUPPORTED),
                                 supports_low_latency_hls: features.contains(Features::VIDEO_HTTP_LIVE_STREAM),
                                 supported_codecs: vec![Codec::H264],
-                                airplay_config: Some(ferricast_core::device::AirplayConfig { features, flags, mode }),
+                                airplay_config: Some(ferricast_core::device::AirplayConfig { features, flags }),
                                 ..Default::default()
                             },
                         };

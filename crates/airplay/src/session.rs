@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use easy_srp::ClientStep3Params;
 use easy_srp::groups::{G_2048, SrpGroup};
 use ed25519_dalek::SigningKey;
-use ferricast_core::device::PairingMode;
+use ferricast_core::device::Features;
 use num_bigint::{BigInt, Sign};
 
 use rand::Rng;
@@ -71,7 +71,7 @@ pub struct AirPlaySession {
     client_device_id: String,
     alive: Arc<AtomicBool>,
     frame_counter: u64,
-    pairing_mode: Option<PairingMode>,
+    features: Option<Features>,
     /// Held open between `connect()` and `submit_pairing()`.
     /// `connect()` sends `/pair-pin-start` and waits for the user to
     /// type the PIN shown on the TV screen; `submit_pairing()` takes
@@ -90,7 +90,7 @@ impl Default for AirPlaySession {
             alive: Default::default(),
             frame_counter: Default::default(),
             pending_conn: None,
-            pairing_mode: None,
+            features: None
         }
     }
 }
@@ -118,41 +118,10 @@ impl CastSession for AirPlaySession {
         let device_config = device.capabilities.airplay_config.expect("Ferricast airplay discovery bug"); 
 
 
-        let pair_challange = PairingChallenge::new_airplay(device_config.flags, device_config.mode);
+        let pair_challange = PairingChallenge::new_airplay(device_config.flags, &device_config.features);
 
+        println!("{:?}", pair_challange);
 
-        if device_config.mode == PairingMode::Transient {
-             if let PairingChallenge::Pin { digits: 4 } = pair_challange {
-             return Err(FerricastError::Protocol("PIN required in transient".to_string()));
-            }
-        }
-
-        let pin_required = {
-            let pin_var = std::env::var(format!("{}_PIN_REQUIRED", device.name.replace(" ", "_").to_uppercase())).unwrap_or_default();
-
-            let force_pin = match pin_var.as_str() {
-                "y" => {
-                    info!("Forcing a PIN request");
-                    true
-                },
-                "n" => {
-                    info!("Canceling any PIN request");
-                    false
-                },
-                _ => {
-                    info!("PIN Required flag not specified, listening to airplay data");
-                    
-                    if let PairingChallenge::Pin { digits: 4 } = pair_challange {
-                        true
-                    } else {
-                        false
-                    }
-                },
-             };
-
-            
-            force_pin 
-    };
 
         info!(addr = %device.addr, port = device.port, "connecting to AirPlay device");
 
@@ -163,7 +132,7 @@ impl CastSession for AirPlaySession {
                     FerricastError::Connection(format!("Cannot connect to AirPlay device: {e}"))
                 })?;
 
-        let manager = RtspManager::new(device_config.mode);
+        let manager = RtspManager::new(device_config.features);
 
         let mut csprng = OsRng;
         let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
@@ -174,6 +143,8 @@ impl CastSession for AirPlaySession {
 
 
         {
+              /*
+
             let (read_half, mut write_half) = socket.split();
             let mut buf_reader = BufReader::new(read_half);
 
@@ -506,10 +477,11 @@ impl CastSession for AirPlaySession {
 
             println!("{:?}", m4);
 
+            */
 
         }
 
-        self.pairing_mode = Some(device_config.mode);
+        self.features = Some(device_config.features);
         self.pending_conn = Some(socket);
         self.state = SessionState::AwaitingPin;
 
@@ -541,8 +513,8 @@ impl CastSession for AirPlaySession {
             FerricastError::Protocol("submit_pairing called without a pending connection".into())
         })?;
 
-        let manager = RtspManager::new(self.pairing_mode.ok_or_else(|| {
-            FerricastError::Protocol("Invalid pairing mode".into())
+        let manager = RtspManager::new(self.features.ok_or_else(|| {
+            FerricastError::Protocol("No features".into())
         })?);
 
         {

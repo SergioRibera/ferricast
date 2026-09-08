@@ -1,4 +1,4 @@
-use crate::device::{Flags, PairingMode};
+use crate::device::{Features, Flags};
 
 /// What the protocol needs from the user before streaming can begin.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,13 +10,13 @@ pub enum PairingChallenge {
 }
 
 impl PairingChallenge {
-    pub fn new_airplay(flags: Flags, mode: PairingMode) -> Self {
-        if flags.contains(Flags::PASSWORD_REQUIRED) && mode == PairingMode::Legacy {
+    pub fn new_airplay(flags: Flags, features: &Features) -> Self {
+        if flags.contains(Flags::PASSWORD_REQUIRED) && features.prefers_legacy_pairing()  {
             return Self::Credential;
         }
 
-        if flags.contains(Flags::PIN_REQUIRED) {
-            return Self::Pin { digits: 8 };
+        if flags.contains(Flags::PIN_ONE_TIME_PAIRING) {
+            return Self::Pin { digits: 4 };
         }
 
         return Self::None;

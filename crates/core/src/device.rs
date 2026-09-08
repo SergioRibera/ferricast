@@ -99,21 +99,7 @@ pub struct AirplayConfig {
     /// bitfield of status flags
     /// For more information visit <https://openairplay.github.io/airplay-spec/status_flags.html>
     pub flags: Flags,
-    /// Pairing mode that airplay device use
-    /// At the time this doc was writen openairplay does not have good documentation about
-    /// "Pairing" So you should read the source code to know how the pairing works
-    pub mode: PairingMode
 }
-
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PairingMode {
-    Legacy,
-    Hap,
-    Transient
-}
-
-
 
 bitflags::bitflags! {
      #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -157,6 +143,42 @@ bitflags::bitflags! {
      }
 }
 
+pub const AIRPLAY_PAIR_LEGACY: u8 = 3;
+pub const AIRPLAY_PAIR_MODERN: u8 = 5;
+pub const AIRPLAY_PAIR_TRANSIENT: u8 = 4;
+pub const AIRPLAY_PAIR_ERR: u8 = 0;
+
+impl Features {
+    pub fn support_moddern_pairing(&self) -> bool {
+        let core_utils = self.contains(Features::CORE_UTILS_PAIRING_AND_ENCRYPTION) || self.contains(Features::SYSTEM_PAIRING) || self.contains(Features::HK_PAIRING_AND_ACCESS_CONTROL) || self.contains(Features::TRANSIENT_PAIRING);
+
+        let third_party = self.contains(Features::HAS_UNIFIED_ADVERTISER_INFO) || self.contains(Features::UNIFIED_PAIR_SETUP_MFI);
+
+        core_utils && !third_party
+    }
+    pub fn supports_transient_pairing(&self) -> bool {
+        self.contains(Features::SYSTEM_PAIRING) || self.contains(Features::TRANSIENT_PAIRING)
+    }
+    pub fn prefers_legacy_pairing(&self) -> bool {
+        !self.support_moddern_pairing()
+    }
+    pub fn pair_effective(&self) -> u8 {
+        if self.prefers_legacy_pairing() {
+            return AIRPLAY_PAIR_LEGACY;
+        }
+
+        if self.support_moddern_pairing() {
+            return AIRPLAY_PAIR_MODERN;
+        }
+
+        if self.supports_transient_pairing() {
+            return AIRPLAY_PAIR_TRANSIENT;
+        }
+
+        return AIRPLAY_PAIR_ERR;
+    }
+}
+
 impl Display for Features {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self)
@@ -169,13 +191,12 @@ bitflags::bitflags! {
         const PROBLEM_HAS_BEEN_DETECTED = (1 << 0);
         const DEVICE_IS_NOT_CONFIGURED = (1 << 1);
         const AUDIO_CABLE = (1 << 2);
-        const PIN_REQUIRED = (1 << 3);
 
 
         const SUPPORTS_AIRPLAY_FROM_CLOUD= (1 << 6);
         const PASSWORD_REQUIRED = (1 << 7);
 
-        const ONE_TIME_PAIRING_REQUIRED = (1 << 9);
+        const PIN_ONE_TIME_PAIRING = (1 << 9);
         const DEVICE_WAS_SETUP_FOR_HK_ACCESS_CONTROL = (1 << 10);
         const DEVICE_SUPPORT_RELAY = (1 << 11);
         const SILENT_PRIMARY = (1 << 12);
