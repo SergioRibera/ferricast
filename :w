@@ -158,7 +158,7 @@ impl CastSession for AirPlaySession {
                 .write(&mut write_half).await?;
 
             let req = RtspResponse::read(&mut buf_reader).await?;
-
+e
             req.is_ok()?;
 
             println!("asd: {:?}", req);

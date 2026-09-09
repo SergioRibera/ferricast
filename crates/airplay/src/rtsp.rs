@@ -1,7 +1,9 @@
-use std::{collections::HashMap, sync::{atomic::AtomicU64}};
+use std::{collections::HashMap, sync::atomic::AtomicU64, time::Duration};
 
 use ferricast_core::{FerricastError, device::Features};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, time::timeout};
+
+use crate::AIRPLAY_TIMEOUT;
 
 
 
@@ -98,10 +100,14 @@ impl RtspReqBuilder {
 
         a.push_str("\r\n");
 
-        writer.write(a.as_bytes()).await?;
+        timeout(AIRPLAY_TIMEOUT, writer.write(a.as_bytes()))
+            .await
+            .map_err(|_| FerricastError::Rtsp("Timeout sending RTSP req".to_string()))??;
 
         if !self.body.is_empty() {
-            writer.write(&self.body).await?;
+            timeout(AIRPLAY_TIMEOUT, writer.write(&self.body))
+                .await
+                .map_err(|_| FerricastError::Rtsp("TImeout sending RTSP req body".to_string()))??;
         }
 
         Ok(())
@@ -133,7 +139,9 @@ impl RtspResponse {
         loop {
             let mut line = String::new();        
     
-            match buf.read_line(&mut line).await {
+            match timeout(AIRPLAY_TIMEOUT, buf.read_line(&mut line))
+                .await
+                .map_err(|_| FerricastError::Rtsp("Timeout reading RTSP response".to_string()))? {
                 Ok(0) => break, 
                 Ok(_) => {
                     if line == "\r\n" {
@@ -165,7 +173,9 @@ impl RtspResponse {
                 
                 let mut content = vec![0_u8; len];
 
-                buf.read(&mut content).await?;
+                timeout(AIRPLAY_TIMEOUT, buf.read(&mut content))
+                    .await
+                    .map_err(|_| FerricastError::Rtsp("Timeout reading RTSP response content".to_string()))??;
 
                 Some(content)
             } else {

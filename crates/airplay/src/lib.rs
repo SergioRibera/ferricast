@@ -3,6 +3,11 @@ pub(crate) mod tlv;
 pub mod discovery;
 pub mod session;
 
+
+pub(crate) const AIRPLAY_TIMEOUT: Duration = Duration::from_secs(5);
+
+use std::time::Duration;
+
 pub use discovery::AirPlayDiscovery;
 pub use session::AirPlaySession;
 
