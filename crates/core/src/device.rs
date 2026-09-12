@@ -91,7 +91,7 @@ pub struct DeviceCapabilities {
 
 
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AirplayConfig {
     /// bitfield of supported features. This was originally a 32 bit value but it has since been expanded to a 64 bit value. To support both these types the mDNS value is encoded as two 32 bit values separated by comma with the comma and second 32 bit value being optional.
     /// For more information visit <https://openairplay.github.io/airplay-spec/features.html>
@@ -99,6 +99,9 @@ pub struct AirplayConfig {
     /// bitfield of status flags
     /// For more information visit <https://openairplay.github.io/airplay-spec/status_flags.html>
     pub flags: Flags,
+    /// Public Key, extracted from MDNS TxT
+    /// For more information visit <https://openairplay.github.io/airplay-spec/service_discovery.html>
+    pub pk: Option<String>,
 }
 
 bitflags::bitflags! {
@@ -158,6 +161,9 @@ impl Features {
     }
     pub fn supports_transient_pairing(&self) -> bool {
         self.contains(Features::SYSTEM_PAIRING) || self.contains(Features::TRANSIENT_PAIRING)
+    }
+    pub fn supports_legacy_pairing(&self) -> bool {
+        self.contains(Features::SUPPORT_LEGACY_PAIRING)
     }
     pub fn prefers_legacy_pairing(&self) -> bool {
         !self.support_moddern_pairing()

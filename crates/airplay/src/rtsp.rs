@@ -64,6 +64,11 @@ impl RtspReqBuilder {
 
         self
     }
+    pub fn get(mut self) -> Self {
+        self.method = Method::GET;
+
+        self
+    }
     pub fn options(mut self) -> Self {
         self.method = Method::OPTIONS;
 
@@ -117,6 +122,7 @@ impl RtspReqBuilder {
 #[derive(Debug)]
 pub enum Method {
     POST,
+    GET,
     OPTIONS,
 }
 

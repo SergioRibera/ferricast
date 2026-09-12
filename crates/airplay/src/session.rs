@@ -115,6 +115,7 @@ impl CastSession for AirPlaySession {
         }
 
 
+
         let device_config = device.capabilities.airplay_config.expect("Ferricast airplay discovery bug"); 
 
 
@@ -133,35 +134,18 @@ impl CastSession for AirPlaySession {
                 })?;
 
         let manager = RtspManager::new(device_config.features);
-
-        let mut csprng = OsRng;
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
-
-        let public_key = signing_key.verifying_key().to_bytes();
-
                 
         let (read_half, mut write_half) = socket.split();
         let mut buf_reader = BufReader::new(read_half);
 
 
 
+
         if device_config.features.support_moddern_pairing() && device_config.features.supports_transient_pairing() {
             println!("transient pairing")
         } else {
-            println!("raw pairing {:?}", public_key.len());
-        
-            manager.builder()
-                .post()
-                .path("/pair-setup".to_string())
-                .content_type("application/octet-stream".to_string())
-                .body(public_key.to_vec())
-                .write(&mut write_half).await?;
+         
 
-            let req = RtspResponse::read(&mut buf_reader).await?;
-
-            req.is_ok()?;
-
-            println!("asd: {:?}", req);
         }
 
 
