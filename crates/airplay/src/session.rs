@@ -116,7 +116,7 @@ impl CastSession for AirPlaySession {
 
 
 
-        let device_config = device.capabilities.airplay_config.expect("Ferricast airplay discovery bug"); 
+        let device_config = device.capabilities.airplay_config.clone().expect("Ferricast airplay discovery bug"); 
 
 
         let pair_challange = PairingChallenge::new_airplay(device_config.flags, &device_config.features);

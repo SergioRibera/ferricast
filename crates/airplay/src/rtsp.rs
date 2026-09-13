@@ -92,6 +92,11 @@ impl RtspReqBuilder {
 
         self
     }
+    pub fn headers(mut self, headers: &[(String, String)]) -> Self {
+        self.headers.extend_from_slice(headers);
+
+        self
+    }
     pub async fn write<T: AsyncWriteExt + Unpin>(self, writer: &mut T) -> Result<(), FerricastError> {
         let mut a = format!("{:?} {} RTSP/1.0\r\nCSeq: {}\r\n", self.method, self.path, self.cseq);
 
