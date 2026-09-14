@@ -3,6 +3,15 @@ use std::collections::HashMap;
 use byteorder::WriteBytesExt;
 use ferricast_core::FerricastError;
 
+pub const TLV_TYPE_STATE: u8 = 6;
+pub const TLV_TYPE_METHOD: u8 = 0;
+pub const TLV_TYPE_FLAGS: u8 = 0x13;
+
+pub const TLV_TYPE_SALT: u8 = 0x2;
+pub const TLV_TYPE_PUBLIC_KEY: u8 = 0x3;
+pub const TLV_TYPE_PROOF: u8 = 0x04;
+
+pub const TLV_TYPE_ERROR: u8 = 0x7;
 
 pub fn encode(items: Vec<(u8, &[u8])>) -> Result<Vec<u8>, FerricastError> {
     let mut bytes = Vec::new();
@@ -49,7 +58,7 @@ pub fn decode(bytes: &[u8]) -> Result<HashMap<u8, Vec<u8>>, FerricastError> {
         offset += 2 + data_len;
     }
 
-    if let Some(err_code) = result.get(&7) {
+    if let Some(err_code) = result.get(&TLV_TYPE_ERROR) {
         return Err(FerricastError::Tlv(format!("Airplay device send error, with code {:?}", err_code)));
     }
 

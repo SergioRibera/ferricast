@@ -1920,6 +1920,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "chacha20poly1305",
+ "cipher 0.5.2",
  "ctr 0.10.1",
  "easy-srp",
  "ed25519-dalek",
