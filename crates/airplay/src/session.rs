@@ -24,15 +24,7 @@ use ferricast_core::{
 use crate::rtsp::{RtspManager, RtspResponse};
 use crate::tlv;
 
-const TLV_TYPE_STATE: u8 = 6;
-const TLV_TYPE_METHOD: u8 = 0;
-const TLV_TYPE_FLAGS: u8 = 0x13;
 
-const TLV_TYPE_SALT: u8 = 0x2;
-const TLV_TYPE_PUBLIC_KEY: u8 = 0x3;
-const TLV_TYPE_PROOF: u8 = 0x04;
-
-const TLV_TYPE_ERROR: u8 = 0x7;
 
 
 const TLV_FLAGS_TRANSIENT: [u8; 4] = 0x00000010_u32.to_le_bytes();
@@ -133,7 +125,7 @@ impl CastSession for AirPlaySession {
                     FerricastError::Connection(format!("Cannot connect to AirPlay device: {e}"))
                 })?;
 
-        let manager = RtspManager::new(device_config.features);
+        let mut manager = RtspManager::new(device_config.features);
                 
         let (read_half, mut write_half) = socket.split();
         let mut buf_reader = BufReader::new(read_half);
@@ -148,6 +140,9 @@ impl CastSession for AirPlaySession {
 
         }
 
+
+        crate::pair::pin_pair::pair_pin(&pair_challange, &mut manager, &mut write_half, &mut buf_reader)
+            .await?;
 
 
 

@@ -59,7 +59,7 @@ pub fn decode(bytes: &[u8]) -> Result<HashMap<u8, Vec<u8>>, FerricastError> {
     }
 
     if let Some(err_code) = result.get(&TLV_TYPE_ERROR) {
-        return Err(FerricastError::Tlv(format!("Airplay device send error, with code {:?}", err_code)));
+        return Err(FerricastError::Tlv(format!("Airplay device send an error, with code {:?}", err_code)));
     }
 
     Ok(result)

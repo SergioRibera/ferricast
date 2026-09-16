@@ -3,17 +3,16 @@ use cipher::StreamCipherSeek;
 use ctr::Ctr128BE;
 use ed25519_dalek::{Signature, VerifyingKey, ed25519::signature::SignerMut};
 use sha2::{Digest, Sha512};
-use tokio::net::TcpStream;
+use tokio::{io::BufReader, net::tcp::{ReadHalf, WriteHalf}};
 
 use ferricast_core::{FerricastError, device::Features};
 use rand::rngs::OsRng;
-use tokio::io::{BufReader, WriteHalf};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::rtsp::{RtspManager, RtspResponse};
 
 
-pub async fn raw_pair(features: &Features, pk: &[u8], manager: &mut RtspManager, write_half: &mut WriteHalf<TcpStream>, buf_reader: &mut BufReader<TcpStream>) -> Result<(), FerricastError> { 
+pub async fn raw_pair(features: &Features, pk: &[u8], manager: &mut RtspManager, write_half: &mut WriteHalf<'_>, buf_reader: &mut BufReader<ReadHalf<'_>>) -> Result<(), FerricastError> { 
     let mut csprng = OsRng; 
     let mut signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
 
