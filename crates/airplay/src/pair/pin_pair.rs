@@ -62,7 +62,7 @@ pub async fn pair_pin(challenge: &PairingChallenge, manager: &mut RtspManager, w
         std::io::stdin().read(&mut b)?;
 
         // TODO(Juanperias): Remove this unwrap  
-        pin = String::from_utf8(b).unwrap().;
+        pin = String::from_utf8(b).unwrap().trim().to_string();
     }
 
     pin_pair_setup(signing_key, &ed_public_key, manager, write_half, buf_reader, pin).await?;
@@ -143,8 +143,8 @@ pub async fn pin_pair_setup(signing_key: ed25519_dalek::SigningKey, client_publi
             let x = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &x_hash); 
         
 
-            let pad_n = pad_to(g_2048.to_bytes_be().1, 384);
-            let pad_g = pad_to(n_2048.to_bytes_be().1, 384);
+            let pad_n = pad_to(n_2048.to_bytes_be().1, 384);
+            let pad_g = pad_to(g_2048.to_bytes_be().1, 384);
 
 
             let mut k_input = Vec::new();
@@ -211,7 +211,7 @@ pub async fn pin_pair_setup(signing_key: ed25519_dalek::SigningKey, client_publi
 
             let mut h_xor = vec![0_u8; 64];
 
-            for i in 0..63 {
+            for i in 0..64 {
                 h_xor[i] = hn_hash[i] ^ hg_hash[i];
             }
 
