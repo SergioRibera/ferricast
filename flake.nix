@@ -104,6 +104,8 @@
           packages = with pkgs; [
             cargo
             rustc
+	    rustfmt
+	    rust-analyzer
 
             cargo-dist
             cargo-release

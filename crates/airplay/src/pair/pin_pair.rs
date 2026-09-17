@@ -62,7 +62,7 @@ pub async fn pair_pin(challenge: &PairingChallenge, manager: &mut RtspManager, w
         std::io::stdin().read(&mut b)?;
 
         // TODO(Juanperias): Remove this unwrap  
-        pin = String::from_utf8(b).unwrap();
+        pin = String::from_utf8(b).unwrap().;
     }
 
     pin_pair_setup(signing_key, &ed_public_key, manager, write_half, buf_reader, pin).await?;
@@ -72,7 +72,7 @@ pub async fn pair_pin(challenge: &PairingChallenge, manager: &mut RtspManager, w
 }
 
 pub async fn pin_pair_setup(signing_key: ed25519_dalek::SigningKey, client_public_key: &[u8], manager: &mut RtspManager, write_half: &mut WriteHalf<'_>, buf_reader: &mut BufReader<ReadHalf<'_>>, pin: String) -> Result<(), FerricastError> {
-    println!("{}", pin);
+    println!("{:?}", pin);
 
 
     let m1 = tlv::encode(vec![
