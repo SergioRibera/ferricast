@@ -1,7 +1,7 @@
-use std::io::Write;
-use std::collections::HashMap;
 use byteorder::WriteBytesExt;
 use ferricast_core::FerricastError;
+use std::collections::HashMap;
+use std::io::Write;
 
 pub const TLV_TYPE_STATE: u8 = 6;
 pub const TLV_TYPE_METHOD: u8 = 0;
@@ -26,18 +26,17 @@ pub fn encode(items: Vec<(u8, &[u8])>) -> Result<Vec<u8>, FerricastError> {
         while !value.is_empty() {
             let chunk_len = std::cmp::min(value.len(), 255);
             let (chunk, rest) = value.split_at(chunk_len);
-            
+
             bytes.write_u8(tag)?;
             bytes.write_u8(chunk_len as u8)?;
-            bytes.write_all(chunk)?; 
-            
+            bytes.write_all(chunk)?;
+
             value = rest;
         }
     }
 
     Ok(bytes)
 }
-
 
 pub fn decode(bytes: &[u8]) -> Result<HashMap<u8, Vec<u8>>, FerricastError> {
     let mut result: HashMap<u8, Vec<u8>> = HashMap::new();
@@ -59,9 +58,11 @@ pub fn decode(bytes: &[u8]) -> Result<HashMap<u8, Vec<u8>>, FerricastError> {
     }
 
     if let Some(err_code) = result.get(&TLV_TYPE_ERROR) {
-        return Err(FerricastError::Tlv(format!("Airplay device send an error, with code {:?}", err_code)));
+        return Err(FerricastError::Tlv(format!(
+            "Airplay device send an error, with code {:?}",
+            err_code
+        )));
     }
 
     Ok(result)
 }
-

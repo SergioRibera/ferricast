@@ -575,10 +575,18 @@ impl ChromecastSession {
         let sink = match port_range {
             Some((start, end)) => {
                 let listener = bind_in_range(start, end).await?;
-                HlsFrameSink::start_on_listener(listener, frame_rx, audio_rx, parameter_sets, hls_config).await?
+                HlsFrameSink::start_on_listener(
+                    listener,
+                    frame_rx,
+                    audio_rx,
+                    parameter_sets,
+                    hls_config,
+                )
+                .await?
             }
             None => {
-                HlsFrameSink::start("0.0.0.0:0", frame_rx, audio_rx, parameter_sets, hls_config).await?
+                HlsFrameSink::start("0.0.0.0:0", frame_rx, audio_rx, parameter_sets, hls_config)
+                    .await?
             }
         };
         let local_addr = sink.local_addr();

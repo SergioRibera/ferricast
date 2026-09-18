@@ -1,5 +1,7 @@
 use bytes::Bytes;
-use ferricast_core::{AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame, FerricastError, Result};
+use ferricast_core::{
+    AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame, FerricastError, Result,
+};
 use opus_rs::{Application, OpusEncoder as RawEncoder};
 
 // 20 ms at 48 kHz — valid for Hybrid mode (frame_rate = 50).
@@ -113,10 +115,8 @@ impl AudioEncoder for OpusEncoder {
             self.pcm_buf.drain(..samples_per_frame);
 
             if n > 0 {
-                let pts_offset_us = self
-                    .samples_emitted
-                    .saturating_mul(1_000_000)
-                    / self.sample_rate.max(1) as u64;
+                let pts_offset_us =
+                    self.samples_emitted.saturating_mul(1_000_000) / self.sample_rate.max(1) as u64;
                 let timestamp_us = self
                     .pts_anchor_us
                     .unwrap_or(0)
@@ -128,8 +128,7 @@ impl AudioEncoder for OpusEncoder {
                     sample_rate: self.sample_rate,
                     channels: self.channels,
                 });
-                self.samples_emitted =
-                    self.samples_emitted.saturating_add(FRAME_SAMPLES as u64);
+                self.samples_emitted = self.samples_emitted.saturating_add(FRAME_SAMPLES as u64);
             }
         }
         Ok(())

@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::net::IpAddr;
-use std::fmt::Display;
 use bytes::Bytes;
+use std::collections::HashMap;
+use std::fmt::Display;
+use std::net::IpAddr;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,11 +85,9 @@ pub struct DeviceCapabilities {
     /// 1st/2nd-gen (`md=Chromecast`) — older firmware may refuse OFFER
     /// from non-Chrome senders; fall back to HLS for those.
     pub supports_cast_streaming: bool,
-    /// This only will have a value if the protocol is cast, other protocols just use None 
+    /// This only will have a value if the protocol is cast, other protocols just use None
     pub airplay_config: Option<AirplayConfig>,
 }
-
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AirplayConfig {
@@ -153,9 +151,13 @@ pub const AIRPLAY_PAIR_ERR: u8 = 0;
 
 impl Features {
     pub fn support_moddern_pairing(&self) -> bool {
-        let core_utils = self.contains(Features::CORE_UTILS_PAIRING_AND_ENCRYPTION) || self.contains(Features::SYSTEM_PAIRING) || self.contains(Features::HK_PAIRING_AND_ACCESS_CONTROL) || self.contains(Features::TRANSIENT_PAIRING);
+        let core_utils = self.contains(Features::CORE_UTILS_PAIRING_AND_ENCRYPTION)
+            || self.contains(Features::SYSTEM_PAIRING)
+            || self.contains(Features::HK_PAIRING_AND_ACCESS_CONTROL)
+            || self.contains(Features::TRANSIENT_PAIRING);
 
-        let third_party = self.contains(Features::HAS_UNIFIED_ADVERTISER_INFO) || self.contains(Features::UNIFIED_PAIR_SETUP_MFI);
+        let third_party = self.contains(Features::HAS_UNIFIED_ADVERTISER_INFO)
+            || self.contains(Features::UNIFIED_PAIR_SETUP_MFI);
 
         core_utils && !third_party
     }

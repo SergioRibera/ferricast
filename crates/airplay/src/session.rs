@@ -17,15 +17,12 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use ferricast_core::{
-    CastSession, Codec, ConnectOutcome, Device, EncodedFrame, FerricastError,
-    PairingChallenge, PairingResponse, Result, StreamConfig,
+    CastSession, Codec, ConnectOutcome, Device, EncodedFrame, FerricastError, PairingChallenge,
+    PairingResponse, Result, StreamConfig,
 };
 
 use crate::rtsp::{RtspManager, RtspResponse};
 use crate::tlv;
-
-
-
 
 const TLV_FLAGS_TRANSIENT: [u8; 4] = 0x00000010_u32.to_le_bytes();
 
@@ -82,7 +79,7 @@ impl Default for AirPlaySession {
             alive: Default::default(),
             frame_counter: Default::default(),
             pending_conn: None,
-            features: None
+            features: None,
         }
     }
 }
@@ -106,48 +103,47 @@ impl CastSession for AirPlaySession {
             return Err(FerricastError::SessionAlreadyActive(device.name.clone()));
         }
 
+        let device_config = device
+            .capabilities
+            .airplay_config
+            .clone()
+            .expect("Ferricast airplay discovery bug");
 
-
-        let device_config = device.capabilities.airplay_config.clone().expect("Ferricast airplay discovery bug"); 
-
-
-        let pair_challange = PairingChallenge::new_airplay(device_config.flags, &device_config.features);
+        let pair_challange =
+            PairingChallenge::new_airplay(device_config.flags, &device_config.features);
 
         println!("{:?}", pair_challange);
 
-
         info!(addr = %device.addr, port = device.port, "connecting to AirPlay device");
 
-        let mut socket =
-            TcpStream::connect((device.addr, device.port))
-                .await
-                .map_err(|e| {
-                    FerricastError::Connection(format!("Cannot connect to AirPlay device: {e}"))
-                })?;
+        let mut socket = TcpStream::connect((device.addr, device.port))
+            .await
+            .map_err(|e| {
+                FerricastError::Connection(format!("Cannot connect to AirPlay device: {e}"))
+            })?;
 
         let mut manager = RtspManager::new(device_config.features);
-                
+
         let (read_half, mut write_half) = socket.split();
         let mut buf_reader = BufReader::new(read_half);
 
-
-
-
-        if device_config.features.support_moddern_pairing() && device_config.features.supports_transient_pairing() {
+        if device_config.features.support_moddern_pairing()
+            && device_config.features.supports_transient_pairing()
+        {
             println!("transient pairing")
         } else {
-         
-
         }
 
-
-        crate::pair::pin_pair::pair_pin(&pair_challange, &mut manager, &mut write_half, &mut buf_reader)
-            .await?;
-
-
+        crate::pair::pin_pair::pair_pin(
+            &pair_challange,
+            &mut manager,
+            &mut write_half,
+            &mut buf_reader,
+        )
+        .await?;
 
         {
-              /*
+            /*
 
             let (read_half, mut write_half) = socket.split();
             let mut buf_reader = BufReader::new(read_half);
@@ -177,7 +173,7 @@ impl CastSession for AirPlaySession {
 
                 info!("Asking for Pin");
 
-            }   
+            }
             */
 
             let mut pin = String::new();
@@ -208,7 +204,7 @@ impl CastSession for AirPlaySession {
                 (TLV_TYPE_STATE, &[1]),
                // (TLV_TYPE_FLAGS, &TLV_FLAGS_TRANSIENT),
             ])?;
-            
+
             manager
                 .builder()
                 .path("/pair-setup".to_string())
@@ -219,11 +215,11 @@ impl CastSession for AirPlaySession {
                 .await?;
 
 
-            
+
 
             let res = RtspResponse::read(&mut buf_reader).await?;
 
-            
+
             res.is_ok()?;
 
 
@@ -246,8 +242,8 @@ impl CastSession for AirPlaySession {
 
             let client_a = client_wf.step1()
                 .map_err(|e| FerricastError::Protocol(format!("SRP error {:?}", e)))?;
-            
-    
+
+
 
             let step_3 = client_wf.step3(ClientStep3Params {
                 client_a: &client_a.client_public_a,
@@ -259,7 +255,7 @@ impl CastSession for AirPlaySession {
 
             let padded_public_key = pad_to(client_a.client_public_a, 384);
 
-    
+
             let m1_proof_sha = &step_3.proof();
 
             let m3 = tlv::encode(vec![
@@ -294,14 +290,14 @@ impl CastSession for AirPlaySession {
             let inner_hash = sha2::Sha512::digest(format!("Pair-Setup:{pin}").as_bytes());
 
             let mut x_input = Vec::new();
-            
+
             x_input.extend_from_slice(server_salt);
             x_input.extend_from_slice(&inner_hash);
 
             let x_hash = sha2::Sha512::digest(&x_input);
 
-            let x = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &x_hash); 
-        
+            let x = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &x_hash);
+
             let g_2048 = BigInt::new(num_bigint::Sign::Plus, vec![5]);
 
             let n_2048 = BigInt::new(num_bigint::Sign::Plus, vec![
@@ -319,14 +315,14 @@ impl CastSession for AirPlaySession {
                     0x7767A13D,
                     0xD52312AB,
                     0x4B03310D,
-                    0xCD7F48A9, 
+                    0xCD7F48A9,
                     0xDA04FD50,
                     0xE8083969,
                     0xEDB767B0,
                     0xCF609517,
                     0x9A163AB3,
                     0x661A05FB,
-                    0xD5FAAAE8, 
+                    0xD5FAAAE8,
                     0x2918A996,
                     0x2F0B93B8,
                     0x55F97993,
@@ -354,11 +350,11 @@ impl CastSession for AirPlaySession {
                     0x61602790,
                     0x04E57AE6,
                     0xAF874E73,
-                    0x03CE5329, 
+                    0x03CE5329,
                     0x9CCC041C,
                     0x7BC308D8,
                     0x2A5698F3,
-                    0xA8D0C382, 
+                    0xA8D0C382,
                     0x71AE35F8,
                     0xE9DBFBB6,
                     0x94B5C803,
@@ -394,10 +390,10 @@ impl CastSession for AirPlaySession {
             use num_traits::Zero;
 
             if a.is_zero() {
-                a = BigInt::from(1u32);   
+                a = BigInt::from(1u32);
             }
 
-            
+
             let A = g_2048.modpow(&a, &n_2048);
 
             let client_public = A.to_bytes_be();
@@ -416,7 +412,7 @@ impl CastSession for AirPlaySession {
             u_input.extend(pad_to(server_public, 384));
 
             let u_hash = Sha512::digest(&u_input);
-            
+
             let u = BigInt::from_bytes_be(Sign::Plus, &u_hash);
 
             let gx = g_2048.modpow(&x, &n_2048);
@@ -432,7 +428,7 @@ impl CastSession for AirPlaySession {
             let exp = u * x + a;
 
             let S = diff.modpow(&exp, &n_2048);
-        
+
             let K = Sha512::digest(S.to_bytes_be().1);
 
             let hn_hash = Sha512::digest(n_2048.to_bytes_be().1);
@@ -447,7 +443,7 @@ impl CastSession for AirPlaySession {
             let hu_hash = Sha512::digest("Pair-Setup");
 
             let mut proof_input = Vec::new();
-            
+
             proof_input.extend(h_xor);
             proof_input.extend_from_slice(&hu_hash);
             proof_input.extend_from_slice(server_salt);
@@ -457,7 +453,7 @@ impl CastSession for AirPlaySession {
 
             let m1_proof = Sha512::digest(&proof_input);
 
-            
+
             let m3 = tlv::encode(vec![
                 (TLV_TYPE_STATE, &[0x03_u8]),
                 (TLV_TYPE_PUBLIC_KEY, &pad_to(client_public.1, 384)),
@@ -482,7 +478,6 @@ impl CastSession for AirPlaySession {
             println!("{:?}", m4);
 
             */
-
         }
 
         self.features = Some(device_config.features);
@@ -490,7 +485,7 @@ impl CastSession for AirPlaySession {
         self.state = SessionState::AwaitingPin;
 
         info!("AirPlay pair-pin-start sent; waiting for user PIN");
-    
+
         Ok(ConnectOutcome::Ready)
         /*Ok(ConnectOutcome::PairingRequired(PairingChallenge::Pin {
             digits: 4,
@@ -509,7 +504,7 @@ impl CastSession for AirPlaySession {
             PairingResponse::Confirmed => {
                 return Err(FerricastError::Protocol(
                     "AirPlay pairing expects a PIN, got Confirmed".into(),
-                ))
+                ));
             }
         };
 
@@ -517,9 +512,10 @@ impl CastSession for AirPlaySession {
             FerricastError::Protocol("submit_pairing called without a pending connection".into())
         })?;
 
-        let manager = RtspManager::new(self.features.ok_or_else(|| {
-            FerricastError::Protocol("No features".into())
-        })?);
+        let manager = RtspManager::new(
+            self.features
+                .ok_or_else(|| FerricastError::Protocol("No features".into()))?,
+        );
 
         {
             let (read_half, mut write_half) = socket.split();
@@ -648,15 +644,14 @@ fn random_string(len: usize) -> String {
     string
 }
 
-
 fn pad_to(data: Vec<u8>, size: usize) -> Vec<u8> {
     if data.len() >= size {
         return data;
     }
 
-    let mut padded = vec![0_u8; size]; 
+    let mut padded = vec![0_u8; size];
 
-    padded[size-data.len()..].copy_from_slice(&data);
+    padded[size - data.len()..].copy_from_slice(&data);
 
     padded
 }

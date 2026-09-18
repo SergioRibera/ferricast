@@ -1,9 +1,8 @@
-pub(crate) mod rtsp;
-pub(crate) mod tlv;
-pub mod pair;
 pub mod discovery;
+pub mod pair;
+pub(crate) mod rtsp;
 pub mod session;
-
+pub(crate) mod tlv;
 
 pub(crate) const AIRPLAY_TIMEOUT: Duration = Duration::from_secs(5);
 

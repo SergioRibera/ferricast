@@ -36,9 +36,9 @@ pub use frame::{
     PixelFormat, RawFrame,
 };
 pub use net::{bind_in_range, bind_udp_in_range, local_addr_for};
+pub use pairing::{PairingChallenge, PairingResponse};
 pub use protocol::{Codec, ProtocolHandler, ReceiverProtocol};
 pub use puller::{AudioStreamInfo, MediaInfo, MediaPacket, MediaPuller, PullSpec, VideoStreamInfo};
-pub use pairing::{PairingChallenge, PairingResponse};
 pub use session::{AudioStreamConfig, CastSession, ConnectOutcome, StreamConfig};
 pub use sink::FrameSink;
 pub use source::{

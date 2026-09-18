@@ -349,8 +349,7 @@ impl CastSession for ChromecastMirrorSession {
         )
         .await?;
 
-        let heartbeat_handle =
-            tokio::spawn(mirror_heartbeat_loop(writer.clone(), alive.clone()));
+        let heartbeat_handle = tokio::spawn(mirror_heartbeat_loop(writer.clone(), alive.clone()));
 
         self.h264_profile = device.capabilities.max_h264_profile;
         self.state = Some(ConnectedState {
@@ -500,9 +499,9 @@ impl CastSession for ChromecastMirrorSession {
             Some((start, end)) => bind_udp_in_range(start, end).await.map_err(|e| {
                 FerricastError::Connection(format!("bind cast streaming UDP in range: {e}"))
             })?,
-            None => UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
-                FerricastError::Connection(format!("bind cast streaming UDP: {e}"))
-            })?,
+            None => UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| FerricastError::Connection(format!("bind cast streaming UDP: {e}")))?,
         };
         socket
             .connect(peer_udp)
@@ -580,9 +579,17 @@ impl CastSession for ChromecastMirrorSession {
         let n_pkts = chunks.len();
         let max_packet_id = (n_pkts.saturating_sub(1)) as u16;
 
-        debug!(frame_id = stream.video_frame_id, n_pkts, data_len = data.len(), keyframe = frame.is_keyframe, "mirror: send_frame");
+        debug!(
+            frame_id = stream.video_frame_id,
+            n_pkts,
+            data_len = data.len(),
+            keyframe = frame.is_keyframe,
+            "mirror: send_frame"
+        );
         if frame.is_keyframe && stream.video_frame_id == 0 {
-            let preview: String = data.iter().take(32)
+            let preview: String = data
+                .iter()
+                .take(32)
                 .map(|b| format!("{b:02x}"))
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -602,7 +609,11 @@ impl CastSession for ChromecastMirrorSession {
 
             // Log IV and encrypted payload for the very first packet ever sent.
             if stream.video_frame_id == 0 && packet_id == 0 {
-                let iv_hex: String = iv.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                let iv_hex: String = iv
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let ssrc_le = stream.video_ssrc.to_le_bytes();
                 let ssrc_be = stream.video_ssrc.to_be_bytes();
                 debug!(
@@ -620,13 +631,17 @@ impl CastSession for ChromecastMirrorSession {
                     use ctr::Ctr128BE;
                     Ctr128BE::<Aes128>::new((&stream.video_aes_key).into(), iv.as_slice().into())
                         .apply_keystream(&mut sample);
-                    let enc_hex: String = sample.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                    let enc_hex: String = sample
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     debug!(first16_encrypted = %enc_hex, "mirror: first 16 encrypted bytes of first packet");
                 }
             }
 
-            let reference_frame_id = (!frame.is_keyframe)
-                .then(|| stream.video_frame_id.wrapping_sub(1));
+            let reference_frame_id =
+                (!frame.is_keyframe).then(|| stream.video_frame_id.wrapping_sub(1));
             let pkt = cast_rtp_video_packet(
                 stream.video_seq,
                 ts,
@@ -1245,7 +1260,9 @@ async fn maybe_send_rtcp_sr(stream: &mut MirrorStreamState) {
 /// Used for the first audio packet so the Cast receiver gets audio
 /// timing before its jitter buffer starts draining.
 async fn send_audio_rtcp_sr(stream: &mut MirrorStreamState) {
-    let Some(ssrc) = stream.audio_ssrc else { return };
+    let Some(ssrc) = stream.audio_ssrc else {
+        return;
+    };
     let (ntp_sec, ntp_frac) = system_time_ntp();
     let audio_sr = rtcp_sr(
         ssrc,
@@ -1274,15 +1291,15 @@ async fn send_audio_rtcp_sr(stream: &mut MirrorStreamState) {
 /// the video surface black even though it's receiving RTP packets.
 fn rtcp_xr_dlrr(our_ssrc: u32, receiver_ssrc: u32, lrr: u32, dlrr: u32) -> [u8; 24] {
     let mut pkt = [0u8; 24];
-    pkt[0] = 0x80;        // V=2 P=0 reserved=0
-    pkt[1] = RTCP_PT_XR;  // PT=207
+    pkt[0] = 0x80; // V=2 P=0 reserved=0
+    pkt[1] = RTCP_PT_XR; // PT=207
     pkt[2] = 0;
-    pkt[3] = 5;            // length = (24/4)−1 = 5
+    pkt[3] = 5; // length = (24/4)−1 = 5
     pkt[4..8].copy_from_slice(&our_ssrc.to_be_bytes());
-    pkt[8] = 5;            // BT=5 (DLRR)
-    pkt[9] = 0;            // reserved
+    pkt[8] = 5; // BT=5 (DLRR)
+    pkt[9] = 0; // reserved
     pkt[10] = 0;
-    pkt[11] = 3;           // block length = 3 words = 12 bytes (one DLRR sub-block)
+    pkt[11] = 3; // block length = 3 words = 12 bytes (one DLRR sub-block)
     pkt[12..16].copy_from_slice(&receiver_ssrc.to_be_bytes());
     pkt[16..20].copy_from_slice(&lrr.to_be_bytes());
     pkt[20..24].copy_from_slice(&dlrr.to_be_bytes());
@@ -1305,8 +1322,8 @@ fn parse_rtcp_xr_rrt(pkt: &[u8]) -> Option<(u32, u32, u32)> {
             break;
         }
         if bt == 4 && block_len == 2 {
-            let ntp_sec  = u32::from_be_bytes(pkt[offset+4..offset+8].try_into().ok()?);
-            let ntp_frac = u32::from_be_bytes(pkt[offset+8..offset+12].try_into().ok()?);
+            let ntp_sec = u32::from_be_bytes(pkt[offset + 4..offset + 8].try_into().ok()?);
+            let ntp_frac = u32::from_be_bytes(pkt[offset + 8..offset + 12].try_into().ok()?);
             return Some((sender_ssrc, ntp_sec, ntp_frac));
         }
         offset = block_end;
@@ -1342,12 +1359,15 @@ async fn rtcp_recv_task(
         match socket.recv_from(&mut buf).await {
             Ok((n, src)) => {
                 let pkt = &buf[..n];
-                let hex_preview: String = pkt.iter().take(16)
+                let hex_preview: String = pkt
+                    .iter()
+                    .take(16)
                     .map(|b| format!("{b:02x}"))
                     .collect::<Vec<_>>()
                     .join(" ");
                 let pt = pkt.get(1).copied().unwrap_or(0);
-                let is_xr_rrt = pkt.len() >= 12 && pt == RTCP_PT_XR && pkt.get(8).copied() == Some(4);
+                let is_xr_rrt =
+                    pkt.len() >= 12 && pt == RTCP_PT_XR && pkt.get(8).copied() == Some(4);
                 if !is_xr_rrt {
                     debug!(n, pt, %src, first_bytes = %hex_preview, "mirror: RTCP non-XR-RRT from Chromecast");
                 } else {
@@ -1384,4 +1404,3 @@ async fn rtcp_recv_task(
         }
     }
 }
-

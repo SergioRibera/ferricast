@@ -407,7 +407,9 @@ impl SourceEnumerator for WaylandSourceEnumerator {
         std::thread::Builder::new()
             .name("ferricast-wl-thumb".into())
             .spawn(move || {
-                let _ = tx.send(crate::wayland_thumb::monitor_png(&id, max_width, max_height));
+                let _ = tx.send(crate::wayland_thumb::monitor_png(
+                    &id, max_width, max_height,
+                ));
             })
             .map_err(|e| SourceError::Backend(format!("spawn: {e}")))?;
         rx.await

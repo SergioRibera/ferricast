@@ -1,11 +1,12 @@
 use std::{collections::HashMap, sync::atomic::AtomicU64, time::Duration};
 
 use ferricast_core::{FerricastError, device::Features};
-use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, time::timeout};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    time::timeout,
+};
 
 use crate::AIRPLAY_TIMEOUT;
-
-
 
 pub struct RtspManager(AtomicU64, Features);
 
@@ -20,26 +21,32 @@ impl RtspManager {
     }
 }
 
-
 pub struct RtspReqBuilder {
     cseq: u64,
     method: Method,
     path: String,
     content_type: String,
     body: Vec<u8>,
-    headers: Vec<(String, String)>
+    headers: Vec<(String, String)>,
 }
 
 fn req_headers(features: &Features) -> Vec<(String, String)> {
     if features.prefers_legacy_pairing() {
-        return vec![
-            ("X-Apple-HKP".to_string(), features.pair_effective().to_string()),
-        ];
+        return vec![(
+            "X-Apple-HKP".to_string(),
+            features.pair_effective().to_string(),
+        )];
     }
 
     return vec![
-        ("X-Apple-HKP".to_string(), features.pair_effective().to_string()),
-        ("X-Apple-Client-Name".to_string(), "Ferricast Client".to_string())
+        (
+            "X-Apple-HKP".to_string(),
+            features.pair_effective().to_string(),
+        ),
+        (
+            "X-Apple-Client-Name".to_string(),
+            "Ferricast Client".to_string(),
+        ),
     ];
 }
 
@@ -52,8 +59,8 @@ impl RtspReqBuilder {
             content_type: String::new(),
             body: Vec::new(),
             headers: req_headers(features),
-        } 
-    } 
+        }
+    }
     pub fn path(mut self, path: String) -> Self {
         self.path = path;
 
@@ -80,8 +87,8 @@ impl RtspReqBuilder {
         self
     }
     pub fn body(mut self, body: Vec<u8>) -> Self {
-        self.headers.push(("Content-Length".to_string(), body.len().to_string()));
-
+        self.headers
+            .push(("Content-Length".to_string(), body.len().to_string()));
 
         self.body = body;
 
@@ -97,8 +104,14 @@ impl RtspReqBuilder {
 
         self
     }
-    pub async fn write<T: AsyncWriteExt + Unpin>(self, writer: &mut T) -> Result<(), FerricastError> {
-        let mut a = format!("{:?} {} RTSP/1.0\r\nCSeq: {}\r\n", self.method, self.path, self.cseq);
+    pub async fn write<T: AsyncWriteExt + Unpin>(
+        self,
+        writer: &mut T,
+    ) -> Result<(), FerricastError> {
+        let mut a = format!(
+            "{:?} {} RTSP/1.0\r\nCSeq: {}\r\n",
+            self.method, self.path, self.cseq
+        );
 
         if !self.content_type.is_empty() {
             a.push_str(format!("Content-Type: {}\r\n", self.content_type).as_str());
@@ -131,29 +144,28 @@ pub enum Method {
     OPTIONS,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct RtspResponse {
     status_line: StatusLine,
     headers: HashMap<String, String>,
-    pub content: Option<Vec<u8>>
+    pub content: Option<Vec<u8>>,
 }
 
 impl RtspResponse {
-    pub async fn read<T: AsyncReadExt + Unpin>(buf: &mut BufReader<T>) -> Result<Self, FerricastError> {
+    pub async fn read<T: AsyncReadExt + Unpin>(
+        buf: &mut BufReader<T>,
+    ) -> Result<Self, FerricastError> {
         let mut status_line: Option<StatusLine> = None;
         let mut headers: HashMap<String, String> = HashMap::new();
 
-        
-
-
         loop {
-            let mut line = String::new();        
-    
+            let mut line = String::new();
+
             match timeout(AIRPLAY_TIMEOUT, buf.read_line(&mut line))
                 .await
-                .map_err(|_| FerricastError::Rtsp("Timeout reading RTSP response".to_string()))? {
-                Ok(0) => break, 
+                .map_err(|_| FerricastError::Rtsp("Timeout reading RTSP response".to_string()))?
+            {
+                Ok(0) => break,
                 Ok(_) => {
                     if line == "\r\n" {
                         break;
@@ -167,50 +179,58 @@ impl RtspResponse {
                     if let Some((name, value)) = line.split_once(':') {
                         headers.insert(name.trim().to_string(), value.trim().to_string());
                     } else {
-                       return Err(FerricastError::Rtsp("Invalid RTSP header format".to_string())); 
+                        return Err(FerricastError::Rtsp(
+                            "Invalid RTSP header format".to_string(),
+                        ));
                     }
-
-                },
+                }
                 Err(_) => break,
             }
         }
 
-        let content = { 
+        let content = {
             if let Some(v) = headers.get("Content-Length") {
-                let len = v.parse::<usize>()
-                    .map_err(|_| FerricastError::Rtsp("Invalid Content-Length Header".to_string()))?;
+                let len = v.parse::<usize>().map_err(|_| {
+                    FerricastError::Rtsp("Invalid Content-Length Header".to_string())
+                })?;
 
-
-                
                 let mut content = vec![0_u8; len];
 
                 timeout(AIRPLAY_TIMEOUT, buf.read(&mut content))
                     .await
-                    .map_err(|_| FerricastError::Rtsp("Timeout reading RTSP response content".to_string()))??;
+                    .map_err(|_| {
+                        FerricastError::Rtsp("Timeout reading RTSP response content".to_string())
+                    })??;
 
                 Some(content)
             } else {
                 None
-            } 
+            }
         };
 
+        let status_line =
+            status_line.ok_or(FerricastError::Rtsp("Invalid RTSP Response".to_string()))?;
 
-        
-        let status_line = status_line.ok_or(FerricastError::Rtsp("Invalid RTSP Response".to_string()))?;
-
-        Ok(Self { status_line, headers, content })
+        Ok(Self {
+            status_line,
+            headers,
+            content,
+        })
     }
     pub fn content(&self) -> Result<&Vec<u8>, FerricastError> {
-        self.content
-            .as_ref()
-            .ok_or(FerricastError::Rtsp("Response does not contains a body".to_string()))
+        self.content.as_ref().ok_or(FerricastError::Rtsp(
+            "Response does not contains a body".to_string(),
+        ))
     }
     pub fn is_ok(&self) -> Result<(), FerricastError> {
         if self.is_success() {
             return Ok(());
         }
 
-        Err(FerricastError::Rtsp(format!("RTSP Response failed with code {}", self.status_line.status_code)))
+        Err(FerricastError::Rtsp(format!(
+            "RTSP Response failed with code {}",
+            self.status_line.status_code
+        )))
     }
 
     pub fn is_success(&self) -> bool {
@@ -234,11 +254,17 @@ impl StatusLine {
             return Err(FerricastError::Rtsp("Invalid Rtsp version".to_string()));
         }
 
-        let status_code = splited.next().unwrap_or_default().parse::<u16>()
+        let status_code = splited
+            .next()
+            .unwrap_or_default()
+            .parse::<u16>()
             .map_err(|e| FerricastError::Rtsp(format!("Invalid status code, {e}")))?;
 
         let description = splited.next().unwrap_or_default().to_string();
 
-        Ok(Self { status_code, description })
+        Ok(Self {
+            status_code,
+            description,
+        })
     }
 }

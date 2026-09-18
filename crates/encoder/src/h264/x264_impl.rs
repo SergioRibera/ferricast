@@ -299,7 +299,7 @@ mod tests {
 
     fn black_bgra_frame(width: u32, height: u32) -> CapturedFrame {
         let mut buf = vec![0u8; (width * height * 4) as usize];
-        
+
         for px in buf.chunks_exact_mut(4) {
             px[3] = 0xff; // opaque alpha; BGR all zero
         }

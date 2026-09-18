@@ -24,7 +24,6 @@ mod wayland_thumb;
 #[cfg(feature = "wlroots")]
 mod wlroots_enum;
 
-
 /// Largest `(w, h)` that fits inside `(max_w, max_h)` while keeping
 /// the aspect ratio of `(src_w, src_h)`. Both dimensions are
 /// clamped to at least 1 so degenerate inputs don't produce a
@@ -55,7 +54,6 @@ pub use pipewire_audio::PipeWireAudioCapture;
 pub use wayland_direct::WaylandDirectCapture;
 #[cfg(feature = "wlroots")]
 pub use wlroots_enum::WaylandSourceEnumerator;
-
 
 use std::sync::Arc;
 

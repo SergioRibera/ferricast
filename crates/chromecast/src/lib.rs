@@ -45,7 +45,10 @@ impl CastSession for ChromecastEitherSession {
     async fn connect(&mut self, device: &Device) -> Result<ConnectOutcome> {
         match self {
             Self::Hls(s) => s.connect(device).await,
-            Self::Mirror { session, connected_device } => {
+            Self::Mirror {
+                session,
+                connected_device,
+            } => {
                 let r = session.connect(device).await;
                 if r.is_ok() {
                     *connected_device = Some(device.clone());
@@ -60,7 +63,10 @@ impl CastSession for ChromecastEitherSession {
         // HLS on timeout (device doesn't support mirroring namespace).
         let fallback_device: Option<Device> = match self {
             Self::Hls(s) => return s.setup_stream(config).await,
-            Self::Mirror { session, connected_device } => {
+            Self::Mirror {
+                session,
+                connected_device,
+            } => {
                 match session.setup_stream(config).await {
                     Ok(()) => return Ok(()),
                     Err(FerricastError::Timeout(ref msg)) => {
@@ -77,8 +83,7 @@ impl CastSession for ChromecastEitherSession {
                     // the device understands Cast Streaming but won't accept our
                     // parameters (old firmware, restricted sender policy).
                     // Fall back to HLS.
-                    Err(FerricastError::Protocol(ref msg)) if msg.contains("ANSWER") =>
-                    {
+                    Err(FerricastError::Protocol(ref msg)) if msg.contains("ANSWER") => {
                         tracing::warn!(
                             %msg,
                             "Cast Streaming OFFER rejected by receiver — falling back to HLS"

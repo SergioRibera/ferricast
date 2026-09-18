@@ -14,9 +14,9 @@ use ferricast_core::{
     AudioDecoderConfig, AudioEncoder, AudioEncoderConfig, AudioFrame, AudioSource, CaptureConfig,
     CaptureSource, CapturedFrame, CastSession, Codec, ConnectOutcome, ControlSession, DecodedAudio,
     DecoderConfig, Device, Discovery, DiscoveryEvent, EncodedFrame, EncoderConfig, FerricastError,
-    FrameSink, MediaCommand, MediaInfo, MediaPacket, MediaPuller, PairingChallenge, PairingResponse,
-    PixelFormat, PlaybackState, ProtocolHandler, PullSpec, ReceiverProtocol, RemoteSender, Result,
-    ScreenCapture, StreamConfig, VideoDecoder, VideoEncoder,
+    FrameSink, MediaCommand, MediaInfo, MediaPacket, MediaPuller, PairingChallenge,
+    PairingResponse, PixelFormat, PlaybackState, ProtocolHandler, PullSpec, ReceiverProtocol,
+    RemoteSender, Result, ScreenCapture, StreamConfig, VideoDecoder, VideoEncoder,
 };
 use ferricast_encoder::aac::AacEncoder;
 #[cfg(feature = "opus-rs")]
@@ -897,8 +897,7 @@ impl StreamManager {
         match session.connect(&device).await? {
             ConnectOutcome::Ready => {}
             ConnectOutcome::PairingRequired(challenge) => {
-                let (respond_tx, respond_rx) =
-                    tokio::sync::oneshot::channel::<PairingResponse>();
+                let (respond_tx, respond_rx) = tokio::sync::oneshot::channel::<PairingResponse>();
                 let respond = std::sync::Arc::new(tokio::sync::Mutex::new(Some(respond_tx)));
                 let _ = self
                     .event_tx
@@ -1862,9 +1861,7 @@ async fn run_audio_pipeline(
 ) -> Result<()> {
     match audio_cfg.codec {
         #[cfg(feature = "opus-rs")]
-        AudioCodec::Opus => {
-            run_audio_pipeline_with(OpusEncoder::new(), audio_cfg, mute, tx).await
-        }
+        AudioCodec::Opus => run_audio_pipeline_with(OpusEncoder::new(), audio_cfg, mute, tx).await,
         _ => run_audio_pipeline_with(AacEncoder::new(), audio_cfg, mute, tx).await,
     }
 }

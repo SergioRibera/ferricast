@@ -5,7 +5,6 @@ use crate::PipeWireCapture;
 #[cfg(feature = "wayland-direct")]
 use crate::WaylandDirectCapture;
 
-
 /// Auto-selecting capture backend.
 ///
 /// `NativeCapture::new` picks a concrete backend at runtime based on
@@ -77,12 +76,9 @@ impl NativeCapture {
         {
             return Self::Pipewire(PipeWireCapture::new());
         }
-        #[cfg(all(
-            not(feature = "wayland-direct"),
-            not(feature = "pipewire"),
-        ))]
+        #[cfg(all(not(feature = "wayland-direct"), not(feature = "pipewire"),))]
         {
-            panic!("X11 is not supported") 
+            panic!("X11 is not supported")
         }
     }
 }

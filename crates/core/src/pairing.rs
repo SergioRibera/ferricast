@@ -4,14 +4,16 @@ use crate::device::{Features, Flags};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingChallenge {
     /// Display a numeric PIN input. `digits` is always 4 for AirPlay.
-    Pin { digits: u8 },
+    Pin {
+        digits: u8,
+    },
     None,
     Credential,
 }
 
 impl PairingChallenge {
     pub fn new_airplay(flags: Flags, features: &Features) -> Self {
-        if flags.contains(Flags::PASSWORD_REQUIRED) && features.prefers_legacy_pairing()  {
+        if flags.contains(Flags::PASSWORD_REQUIRED) && features.prefers_legacy_pairing() {
             return Self::Credential;
         }
 
@@ -20,7 +22,6 @@ impl PairingChallenge {
         }
 
         return Self::None;
-
     }
 }
 
