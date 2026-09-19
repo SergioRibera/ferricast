@@ -1,6 +1,7 @@
 use std::io::Read;
 
 use ferricast_core::{FerricastError, PairingChallenge};
+use hkdf::Hkdf;
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{FromPrimitive, Num};
 use rand::{Rng, rngs::OsRng};
@@ -257,7 +258,7 @@ pub async fn pin_pair_setup(
 
     let m3 = tlv::encode(vec![
         (TLV_TYPE_STATE, &[0x03_u8]),
-        (TLV_TYPE_PUBLIC_KEY, &pad_to(client_public.1, 384)),
+        (TLV_TYPE_PUBLIC_KEY, &pad_to(client_public.1.clone(), 384)),
         (TLV_TYPE_PROOF, &m1_proof),
     ])?;
 
@@ -277,7 +278,35 @@ pub async fn pin_pair_setup(
     let m4 = res.content()?;
     let m4 = tlv::decode(m4)?;
 
-    println!("{:?}", m4);
+    let m4_proof = m4.get(&TLV_TYPE_PROOF)
+        .ok_or(FerricastError::Protocol("Invalid TLV, no proof".to_string()))?;
+
+
+
+    tracing::info!("M4!");
+
+
+    let mut m2_proof_input = Vec::new();
+
+    m2_proof_input.extend_from_slice(&client_public.1);
+    m2_proof_input.extend_from_slice(&m1_proof);
+    m2_proof_input.extend_from_slice(&K);
+
+    let m2_proof_expected = Sha512::digest(&m2_proof_input);
+
+    if m2_proof_expected.as_slice() != m4_proof {
+        return Err(FerricastError::Protocol("server proof mismatch".to_string()));
+    }
+
+
+ 
+    let k_bytes = K.as_slice();
+
+    let session_key = hkdf(k_bytes, b"Pair-Setup-Encrypt-Salt", b"Pair-Setup-Encrypt-Info", 32);
+    let sig_key = hkdf(k_bytes, b"Pair-Setup-Controller-Sign-Salt", b"Pair-Setup-Controller-Sign-Info", 32);
+
+
+
 
     Ok(())
 }
@@ -292,4 +321,15 @@ fn pad_to(data: Vec<u8>, size: usize) -> Vec<u8> {
     padded[size - data.len()..].copy_from_slice(&data);
 
     padded
+}
+
+fn hkdf(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>, FerricastError> {
+    let hkdf = Hkdf::<Sha512>::new(Some(salt), secret);
+
+    let mut buf = vec![0_u8; len];
+
+    hkdf.expand(info, &mut buf)
+        .map_err(|_| FerricastError::Protocol("Cannot expand HKDF".to_string()))?;
+
+    Ok(buf)
 }
