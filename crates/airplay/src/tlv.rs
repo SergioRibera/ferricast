@@ -3,6 +3,9 @@ use ferricast_core::FerricastError;
 use std::collections::HashMap;
 use std::io::Write;
 
+
+pub const TLV_TYPE_IDENTIFIER: u8 = 0x1;
+
 pub const TLV_TYPE_STATE: u8 = 6;
 pub const TLV_TYPE_METHOD: u8 = 0;
 pub const TLV_TYPE_FLAGS: u8 = 0x13;
@@ -10,6 +13,9 @@ pub const TLV_TYPE_FLAGS: u8 = 0x13;
 pub const TLV_TYPE_SALT: u8 = 0x2;
 pub const TLV_TYPE_PUBLIC_KEY: u8 = 0x3;
 pub const TLV_TYPE_PROOF: u8 = 0x04;
+
+pub const TLV_TYPE_SIGNATURE: u8 = 0x0A;
+pub const TLV_TYPE_ENCRYPTED_DATA: u8 = 0x05;
 
 pub const TLV_TYPE_ERROR: u8 = 0x7;
 

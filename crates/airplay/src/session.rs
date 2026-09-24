@@ -134,11 +134,15 @@ impl CastSession for AirPlaySession {
         } else {
         }
 
+
+        let client_id = Uuid::new_v4();
+
         crate::pair::pin_pair::pair_pin(
             &pair_challange,
             &mut manager,
             &mut write_half,
             &mut buf_reader,
+            &client_id
         )
         .await?;
 

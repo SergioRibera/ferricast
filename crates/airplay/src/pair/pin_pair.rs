@@ -1,5 +1,7 @@
 use std::io::Read;
 
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
+use ed25519_dalek::Signer;
 use ferricast_core::{FerricastError, PairingChallenge};
 use hkdf::Hkdf;
 use num_bigint::{BigInt, BigUint, Sign};
@@ -10,11 +12,12 @@ use tokio::{
     io::BufReader,
     net::tcp::{ReadHalf, WriteHalf},
 };
+use uuid::Uuid;
 
 use crate::{
     rtsp::{RtspManager, RtspResponse},
     tlv::{
-        self, TLV_TYPE_METHOD, TLV_TYPE_PROOF, TLV_TYPE_PUBLIC_KEY, TLV_TYPE_SALT, TLV_TYPE_STATE,
+        self, TLV_TYPE_ENCRYPTED_DATA, TLV_TYPE_IDENTIFIER, TLV_TYPE_METHOD, TLV_TYPE_PROOF, TLV_TYPE_PUBLIC_KEY, TLV_TYPE_SALT, TLV_TYPE_SIGNATURE, TLV_TYPE_STATE
     },
 };
 
@@ -45,6 +48,7 @@ pub async fn pair_pin(
     manager: &mut RtspManager,
     write_half: &mut WriteHalf<'_>,
     buf_reader: &mut BufReader<ReadHalf<'_>>,
+    uuid: &Uuid
 ) -> Result<(), FerricastError> {
     let mut csprng = OsRng;
     let mut signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
@@ -87,6 +91,7 @@ pub async fn pair_pin(
         write_half,
         buf_reader,
         pin,
+        uuid
     )
     .await?;
 
@@ -100,6 +105,7 @@ pub async fn pin_pair_setup(
     write_half: &mut WriteHalf<'_>,
     buf_reader: &mut BufReader<ReadHalf<'_>>,
     pin: String,
+    id: &Uuid
 ) -> Result<(), FerricastError> {
     let m1 = tlv::encode(vec![(TLV_TYPE_METHOD, &[0x0]), (TLV_TYPE_STATE, &[0x01])])?;
 
@@ -302,9 +308,57 @@ pub async fn pin_pair_setup(
  
     let k_bytes = K.as_slice();
 
-    let session_key = hkdf(k_bytes, b"Pair-Setup-Encrypt-Salt", b"Pair-Setup-Encrypt-Info", 32);
-    let sig_key = hkdf(k_bytes, b"Pair-Setup-Controller-Sign-Salt", b"Pair-Setup-Controller-Sign-Info", 32);
+    let session_key = hkdf(k_bytes, b"Pair-Setup-Encrypt-Salt", b"Pair-Setup-Encrypt-Info", 32)?;
+    let sig_key = hkdf(k_bytes, b"Pair-Setup-Controller-Sign-Salt", b"Pair-Setup-Controller-Sign-Info", 32)?;
 
+
+    let mut sig_input = Vec::new();
+
+    sig_input.extend_from_slice(&sig_key);  
+    sig_input.extend_from_slice(&id.into_bytes());
+    sig_input.extend_from_slice(client_public_key);
+
+    let signature = signing_key.sign(&sig_input);
+
+    let body = tlv::encode(vec![
+        (TLV_TYPE_IDENTIFIER, &id.into_bytes()),
+        (TLV_TYPE_PUBLIC_KEY, client_public_key),
+        (TLV_TYPE_SIGNATURE, &signature.to_bytes())
+    ])?;
+
+    let aead = ChaCha20Poly1305::new_from_slice(&session_key)
+        .map_err(|e| FerricastError::Protocol(format!("Failed to create ChaCha20Poly1305, {:?}", e)))?;
+
+    let mut nonce = vec![0_u8; 12];
+    nonce[4..].copy_from_slice(b"PS-Msg05");
+
+    let encrypted = aead.encrypt(Nonce::from_slice(&nonce), body.as_slice())
+        .map_err(|e| FerricastError::Protocol(format!("Failed to encrypt TLV msg, {:?}", e)))?;
+   
+
+    let m5 = tlv::encode(vec![
+        (TLV_TYPE_ENCRYPTED_DATA, &encrypted),
+        (TLV_TYPE_STATE, &[5]),
+    ])?;
+
+    manager
+        .builder()
+        .post()
+        .content_type("application/octet-stream".to_string())
+        .path("/pair-setup".to_string())
+        .body(m5)
+        .write(write_half)
+        .await?;
+
+    let res = RtspResponse::read(buf_reader).await?;
+
+    res.is_ok()?;
+
+    let m6 = res.content()?;
+    let m6 = tlv::decode(m6);
+
+    println!("M6: {:?}", m6);
+    println!("Shared Secret: {:?}", K);
 
 
 
