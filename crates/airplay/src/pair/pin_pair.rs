@@ -1,7 +1,7 @@
 use std::io::Read;
 
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
-use ed25519_dalek::Signer;
+use ed25519_dalek::{Signer, ed25519::signature::SignerMut};
 use ferricast_core::{FerricastError, PairingChallenge};
 use hkdf::Hkdf;
 use num_bigint::{BigInt, BigUint, Sign};
@@ -12,7 +12,9 @@ use tokio::{
     io::BufReader,
     net::tcp::{ReadHalf, WriteHalf},
 };
+use tracing::info;
 use uuid::Uuid;
+use x25519_dalek::PublicKey;
 
 use crate::{
     rtsp::{RtspManager, RtspResponse},
@@ -56,7 +58,7 @@ pub async fn pair_pin(
     let ed_public_key = signing_key.verifying_key().to_bytes();
 
     let mut pin = String::new();
-
+ 
     if !matches!(
         challenge,
         PairingChallenge::None | PairingChallenge::Credential
@@ -85,7 +87,7 @@ pub async fn pair_pin(
     }
 
     pin_pair_setup(
-        signing_key,
+        signing_key.clone(),
         &ed_public_key,
         manager,
         write_half,
@@ -94,6 +96,10 @@ pub async fn pair_pin(
         uuid
     )
     .await?;
+
+    pin_pair_verify(signing_key, manager, write_half, buf_reader, uuid)
+        .await?;
+    
 
     Ok(())
 }
@@ -329,6 +335,7 @@ pub async fn pin_pair_setup(
     let aead = ChaCha20Poly1305::new_from_slice(&session_key)
         .map_err(|e| FerricastError::Protocol(format!("Failed to create ChaCha20Poly1305, {:?}", e)))?;
 
+    
     let mut nonce = vec![0_u8; 12];
     nonce[4..].copy_from_slice(b"PS-Msg05");
 
@@ -363,6 +370,124 @@ pub async fn pin_pair_setup(
 
 
     Ok(())
+}
+
+
+async fn pin_pair_verify(
+    signing_key: ed25519_dalek::SigningKey,
+    manager: &mut RtspManager,
+    write_half: &mut WriteHalf<'_>,
+    buf_reader: &mut BufReader<ReadHalf<'_>>,
+    uuid: &Uuid   
+) -> Result<(), FerricastError> {
+    let mut os_rng = OsRng;
+    let client_static_secret = x25519_dalek::StaticSecret::random_from_rng(&mut os_rng);
+
+    let client_public = PublicKey::from(&client_static_secret);
+
+    let v1 = tlv::encode(vec![
+        (TLV_TYPE_STATE, &[0x1]),
+        (TLV_TYPE_PUBLIC_KEY, client_public.as_bytes())
+    ])?;
+
+    manager.builder()
+        .post()
+        .path("/pair-verify".to_string())
+        .content_type("application/octet-stream".to_string())
+        .body(v1)
+        .write(write_half)
+        .await?;
+
+    let res = RtspResponse::read(buf_reader).await?;
+
+    let v2 = res.content()?;
+    let v2 = tlv::decode(v2)?;
+
+    let server_key_data = v2.get(&TLV_TYPE_PUBLIC_KEY).ok_or(FerricastError::Protocol("Invalid Response from Airplay Server".to_string()))?;
+
+    let server_encrypted = v2.get(&TLV_TYPE_ENCRYPTED_DATA).ok_or(FerricastError::Protocol("Invalid Response from airplay server".to_string()))?;
+
+    if server_key_data.len() < 32 {
+        return Err(FerricastError::Protocol("Invalid Server Key Data".to_string()));
+    }
+
+    info!("Server Key {:?} Server Encrypted Data {:?}", server_key_data, server_encrypted);
+
+    let s_pk: [u8; 32] = (&server_key_data[..32]).try_into().unwrap();
+
+
+    
+    let server_public_key = PublicKey::from(s_pk);
+
+    let shared = client_static_secret.diffie_hellman(&server_public_key);
+
+    let verify_key = hkdf(shared.as_bytes(), b"Pair-Verify-Encrypt-Salt", b"Pair-Verify-Encrypt-Info", 32)?;
+
+    
+    let aead = ChaCha20Poly1305::new_from_slice(&verify_key)
+        .map_err(|e| FerricastError::Protocol(format!("Failed to create ChaCha20Poly1305, {:?}", e)))?;
+
+    let mut nonce = vec![0_u8; 12];
+    nonce[4..].copy_from_slice(b"PS-Msg02");
+
+    
+    let server_decrypted = aead.decrypt(Nonce::from_slice(&nonce), server_encrypted.as_slice()).map_err(|e| FerricastError::Protocol(format!("Invalid Server Encrypted info {:?}", e)))?;
+
+    let client_id_bytes = uuid.as_bytes();
+
+    let mut sig_input = Vec::new();
+
+    sig_input.extend_from_slice(client_public.as_bytes());
+    sig_input.extend_from_slice(client_id_bytes);
+    sig_input.extend_from_slice(server_public_key.as_bytes());  
+
+    let signature = signing_key.sign(sig_input.as_slice());
+
+
+    let tlv_body = tlv::encode(vec![
+        (TLV_TYPE_IDENTIFIER, client_id_bytes),
+        (TLV_TYPE_SIGNATURE, &signature.to_bytes())
+    ])?;
+    
+    let nonce = Nonce::from_slice(b"PV-Msg03");
+
+    let encrypted = aead.encrypt(nonce, tlv_body.as_slice())
+        .map_err(|e| FerricastError::Protocol(format!("Failed to Encrypt tlv body {:?}", e)))?;
+
+    let v3 = tlv::encode(vec![
+        (TLV_TYPE_STATE, &[0x03]),
+        (TLV_TYPE_ENCRYPTED_DATA, &encrypted),
+    ])?;
+
+    /*
+    manager.builder()
+        .post()
+        .path("/pair-verify".to_string())
+        .content_type("application/octet-stream".to_string())
+        ;
+*/
+
+    
+    
+    
+
+    
+    
+
+    
+
+    
+    
+    
+
+    
+
+
+    
+    println!("{:?}", res);
+
+    
+    Ok(())    
 }
 
 fn pad_to(data: Vec<u8>, size: usize) -> Vec<u8> {
