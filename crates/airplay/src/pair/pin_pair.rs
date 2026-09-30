@@ -459,33 +459,23 @@ async fn pin_pair_verify(
         (TLV_TYPE_ENCRYPTED_DATA, &encrypted),
     ])?;
 
-    /*
+    
     manager.builder()
         .post()
         .path("/pair-verify".to_string())
         .content_type("application/octet-stream".to_string())
-        ;
-*/
+        .body(v3)
+        .write(write_half).await?;
+
+    let res = RtspResponse::read(buf_reader).await?;
+
+    let v4 = res.content()?;
+    let v4 = tlv::decode(v4);
 
     
+    info!("Pin pair verified!");
     
-    
-
-    
-    
-
-    
-
-    
-    
-    
-
-    
-
-
-    
-    println!("{:?}", res);
-
+    println!("{:?}", v4);
     
     Ok(())    
 }
