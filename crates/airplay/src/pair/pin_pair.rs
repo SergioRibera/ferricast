@@ -86,6 +86,9 @@ pub async fn pair_pin(
         pin = String::from_utf8(b).unwrap().trim().to_string();
     }
 
+
+    tracing::info!("Pin Pair Setup");
+    
     pin_pair_setup(
         signing_key.clone(),
         &ed_public_key,
@@ -95,10 +98,14 @@ pub async fn pair_pin(
         pin,
         uuid
     )
-    .await?;
+        .await?;
+
+    tracing::info!("Pin Pair Verify");
 
     pin_pair_verify(signing_key, manager, write_half, buf_reader, uuid)
         .await?;
+
+    tracing::info!("Done");
     
 
     Ok(())
@@ -379,7 +386,7 @@ async fn pin_pair_verify(
     write_half: &mut WriteHalf<'_>,
     buf_reader: &mut BufReader<ReadHalf<'_>>,
     uuid: &Uuid   
-) -> Result<(), FerricastError> {
+) -> Result<(), FerricastError> { 
     let mut os_rng = OsRng;
     let client_static_secret = x25519_dalek::StaticSecret::random_from_rng(&mut os_rng);
 
@@ -405,6 +412,8 @@ async fn pin_pair_verify(
 
     let server_key_data = v2.get(&TLV_TYPE_PUBLIC_KEY).ok_or(FerricastError::Protocol("Invalid Response from Airplay Server".to_string()))?;
 
+    println!("{:?}", v2.get(&TLV_TYPE_ENCRYPTED_DATA));
+    
     let server_encrypted = v2.get(&TLV_TYPE_ENCRYPTED_DATA).ok_or(FerricastError::Protocol("Invalid Response from airplay server".to_string()))?;
 
     if server_key_data.len() < 32 {
@@ -428,7 +437,7 @@ async fn pin_pair_verify(
         .map_err(|e| FerricastError::Protocol(format!("Failed to create ChaCha20Poly1305, {:?}", e)))?;
 
     let mut nonce = vec![0_u8; 12];
-    nonce[4..].copy_from_slice(b"PS-Msg02");
+    nonce[4..].copy_from_slice(b"PV-Msg02");
 
     
     let server_decrypted = aead.decrypt(Nonce::from_slice(&nonce), server_encrypted.as_slice()).map_err(|e| FerricastError::Protocol(format!("Invalid Server Encrypted info {:?}", e)))?;
