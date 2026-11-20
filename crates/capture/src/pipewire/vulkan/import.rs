@@ -573,12 +573,21 @@ fn ensure_staging(
         if s.capacity >= size {
             return Ok(());
         }
-        // Old buffer too small. Wait on this slot's fence so the GPU
-        // isn't writing into the buffer we're about to free, then
-        // tear it down (unmap before free).
+        // Old buffer too small. A slot's fence is only ever signalled
+        // by a submission that hasn't been drained yet
+        // (`pending_meta.is_some()`); every drain resets it, so
+        // waiting on an idle slot's fence would block forever.
+        // Callers drain the slot before reaching here, so an
+        // in-flight slot is a bookkeeping bug — refuse rather than
+        // free memory the GPU may still be writing.
+        if slot.pending_meta.is_some() {
+            return Err(FerricastError::Capture(
+                "vulkan: ensure_staging on a slot with an undrained submission".into(),
+            ));
+        }
+        // SAFETY: the slot has no submission in flight (checked
+        // above), so the GPU no longer references this buffer.
         unsafe {
-            let _ = inner.device.wait_for_fences(&[slot.fence], true, u64::MAX);
-            let _ = inner.device.reset_fences(&[slot.fence]);
             inner.device.unmap_memory(s.memory);
             inner.device.destroy_buffer(s.buffer, None);
             inner.device.free_memory(s.memory, None);

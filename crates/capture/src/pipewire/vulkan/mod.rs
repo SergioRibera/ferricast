@@ -363,8 +363,18 @@ impl VulkanImporter {
         // Drop any in-flight pipeline state — the bytes those slots
         // were going to produce are now meaningless because the
         // images they reference are gone.
-        for slot in state.slots.iter_mut() {
-            slot.pending_meta = None;
+        // Their fences are signalled (we waited for idle above) but
+        // were never reset by a drain; reset them so the next submit
+        // on the slot gets the unsignalled fence `vkQueueSubmit`
+        // requires and the next drain doesn't return early.
+        for slot in &mut state.slots {
+            if slot.pending_meta.take().is_some() {
+                // SAFETY: the device is idle, so the fence isn't
+                // referenced by any pending queue submission.
+                if let Err(e) = unsafe { self.inner.device.reset_fences(&[slot.fence]) } {
+                    warn!(error = %e, "reset_fences after cache reset failed");
+                }
+            }
         }
         state.pending.clear();
         // Renegotiation = a fresh stream that will need to be
