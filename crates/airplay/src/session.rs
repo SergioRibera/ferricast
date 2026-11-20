@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use ferricast_core::device::{AirPlayPairing, AirplayConfig};
 use ferricast_core::{
-    CastSession, Codec, ConnectOutcome, Device, EncodedFrame, FerricastError, PairingChallenge,
-    PairingResponse, Result, StreamConfig,
+    AudioCodec, AudioFrame, CastSession, Codec, ConnectOutcome, Device, EncodedFrame,
+    FerricastError, PairingChallenge, PairingResponse, Result, StreamConfig,
 };
 use plist::{Dictionary, Value};
 use tokio::net::{TcpStream, UdpSocket};
@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::audio::{self, AudioStream, PayloadCipher, STREAM_TYPE_AUDIO};
 use crate::crypto::sha512_16;
 use crate::fairplay;
 use crate::mirror::{MirrorStream, stream_cipher};
@@ -57,6 +58,8 @@ impl Drop for TaskGuard {
 /// Everything that only exists while streaming.
 struct Stream {
     mirror: MirrorStream,
+    /// `None` when audio is off or the receiver refused the audio stream.
+    audio: Option<AudioStream>,
     _timing: TimingServer,
     _feedback: TaskGuard,
 }
@@ -277,11 +280,7 @@ impl AirPlaySession {
             None => fp.aes_key,
         };
 
-        let timing_socket = match config.port_range {
-            Some((start, end)) => ferricast_core::bind_udp_in_range(start, end).await?,
-            None => UdpSocket::bind(("0.0.0.0", 0)).await?,
-        };
-        let timing = TimingServer::start(timing_socket)?;
+        let timing = TimingServer::start(bind_udp(config).await?)?;
 
         let mut setup = Dictionary::new();
         setup.insert("deviceID".into(), Value::String(identity.device_id.clone()));
@@ -302,10 +301,8 @@ impl AirPlaySession {
         setup.insert("timingPort".into(), Value::Integer(timing.port().into()));
         setup.insert("et".into(), Value::Integer(32.into()));
         setup.insert("ekey".into(), Value::Data(fp.ekey));
-        setup.insert(
-            "eiv".into(),
-            Value::Data(rand::random::<[u8; 16]>().to_vec()),
-        );
+        let eiv: [u8; 16] = rand::random();
+        setup.insert("eiv".into(), Value::Data(eiv.to_vec()));
         let reply = guard
             .request("SETUP", &uri, Some(CONTENT_BPLIST), &bplist(setup)?)
             .await?
@@ -330,16 +327,9 @@ impl AirPlaySession {
             .request("SETUP", &uri, Some(CONTENT_BPLIST), &bplist(setup)?)
             .await?
             .ensure_success("SETUP mirroring stream")?;
-        let data_port = reply_dict(&reply, "SETUP mirroring stream")?
-            .get("streams")
-            .and_then(Value::as_array)
-            .and_then(|s| {
-                s.iter()
-                    .find_map(|s| s.as_dictionary()?.get("dataPort")?.as_unsigned_integer())
-            })
-            .and_then(|p| u16::try_from(p).ok())
-            .filter(|p| *p != 0)
-            .ok_or_else(|| {
+        let reply = reply_dict(&reply, "SETUP mirroring stream")?;
+        let data_port =
+            reply_stream_port(&reply, STREAM_TYPE_MIRROR, "dataPort").ok_or_else(|| {
                 FerricastError::Protocol("SETUP reply has no mirroring dataPort".into())
             })?;
 
@@ -352,6 +342,17 @@ impl AirPlaySession {
             .map_err(|e| {
                 FerricastError::Connection(format!("mirroring data connection to {data_addr}: {e}"))
             })?;
+
+        let audio = match &config.audio {
+            Some(_) => match setup_audio(&mut guard, &uri, config, &base_key, eiv).await {
+                Ok(audio) => Some(audio),
+                Err(e) => {
+                    warn!(error = %e, "AirPlay audio stream refused; mirroring without audio");
+                    None
+                }
+            },
+            None => None,
+        };
 
         guard
             .request("RECORD", &uri, None, &[])
@@ -368,10 +369,82 @@ impl AirPlaySession {
                 config.width,
                 config.height,
             ),
+            audio,
             _timing: timing,
             _feedback: TaskGuard(feedback),
         })
     }
+}
+
+/// UDP socket in `config.port_range`, or on an ephemeral port.
+async fn bind_udp(config: &StreamConfig) -> Result<UdpSocket> {
+    match config.port_range {
+        Some((start, end)) => ferricast_core::bind_udp_in_range(start, end).await,
+        None => Ok(UdpSocket::bind(("0.0.0.0", 0)).await?),
+    }
+}
+
+/// Port `key` of the reply's stream entry of type `stream_type`.
+fn reply_stream_port(reply: &Dictionary, stream_type: u64, key: &str) -> Option<u16> {
+    reply
+        .get("streams")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_dictionary)
+        .find(|s| {
+            s.get("type")
+                .and_then(Value::as_unsigned_integer)
+                .is_none_or(|t| t == stream_type)
+        })?
+        .get(key)?
+        .as_unsigned_integer()
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p != 0)
+}
+
+/// `SETUP` the AAC-ELD audio stream and open its sockets.
+async fn setup_audio(
+    rtsp: &mut RtspClient,
+    uri: &str,
+    config: &StreamConfig,
+    base_key: &[u8; 16],
+    eiv: [u8; 16],
+) -> Result<AudioStream> {
+    let data = bind_udp(config).await?;
+    let control = bind_udp(config).await?;
+    let control_port = control
+        .local_addr()
+        .map_err(|e| FerricastError::Connection(format!("audio control socket: {e}")))?
+        .port();
+    let mut setup = Dictionary::new();
+    setup.insert(
+        "streams".into(),
+        Value::Array(vec![Value::Dictionary(audio::setup_stream_dict(
+            control_port,
+        ))]),
+    );
+    let reply = rtsp
+        .request("SETUP", uri, Some(CONTENT_BPLIST), &bplist(setup)?)
+        .await?
+        .ensure_success("SETUP audio stream")?;
+    let reply = reply_dict(&reply, "SETUP audio stream")?;
+    let port = |key| {
+        reply_stream_port(&reply, STREAM_TYPE_AUDIO, key).ok_or_else(|| {
+            FerricastError::Protocol(format!("SETUP audio stream reply has no {key}"))
+        })
+    };
+    let ip = rtsp.peer_addr().ip();
+    let data_addr = SocketAddr::new(ip, port("dataPort")?);
+    let control_addr = SocketAddr::new(ip, port("controlPort")?);
+    info!(%data_addr, %control_addr, "AirPlay audio stream established");
+    AudioStream::start(
+        data,
+        control,
+        data_addr,
+        control_addr,
+        PayloadCipher::new(base_key, eiv),
+    )
+    .await
 }
 
 /// Post `/feedback` periodically; the receiver resets the session after a
@@ -547,24 +620,53 @@ impl CastSession for AirPlaySession {
         Ok(())
     }
 
+    async fn send_audio_frame(&mut self, frame: &AudioFrame) -> Result<()> {
+        let Some(audio) = self.stream.as_mut().and_then(|s| s.audio.as_mut()) else {
+            // Audio off or refused by the receiver: mirroring goes on silent.
+            return Ok(());
+        };
+        if frame.codec != AudioCodec::AacEld {
+            return Err(FerricastError::Streaming(format!(
+                "AirPlay mirroring audio is AAC-ELD, got {:?}",
+                frame.codec
+            )));
+        }
+        audio
+            .send(frame)
+            .await
+            .map_err(|e| FerricastError::Streaming(format!("AirPlay audio send failed: {e}")))
+    }
+
+    fn preferred_audio_codec(&self) -> AudioCodec {
+        AudioCodec::AacEld
+    }
+
     async fn stop(&mut self) -> Result<()> {
+        let mut stream_types = vec![STREAM_TYPE_MIRROR];
         if let Some(mut stream) = self.stream.take() {
             info!(
                 frames = stream.mirror.frames_sent(),
+                audio_frames = stream.audio.as_ref().map(AudioStream::frames_sent),
                 "stopping AirPlay mirroring"
             );
+            if stream.audio.is_some() {
+                stream_types.push(STREAM_TYPE_AUDIO);
+            }
             drop(stream._feedback);
             stream.mirror.shutdown().await;
         }
         if let Some(link) = self.link.take() {
             let mut rtsp = link.rtsp.lock().await;
-            let mut stream = Dictionary::new();
-            stream.insert("type".into(), Value::Integer(STREAM_TYPE_MIRROR.into()));
+            let streams = stream_types
+                .into_iter()
+                .map(|t| {
+                    let mut stream = Dictionary::new();
+                    stream.insert("type".into(), Value::Integer(t.into()));
+                    Value::Dictionary(stream)
+                })
+                .collect();
             let mut body = Dictionary::new();
-            body.insert(
-                "streams".into(),
-                Value::Array(vec![Value::Dictionary(stream)]),
-            );
+            body.insert("streams".into(), Value::Array(streams));
             // The receiver may close the connection after the first
             // TEARDOWN; neither failure matters on the way out.
             if let Ok(body) = bplist(body) {

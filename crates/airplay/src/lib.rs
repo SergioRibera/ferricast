@@ -4,6 +4,7 @@
 //! RPiPlay) using legacy pairing, with HomeKit pairing for AirPlay 2
 //! receivers.
 
+mod audio;
 mod crypto;
 pub mod discovery;
 mod fairplay;
