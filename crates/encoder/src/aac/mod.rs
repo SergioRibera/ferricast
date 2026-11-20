@@ -28,7 +28,9 @@ pub use fdk_impl::FdkAacEncoder;
 /// Backend-agnostic AAC encoder. `configure()` picks a backend at
 /// first call and the variant stays put until the encoder is
 /// dropped.
+#[derive(Default)]
 pub enum AacEncoder {
+    #[default]
     Pending,
     #[cfg(feature = "fdk-aac")]
     Fdk(FdkAacEncoder),
@@ -38,11 +40,24 @@ impl AacEncoder {
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-impl Default for AacEncoder {
-    fn default() -> Self {
-        AacEncoder::Pending
+    #[cfg(feature = "fdk-aac")]
+    fn select_backend(config: &AudioEncoderConfig) -> Result<Self> {
+        let enc = FdkAacEncoder::new(config)?;
+        tracing::info!(
+            sample_rate = config.sample_rate,
+            channels = config.channels,
+            bitrate_kbps = config.bitrate_kbps,
+            "AAC encoder backend: fdk-aac (libfdk-aac)"
+        );
+        Ok(AacEncoder::Fdk(enc))
+    }
+
+    #[cfg(not(feature = "fdk-aac"))]
+    fn select_backend(_config: &AudioEncoderConfig) -> Result<Self> {
+        Err(FerricastError::Encoder(
+            "AacEncoder: no backend compiled in (enable the `fdk-aac` feature)".into(),
+        ))
     }
 }
 
@@ -54,29 +69,14 @@ impl AudioEncoder for AacEncoder {
                 config.codec
             )));
         }
-
-        #[cfg(feature = "fdk-aac")]
-        {
-            let enc = FdkAacEncoder::new(config)?;
-            tracing::info!(
-                sample_rate = config.sample_rate,
-                channels = config.channels,
-                bitrate_kbps = config.bitrate_kbps,
-                "AAC encoder backend: fdk-aac (libfdk-aac)"
-            );
-            *self = AacEncoder::Fdk(enc);
-            return Ok(());
-        }
-
-        #[cfg(not(feature = "fdk-aac"))]
-        {
-            let _ = config;
-            Err(FerricastError::Encoder(
-                "AacEncoder: no backend compiled in (enable the `fdk-aac` feature)".into(),
-            ))
-        }
+        *self = Self::select_backend(config)?;
+        Ok(())
     }
 
+    #[cfg_attr(
+        not(feature = "fdk-aac"),
+        expect(unused_variables, reason = "only the fdk-aac arm consumes the frame")
+    )]
     fn encode(&mut self, frame: &AudioFrame) -> Result<()> {
         match self {
             AacEncoder::Pending => Err(FerricastError::Encoder(

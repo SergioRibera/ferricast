@@ -2115,7 +2115,7 @@ dependencies = [
  "opus-rs",
  "shiguredo_nvcodec",
  "tracing",
- "x264",
+ "x264-sys",
  "yuv",
 ]
 
@@ -7739,16 +7739,6 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "zeroize",
-]
-
-[[package]]
-name = "x264"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc93ffd258cebeced05f02b73fb291e17fe78a6a99bfcff1091e6606ed0dec92"
-dependencies = [
- "pkg-config",
- "x264-sys",
 ]
 
 [[package]]

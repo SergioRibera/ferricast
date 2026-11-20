@@ -24,19 +24,21 @@ pub(super) struct StreamParams {
     /// Main tier — every decoder we care about supports it; High tier
     /// only unlocks higher bitrate caps we don't approach.
     pub tier_flag: u8,
+    /// Coded picture size (`pic_width/height_in_luma_samples`); must be
+    /// a multiple of MinCbSizeY.
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    /// Output of [`crate::h264::headers::FrameCrop`] equivalent —
-    /// HEVC encodes the cropping window as offsets in *luma samples*
-    /// (already in pixels, no 2× scaling like H.264's frame_crop).
+    /// Crops the coded size back to the visible picture.
     pub conformance_window: Option<ConformanceWindow>,
     pub bit_depth_luma_minus8: u8,
     pub bit_depth_chroma_minus8: u8,
     pub max_num_ref_frames: u32,
 }
 
-/// Conformance cropping window in luma samples (§7.4.3.2.1).
+/// Conformance cropping window (§7.4.3.2.1). Offsets count chroma
+/// samples: luma offset = SubWidthC (or SubHeightC) × value, i.e. ×2
+/// in 4:2:0.
 #[derive(Clone, Copy)]
 pub(super) struct ConformanceWindow {
     pub left: u32,
@@ -263,8 +265,19 @@ fn write_vui(w: &mut BitWriter, p: &StreamParams) {
     w.write_bits(0, 1);
     // overscan_info_present_flag u(1) = 0
     w.write_bits(0, 1);
-    // video_signal_type_present_flag u(1) = 0
+    // video_signal_type_present_flag u(1) = 1: the RGB → YUV upload is
+    // BT.709 limited range, signalled with H.273 code points.
+    w.write_bits(1, 1);
+    // video_format u(3) = 5 (unspecified)
+    w.write_bits(5, 3);
+    // video_full_range_flag u(1) = 0
     w.write_bits(0, 1);
+    // colour_description_present_flag u(1) = 1
+    w.write_bits(1, 1);
+    // colour_primaries, transfer_characteristics, matrix_coeffs u(8) = 1 (BT.709)
+    w.write_bits(1, 8);
+    w.write_bits(1, 8);
+    w.write_bits(1, 8);
     // chroma_loc_info_present_flag u(1) = 0
     w.write_bits(0, 1);
     // neutral_chroma_indication_flag u(1) = 0

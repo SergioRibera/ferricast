@@ -27,9 +27,12 @@ use std::marker::PhantomData;
 
 use bytes::Bytes;
 use ferricast_core::{
-    CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, PixelFormat, Result,
-    VideoEncoder,
+    CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, PixelFormat, RawFrame,
+    Result, VideoEncoder,
 };
+
+use crate::config_ext::EncoderConfigExt;
+use crate::frame_view::FrameView;
 use shiguredo_nvcodec::{
     BufferFormat, CodecConfig, EncodeOptions, Encoder as NvEncoder, EncoderCodec,
     EncoderConfig as NvCfg, H264EncoderConfig, H264Profile as NvH264Profile, PictureType, Preset,
@@ -148,6 +151,9 @@ pub struct NvencEncoder<C: NvencCodec> {
     /// the segmenter can anchor segment boundaries to wall clock
     /// when the capture stalls.
     pending_keyframe: bool,
+    /// Scratch for repacking row-padded CPU frames into the tight
+    /// layout NVENC's host upload expects. Reused across frames.
+    repack: Vec<u8>,
     /// `NvEncRegisterResource` is expensive (driver round-trip plus
     /// `cuExternalMemoryImport`), so we cache the registration
     /// keyed by `(fd, modifier, dims)`. PipeWire and our wayland-direct
@@ -160,6 +166,9 @@ pub struct NvencEncoder<C: NvencCodec> {
     /// implicitly via the soft-fallback path.
     #[cfg(feature = "nvenc-zero-copy")]
     dmabuf_cache: HashMap<DmabufKey, RegisteredResource>,
+    /// The configuration this session was opened for (bitrate kept in
+    /// sync with live retargets).
+    requested: EncoderConfig,
     _codec: PhantomData<C>,
 }
 
@@ -167,6 +176,7 @@ pub struct NvencEncoder<C: NvencCodec> {
 struct NvencCfg {
     width: u32,
     height: u32,
+    pixel_format: PixelFormat,
     fps: u32,
     keyframe_interval: u32,
 }
@@ -279,30 +289,37 @@ impl<C: NvencCodec> NvencEncoder<C> {
             cfg: NvencCfg {
                 width: cfg.width.max(16),
                 height: cfg.height.max(16),
+                pixel_format: cfg.pixel_format,
                 fps: cfg.fps.max(1),
                 keyframe_interval: cfg.keyframe_interval_frames(),
             },
             frame_count: 0,
             pending_keyframe: false,
+            repack: Vec::new(),
             #[cfg(feature = "nvenc-zero-copy")]
             dmabuf_cache: HashMap::new(),
+            requested: cfg,
             _codec: PhantomData,
         })
     }
 
-    fn encode_cpu(&mut self, host: &[u8], options: &EncodeOptions) -> Result<()> {
-        let expected = (self.cfg.width as usize)
-            .saturating_mul(self.cfg.height as usize)
-            .saturating_mul(4);
-        if host.len() < expected {
+    fn encode_cpu(&mut self, raw: &RawFrame, options: &EncodeOptions) -> Result<()> {
+        if raw.format != self.cfg.pixel_format {
+            // The session was opened for one byte order; feeding the
+            // other would silently swap red and blue.
             return Err(FerricastError::Encoder(format!(
-                "NVENC ({}): short frame {} bytes, want {expected}",
+                "NVENC ({}): frame format {:?} differs from configured {:?}",
                 C::NAME,
-                host.len()
+                raw.format,
+                self.cfg.pixel_format
             )));
         }
+        let view = FrameView::new(raw, self.cfg.width, self.cfg.height)?;
+        // NVENC's CPU path takes tightly packed rows (`inputPitch` is
+        // derived from the width), so padded frames are repacked.
+        let host = view.tight_rows(&mut self.repack);
         self.encoder
-            .encode(&host[..expected], options)
+            .encode(host, options)
             .map_err(|e| FerricastError::Encoder(format!("NVENC ({}) encode (cpu): {e}", C::NAME)))
     }
 
@@ -361,31 +378,11 @@ impl<C: NvencCodec> NvencEncoder<C> {
             })?;
         Ok(())
     }
-}
 
-impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
-    const CODEC: Codec = C::FERRICAST_CODEC;
-
-    fn configure(&mut self, _config: &EncoderConfig) -> Result<()> {
-        // The `shiguredo_nvcodec::Encoder` is built fully configured
-        // by `probe_with`. A reconfigure-after-the-fact would mean
-        // tearing down the CUDA context and rebuilding the session;
-        // we don't support that today (the factory hands us a freshly-
-        // probed instance whenever the resolution changes).
-        //
-        // Drop the dmabuf cache anyway — `register_external_dmabuf`
-        // bakes the dimensions into NVENC's internal surface, so a
-        // cached `RegisteredResource` from a previous size is junk
-        // even if the fd happens to match. The cache will refill
-        // organically on the first encode at the new size.
-        #[cfg(feature = "nvenc-zero-copy")]
-        self.dmabuf_cache.clear();
-        Ok(())
-    }
-
-    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
-        let force_idr = self.frame_count % (self.cfg.keyframe_interval as u64) == 0
-            || std::mem::take(&mut self.pending_keyframe);
+    /// Submit one picture and collect its bitstream. `force_idr` is
+    /// decided by the caller so it can keep the request alive when
+    /// this fails.
+    fn encode_frame(&mut self, frame: CapturedFrame, force_idr: bool) -> Result<EncodedFrame> {
         let options = EncodeOptions {
             force_intra: false,
             force_idr,
@@ -410,18 +407,18 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
                         // sticky.
                         warn!(codec = C::NAME, %e, "NVENC dmabuf path failed; falling back to CPU readback for this frame");
                         let raw = CapturedFrame::Gpu(g).into_cpu()?;
-                        self.encode_cpu(&raw.data, &options)?;
+                        self.encode_cpu(&raw, &options)?;
                     }
                 }
                 CapturedFrame::Cpu(raw) => {
-                    self.encode_cpu(&raw.data, &options)?;
+                    self.encode_cpu(&raw, &options)?;
                 }
             }
         }
         #[cfg(not(feature = "nvenc-zero-copy"))]
         {
             let raw = frame.into_cpu()?;
-            self.encode_cpu(&raw.data, &options)?;
+            self.encode_cpu(&raw, &options)?;
         }
 
         let nv_frame = self.encoder.next_frame().ok_or_else(|| {
@@ -440,6 +437,39 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
             is_keyframe,
             pts_dts: (pts, pts),
         })
+    }
+}
+
+impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
+    const CODEC: Codec = C::FERRICAST_CODEC;
+
+    fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
+        if self.requested.same_session_shape(config) {
+            // Same session; only the bitrate may differ, and NVENC
+            // retargets that live.
+            if config.bitrate_kbps != self.requested.bitrate_kbps {
+                self.set_bitrate_kbps(config.bitrate_kbps)?;
+            }
+            return Ok(());
+        }
+        // Geometry, frame rate, GOP, input format or profile changed:
+        // those are baked into the NVENC session (and any registered
+        // DMA-BUFs), so open a fresh one.
+        *self = Self::probe_with(config.clone())?;
+        Ok(())
+    }
+
+    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
+        let force_idr = self
+            .frame_count
+            .is_multiple_of(u64::from(self.cfg.keyframe_interval))
+            || self.pending_keyframe;
+        let result = self.encode_frame(frame, force_idr);
+        // A requested IDR is only consumed by a picture NVENC actually
+        // produced, and any failure asks for a fresh IDR so the receiver
+        // never predicts across the gap.
+        self.pending_keyframe = result.is_err();
+        result
     }
 
     fn flush(self) -> Result<Vec<EncodedFrame>> {
@@ -470,6 +500,7 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
                     C::NAME
                 ))
             })?;
+        self.requested.bitrate_kbps = kbps;
         info!(codec = C::NAME, kbps, "NVENC bitrate live-reconfigured");
         Ok(())
     }
@@ -480,11 +511,9 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
         // already via this method, so we synthesise them here via
         // `nvEncGetSequenceParams` — which returns SPS/PPS for H.264
         // and VPS/SPS/PPS for HEVC.
-        let a = self.encoder.get_sequence_params().map_err(|e| {
+        self.encoder.get_sequence_params().map_err(|e| {
             FerricastError::Encoder(format!("NVENC ({}): get_sequence_params: {e}", C::NAME))
-        });
-
-        a
+        })
     }
 }
 
