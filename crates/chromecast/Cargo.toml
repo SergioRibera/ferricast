@@ -52,3 +52,9 @@ ctr = "0.9"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 rand = "0.8"
 
+[features]
+# Cast Streaming (mirroring) sends Opus audio; without an Opus encoder in the
+# build, Chromecast sessions always use HLS. The root crate's `opus-rs`
+# feature should enable this one.
+default = ["opus"]
+opus = []
