@@ -39,23 +39,84 @@ const KEEPALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// (rfc8216bis §6.2.5.2).
 const BLOCKING_RELOAD_TARGET_DURATIONS: u32 = 3;
 
+/// Segments are only cached briefly: URLs are unique per server (see
+/// [`UrlToken`]), but a long `immutable` lifetime buys nothing for a
+/// live window that is gone within a minute.
+const SEGMENT_MAX_AGE_SECS: u32 = 60;
+
+/// Random path prefix (`/<token>/…`) every URL of one server carries.
+///
+/// Segment names restart at `segment-0.ts` for every new server and
+/// the port is often reused, so without a per-server prefix a client
+/// (or an HTTP cache) could be handed bytes cached from an earlier
+/// stream. It also keeps other LAN hosts from guessing the stream URL.
+/// 128 bits from the OS CSPRNG, hex encoded.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct UrlToken(String);
+
+impl UrlToken {
+    /// # Errors
+    ///
+    /// The system random number generator failed.
+    pub(crate) fn generate() -> Result<Self> {
+        use ring::rand::SecureRandom as _;
+        let mut bytes = [0u8; 16];
+        ring::rand::SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| FerricastError::Hls("system RNG failed to produce a URL token".into()))?;
+        Ok(Self(bytes.iter().map(|b| format!("{b:02x}")).collect()))
+    }
+
+    /// Path of the media playlist, e.g. `/<token>/index.m3u8`.
+    pub(crate) fn playlist_path(&self) -> String {
+        format!("/{}/index.m3u8", self.0)
+    }
+
+    /// The route part of `path` (`/index.m3u8`, `/segment-3.ts`, …)
+    /// when it starts with this token, `None` otherwise. The token is
+    /// compared in constant time.
+    fn strip<'a>(&self, path: &'a str) -> Option<&'a str> {
+        let rest = path.strip_prefix('/')?;
+        let token = rest.get(..self.0.len())?;
+        let route = rest.get(self.0.len()..)?;
+        let same = token
+            .bytes()
+            .zip(self.0.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+        (same && route.starts_with('/')).then_some(route)
+    }
+}
+
+impl std::fmt::Debug for UrlToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keep the secret out of logs.
+        f.write_str("UrlToken(..)")
+    }
+}
+
 /// State one HLS server shares with all of its connection handlers.
 pub(crate) struct ServerState {
     pub(crate) ring: Arc<RwLock<SegmentRing>>,
     pub(crate) adaptive: Option<Arc<AdaptiveBitrateState>>,
     pub(crate) stats: SessionStats,
+    pub(crate) token: UrlToken,
 }
 
 impl ServerState {
+    /// # Errors
+    ///
+    /// The URL token could not be generated.
     pub(crate) fn new(
         ring: Arc<RwLock<SegmentRing>>,
         adaptive: Option<Arc<AdaptiveBitrateState>>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             ring,
             adaptive,
             stats: SessionStats::new(),
-        }
+            token: UrlToken::generate()?,
+        })
     }
 }
 
@@ -113,7 +174,11 @@ where
             Some((p, q)) => (p, q),
             None => (request.path.as_str(), ""),
         };
-        let (status, body_len) = match (request.method.as_str(), path_only) {
+        // Every route lives under the server's token; anything else
+        // falls through to 404 (OPTIONS preflights are answered for
+        // any path, they expose nothing).
+        let route = state.token.strip(path_only).unwrap_or("");
+        let (status, body_len) = match (request.method.as_str(), route) {
             ("OPTIONS", _) => {
                 write_options(&mut write_half, !client_wants_close).await?;
                 (204, 0usize)
@@ -865,7 +930,9 @@ fn write_common(
     head.push_str(&format!("Content-Type: {}\r\n", content_type));
     head.push_str(&format!("Content-Length: {}\r\n", content_length));
     if cacheable {
-        head.push_str("Cache-Control: public, max-age=31536000, immutable\r\n");
+        head.push_str(&format!(
+            "Cache-Control: public, max-age={SEGMENT_MAX_AGE_SECS}\r\n"
+        ));
     } else {
         head.push_str("Cache-Control: no-cache, no-store, must-revalidate\r\n");
     }

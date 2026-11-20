@@ -250,6 +250,10 @@ impl HlsServer {
             config.keep_segments,
             config.target_duration(),
         )));
+        let state = Arc::new(http::ServerState::new(
+            ring.clone(),
+            config.adaptive.clone(),
+        )?);
         let writer = ring.clone();
         let cfg = config.clone();
         let segmenter = tokio::spawn(async move {
@@ -273,7 +277,6 @@ impl HlsServer {
             "HLS server ready"
         );
 
-        let state = Arc::new(http::ServerState::new(ring, config.adaptive.clone()));
         Ok(Self {
             listener,
             connections: Arc::new(Connections::new(state, config.tls.clone())),
@@ -289,6 +292,13 @@ impl HlsServer {
     /// The socket's address cannot be queried.
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.listener.local_addr().map_err(FerricastError::from)
+    }
+
+    /// Path of the media playlist, `/<token>/index.m3u8`. Requests
+    /// outside the per-server random token prefix get 404.
+    #[must_use]
+    pub fn playlist_path(&self) -> String {
+        self.connections.state.token.playlist_path()
     }
 
     /// Accept a single connection and dispatch it to a per-connection
@@ -505,6 +515,11 @@ impl HlsFrameSink {
             config.keep_segments,
             config.target_duration(),
         )));
+        let state = Arc::new(http::ServerState::new(
+            ring.clone(),
+            config.adaptive.clone(),
+        )?);
+
         let segmenter_ring = ring.clone();
         let cfg_for_segmenter = config.clone();
         let segmenter = tokio::spawn(async move {
@@ -521,10 +536,6 @@ impl HlsFrameSink {
             }
         });
 
-        let state = Arc::new(http::ServerState::new(
-            ring.clone(),
-            config.adaptive.clone(),
-        ));
         let connections = Arc::new(Connections::new(state, config.tls.clone()));
         let scheme: &'static str = if config.tls.is_some() {
             "https"
@@ -568,6 +579,15 @@ impl HlsFrameSink {
     #[must_use]
     pub fn scheme(&self) -> &'static str {
         self.scheme
+    }
+
+    /// Path of the media playlist, `/<token>/index.m3u8`, where the
+    /// token is 128 random bits unique to this sink. Build the player
+    /// URL as `{scheme}://{host}:{port}{playlist_path}`; requests
+    /// outside the token prefix get 404.
+    #[must_use]
+    pub fn playlist_path(&self) -> String {
+        self.connections.state.token.playlist_path()
     }
 
     /// Wait until at least one segment has been pushed to the ring.
@@ -672,8 +692,8 @@ mod tests {
         assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
         drop(idle);
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let reply = get(addr, "/index.m3u8").await;
-        assert!(!reply.starts_with("HTTP/1.1 503"), "{reply}");
+        let reply = get(addr, &sink.playlist_path()).await;
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     }
 
     #[tokio::test]
@@ -687,5 +707,31 @@ mod tests {
             .await
             .expect("handler must be aborted, not left waiting for a request");
         assert!(matches!(read, Ok(0) | Err(_)));
+    }
+
+    #[tokio::test]
+    async fn routes_require_the_random_token() {
+        let (server, _tx) = sink().await;
+        let addr = server.local_addr();
+        let path = server.playlist_path();
+        let token = path
+            .strip_prefix('/')
+            .and_then(|p| p.strip_suffix("/index.m3u8"))
+            .unwrap();
+        assert_eq!(token.len(), 32);
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        let (other, _tx2) = sink().await;
+        assert_ne!(other.playlist_path(), path, "tokens must differ per sink");
+
+        let ok = get(addr, &path).await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        assert!(ok.contains("#EXTM3U"), "{ok}");
+        for bad in ["/index.m3u8", "/segment-0.ts", "/0123/index.m3u8", "/"] {
+            let reply = get(addr, bad).await;
+            assert!(reply.starts_with("HTTP/1.1 404"), "{bad}: {reply}");
+        }
+        let seg = get(addr, &format!("/{token}/segment-0.ts")).await;
+        // No segment yet, but the route is reachable under the token.
+        assert!(seg.starts_with("HTTP/1.1 404"), "{seg}");
     }
 }
