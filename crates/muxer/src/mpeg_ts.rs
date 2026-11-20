@@ -253,7 +253,7 @@ impl MpegTs {
             self.emit_pmt();
             self.psi_emitted = true;
         }
-        let pes = build_audio_pes(payload, pts_90k);
+        let pes = build_audio_pes(payload, pts_90k)?;
         // PCR stays exclusive to PID_VIDEO (the PMT's declared
         // `PCR_PID`). Emitting PCR on the audio PID confuses the
         // receiver's STC PLL and produces glitchy A/V on chromecast.
@@ -361,7 +361,7 @@ impl Muxer for MpegTs {
                 let mut apts = start_apts;
                 let mut frames_emitted = 0u32;
                 while apts < lag_threshold && frames_emitted < SILENT_INJECT_MAX_PER_FRAME {
-                    let aac_pes = build_audio_pes(&SILENT_AAC_FRAME, apts);
+                    let aac_pes = build_audio_pes(&SILENT_AAC_FRAME, apts)?;
                     write_pes_to_ts(
                         &mut self.out,
                         PID_AUDIO,
@@ -533,19 +533,31 @@ fn build_pes(payload: &[u8], pts_90k: u64, dts_90k: u64) -> Vec<u8> {
 /// Unlike video, audio PES MUST carry a non-zero `PES_packet_length`
 /// — `0` is only legal for video. PTS is included; DTS is omitted
 /// (audio has no reordering, so DTS == PTS implicitly).
-fn build_audio_pes(payload: &[u8], pts_90k: u64) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Fails when the payload is too large for the 16-bit
+/// `PES_packet_length` (more than 65 527 bytes, i.e. dozens of ADTS
+/// frames in one push); truncating the field would corrupt the stream.
+fn build_audio_pes(payload: &[u8], pts_90k: u64) -> Result<Vec<u8>, FerricastError> {
     // header: prefix(3) + stream_id(1) + length(2) + flags(2) +
     //         header_data_length(1) + PTS(5) = 14 bytes header, then payload.
     let pes_body_len = 3 /* flags+hdr_len */ + 5 /* PTS */ + payload.len();
+    let length = u16::try_from(pes_body_len).map_err(|_| {
+        FerricastError::Encoder(format!(
+            "audio access unit of {} bytes does not fit in one PES packet",
+            payload.len()
+        ))
+    })?;
     let mut pes = Vec::with_capacity(6 + pes_body_len);
     pes.extend_from_slice(&[0x00, 0x00, 0x01, PES_STREAM_ID_AUDIO]);
-    pes.extend_from_slice(&(pes_body_len as u16).to_be_bytes());
+    pes.extend_from_slice(&length.to_be_bytes());
     pes.push(0x84); // '10' marker + alignment_indicator=1
     pes.push(0x80); // PTS_DTS_flags=10 (PTS only)
     pes.push(0x05); // PES_header_data_length
     pes.extend_from_slice(&encode_ts(0b0010, pts_90k));
     pes.extend_from_slice(payload);
-    pes
+    Ok(pes)
 }
 
 /// Encode a 33-bit timestamp into 5 bytes per ISO/IEC 13818-1
@@ -850,7 +862,7 @@ mod tests {
         // whether stuffing forces an AF to exist.
         let mut out = Vec::new();
         let mut cc = 0;
-        let pes = build_audio_pes(&[0x55; 32], 90_000);
+        let pes = build_audio_pes(&[0x55; 32], 90_000).unwrap();
         write_pes_to_ts(&mut out, PID_AUDIO, &mut cc, &pes, false, None);
         assert_eq!(out.len(), TS_PACKET_SIZE);
         let afc = (out[3] >> 4) & 0b11;
@@ -870,12 +882,21 @@ mod tests {
     }
 
     #[test]
+    fn audio_pes_length_never_truncates() {
+        let largest = build_audio_pes(&vec![0; 65_527], 0).unwrap();
+        assert_eq!(u16::from_be_bytes([largest[4], largest[5]]), u16::MAX);
+        assert!(build_audio_pes(&vec![0; 65_528], 0).is_err());
+        let mut muxer = MpegTs::default().with_external_audio(true);
+        assert!(muxer.add_audio_frame(&vec![0; 70_000], 0).is_err());
+    }
+
+    #[test]
     fn audio_keyframe_emits_rai_without_pcr() {
         // Defensive: when audio is marked random_access with no
         // PCR, the AF should set RAI=1 but PCR_flag=0.
         let mut out = Vec::new();
         let mut cc = 0;
-        let pes = build_audio_pes(&[0xAA; 64], 90_000);
+        let pes = build_audio_pes(&[0xAA; 64], 90_000).unwrap();
         write_pes_to_ts(&mut out, PID_AUDIO, &mut cc, &pes, true, None);
         assert_eq!(out.len(), TS_PACKET_SIZE);
         let afc = (out[3] >> 4) & 0b11;
