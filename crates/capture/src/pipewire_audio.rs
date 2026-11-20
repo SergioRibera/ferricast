@@ -168,8 +168,9 @@ fn spawn_worker(
     mute: AudioMuteHandle,
 ) -> Result<AudioWorkerHandle> {
     // Moderate buffer: 32 chunks × ~21 ms ≈ 680 ms. The PipeWire
-    // callback runs on an RT thread that can't block; `try_send`
-    // returning `Full` is the only realistic backpressure response.
+    // callback runs on the stream's main loop, which must not block;
+    // `try_send` returning `Full` is the only realistic backpressure
+    // response.
     // 32 is large enough to ride out short supervisor stalls (HTTP
     // read locks, segment-close ring writes) without holding so
     // many chunks in flight that, once the supervisor catches up,
@@ -314,11 +315,18 @@ fn run_loop(
     let pod = build_audio_format_pod(config.sample_rate, config.channels);
     let mut pods = [pod_view(&pod)];
 
+    // No `RT_PROCESS`: with it, `process` runs on PipeWire's data
+    // thread while `param_changed` runs on this main-loop thread, and
+    // both get `&mut UserData` — aliased mutable access across threads.
+    // `handle_process` also allocates, logs and `try_send`s, none of
+    // which is RT-safe. Without the flag PipeWire invokes `process`
+    // on the main loop too; at ~21 ms quanta the extra hop is
+    // irrelevant.
     stream
         .connect(
             pw::spa::utils::Direction::Input,
             None,
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
             pods.as_mut_slice(),
         )
         .map_err(|e| FerricastError::Capture(format!("audio Stream::connect: {e}")))?;
