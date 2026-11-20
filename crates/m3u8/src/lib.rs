@@ -191,21 +191,16 @@ impl M3u8Writer {
         self
     }
 
-    /// Enable Low-Latency HLS. `part_target_secs` is the advertised
+    /// Enable Low-Latency HLS. `part_target_secs` is the requested
     /// `PART-TARGET` (Apple recommends 0.2–0.5 s; clients pace
     /// blocking-reload requests to ~3× this value). Setting this
-    /// also implicitly turns on `CAN-BLOCK-RELOAD=YES` and sets
-    /// reasonable defaults for the two hold-back values (3 × the
-    /// target / part-target floors). Override afterwards if needed.
+    /// also implicitly turns on `CAN-BLOCK-RELOAD=YES`. Unless set
+    /// explicitly, the hold-back values default at render time to
+    /// 3 × `TARGETDURATION` and 3 × `PART-TARGET`, so builder call
+    /// order does not matter.
     pub fn with_part_target(mut self, secs: f32) -> Self {
         self.part_target_secs = Some(secs);
         self.can_block_reload = true;
-        if self.part_hold_back_secs.is_none() {
-            self.part_hold_back_secs = Some(secs * 3.0);
-        }
-        if self.hold_back_secs.is_none() {
-            self.hold_back_secs = Some((self.target_duration as f32) * 3.0);
-        }
         self
     }
 
@@ -275,6 +270,48 @@ impl M3u8Writer {
         Ok(s)
     }
 
+    fn parts(&self) -> impl Iterator<Item = &Part> {
+        self.parts_by_segment
+            .iter()
+            .flatten()
+            .chain(&self.pending_parts)
+    }
+
+    /// The `PART-TARGET` to advertise, or `None` without LL-HLS.
+    ///
+    /// Every part must last at most `PART-TARGET` (RFC 8216bis
+    /// §4.4.3.7), so the advertised value is the requested target or
+    /// the longest listed part, whichever is larger (rounded up to the
+    /// millisecond the playlist is written with).
+    ///
+    /// # Errors
+    ///
+    /// Parts listed without [`Self::with_part_target`] (they would be
+    /// emitted without `EXT-X-PART-INF`), or parts whose duration is
+    /// negative or not finite.
+    fn effective_part_target(&self) -> Result<Option<f32>, FerricastError> {
+        let mut longest = None::<f32>;
+        for part in self.parts() {
+            if !part.duration.is_finite() || part.duration < 0.0 {
+                return Err(FerricastError::M3u8(format!(
+                    "invalid part duration {:.3} for {}",
+                    part.duration, part.uri
+                )));
+            }
+            longest = Some(longest.map_or(part.duration, |l| l.max(part.duration)));
+        }
+        match (self.part_target_secs, longest) {
+            (None, None) => Ok(None),
+            (None, Some(_)) => Err(FerricastError::M3u8(
+                "parts listed without a part target (EXT-X-PART-INF)".into(),
+            )),
+            (Some(target), None) => Ok(Some(target)),
+            (Some(target), Some(longest)) => {
+                Ok(Some(target.max((longest * 1000.0).ceil() / 1000.0)))
+            }
+        }
+    }
+
     fn write(&self, w: &mut String) -> Result<(), FerricastError> {
         // Header tags must appear in the order defined by RFC 8216
         // §4.3.1: file-wide tags before any segment tag.
@@ -302,34 +339,26 @@ impl M3u8Writer {
         // advertises CAN-BLOCK-RELOAD and the hold-back values so
         // the client knows how to pace its blocking playlist reload
         // requests.
-        if let Some(pt) = self.part_target_secs {
+        let part_target = self.effective_part_target()?;
+        if let Some(pt) = part_target {
             writeln!(w, "#EXT-X-PART-INF:PART-TARGET={:.3}", pt).map_err(fmt_err)?;
         }
-        if self.can_block_reload
-            || self.part_hold_back_secs.is_some()
-            || self.hold_back_secs.is_some()
-        {
-            let mut control = String::from("#EXT-X-SERVER-CONTROL:");
-            let mut first = true;
+        let hold_back = self
+            .hold_back_secs
+            .or_else(|| part_target.map(|_| f32::from(self.target_duration) * 3.0));
+        let part_hold_back = self.part_hold_back_secs.or(part_target.map(|pt| pt * 3.0));
+        if self.can_block_reload || part_hold_back.is_some() || hold_back.is_some() {
+            let mut attributes = Vec::new();
             if self.can_block_reload {
-                control.push_str("CAN-BLOCK-RELOAD=YES");
-                first = false;
+                attributes.push("CAN-BLOCK-RELOAD=YES".to_owned());
             }
-            if let Some(hb) = self.hold_back_secs {
-                if !first {
-                    control.push(',');
-                }
-                let _ = write!(&mut control, "HOLD-BACK={:.3}", hb);
-                first = false;
+            if let Some(hb) = hold_back {
+                attributes.push(format!("HOLD-BACK={hb:.3}"));
             }
-            if let Some(phb) = self.part_hold_back_secs {
-                if !first {
-                    control.push(',');
-                }
-                let _ = write!(&mut control, "PART-HOLD-BACK={:.3}", phb);
+            if let Some(phb) = part_hold_back {
+                attributes.push(format!("PART-HOLD-BACK={phb:.3}"));
             }
-            control.push('\n');
-            w.push_str(&control);
+            writeln!(w, "#EXT-X-SERVER-CONTROL:{}", attributes.join(",")).map_err(fmt_err)?;
         }
 
         for (i, seg) in self.segments.iter().enumerate() {
@@ -452,6 +481,48 @@ mod tests {
         assert!(s.contains("CAN-BLOCK-RELOAD=YES"));
         assert!(s.contains("PART-HOLD-BACK=1.500")); // 3 × 0.5
         assert!(s.contains("HOLD-BACK=12.000")); // 3 × target_duration=4
+    }
+
+    #[test]
+    fn hold_back_follows_the_final_target_duration_whatever_the_call_order() {
+        let s = M3u8Writer::live(M3u8Version::V6)
+            .with_part_target(0.5)
+            .with_target_duration(4)
+            .to_string()
+            .unwrap();
+        assert!(s.contains("HOLD-BACK=12.000"), "{s}");
+        let s = M3u8Writer::live(M3u8Version::V6)
+            .with_part_target(0.5)
+            .with_hold_back(7.0)
+            .to_string()
+            .unwrap();
+        assert!(s.contains("HOLD-BACK=7.000,PART-HOLD-BACK=1.500"), "{s}");
+    }
+
+    #[test]
+    fn parts_without_a_part_target_are_rejected() {
+        let mut w = M3u8Writer::live(M3u8Version::V6).with_target_duration(4);
+        w.add_segment(Segment::new(2.0, "a.ts")).unwrap();
+        w.attach_parts(vec![Part::new(0.5, "a.0.ts")]).unwrap();
+        assert!(w.to_string().is_err());
+        let mut w = M3u8Writer::live(M3u8Version::V6);
+        w.set_pending_parts(vec![Part::new(0.5, "b.0.ts")]);
+        assert!(w.to_string().is_err());
+    }
+
+    #[test]
+    fn part_target_covers_the_longest_part() {
+        let mut w = M3u8Writer::live(M3u8Version::V6)
+            .with_target_duration(4)
+            .with_part_target(0.5);
+        w.add_segment(Segment::new(2.0, "a.ts")).unwrap();
+        w.attach_parts(vec![Part::new(0.5, "a.0.ts"), Part::new(0.5333, "a.1.ts")])
+            .unwrap();
+        let s = w.to_string().unwrap();
+        assert!(s.contains("PART-TARGET=0.534"), "{s}");
+        assert!(s.contains("PART-HOLD-BACK=1.602"), "{s}");
+        w.set_pending_parts(vec![Part::new(f32::NAN, "b.0.ts")]);
+        assert!(w.to_string().is_err());
     }
 
     #[test]
