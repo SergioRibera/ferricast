@@ -268,6 +268,15 @@ impl StreamManager {
         self.receiver.register_receiver::<P>();
     }
 
+    /// Register a configured receiver-side protocol instance (custom
+    /// port, friendly name, …).
+    pub fn register_receiver_instance<P>(&mut self, protocol: P)
+    where
+        P: ReceiverProtocol + 'static,
+    {
+        self.receiver.register_receiver_instance(protocol);
+    }
+
     /// Register a video decoder. Pipeline picks one per session by
     /// `D::CODEC`. Last registration for a given codec wins —
     /// register the preferred backend last (the builder's `with_*`
@@ -1192,6 +1201,16 @@ impl StreamManagerBuilder {
         P: ReceiverProtocol + Clone + Default + 'static,
     {
         self.manager.register_receiver::<P>();
+        self
+    }
+
+    /// Register a configured receiver-side protocol instance (custom
+    /// port, friendly name, …).
+    pub fn with_receiver<P>(mut self, protocol: P) -> Self
+    where
+        P: ReceiverProtocol + 'static,
+    {
+        self.manager.register_receiver_instance(protocol);
         self
     }
 

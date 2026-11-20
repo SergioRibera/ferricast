@@ -1,6 +1,15 @@
 //! Receiver side of the manager: advertise this process as a cast
 //! target, accept control connections from remote senders, and run
 //! the pull → decode → sink pipeline for each LOAD.
+//!
+//! Layout:
+//! - this file — type erasure, the registry ([`ReceiverHost`]) and
+//!   the per-protocol accept supervisor;
+//! - [`session`] — one task per accepted control connection;
+//! - [`pump`] — one task per loaded media: pull, decode, pace, sink.
+
+mod pump;
+mod session;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -8,15 +17,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex, mpsc, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
 use ferricast_core::{
     AdvertiseInfo, Advertiser, AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame,
-    CapturedFrame, Codec, ControlSession, DecodedAudio, DecoderConfig, EncodedFrame,
-    FerricastError, FrameSink, MediaCommand, MediaInfo, MediaPacket, MediaPuller, PixelFormat,
-    PlaybackState, PullSpec, ReceiverProtocol, RemoteSender, Result, VideoDecoder,
+    CapturedFrame, Codec, ControlSession, DecodedAudio, DecoderConfig, EncodedFrame, FrameSink,
+    MediaCommand, MediaInfo, MediaPacket, MediaPuller, PlaybackState, PullSpec, ReceiverProtocol,
+    RemoteSender, Result, VideoDecoder,
 };
 
 use crate::manager::ManagerEvent;
@@ -24,10 +33,9 @@ use crate::manager::ManagerEvent;
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 // ──────────────────────────────────────────────────────────────────
-// Receiver-side erasure. Mirrors the sender-side erasure above:
-// every receiver trait that the manager talks to via `dyn`-style
-// dispatch goes through an `ErasedX` shim because the native trait
-// uses RPITIT (`impl Future + Send`) which isn't object-safe.
+// Receiver-side erasure: the native traits use RPITIT
+// (`impl Future + Send`), which isn't object-safe, so the manager
+// talks to them through these `ErasedX` shims.
 
 trait ErasedAdvertiser: Send + Sync {
     fn start(&mut self, info: AdvertiseInfo) -> BoxFut<'_, Result<()>>;
@@ -87,14 +95,10 @@ impl<T: MediaPuller> ErasedPuller for T {
     }
 }
 
-// Decoders and sinks aren't async (or are async but don't need
-// lifetime tricks), so plain `dyn` works. `Box<dyn ErasedVideoDecoder>`
-// is what the pipeline holds; the wrapper just exists so `decode`'s
-// concrete type doesn't leak out of the registry.
-
 trait ErasedVideoDecoder: Send {
     fn configure(&mut self, config: &DecoderConfig) -> Result<()>;
     fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>>;
+    fn flush(&mut self) -> Result<Vec<CapturedFrame>>;
 }
 
 impl<T: VideoDecoder> ErasedVideoDecoder for T {
@@ -104,11 +108,15 @@ impl<T: VideoDecoder> ErasedVideoDecoder for T {
     fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
         VideoDecoder::decode(self, frame)
     }
+    fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
+        VideoDecoder::flush(self)
+    }
 }
 
 trait ErasedAudioDecoder: Send {
     fn configure(&mut self, config: &AudioDecoderConfig) -> Result<()>;
     fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>>;
+    fn flush(&mut self) -> Result<Vec<DecodedAudio>>;
 }
 
 impl<T: AudioDecoder> ErasedAudioDecoder for T {
@@ -118,26 +126,30 @@ impl<T: AudioDecoder> ErasedAudioDecoder for T {
     fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
         AudioDecoder::decode(self, frame)
     }
+    fn flush(&mut self) -> Result<Vec<DecodedAudio>> {
+        AudioDecoder::flush(self)
+    }
 }
-
-// `FrameSink` is already object-safe (uses `async_trait`) so the
-// pipeline holds `Box<dyn FrameSink>` directly — no `ErasedSink`
-// wrapper needed.
 
 // Factory used by the receiver pipeline to ask the application
 // (typically the GUI) for somewhere to send decoded frames. Called
-// once per accepted session, after the puller has reported
-// `MediaInfo` — that way the app can open an audio-only card view
-// vs. a video window based on whether `info.video.is_some()`.
+// once per LOAD, after the puller has reported `MediaInfo` and the
+// decoders are resolved — that way the app can open an audio-only
+// card view vs. a video window based on `info.video.is_some()`, and
+// nothing opens for media that cannot play.
 type SinkFactory = Arc<
     dyn Fn(&RemoteSender, &MediaInfo) -> BoxFut<'static, Result<Box<dyn FrameSink>>> + Send + Sync,
 >;
+type ControlFactory = Arc<dyn Fn() -> Result<Box<dyn ErasedControlSession>> + Send + Sync>;
+type PullerFactory = Arc<dyn Fn() -> Result<Box<dyn ErasedPuller>> + Send + Sync>;
+type VideoDecoderFactory = Arc<dyn Fn() -> Box<dyn ErasedVideoDecoder> + Send + Sync>;
+type AudioDecoderFactory = Arc<dyn Fn() -> Box<dyn ErasedAudioDecoder> + Send + Sync>;
 
 struct RegisteredReceiver {
     protocol: &'static str,
     create_advertiser: Box<dyn Fn() -> Box<dyn ErasedAdvertiser> + Send + Sync>,
-    create_control: Arc<dyn Fn() -> Result<Box<dyn ErasedControlSession>> + Send + Sync>,
-    create_puller: Arc<dyn Fn() -> Result<Box<dyn ErasedPuller>> + Send + Sync>,
+    create_control: ControlFactory,
+    create_puller: PullerFactory,
     advertise_info: AdvertiseInfo,
 }
 
@@ -148,9 +160,18 @@ struct ActiveReceiver {
     advertiser: Box<dyn ErasedAdvertiser>,
 }
 
+/// How long `stop_receivers` waits for a supervisor (and the
+/// sessions it winds down) before aborting it.
+const SUPERVISOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a supervisor gives its sessions to stop cleanly.
+const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(100);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
 /// Receiver-side state of the [`crate::StreamManager`]: registered
 /// receiver protocols, decoder factories, the sink factory and the
 /// running accept supervisors.
+#[derive(Default)]
 pub(crate) struct ReceiverHost {
     receivers: Vec<RegisteredReceiver>,
     /// Codec → factory map. Pipeline picks a video decoder based on
@@ -159,38 +180,45 @@ pub(crate) struct ReceiverHost {
     /// and the last one wins — register the preferred backend last,
     /// or use the builder's `with_*_decoder` helpers which append
     /// in priority order.
-    video_decoders: HashMap<Codec, Arc<dyn Fn() -> Box<dyn ErasedVideoDecoder> + Send + Sync>>,
-    audio_decoders: HashMap<AudioCodec, Arc<dyn Fn() -> Box<dyn ErasedAudioDecoder> + Send + Sync>>,
+    video_decoders: HashMap<Codec, VideoDecoderFactory>,
+    audio_decoders: HashMap<AudioCodec, AudioDecoderFactory>,
     sink_factory: Option<SinkFactory>,
     active_receivers: Arc<Mutex<HashMap<Uuid, ActiveReceiver>>>,
     receivers_running: bool,
 }
 
-impl Default for ReceiverHost {
-    fn default() -> Self {
-        Self {
-            receivers: Vec::new(),
-            video_decoders: HashMap::new(),
-            audio_decoders: HashMap::new(),
-            sink_factory: None,
-            active_receivers: Arc::new(Mutex::new(HashMap::new())),
-            receivers_running: false,
-        }
-    }
+/// Everything a session needs to run LOADs, shared by all sessions
+/// of one receiver protocol.
+struct PipelineCtx {
+    protocol: &'static str,
+    create_puller: PullerFactory,
+    video_decoders: HashMap<Codec, VideoDecoderFactory>,
+    audio_decoders: HashMap<AudioCodec, AudioDecoderFactory>,
+    sink_factory: SinkFactory,
+    event_tx: mpsc::Sender<ManagerEvent>,
+    /// Which session currently owns playback (Cast semantics: the
+    /// latest LOAD wins, the previous one is interrupted).
+    playback: session::PlaybackOwner,
 }
 
 impl ReceiverHost {
-    /// Register a receiver-side protocol (advertiser + control +
-    /// puller). Mirror of [`Self::register`] for senders.
+    /// Register a receiver-side protocol built with `P::default()`.
     pub(crate) fn register_receiver<P>(&mut self)
     where
-        P: ReceiverProtocol + Clone + Default + 'static,
+        P: ReceiverProtocol + Default + 'static,
     {
-        let p_adv = P::default();
-        let p_ctrl = p_adv.clone();
-        let p_pull = p_adv.clone();
-        let info = p_adv.advertise_info();
+        self.register_receiver_instance(P::default());
+    }
 
+    /// Register a configured receiver-side protocol instance
+    /// (advertiser + control + puller).
+    pub(crate) fn register_receiver_instance<P>(&mut self, protocol: P)
+    where
+        P: ReceiverProtocol + 'static,
+    {
+        let p = Arc::new(protocol);
+        let info = p.advertise_info();
+        let (p_adv, p_ctrl, p_pull) = (p.clone(), p.clone(), p);
         self.receivers.push(RegisteredReceiver {
             protocol: P::PROTOCOL,
             create_advertiser: Box::new(move || {
@@ -209,10 +237,7 @@ impl ReceiverHost {
     }
 
     /// Register a video decoder. Pipeline picks one per session by
-    /// `D::CODEC`. Last registration for a given codec wins —
-    /// register the preferred backend last (the builder's `with_*`
-    /// helpers do this in NVDEC → VA-API → sw order, same priority
-    /// the encoder uses).
+    /// `D::CODEC`. Last registration for a given codec wins.
     pub(crate) fn register_video_decoder<D>(&mut self)
     where
         D: VideoDecoder + Default + 'static,
@@ -234,13 +259,8 @@ impl ReceiverHost {
     }
 
     /// Install the callback the pipeline uses to ask the host
-    /// application for a [`FrameSink`] whenever a new receiver
-    /// session resolves its `MediaInfo`. The GUI typically opens a
-    /// new window here (video) or a transport-control card (audio
-    /// only) and returns the sink the window owns. Required before
-    /// [`Self::start_receivers`] — without it the pipeline rejects
-    /// inbound sessions because it has nowhere to put decoded
-    /// frames.
+    /// application for a [`FrameSink`] whenever a LOAD resolves its
+    /// `MediaInfo`. Required before [`Self::start_receivers`].
     pub(crate) fn set_sink_factory<F, Fut>(&mut self, factory: F)
     where
         F: Fn(&RemoteSender, &MediaInfo) -> Fut + Send + Sync + 'static,
@@ -248,7 +268,7 @@ impl ReceiverHost {
     {
         self.sink_factory = Some(Arc::new(move |remote, info| {
             let fut = factory(remote, info);
-            Box::pin(async move { fut.await })
+            Box::pin(fut)
         }));
     }
 
@@ -256,9 +276,10 @@ impl ReceiverHost {
         self.receivers.iter().map(|r| r.protocol).collect()
     }
 
-    /// Start every registered receiver protocol's advertiser and
-    /// per-protocol accept supervisor. Requires
-    /// [`Self::set_sink_factory`] to have been called.
+    /// Bind, advertise and start the accept supervisor of every
+    /// registered receiver protocol. A protocol whose control port
+    /// cannot be bound is reported with [`ManagerEvent::ReceiverError`]
+    /// and not advertised.
     pub(crate) async fn start_receivers(
         &mut self,
         event_tx: &mpsc::Sender<ManagerEvent>,
@@ -267,7 +288,7 @@ impl ReceiverHost {
             return Ok(());
         }
         let sink_factory = self.sink_factory.clone().ok_or_else(|| {
-            FerricastError::Receiver(
+            ferricast_core::FerricastError::Receiver(
                 "start_receivers called before set_sink_factory — \
                  the pipeline has nowhere to send decoded frames"
                     .into(),
@@ -275,108 +296,55 @@ impl ReceiverHost {
         })?;
 
         for proto in &self.receivers {
+            let receiver_id = Uuid::new_v4();
+            let protocol = proto.protocol;
+
+            // Bind before advertising, so a taken port never ends up
+            // advertised with nothing behind it.
+            let first_control = match (proto.create_control)() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(protocol, %e, "receiver control could not start; not advertising");
+                    let _ = event_tx
+                        .send(ManagerEvent::ReceiverError {
+                            receiver_id,
+                            message: e.to_string(),
+                        })
+                        .await;
+                    continue;
+                }
+            };
+
             let mut advertiser = (proto.create_advertiser)();
             if let Err(e) = advertiser.start(proto.advertise_info.clone()).await {
-                tracing::warn!(
-                    protocol = proto.protocol,
-                    %e,
-                    "receiver advertiser failed to start; skipping"
-                );
+                tracing::warn!(protocol, %e, "receiver advertiser failed to start; skipping");
                 continue;
             }
             tracing::info!(
-                protocol = proto.protocol,
+                protocol,
                 friendly_name = %proto.advertise_info.friendly_name,
                 port = proto.advertise_info.port,
                 "receiver advertised"
             );
 
-            // Per-protocol accept supervisor. One control session at
-            // a time — when it dies (remote closed, fatal error) we
-            // build a fresh one and call `accept()` again. Mirrors
-            // the supervisor pattern on the sender side.
-            let receiver_id = Uuid::new_v4();
-            let create_control = proto.create_control.clone();
-            let create_puller = proto.create_puller.clone();
-            let event_tx = event_tx.clone();
-            let active = self.active_receivers.clone();
-            let video_decoders = self.video_decoders.clone();
-            let audio_decoders = self.audio_decoders.clone();
-            let sink_factory = sink_factory.clone();
-            let protocol = proto.protocol;
-            let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
-
-            let task = tokio::spawn(async move {
-                loop {
-                    let mut control = match (create_control)() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::error!(protocol, %e, "create_control failed; exiting supervisor");
-                            let _ = event_tx
-                                .send(ManagerEvent::ReceiverError {
-                                    receiver_id,
-                                    message: format!("create_control: {e}"),
-                                })
-                                .await;
-                            return;
-                        }
-                    };
-
-                    let remote = tokio::select! {
-                        _ = cancel_rx.recv() => return,
-                        r = control.accept() => match r {
-                            Ok(r) => r,
-                            Err(e) => {
-                                tracing::warn!(protocol, %e, "control.accept failed; retrying");
-                                continue;
-                            }
-                        }
-                    };
-                    tracing::info!(
-                        protocol,
-                        sender_id = %remote.id,
-                        sender_addr = %remote.addr,
-                        "receiver: remote sender connected"
-                    );
-                    let _ = event_tx
-                        .send(ManagerEvent::ReceiverIncoming {
-                            receiver_id,
-                            protocol,
-                            remote: remote.clone(),
-                        })
-                        .await;
-
-                    let session_result = run_receiver_session(
-                        receiver_id,
-                        protocol,
-                        remote,
-                        &mut control,
-                        create_puller.clone(),
-                        &video_decoders,
-                        &audio_decoders,
-                        sink_factory.clone(),
-                        event_tx.clone(),
-                        &mut cancel_rx,
-                    )
-                    .await;
-
-                    if let Err(e) = session_result {
-                        tracing::warn!(protocol, %e, "receiver session ended with error");
-                        let _ = event_tx
-                            .send(ManagerEvent::ReceiverError {
-                                receiver_id,
-                                message: e.to_string(),
-                            })
-                            .await;
-                    }
-                    let _ = control.close().await;
-                    let _ = event_tx
-                        .send(ManagerEvent::ReceiverStopped { receiver_id })
-                        .await;
-                }
+            let ctx = Arc::new(PipelineCtx {
+                protocol,
+                create_puller: proto.create_puller.clone(),
+                video_decoders: self.video_decoders.clone(),
+                audio_decoders: self.audio_decoders.clone(),
+                sink_factory: sink_factory.clone(),
+                event_tx: event_tx.clone(),
+                playback: session::PlaybackOwner::default(),
             });
+            let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+            let supervisor = Supervisor {
+                ctx,
+                create_control: proto.create_control.clone(),
+                cancel_rx,
+            };
+            let task = tokio::spawn(supervisor.run(first_control));
 
-            active.lock().await.insert(
+            self.active_receivers.lock().await.insert(
                 receiver_id,
                 ActiveReceiver {
                     protocol,
@@ -392,18 +360,19 @@ impl ReceiverHost {
     }
 
     pub(crate) async fn stop_receivers(&mut self) -> Result<()> {
-        let active = {
-            let mut guard = self.active_receivers.lock().await;
-            std::mem::take(&mut *guard)
-        };
+        let active = std::mem::take(&mut *self.active_receivers.lock().await);
         for (_, mut r) in active {
             let _ = r.cancel_tx.send(()).await;
             let _ = r.advertiser.stop().await;
-            match tokio::time::timeout(Duration::from_secs(5), r.task).await {
+            match tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, &mut r.task).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::warn!(?e, "receiver task panicked"),
                 Err(_) => {
-                    tracing::warn!(protocol = r.protocol, "receiver task did not finish in 5s")
+                    tracing::warn!(
+                        protocol = r.protocol,
+                        "receiver task did not stop in time; aborting"
+                    );
+                    r.task.abort();
                 }
             }
         }
@@ -412,276 +381,87 @@ impl ReceiverHost {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────
-// Receiver pipeline helpers.
-//
-// `run_receiver_session` is the per-control-connection state machine:
-// it reads commands off the control channel, on LOAD it builds a
-// fresh puller + decoders + sink and hands them to `run_pump`, and
-// it forwards PLAY/PAUSE/STOP/SEEK to the pump via `PumpCmd`.
-
-enum PumpCmd {
-    Play,
-    Pause,
-    Stop,
-    Seek(u64),
+/// Accept loop of one receiver protocol: every accepted control
+/// connection gets its own session task, so several senders can be
+/// connected at once.
+struct Supervisor {
+    ctx: Arc<PipelineCtx>,
+    create_control: ControlFactory,
+    cancel_rx: mpsc::Receiver<()>,
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_receiver_session(
-    receiver_id: Uuid,
-    protocol: &'static str,
-    remote: RemoteSender,
-    control: &mut Box<dyn ErasedControlSession>,
-    create_puller: Arc<dyn Fn() -> Result<Box<dyn ErasedPuller>> + Send + Sync>,
-    video_decoders: &HashMap<Codec, Arc<dyn Fn() -> Box<dyn ErasedVideoDecoder> + Send + Sync>>,
-    audio_decoders: &HashMap<
-        AudioCodec,
-        Arc<dyn Fn() -> Box<dyn ErasedAudioDecoder> + Send + Sync>,
-    >,
-    sink_factory: SinkFactory,
-    event_tx: mpsc::Sender<ManagerEvent>,
-    cancel_rx: &mut mpsc::Receiver<()>,
-) -> Result<()> {
-    let mut pump: Option<JoinHandle<()>> = None;
-    let mut pump_tx: Option<mpsc::Sender<PumpCmd>> = None;
+impl Supervisor {
+    async fn run(mut self, first_control: Box<dyn ErasedControlSession>) {
+        let protocol = self.ctx.protocol;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut sessions = JoinSet::new();
+        let mut control = Some(first_control);
+        let mut backoff = ACCEPT_BACKOFF_START;
 
-    loop {
-        tokio::select! {
-            _ = cancel_rx.recv() => {
-                if let Some(tx) = pump_tx.take() { let _ = tx.send(PumpCmd::Stop).await; }
-                if let Some(h) = pump.take() { let _ = h.await; }
-                return Ok(());
-            }
-            cmd = control.next_command() => {
-                let cmd = cmd?;
-                match cmd {
-                    MediaCommand::Load { url, autoplay, .. } => {
-                        // Tear down any in-flight pump from a prior LOAD.
-                        if let Some(tx) = pump_tx.take() { let _ = tx.send(PumpCmd::Stop).await; }
-                        if let Some(h) = pump.take() { let _ = h.await; }
-
-                        let mut puller = (create_puller)()?;
-                        let info = puller
-                            .open(PullSpec { url: url.clone(), headers: HashMap::new() })
-                            .await?;
-                        tracing::info!(protocol, %url, ?info, "receiver: puller opened");
-
-                        let _ = event_tx
-                            .send(ManagerEvent::ReceiverStarted {
-                                receiver_id,
-                                remote: remote.clone(),
-                                info: info.clone(),
-                            })
-                            .await;
-
-                        let sink = (sink_factory)(&remote, &info).await?;
-
-                        let video_dec = match &info.video {
-                            Some(v) => {
-                                let f = video_decoders.get(&v.codec).ok_or_else(|| {
-                                    FerricastError::Decode(format!(
-                                        "no video decoder registered for codec {:?}",
-                                        v.codec
-                                    ))
-                                })?;
-                                let mut d = (f)();
-                                d.configure(&DecoderConfig {
-                                    codec: v.codec,
-                                    width: v.width,
-                                    height: v.height,
-                                    pixel_format: PixelFormat::Bgra,
-                                    low_latency: true,
-                                })?;
-                                Some(d)
-                            }
-                            None => None,
-                        };
-                        let audio_dec = match &info.audio {
-                            Some(a) => {
-                                let f = audio_decoders.get(&a.codec).ok_or_else(|| {
-                                    FerricastError::Decode(format!(
-                                        "no audio decoder registered for codec {:?}",
-                                        a.codec
-                                    ))
-                                })?;
-                                let mut d = (f)();
-                                d.configure(&AudioDecoderConfig {
-                                    codec: a.codec,
-                                    sample_rate: a.sample_rate,
-                                    channels: a.channels,
-                                })?;
-                                Some(d)
-                            }
-                            None => None,
-                        };
-
-                        let (ptx, prx) = mpsc::channel(8);
-                        let ev = event_tx.clone();
-                        let h = tokio::spawn(run_pump(
-                            receiver_id,
-                            puller,
-                            video_dec,
-                            audio_dec,
-                            sink,
-                            prx,
-                            ev,
-                            autoplay,
-                        ));
-                        pump = Some(h);
-                        pump_tx = Some(ptx);
-
-                        let state = if autoplay {
-                            PlaybackState::Playing
-                        } else {
-                            PlaybackState::Paused
-                        };
-                        let _ = control.report_state(state.clone()).await;
-                        let _ = event_tx
-                            .send(ManagerEvent::ReceiverStateChanged {
-                                receiver_id,
-                                state,
-                            })
-                            .await;
+        loop {
+            let Some(ctrl) = control.as_mut() else {
+                // Waiting to retry creating a control.
+                tokio::select! {
+                    _ = self.cancel_rx.recv() => break,
+                    () = tokio::time::sleep(backoff) => {}
+                }
+                match (self.create_control)() {
+                    Ok(c) => control = Some(c),
+                    Err(e) => {
+                        tracing::warn!(protocol, %e, "create_control failed; retrying");
+                        backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
                     }
-                    MediaCommand::Play => {
-                        if let Some(tx) = pump_tx.as_ref() {
-                            let _ = tx.send(PumpCmd::Play).await;
-                        }
-                        let _ = control.report_state(PlaybackState::Playing).await;
-                        let _ = event_tx
-                            .send(ManagerEvent::ReceiverStateChanged {
-                                receiver_id,
-                                state: PlaybackState::Playing,
-                            })
-                            .await;
+                }
+                continue;
+            };
+            tokio::select! {
+                _ = self.cancel_rx.recv() => break,
+                Some(joined) = sessions.join_next() => {
+                    if let Err(e) = joined {
+                        tracing::warn!(protocol, ?e, "receiver session task failed");
                     }
-                    MediaCommand::Pause => {
-                        if let Some(tx) = pump_tx.as_ref() {
-                            let _ = tx.send(PumpCmd::Pause).await;
-                        }
-                        let _ = control.report_state(PlaybackState::Paused).await;
-                        let _ = event_tx
-                            .send(ManagerEvent::ReceiverStateChanged {
-                                receiver_id,
-                                state: PlaybackState::Paused,
-                            })
-                            .await;
-                    }
-                    MediaCommand::Stop => {
-                        if let Some(tx) = pump_tx.take() {
-                            let _ = tx.send(PumpCmd::Stop).await;
-                        }
-                        if let Some(h) = pump.take() {
-                            let _ = h.await;
-                        }
-                        let _ = control.report_state(PlaybackState::Idle).await;
-                        let _ = event_tx
-                            .send(ManagerEvent::ReceiverStateChanged {
-                                receiver_id,
-                                state: PlaybackState::Idle,
-                            })
-                            .await;
-                    }
-                    MediaCommand::Seek { position_us } => {
-                        if let Some(tx) = pump_tx.as_ref() {
-                            let _ = tx.send(PumpCmd::Seek(position_us)).await;
-                        }
-                    }
-                    MediaCommand::GetStatus => {
-                        // Receiver protocol crates handle their own
-                        // status reporting cadence; the manager just
-                        // acknowledges the command was received and
-                        // moves on.
-                    }
-                    other => {
-                        // Queue ops, volume, track selection, app
-                        // launch — wire these through as the protocol
-                        // crates need them. Logged for diagnostic
-                        // visibility; not an error.
-                        tracing::debug!(
-                            protocol,
-                            ?other,
-                            "receiver: command accepted but not yet routed"
+                }
+                accepted = ctrl.accept() => match accepted {
+                    Ok(remote) => {
+                        backoff = ACCEPT_BACKOFF_START;
+                        let accepted_control = control.take().expect("invariant: matched Some above");
+                        let session = session::Session::new(
+                            self.ctx.clone(),
+                            accepted_control,
+                            remote,
+                            shutdown_rx.clone(),
                         );
+                        sessions.spawn(session.run());
+                        match (self.create_control)() {
+                            Ok(c) => control = Some(c),
+                            Err(e) => {
+                                tracing::warn!(protocol, %e, "create_control failed; retrying");
+                            }
+                        }
                     }
-                }
+                    Err(e) => {
+                        // A failed handshake or a listener error; back
+                        // off so a persistent failure cannot spin.
+                        tracing::warn!(protocol, %e, retry_in = ?backoff, "control.accept failed");
+                        tokio::select! {
+                            _ = self.cancel_rx.recv() => break,
+                            () = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                    }
+                },
             }
         }
-    }
-}
 
-#[allow(clippy::too_many_arguments)]
-async fn run_pump(
-    receiver_id: Uuid,
-    mut puller: Box<dyn ErasedPuller>,
-    mut video_dec: Option<Box<dyn ErasedVideoDecoder>>,
-    mut audio_dec: Option<Box<dyn ErasedAudioDecoder>>,
-    mut sink: Box<dyn FrameSink>,
-    mut cmd_rx: mpsc::Receiver<PumpCmd>,
-    event_tx: mpsc::Sender<ManagerEvent>,
-    autoplay: bool,
-) {
-    let mut playing = autoplay;
-    loop {
-        tokio::select! {
-            cmd = cmd_rx.recv() => match cmd {
-                Some(PumpCmd::Play) => playing = true,
-                Some(PumpCmd::Pause) => playing = false,
-                Some(PumpCmd::Seek(pos)) => {
-                    if let Err(e) = puller.seek(pos).await {
-                        tracing::warn!(%e, "pump: seek failed");
-                    }
-                }
-                Some(PumpCmd::Stop) | None => break,
-            },
-            packet = puller.next(), if playing => match packet {
-                Ok(MediaPacket::Video(f)) => {
-                    let Some(d) = video_dec.as_mut() else { continue };
-                    match d.decode(f) {
-                        Ok(Some(frame)) => {
-                            if let Err(e) = sink.push_video(frame).await {
-                                tracing::warn!(%e, "pump: sink.push_video failed");
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => tracing::warn!(%e, "pump: video decode failed"),
-                    }
-                }
-                Ok(MediaPacket::Audio(a)) => {
-                    let Some(d) = audio_dec.as_mut() else { continue };
-                    match d.decode(a) {
-                        Ok(Some(pcm)) => {
-                            if let Err(e) = sink.push_audio(pcm).await {
-                                tracing::warn!(%e, "pump: sink.push_audio failed");
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => tracing::warn!(%e, "pump: audio decode failed"),
-                    }
-                }
-                Ok(MediaPacket::Discontinuity) => {}
-                Ok(MediaPacket::Eos) => {
-                    let _ = event_tx
-                        .send(ManagerEvent::ReceiverStateChanged {
-                            receiver_id,
-                            state: PlaybackState::Ended,
-                        })
-                        .await;
-                    break;
-                }
-                Err(e) => {
-                    tracing::error!(%e, "pump: puller error");
-                    let _ = event_tx
-                        .send(ManagerEvent::ReceiverError {
-                            receiver_id,
-                            message: e.to_string(),
-                        })
-                        .await;
-                    break;
-                }
-            }
+        // Ask sessions to stop their pumps and close; abort laggards.
+        let _ = shutdown_tx.send(true);
+        let drained = tokio::time::timeout(SESSION_STOP_TIMEOUT, async {
+            while sessions.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            tracing::warn!(protocol, "receiver sessions did not stop in time; aborting");
+            sessions.shutdown().await;
         }
     }
-    let _ = puller.close().await;
 }
