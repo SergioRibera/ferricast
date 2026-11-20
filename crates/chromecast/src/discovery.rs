@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -109,21 +110,19 @@ impl Discovery for ChromecastDiscovery {
                         // picker and (worse) lets the user pick
                         // itself, which deadlocks the HLS pipeline
                         // through the loopback path.
-                        if let Some(id) = txt.get("id") {
-                            if self_filter::contains(id) {
-                                debug!(
-                                    name = info.get_fullname(),
-                                    device_id = %id,
-                                    "skipping self-advertised chromecast receiver"
-                                );
-                                continue;
-                            }
+                        if let Some(id) = txt.get("id")
+                            && self_filter::contains(id)
+                        {
+                            debug!(
+                                name = info.get_fullname(),
+                                device_id = %id,
+                                "skipping self-advertised chromecast receiver"
+                            );
+                            continue;
                         }
 
-                        let device_uuid = txt
-                            .get("id")
-                            .and_then(|id| Uuid::try_parse(id).ok())
-                            .unwrap_or_else(|| Uuid::new_v4());
+                        let device_uuid =
+                            device_uuid(txt.get("id").map(String::as_str), info.get_fullname());
 
                         let friendly_name = txt
                             .get("fn")
@@ -140,16 +139,19 @@ impl Discovery for ChromecastDiscovery {
                         let capabilities =
                             capabilities_for_model(model.as_deref().unwrap_or(""), ca);
 
-                        let addr: std::net::IpAddr = match info.get_addresses_v4().iter().next() {
-                            Some(addr) => (*(*addr)).into(),
-                            None => {
-                                warn!(
-                                    name = info.get_fullname(),
-                                    "resolved service has no addresses, skipping"
-                                );
-                                continue;
-                            }
-                        };
+                        let candidates: Vec<Ipv4Addr> =
+                            info.get_addresses_v4().into_iter().copied().collect();
+                        let addr: std::net::IpAddr =
+                            match pick_address(&candidates, &local_ipv4_networks()) {
+                                Some(addr) => addr.into(),
+                                None => {
+                                    warn!(
+                                        name = info.get_fullname(),
+                                        "resolved service has no addresses, skipping"
+                                    );
+                                    continue;
+                                }
+                            };
 
                         let port = info.get_port();
 
@@ -184,11 +186,11 @@ impl Discovery for ChromecastDiscovery {
                     ServiceEvent::ServiceRemoved(_, fullname) => {
                         info!(name = %fullname, "chromecast service removed");
 
-                        if let Some(uuid) = known.remove(fullname.as_str()) {
-                            if tx.send(DiscoveryEvent::DeviceLost(uuid)).await.is_err() {
-                                debug!("discovery event channel closed, stopping");
-                                break;
-                            }
+                        if let Some(uuid) = known.remove(fullname.as_str())
+                            && tx.send(DiscoveryEvent::DeviceLost(uuid)).await.is_err()
+                        {
+                            debug!("discovery event channel closed, stopping");
+                            break;
                         }
                     }
 
@@ -221,10 +223,10 @@ impl Discovery for ChromecastDiscovery {
         info!("stopping chromecast mDNS discovery");
         self.running.store(false, Ordering::SeqCst);
 
-        if let Some(daemon) = self.daemon.take() {
-            if let Err(e) = daemon.shutdown() {
-                warn!("error shutting down mDNS daemon: {e}");
-            }
+        if let Some(daemon) = self.daemon.take()
+            && let Err(e) = daemon.shutdown()
+        {
+            warn!("error shutting down mDNS daemon: {e}");
         }
 
         if let Some(handle) = self.task_handle.take() {
@@ -291,7 +293,7 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
         // the model branches below override to Main / Main10 only on
         // devices known to support it.
         max_h265_profile: None,
-        supported_codecs: vec![Codec::H264, Codec::Vp8],
+        supported_codecs: vec![Codec::H264],
         // 1st/2nd-gen Chromecast firmware's HLS parser locks up on
         // EXT-X-VERSION:6 / EXT-X-PART-INF (field-tested). Newer
         // model branches below override to `true` only where it's
@@ -388,4 +390,94 @@ fn capabilities_for_model(md: &str, ca: u32) -> DeviceCapabilities {
     }
 
     caps
+}
+
+/// Namespace for device ids derived from mDNS data, so a device keeps the
+/// same id across rediscoveries and restarts.
+const DEVICE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x6c1f_4a2e_93d0_4b5f_8e7a_0c3d_2b19_f4e1);
+
+/// Stable device id: the `id` TXT record when it is a UUID (Chromecasts
+/// publish 32 hex digits), otherwise a name-based UUID of that record or,
+/// failing that, of the mDNS full name.
+fn device_uuid(id_txt: Option<&str>, fullname: &str) -> Uuid {
+    let id_txt = id_txt.filter(|id| !id.is_empty());
+    id_txt
+        .and_then(|id| Uuid::try_parse(id).ok())
+        .unwrap_or_else(|| {
+            Uuid::new_v5(&DEVICE_ID_NAMESPACE, id_txt.unwrap_or(fullname).as_bytes())
+        })
+}
+
+/// IPv4 networks (address, netmask) of the non-loopback local interfaces.
+fn local_ipv4_networks() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    if_addrs::get_if_addrs()
+        .map(|ifaces| {
+            ifaces
+                .into_iter()
+                .filter(|i| !i.is_loopback())
+                .filter_map(|i| match i.addr {
+                    if_addrs::IfAddr::V4(v4) => Some((v4.ip, v4.netmask)),
+                    if_addrs::IfAddr::V6(_) => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Picks the advertised address to connect to: one on a directly attached
+/// subnet when available (devices often also advertise addresses of other
+/// interfaces, e.g. a docker bridge on Android TV), otherwise the lowest
+/// address so the choice is deterministic.
+fn pick_address(candidates: &[Ipv4Addr], local: &[(Ipv4Addr, Ipv4Addr)]) -> Option<Ipv4Addr> {
+    let on_local_subnet = |addr: &Ipv4Addr| {
+        local.iter().any(|(ip, mask)| {
+            let mask = u32::from(*mask);
+            mask != 0 && u32::from(*ip) & mask == u32::from(*addr) & mask
+        })
+    };
+    let mut sorted = candidates.to_vec();
+    sorted.sort_unstable();
+    sorted
+        .iter()
+        .copied()
+        .find(on_local_subnet)
+        .or_else(|| sorted.first().copied())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_id_is_stable() {
+        let hex = "0123456789abcdef0123456789abcdef";
+        assert_eq!(device_uuid(Some(hex), "x"), Uuid::try_parse(hex).unwrap());
+        let a = device_uuid(Some("not-a-uuid"), "TV._googlecast._tcp.local.");
+        assert_eq!(a, device_uuid(Some("not-a-uuid"), "other"));
+        let b = device_uuid(None, "TV._googlecast._tcp.local.");
+        assert_eq!(b, device_uuid(Some(""), "TV._googlecast._tcp.local."));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn prefers_address_on_local_subnet() {
+        let lan = Ipv4Addr::new(192, 168, 1, 40);
+        let docker = Ipv4Addr::new(172, 17, 0, 1);
+        let local = [(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        assert_eq!(pick_address(&[docker, lan], &local), Some(lan));
+        assert_eq!(pick_address(&[lan, docker], &[]), Some(docker));
+        assert_eq!(pick_address(&[], &local), None);
+    }
+
+    #[test]
+    fn vp8_is_not_advertised() {
+        assert!(
+            !capabilities_for_model("Chromecast", 0)
+                .supported_codecs
+                .contains(&Codec::Vp8)
+        );
+    }
 }

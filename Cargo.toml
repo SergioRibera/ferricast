@@ -22,7 +22,7 @@ members = [
 ferricast = { path = ".", default-features = false }
 ferricast-core = { path = "crates/core" }
 ferricast-capture = { path = "crates/capture", default-features = false }
-ferricast-chromecast = { path = "crates/chromecast" }
+ferricast-chromecast = { path = "crates/chromecast", default-features = false }
 ferricast-encoder = { path = "crates/encoder", default-features = false }
 ferricast-decoder = { path = "crates/decoder", default-features = false }
 ferricast-demuxer = { path = "crates/demuxer" }
@@ -99,7 +99,7 @@ aac = ["ferricast-decoder/aac"]
 fdk-aac = ["ferricast-encoder/fdk-aac"]
 # Pure-Rust Opus encoder for Cast Streaming (RTP mirror path).
 # No system-library dependency — opus-rs is 100% Rust.
-opus-rs = ["ferricast-encoder/opus-rs"]
+opus-rs = ["ferricast-encoder/opus-rs", "ferricast-chromecast?/opus"]
 # Wayland source enumeration (foreign-toplevel + xdg-output).
 # Orthogonal to `pipewire`: that's for *capture* on Wayland; this is
 # for *picking the source to capture* via an in-process picker
