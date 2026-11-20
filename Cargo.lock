@@ -1957,6 +1957,8 @@ dependencies = [
 name = "ferricast"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "ferricast-airplay",
  "ferricast-capture",
  "ferricast-chromecast",
@@ -1964,7 +1966,11 @@ dependencies = [
  "ferricast-decoder",
  "ferricast-encoder",
  "ferricast-hls",
+ "rustls",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "uuid",
 ]
