@@ -167,23 +167,28 @@ impl Features {
     pub fn supports_legacy_pairing(&self) -> bool {
         self.contains(Features::SUPPORT_LEGACY_PAIRING)
     }
+    /// True when the receiver does not speak modern (HomeKit) pairing.
+    /// Note this does not imply legacy pairing is available; see
+    /// [`Self::pair_effective`] for the mode actually negotiated.
     pub fn prefers_legacy_pairing(&self) -> bool {
         !self.support_moddern_pairing()
     }
+
+    /// The `X-Apple-HKP` pairing mode to use with this receiver:
+    /// modern HomeKit pairing when supported, otherwise transient
+    /// pairing, otherwise legacy pairing if the receiver advertises
+    /// `SUPPORT_LEGACY_PAIRING`, and [`AIRPLAY_PAIR_ERR`] when none
+    /// of them is available.
     pub fn pair_effective(&self) -> u8 {
-        if self.prefers_legacy_pairing() {
-            return AIRPLAY_PAIR_LEGACY;
-        }
-
         if self.support_moddern_pairing() {
-            return AIRPLAY_PAIR_MODERN;
+            AIRPLAY_PAIR_MODERN
+        } else if self.supports_transient_pairing() {
+            AIRPLAY_PAIR_TRANSIENT
+        } else if self.supports_legacy_pairing() {
+            AIRPLAY_PAIR_LEGACY
+        } else {
+            AIRPLAY_PAIR_ERR
         }
-
-        if self.supports_transient_pairing() {
-            return AIRPLAY_PAIR_TRANSIENT;
-        }
-
-        AIRPLAY_PAIR_ERR
     }
 }
 
@@ -260,4 +265,34 @@ pub enum DiscoveryEvent {
         protocol: &'static str,
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pairing_mode_decision_table() {
+        let modern = Features::HK_PAIRING_AND_ACCESS_CONTROL;
+        let transient = Features::TRANSIENT_PAIRING;
+        let legacy = Features::SUPPORT_LEGACY_PAIRING;
+        let third_party = Features::HAS_UNIFIED_ADVERTISER_INFO;
+        let cases = [
+            (modern, AIRPLAY_PAIR_MODERN),
+            (modern | legacy, AIRPLAY_PAIR_MODERN),
+            (transient, AIRPLAY_PAIR_MODERN),
+            (transient | third_party, AIRPLAY_PAIR_TRANSIENT),
+            (
+                Features::SYSTEM_PAIRING | third_party | legacy,
+                AIRPLAY_PAIR_TRANSIENT,
+            ),
+            (modern | third_party | legacy, AIRPLAY_PAIR_LEGACY),
+            (legacy, AIRPLAY_PAIR_LEGACY),
+            (modern | third_party, AIRPLAY_PAIR_ERR),
+            (Features::empty(), AIRPLAY_PAIR_ERR),
+        ];
+        for (features, expected) in cases {
+            assert_eq!(features.pair_effective(), expected, "{features:?}");
+        }
+    }
 }
