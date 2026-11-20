@@ -349,10 +349,24 @@ impl Muxer for MpegTs {
             self.psi_emitted = true;
         }
 
+        // A keyframe that carries its own parameter sets (the encoder
+        // repeats them on every IDR, and emits new ones after a
+        // reconfigure such as a resolution change) refreshes the
+        // cached copy, and is not prefixed with the cached ones: the
+        // stale set would otherwise precede the fresh one in every
+        // later access unit that lacks in-band headers.
+        let in_band = frame.is_keyframe
+            && match in_band_parameter_sets(frame.codec, &frame.data) {
+                Some(sets) => {
+                    self.parameter_sets = sets;
+                    true
+                }
+                None => false,
+            };
         let au = build_access_unit(
             self.video_codec,
             &self.parameter_sets,
-            frame.is_keyframe,
+            frame.is_keyframe && !in_band,
             &frame.data,
         );
         let pes = build_pes(&au, pts_90k, dts_90k);
@@ -679,6 +693,68 @@ fn build_access_unit(
     }
     au.extend_from_slice(frame_data);
     au
+}
+
+/// Collect the parameter-set NAL units (H.264 SPS/PPS, HEVC
+/// VPS/SPS/PPS) carried in an Annex B access unit, re-serialised with
+/// 4-byte start codes so two extractions compare equal whenever the
+/// sets are the same. `None` when the access unit carries none, or
+/// when `codec` cannot be carried in MPEG-TS.
+#[must_use]
+pub fn in_band_parameter_sets(codec: Codec, annex_b: &[u8]) -> Option<Vec<u8>> {
+    let is_parameter_set: fn(u8) -> bool = match codec {
+        Codec::H264 => |header| matches!(header & 0x1F, 7 | 8),
+        Codec::H265 => |header| matches!((header >> 1) & 0x3F, 32..=34),
+        Codec::Vp8 | Codec::Vp9 | Codec::Av1 => return None,
+    };
+    let mut sets = Vec::new();
+    for nal in AnnexBNals::new(annex_b) {
+        if let Some(&header) = nal.first()
+            && is_parameter_set(header)
+        {
+            sets.extend_from_slice(&[0, 0, 0, 1]);
+            sets.extend_from_slice(nal);
+        }
+    }
+    (!sets.is_empty()).then_some(sets)
+}
+
+/// Iterator over the NAL unit payloads (without start codes or
+/// trailing zero padding) of an Annex B byte stream.
+struct AnnexBNals<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> AnnexBNals<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        let rest = find_start_code(data).map_or(&[][..], |(_, after)| &data[after..]);
+        Self { rest }
+    }
+}
+
+impl<'a> Iterator for AnnexBNals<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        let (nal, rest) = match find_start_code(self.rest) {
+            Some((at, after)) => (&self.rest[..at], &self.rest[after..]),
+            None => (self.rest, &[][..]),
+        };
+        self.rest = rest;
+        let end = nal.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        Some(&nal[..end])
+    }
+}
+
+/// Position of the first `00 00 01` start code: (index of its first
+/// byte, index just past it).
+fn find_start_code(data: &[u8]) -> Option<(usize, usize)> {
+    data.windows(3)
+        .position(|w| w == [0, 0, 1])
+        .map(|at| (at, at + 3))
 }
 
 // ---------------------------------------------------------------------
@@ -1062,5 +1138,64 @@ mod tests {
         let flags = out[5];
         assert_eq!(flags & 0x40, 0x40, "RAI should be set");
         assert_eq!(flags & 0x10, 0, "PCR_flag must remain clear");
+    }
+}
+
+#[cfg(test)]
+mod parameter_set_tests {
+    use super::*;
+
+    const SPS_A: [u8; 8] = [0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F];
+    const SPS_B: [u8; 8] = [0, 0, 0, 1, 0x67, 0x42, 0x00, 0x28];
+    const PPS: [u8; 7] = [0, 0, 1, 0x68, 0xCE, 0x06, 0xE2];
+
+    fn idr(with: &[&[u8]]) -> EncodedFrame {
+        let mut data: Vec<u8> = with.concat();
+        data.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84]);
+        EncodedFrame {
+            codec: Codec::H264,
+            data: data.into(),
+            timestamp_us: 0,
+            is_keyframe: true,
+            duration_us: None,
+            pts_dts: (0, 0),
+        }
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn extracts_and_normalises_parameter_sets() {
+        let f = idr(&[&SPS_A, &PPS]);
+        let sets = in_band_parameter_sets(Codec::H264, &f.data).unwrap();
+        assert_eq!(
+            sets,
+            [&SPS_A[..], &[0, 0, 0, 1, 0x68, 0xCE, 0x06, 0xE2][..]].concat()
+        );
+        assert!(in_band_parameter_sets(Codec::H264, &idr(&[]).data).is_none());
+        // HEVC VPS (32) / SPS (33) / PPS (34) headers.
+        let hevc = [0, 0, 0, 1, 0x40, 0x01, 0, 0, 0, 1, 0x26, 0x01, 0xAF];
+        assert_eq!(
+            in_band_parameter_sets(Codec::H265, &hevc).unwrap(),
+            [0, 0, 0, 1, 0x40, 0x01]
+        );
+    }
+
+    #[test]
+    fn keyframe_with_new_parameter_sets_replaces_the_cached_ones() {
+        let mut muxer = MpegTs::default();
+        muxer.config([&SPS_A[..], &PPS[..]].concat()).unwrap();
+        // The encoder reconfigured: the IDR carries a new SPS.
+        muxer.add_frame(&idr(&[&SPS_B, &PPS]), 0, 0).unwrap();
+        // A later IDR without in-band headers gets the new SPS.
+        muxer.add_frame(&idr(&[]), 3000, 3000).unwrap();
+        let out = muxer.drain();
+        assert!(
+            !contains(&out, &SPS_A[4..]),
+            "stale SPS must not be emitted"
+        );
+        assert!(contains(&out, &SPS_B[4..]));
     }
 }

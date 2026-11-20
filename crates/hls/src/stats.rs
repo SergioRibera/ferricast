@@ -1,52 +1,88 @@
-//! Per-session HLS telemetry shared between the HTTP handler tasks.
+//! Per-peer HLS telemetry shared between the HTTP handler tasks.
 //!
 //! The HTTP handler is invoked once per TCP connection, so any
 //! cross-request state — "how long since the last segment GET",
 //! "have we collected enough samples to probe bandwidth yet" — has
-//! to live behind an `Arc`. Construct one of these per
-//! `HlsFrameSink` / `HlsServer` and clone the `Arc` into every
-//! handler spawn.
+//! to live behind an `Arc`. One [`SessionStats`] exists per
+//! `HlsFrameSink` / `HlsServer`; inside it every client IP gets its
+//! own counters, so a second viewer (VLC on a laptop, a loopback
+//! self-test) neither skews the cast receiver's numbers nor its
+//! bandwidth probe.
 //!
-//! Everything here is lock-free or behind a `parking_lot`-style
-//! short-critical-section `Mutex` (we use `tokio::sync::Mutex` to
-//! match the rest of the crate, though contention is rare — at most
-//! one segment GET per ~4 s on the steady path).
+//! Critical sections are a few field updates, so a `std` mutex is
+//! enough (contention is at most one segment GET per peer every
+//! couple of seconds).
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
-/// Telemetry the HTTP handler updates on every segment GET. Read by
-/// nothing else today; the values exist for log lines that produce a
-/// human-readable timeline of how the receiver is interacting with
-/// our HLS endpoint.
+/// Upper bound on peers with their own counters. Further peers still
+/// get served, their deliveries are just not tracked across requests.
+const MAX_TRACKED_PEERS: usize = 32;
+
+/// Telemetry the HTTP handler updates on every segment GET, keyed by
+/// client IP.
+#[derive(Default)]
 pub struct SessionStats {
     inner: Mutex<Inner>,
 }
 
+#[derive(Default)]
 struct Inner {
+    peers: HashMap<IpAddr, PeerStats>,
+    /// The first peer that fetched a segment. Without an allowlist it
+    /// is the one whose deliveries drive the adaptive bitrate.
+    first_peer: Option<IpAddr>,
+}
+
+/// Counters for one client IP.
+#[derive(Default)]
+struct PeerStats {
     /// When the last successful segment GET completed. `None` until
     /// the very first one. Subsequent GETs report `now - last` as
     /// the inter-request gap.
-    pub last_segment_get_at: Option<Instant>,
+    last_segment_get_at: Option<Instant>,
 
-    /// Highest seq the receiver has successfully fetched. Used to
-    /// spot the receiver going backward (would indicate a fresh
-    /// LOAD after a 301) or skipping forward (catching up).
-    pub last_fetched_seq: Option<u64>,
+    /// Last seq this peer fetched. Used to spot the receiver going
+    /// backward (would indicate a fresh LOAD after a 301) or skipping
+    /// forward (catching up).
+    last_fetched_seq: Option<u64>,
 
-    /// How many segment GETs we've completed end-to-end. Bandwidth
-    /// probing uses the first few of these to seed the adaptive
-    /// controller with a realistic target.
-    pub segment_get_count: u32,
+    /// How many segment GETs this peer completed end-to-end.
+    segment_get_count: u32,
 
-    /// Rolling buffer of per-segment effective Mbps for the
-    /// bandwidth probe. Capped at PROBE_SAMPLES; once full we
-    /// average and call the probe once, then leave it alone.
-    pub probe_samples_mbps: Vec<f64>,
+    /// Per-segment effective Mbps for the bandwidth probe. Capped at
+    /// `PROBE_SAMPLES`; once full we average and report the probe
+    /// once, then leave it alone.
+    probe_samples_mbps: Vec<f64>,
 
-    /// Set once we've fed the bandwidth probe to the controller so
-    /// we don't keep re-probing on every segment.
-    pub probe_done: bool,
+    /// Set once the probe was reported so it doesn't re-fire.
+    probe_done: bool,
+}
+
+impl PeerStats {
+    fn record(&mut self, seq: u64, mbps: f64, completed_at: Instant) -> SegmentGetTelemetry {
+        let prev_get_at = self.last_segment_get_at.replace(completed_at);
+        let prev_seq = self.last_fetched_seq.replace(seq);
+        self.segment_get_count = self.segment_get_count.saturating_add(1);
+        let probe_avg_mbps = if self.probe_done {
+            None
+        } else {
+            self.probe_samples_mbps.push(mbps);
+            (self.probe_samples_mbps.len() >= SessionStats::PROBE_SAMPLES).then(|| {
+                self.probe_done = true;
+                self.probe_samples_mbps.iter().sum::<f64>() / self.probe_samples_mbps.len() as f64
+            })
+        };
+        SegmentGetTelemetry {
+            inter_request_gap: prev_get_at.map(|t| completed_at.duration_since(t)),
+            prev_seq,
+            count_so_far: self.segment_get_count,
+            probe_avg_mbps,
+        }
+    }
 }
 
 impl SessionStats {
@@ -56,59 +92,40 @@ impl SessionStats {
     /// converging fast (~12 s on a typical 4 s-segment stream).
     pub const PROBE_SAMPLES: usize = 3;
 
+    #[must_use]
     pub fn new() -> Self {
-        Self {
-            inner: Mutex::new(Inner {
-                last_segment_get_at: None,
-                last_fetched_seq: None,
-                segment_get_count: 0,
-                probe_samples_mbps: Vec::with_capacity(Self::PROBE_SAMPLES),
-                probe_done: false,
-            }),
-        }
+        Self::default()
     }
 
-    /// Record one successful segment GET. Returns the previous
-    /// `last_segment_get_at` (so the caller can compute the
-    /// inter-request gap inline) and, when enough samples have
-    /// accumulated, the average measured Mbps for one-shot
-    /// bandwidth probing — the caller is then responsible for
-    /// feeding it to the adaptive controller.
+    /// Record one successful segment GET by `peer`. Returns the
+    /// peer's previous GET time and seq (so the caller can log the
+    /// inter-request gap) and, once that peer has accumulated enough
+    /// samples, the average measured Mbps for one-shot bandwidth
+    /// probing — the caller decides whether to feed it to the
+    /// adaptive controller.
     pub fn record_segment_get(
         &self,
+        peer: IpAddr,
         seq: u64,
         mbps: f64,
         completed_at: Instant,
     ) -> SegmentGetTelemetry {
-        let mut g = self.inner.lock().expect("stats mutex poisoned");
-        let prev_get_at = g.last_segment_get_at.replace(completed_at);
-        let prev_seq = g.last_fetched_seq.replace(seq);
-        g.segment_get_count = g.segment_get_count.saturating_add(1);
-        let probe_avg = if !g.probe_done && g.probe_samples_mbps.len() < Self::PROBE_SAMPLES {
-            g.probe_samples_mbps.push(mbps);
-            if g.probe_samples_mbps.len() == Self::PROBE_SAMPLES {
-                let avg =
-                    g.probe_samples_mbps.iter().sum::<f64>() / g.probe_samples_mbps.len() as f64;
-                g.probe_done = true;
-                Some(avg)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        SegmentGetTelemetry {
-            inter_request_gap: prev_get_at.map(|t| completed_at.duration_since(t)),
-            prev_seq,
-            count_so_far: g.segment_get_count,
-            probe_avg_mbps: probe_avg,
+        let peer = peer.to_canonical();
+        let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        g.first_peer.get_or_insert(peer);
+        if !g.peers.contains_key(&peer) && g.peers.len() >= MAX_TRACKED_PEERS {
+            return PeerStats::default().record(seq, mbps, completed_at);
         }
+        g.peers
+            .entry(peer)
+            .or_default()
+            .record(seq, mbps, completed_at)
     }
-}
 
-impl Default for SessionStats {
-    fn default() -> Self {
-        Self::new()
+    /// Whether `peer` was the first client to fetch a segment.
+    pub fn is_first_peer(&self, peer: IpAddr) -> bool {
+        let g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        g.first_peer == Some(peer.to_canonical())
     }
 }
 
@@ -120,9 +137,42 @@ pub struct SegmentGetTelemetry {
     pub inter_request_gap: Option<std::time::Duration>,
     pub prev_seq: Option<u64>,
     pub count_so_far: u32,
-    /// `Some` exactly once, on the request that completed the
-    /// bandwidth-probe window. The caller passes this to
+    /// `Some` exactly once per peer, on the request that completed
+    /// its bandwidth-probe window. The caller passes this to
     /// `AdaptiveBitrateState::observe_link_capacity_kbps` (after
     /// converting Mbps → kbps).
     pub probe_avg_mbps: Option<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peers_are_tracked_independently() {
+        let stats = SessionStats::new();
+        let cast: IpAddr = "192.168.1.30".parse().unwrap();
+        let viewer: IpAddr = "192.168.1.50".parse().unwrap();
+        let t = Instant::now();
+        assert!(
+            stats
+                .record_segment_get(cast, 0, 5.0, t)
+                .probe_avg_mbps
+                .is_none()
+        );
+        // Another peer's GETs don't advance the cast peer's probe.
+        for seq in 0..5 {
+            stats.record_segment_get(viewer, seq, 100.0, t);
+        }
+        let tele = stats.record_segment_get(cast, 1, 5.0, t);
+        assert_eq!(tele.prev_seq, Some(0));
+        assert_eq!(tele.count_so_far, 2);
+        assert!(tele.probe_avg_mbps.is_none());
+        let tele = stats.record_segment_get(cast, 2, 8.0, t);
+        assert_eq!(tele.probe_avg_mbps, Some(6.0));
+        assert!(stats.is_first_peer(cast));
+        assert!(!stats.is_first_peer(viewer));
+        // IPv4-mapped IPv6 is the same peer.
+        assert!(stats.is_first_peer("::ffff:192.168.1.30".parse().unwrap()));
+    }
 }

@@ -61,9 +61,8 @@ pub struct SegmentRing {
     capacity: usize,
     segments: VecDeque<Segment>,
     next_seq: u64,
-    /// Increments every time the segmenter has to start over (encoder
-    /// restart, capture re-opened, …). Players advertise the latest
-    /// value via `#EXT-X-DISCONTINUITY-SEQUENCE`.
+    /// Number of `#EXT-X-DISCONTINUITY` tags evicted from the window,
+    /// advertised as `#EXT-X-DISCONTINUITY-SEQUENCE`.
     discontinuity_seq: u32,
     /// LL-HLS: parts that have been published for the segment
     /// currently under construction (no `data` yet because the
@@ -71,6 +70,9 @@ pub struct SegmentRing {
     /// `complete_pending_segment` moves these into the next
     /// `Segment.parts` entry.
     pending_parts: Vec<Part>,
+    /// `#EXT-X-TARGETDURATION`, fixed for the lifetime of the ring:
+    /// RFC 8216 §6.2.1 forbids changing it between playlist reloads.
+    target_duration: u8,
     /// LL-HLS PART-TARGET advertised in the playlist. `Some(_)`
     /// gates emission of LL-HLS tags. The segmenter sets this from
     /// `HlsConfig::part_target_secs`.
@@ -83,12 +85,17 @@ pub struct SegmentRing {
 }
 
 impl SegmentRing {
-    pub fn new(capacity: usize) -> Self {
+    /// Ring retaining `capacity` segments whose playlist advertises a
+    /// fixed `#EXT-X-TARGETDURATION` of `target_duration` seconds
+    /// (clamped to at least 1).
+    #[must_use]
+    pub fn new(capacity: usize, target_duration: u8) -> Self {
         Self {
             capacity,
             segments: VecDeque::with_capacity(capacity),
             next_seq: 0,
             discontinuity_seq: 0,
+            target_duration: target_duration.max(1),
             pending_parts: Vec::new(),
             part_target_secs: None,
             notify: Arc::new(Notify::new()),
@@ -108,6 +115,35 @@ impl SegmentRing {
         self.next_seq
     }
 
+    /// The fixed `#EXT-X-TARGETDURATION` this ring advertises.
+    #[must_use]
+    pub fn target_duration(&self) -> u8 {
+        self.target_duration
+    }
+
+    /// Clamp a segment duration so that, rounded to the nearest
+    /// integer, it never exceeds the advertised target duration
+    /// (RFC 8216 §4.3.3.1). The target is fixed, so an overlong
+    /// segment (encoder ignored the forced IDR) is reported slightly
+    /// short instead of breaking every later playlist build.
+    fn clamp_to_target(&self, duration_secs: f32) -> f32 {
+        let target = f32::from(self.target_duration);
+        if duration_secs.is_finite() && duration_secs.round() <= target {
+            return duration_secs.max(0.0);
+        }
+        tracing::warn!(
+            duration_secs,
+            target_duration = self.target_duration,
+            "HLS segment longer than EXT-X-TARGETDURATION; clamping EXTINF \
+             (encoder keyframe cadence is too slow for the configured target)"
+        );
+        if duration_secs.is_finite() {
+            target
+        } else {
+            0.0
+        }
+    }
+
     pub fn pending_parts(&self) -> &[Part] {
         &self.pending_parts
     }
@@ -121,7 +157,22 @@ impl SegmentRing {
         independent: bool,
         data: Bytes,
     ) -> (u64, u32) {
-        let idx = self.pending_parts.len() as u32;
+        // The segmenter closes parts before they cross PART-TARGET;
+        // this guard only fires on a capture gap. PART-TARGET itself
+        // never changes between reloads, so report the part as
+        // target-long rather than invalidating the playlist.
+        let duration_secs = match self.part_target_secs {
+            Some(pt) if duration_secs.is_nan() || duration_secs > pt => {
+                tracing::warn!(
+                    duration_secs,
+                    part_target_secs = pt,
+                    "LL-HLS part longer than PART-TARGET; clamping its duration"
+                );
+                pt
+            }
+            _ => duration_secs.max(0.0),
+        };
+        let idx = u32::try_from(self.pending_parts.len()).unwrap_or(u32::MAX);
         let seq = self.next_seq;
         self.pending_parts.push(Part {
             idx,
@@ -151,9 +202,7 @@ impl SegmentRing {
         data: Bytes,
         parts: Vec<Part>,
     ) -> u64 {
-        if discontinuity && !self.segments.is_empty() {
-            self.discontinuity_seq = self.discontinuity_seq.saturating_add(1);
-        }
+        let duration_secs = self.clamp_to_target(duration_secs);
         let seq = self.next_seq;
         self.next_seq += 1;
         self.segments.push_back(Segment {
@@ -164,8 +213,16 @@ impl SegmentRing {
             data,
             parts,
         });
+        // RFC 8216 §6.2.2: EXT-X-DISCONTINUITY-SEQUENCE counts the
+        // discontinuity tags that have slid out of the playlist, so
+        // it advances when a tagged segment is evicted, not when one
+        // is added.
         while self.segments.len() > self.capacity {
-            self.segments.pop_front();
+            if let Some(evicted) = self.segments.pop_front()
+                && evicted.discontinuity
+            {
+                self.discontinuity_seq = self.discontinuity_seq.saturating_add(1);
+            }
         }
         // Pending parts are now part of the just-finished segment.
         // Clear so the next one can accumulate.
@@ -174,18 +231,26 @@ impl SegmentRing {
         seq
     }
 
-    /// Close the in-progress segment by consuming its accumulated
-    /// `pending_parts` as the new segment's `parts`. Convenience for
-    /// the segmenter — equivalent to a manual `push_with_parts` with
-    /// `std::mem::take(&mut pending_parts)`.
-    pub fn complete_pending_segment(
-        &mut self,
-        duration_secs: f32,
-        discontinuity: bool,
-        data: Bytes,
-    ) -> u64 {
-        let parts = std::mem::take(&mut self.pending_parts);
-        self.push_with_parts(duration_secs, discontinuity, data, parts)
+    /// Close the in-progress segment from its accumulated
+    /// `pending_parts`: the segment body is their concatenation, and
+    /// each part is re-pointed at a slice of that body so the bytes
+    /// are held once (the separate part buffers are released as soon
+    /// as in-flight HTTP responses drop their clones).
+    pub fn complete_pending_segment(&mut self, duration_secs: f32, discontinuity: bool) -> u64 {
+        let mut parts = std::mem::take(&mut self.pending_parts);
+        let total: usize = parts.iter().map(|p| p.data.len()).sum();
+        let mut body = bytes::BytesMut::with_capacity(total);
+        for part in &parts {
+            body.extend_from_slice(&part.data);
+        }
+        let body = body.freeze();
+        let mut offset = 0;
+        for part in &mut parts {
+            let end = offset + part.data.len();
+            part.data = body.slice(offset..end);
+            offset = end;
+        }
+        self.push_with_parts(duration_secs, discontinuity, body, parts)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -217,7 +282,14 @@ impl SegmentRing {
         if let Some(seg) = self.get(msn) {
             return match part {
                 None => true,
-                Some(p) => seg.parts.iter().any(|x| x.idx >= p),
+                // A part index past the last part of a completed
+                // segment names part 0 of the next one (rfc8216bis
+                // §6.2.5.2). Classic segments have no parts at all:
+                // the completed segment satisfies any part request.
+                Some(p) if !seg.parts.is_empty() && p as usize >= seg.parts.len() => {
+                    self.has_reached(msn.saturating_add(1), Some(0))
+                }
+                Some(_) => true,
             };
         }
         if msn == self.next_seq {
@@ -237,19 +309,12 @@ impl SegmentRing {
     }
 
     /// Build the live media playlist from the current ring contents.
-    pub fn build_playlist(&self, min_target_duration: u8) -> Result<String, FerricastError> {
-        let observed_max = self
-            .segments
-            .iter()
-            .map(|s| s.duration_secs)
-            .filter(|d| d.is_finite() && *d > 0.0)
-            .fold(0.0_f32, f32::max);
-        let observed_ceil = if observed_max > 0.0 {
-            (observed_max.ceil() as u32).min(u8::MAX as u32) as u8
-        } else {
-            0
-        };
-        let target = min_target_duration.max(observed_ceil).max(1);
+    ///
+    /// # Errors
+    ///
+    /// Propagates playlist-writer validation failures.
+    pub fn build_playlist(&self) -> Result<String, FerricastError> {
+        let target = self.target_duration;
 
         let first_seq = self.segments.front().map(|s| s.seq).unwrap_or(0);
 
@@ -318,28 +383,91 @@ impl SegmentRing {
     }
 }
 
-/// Poll the ring until the segmenter has pushed at least one segment.
+/// Poll the ring until the segmenter has completed at least `count`
+/// segments.
 ///
-/// Returns `true` when a segment lands, `false` after the 30-second
-/// deadline — which indicates the encoder/capture pipeline has failed
-/// and is never going to produce output.
-pub async fn wait_for_first_segment(ring: &Arc<RwLock<SegmentRing>>) -> bool {
-    const TIMEOUT: Duration = Duration::from_secs(30);
-    let deadline = std::time::Instant::now() + TIMEOUT;
+/// Returns `true` once they exist, `false` after `timeout` — which
+/// indicates the encoder/capture pipeline has failed and is never going
+/// to produce output.
+pub async fn wait_for_segments(
+    ring: &Arc<RwLock<SegmentRing>>,
+    count: u64,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if !ring.read().await.is_empty() {
+        if ring.read().await.next_seq() >= count {
             return true;
         }
-        let remaining = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .unwrap_or(Duration::ZERO);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             tracing::warn!(
-                "HLS: timed out after 30s waiting for first segment; \
+                segments = count,
+                timeout_s = timeout.as_secs(),
+                "HLS: timed out waiting for startup segments; \
                  encoder or capture pipeline likely failed"
             );
             return false;
         }
         tokio::time::sleep(Duration::from_millis(50).min(remaining)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_segment_parts_share_the_segment_body() {
+        let mut ring = SegmentRing::new(4, 4);
+        ring.enable_low_latency(0.5);
+        ring.push_pending_part(0.5, true, Bytes::from_static(&[1; 188]));
+        ring.push_pending_part(0.5, false, Bytes::from_static(&[2; 376]));
+        let seq = ring.complete_pending_segment(1.0, false);
+        let seg = ring.get(seq).unwrap();
+        assert_eq!(seg.data.len(), 564);
+        assert_eq!(&seg.data[..188], &[1; 188][..]);
+        let body = seg.data.as_ptr_range();
+        for part in &seg.parts {
+            let p = part.data.as_ptr_range();
+            assert!(
+                body.start <= p.start && p.end <= body.end,
+                "part not a body slice"
+            );
+        }
+        assert_eq!(&seg.parts[1].data[..], &[2; 376][..]);
+    }
+}
+
+#[cfg(test)]
+mod discontinuity_tests {
+    use super::*;
+
+    fn seg() -> Bytes {
+        Bytes::from_static(&[0x47; 188])
+    }
+
+    #[test]
+    fn discontinuity_sequence_advances_when_tagged_segment_is_evicted() {
+        let mut ring = SegmentRing::new(3, 4);
+        ring.push(2.0, false, seg());
+        ring.push(2.0, true, seg());
+        let p = ring.build_playlist().unwrap();
+        assert!(!p.contains("#EXT-X-DISCONTINUITY-SEQUENCE"), "{p}");
+        assert!(p.contains("#EXT-X-DISCONTINUITY\n"), "{p}");
+        // Evict the untagged segment 0: still nothing removed.
+        ring.push(2.0, false, seg());
+        ring.push(2.0, false, seg());
+        assert!(
+            !ring
+                .build_playlist()
+                .unwrap()
+                .contains("DISCONTINUITY-SEQUENCE")
+        );
+        // Evict the tagged segment 1.
+        ring.push(2.0, false, seg());
+        let p = ring.build_playlist().unwrap();
+        assert!(p.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1"), "{p}");
+        assert!(!p.contains("#EXT-X-DISCONTINUITY\n"), "{p}");
     }
 }

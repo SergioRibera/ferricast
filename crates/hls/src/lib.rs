@@ -37,14 +37,15 @@ pub mod puller;
 pub use puller::HlsPuller;
 
 use std::future::Future;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio::sync::{RwLock, mpsc};
-use tokio::task::JoinHandle;
+use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 use ferricast_core::{
     AudioFrame, EncodedFrame, FerricastError, Result, ScreenCapture, VideoEncoder,
@@ -152,6 +153,14 @@ pub struct HlsConfig {
     /// Recommended values: 0.2–0.5 s. Smaller means more overhead
     /// and a longer playlist; larger reduces the latency benefit.
     pub part_target_secs: Option<f32>,
+
+    /// Segments that must exist before the stream counts as playable
+    /// ([`HlsFrameSink::first_segment_ready`], [`HlsServer::start`]).
+    /// RFC 8216 §6.3.3: a client starts a live stream at least three
+    /// target durations from the end of the playlist, so pointing a
+    /// player at it earlier makes it stall or start at the very edge.
+    /// Clamped to `1..=keep_segments`.
+    pub startup_segments: usize,
 }
 
 impl Default for HlsConfig {
@@ -173,7 +182,78 @@ impl Default for HlsConfig {
             adaptive: None,
             tls: None,
             part_target_secs: None,
+            startup_segments: 3,
         }
+    }
+}
+
+/// Base allowance for the first segments to appear: covers encoder
+/// warm-up and the wait for the first keyframe.
+const STARTUP_TIMEOUT_BASE: Duration = Duration::from_secs(30);
+
+/// Readiness criterion derived from [`HlsConfig`].
+#[derive(Debug, Clone, Copy)]
+struct Startup {
+    segments: u64,
+    timeout: Duration,
+}
+
+impl Startup {
+    async fn wait(self, ring: &Arc<RwLock<SegmentRing>>) -> bool {
+        ring::wait_for_segments(ring, self.segments, self.timeout).await
+    }
+}
+
+impl HlsConfig {
+    /// Reject configurations no server can honour.
+    fn validate(&self) -> Result<()> {
+        if self.keep_segments < 3 {
+            return Err(FerricastError::Hls(format!(
+                "keep_segments={} too small (minimum 3)",
+                self.keep_segments
+            )));
+        }
+        if f32::from(self.playlist_target_duration) < self.segment_target_secs {
+            return Err(FerricastError::Hls(format!(
+                "playlist_target_duration={}s < segment_target_secs={}s",
+                self.playlist_target_duration, self.segment_target_secs
+            )));
+        }
+        Ok(())
+    }
+
+    /// What "playable" means for this config: how many segments, and
+    /// how long to wait for them before declaring the pipeline dead
+    /// (30 s plus the time the segments take to produce).
+    fn startup(&self) -> Startup {
+        let segments = self.startup_segments.clamp(1, self.keep_segments.max(1));
+        let per_segment = if self.segment_target_secs.is_finite() && self.segment_target_secs > 0.0
+        {
+            Duration::from_secs_f32(self.segment_target_secs)
+        } else {
+            Duration::ZERO
+        };
+        let count = u32::try_from(segments).unwrap_or(u32::MAX);
+        Startup {
+            segments: u64::from(count),
+            timeout: STARTUP_TIMEOUT_BASE.saturating_add(per_segment.saturating_mul(count)),
+        }
+    }
+
+    /// The fixed `#EXT-X-TARGETDURATION` the playlist advertises:
+    /// [`Self::playlist_target_duration`], raised to at least
+    /// `ceil(segment_target_secs)`. Computed once per server and never
+    /// changed afterwards (RFC 8216 §6.2.1).
+    #[must_use]
+    pub fn target_duration(&self) -> u8 {
+        let ceil = if self.segment_target_secs.is_finite() && self.segment_target_secs > 0.0 {
+            // Saturating float→int cast: a nonsensical huge target
+            // pins to u8::MAX instead of wrapping.
+            self.segment_target_secs.ceil() as u8
+        } else {
+            1
+        };
+        self.playlist_target_duration.max(ceil).max(1)
     }
 }
 
@@ -182,12 +262,8 @@ impl Default for HlsConfig {
 /// [`Self::run`] then accepts connections forever.
 pub struct HlsServer {
     listener: TcpListener,
-    ring: Arc<RwLock<SegmentRing>>,
-    adaptive: Option<Arc<ferricast_core::AdaptiveBitrateState>>,
-    stats: Arc<stats::SessionStats>,
-    tls: Option<TlsAcceptor>,
-    /// Cancels the capture loop when the server is dropped.
-    _segmenter: JoinHandle<()>,
+    connections: Arc<Connections>,
+    segmenter: JoinHandle<()>,
 }
 
 impl HlsServer {
@@ -195,24 +271,18 @@ impl HlsServer {
     /// and return. The server is ready to serve as soon as this
     /// resolves — players that connect immediately will see a
     /// non-empty playlist on their first request.
+    ///
+    /// # Errors
+    ///
+    /// Invalid configuration, bind failure, or no segment produced
+    /// before the startup deadline.
     pub async fn start<S, E, A>(addr: A, capture: S, encoder: E, config: HlsConfig) -> Result<Self>
     where
         S: ScreenCapture + Send + 'static,
         E: VideoEncoder + Send + 'static,
         A: ToSocketAddrs,
     {
-        if config.keep_segments < 3 {
-            return Err(FerricastError::Hls(format!(
-                "keep_segments={} too small (minimum 3)",
-                config.keep_segments
-            )));
-        }
-        if (config.playlist_target_duration as f32) < config.segment_target_secs {
-            return Err(FerricastError::Hls(format!(
-                "playlist_target_duration={}s < segment_target_secs={}s",
-                config.playlist_target_duration, config.segment_target_secs
-            )));
-        }
+        config.validate()?;
 
         let listener = TcpListener::bind(addr).await?;
         let local = listener
@@ -220,7 +290,14 @@ impl HlsServer {
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "?".into());
 
-        let ring = Arc::new(RwLock::new(SegmentRing::new(config.keep_segments)));
+        let ring = Arc::new(RwLock::new(SegmentRing::new(
+            config.keep_segments,
+            config.target_duration(),
+        )));
+        let state = Arc::new(http::ServerState::new(
+            ring.clone(),
+            config.adaptive.clone(),
+        )?);
         let writer = ring.clone();
         let cfg = config.clone();
         let segmenter = tokio::spawn(async move {
@@ -229,10 +306,11 @@ impl HlsServer {
             }
         });
 
-        if !ring::wait_for_first_segment(&ring).await {
+        if !config.startup().wait(&ring).await {
             segmenter.abort();
             return Err(FerricastError::Hls(
-                "HLS segmenter did not produce any output within 30s; encoder likely failed".into(),
+                "HLS segmenter did not produce the startup segments in time; encoder likely failed"
+                    .into(),
             ));
         }
 
@@ -244,60 +322,165 @@ impl HlsServer {
             "HLS server ready"
         );
 
-        let tls = config.tls.clone().map(TlsAcceptor::from);
         Ok(Self {
             listener,
-            ring,
-            adaptive: config.adaptive.clone(),
-            stats: Arc::new(stats::SessionStats::new()),
-            tls,
-            _segmenter: segmenter,
+            connections: Arc::new(Connections::new(state, config.tls.clone())),
+            segmenter,
         })
     }
 
     /// Bound socket address. Useful when [`Self::start`] is given
     /// `0.0.0.0:0` and the caller needs to discover the assigned port.
+    ///
+    /// # Errors
+    ///
+    /// The socket's address cannot be queried.
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.listener.local_addr().map_err(FerricastError::from)
+    }
+
+    /// Path of the media playlist, `/<token>/index.m3u8`. Requests
+    /// outside the per-server random token prefix get 404.
+    #[must_use]
+    pub fn playlist_path(&self) -> String {
+        self.connections.state.token.playlist_path()
+    }
+
+    /// Only let `ip` (plus loopback and other allowed peers) fetch from
+    /// this server; other peers get 403. Until the first call every
+    /// peer may fetch. Applies to connections already open, too.
+    pub fn allow_peer(&self, ip: IpAddr) {
+        self.connections.state.allow_peer(ip);
     }
 
     /// Accept a single connection and dispatch it to a per-connection
     /// task. Useful when the caller wants to drive accept manually
     /// (e.g. integrate with a select! loop).
+    ///
+    /// # Errors
+    ///
+    /// The `accept` call failed; the caller decides whether to retry.
     pub async fn accept_one(&self) -> Result<()> {
         let (socket, peer) = self.listener.accept().await?;
-        let ring = self.ring.clone();
-        let adaptive = self.adaptive.clone();
-        let stats = self.stats.clone();
-        let tls = self.tls.clone();
-        tokio::spawn(async move {
-            spawn_handler(socket, peer.to_string(), tls, ring, adaptive, stats).await;
-        });
+        self.connections.dispatch(socket, peer);
         Ok(())
     }
 
-    /// Accept loop. Runs until the listener errors out (interface
-    /// going away, fd exhaustion, …). Per-connection failures are
-    /// logged but never bring down the loop.
+    /// Accept loop. Runs until the returned future is dropped.
+    /// Transient accept failures (fd exhaustion, aborted handshakes)
+    /// are logged and retried after a short pause; they never stop the
+    /// server.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error today; the `Result` is kept for API
+    /// stability.
     pub async fn run(self) -> Result<()> {
-        loop {
-            match self.listener.accept().await {
-                Ok((socket, peer)) => {
-                    let ring = self.ring.clone();
-                    let adaptive = self.adaptive.clone();
-                    let stats = self.stats.clone();
-                    let tls = self.tls.clone();
+        self.connections.accept_loop(&self.listener).await;
+        Ok(())
+    }
+}
 
-                    tokio::spawn(async move {
-                        spawn_handler(socket, peer.to_string(), tls, ring, adaptive, stats).await;
-                    });
-                }
+impl Drop for HlsServer {
+    fn drop(&mut self) {
+        // The segmenter owns the capture + encoder; it must not
+        // outlive the server. Handler tasks would otherwise keep
+        // serving a ring nobody updates.
+        self.segmenter.abort();
+        self.connections.shutdown();
+    }
+}
+
+/// Upper bound on simultaneously served connections per server. A
+/// Chromecast uses one or two; the cap only matters when something
+/// floods the port.
+const MAX_CONNECTIONS: usize = 64;
+
+/// Pause after a failed `accept()` before trying again. Errors like
+/// `EMFILE` repeat immediately while the condition lasts, so retrying
+/// in a tight loop would spin a core.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// A client that opens a TCP connection but never completes the TLS
+/// handshake is dropped after this long.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// TCP keepalive: first probe after this much idle time…
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+/// …then one probe every interval…
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// …and the connection is dropped after this many unanswered probes.
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// The connections one server accepts: TLS wrapping, the concurrency
+/// cap, and the handler tasks (aborted together on shutdown).
+struct Connections {
+    state: Arc<http::ServerState>,
+    tls: Option<TlsAcceptor>,
+    permits: Arc<Semaphore>,
+    handlers: StdMutex<JoinSet<()>>,
+}
+
+impl Connections {
+    fn new(state: Arc<http::ServerState>, tls: Option<Arc<rustls::ServerConfig>>) -> Self {
+        Self {
+            state,
+            tls: tls.map(TlsAcceptor::from),
+            permits: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            handlers: StdMutex::new(JoinSet::new()),
+        }
+    }
+
+    fn handlers(&self) -> std::sync::MutexGuard<'_, JoinSet<()>> {
+        // A panic while holding the lock leaves the JoinSet intact.
+        self.handlers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Accept forever, retrying after transient errors.
+    async fn accept_loop(&self, listener: &TcpListener) {
+        loop {
+            match listener.accept().await {
+                Ok((socket, peer)) => self.dispatch(socket, peer),
                 Err(e) => {
-                    error!(error = %e, "HLS listener accept failed");
-                    return Err(FerricastError::from(e));
+                    warn!(error = %e, "HLS accept failed; retrying");
+                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
                 }
             }
         }
+    }
+
+    /// Hand an accepted socket to a tracked handler task, or turn it
+    /// away with 503 when the connection cap is reached.
+    fn dispatch(&self, socket: TcpStream, peer: SocketAddr) {
+        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+            warn!(%peer, limit = MAX_CONNECTIONS, "HLS connection limit reached; rejecting");
+            // Best effort, never blocks: one non-blocking write on the
+            // fresh socket, whose send buffer has room for this short
+            // response. (Tokio's `try_write` would refuse before the
+            // reactor has seen the socket become writable.)
+            if let Ok(mut std_socket) = socket.into_std() {
+                let _ = std::io::Write::write(
+                    &mut std_socket,
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+                      Retry-After: 1\r\nConnection: close\r\n\r\n",
+                );
+            }
+            return;
+        };
+        let state = self.state.clone();
+        let tls = self.tls.clone();
+        let mut handlers = self.handlers();
+        // Reap finished handlers so the set doesn't grow unbounded.
+        while handlers.try_join_next().is_some() {}
+        handlers.spawn(async move {
+            serve_connection(socket, peer, tls, state).await;
+            drop(permit);
+        });
+    }
+
+    /// Abort every connection handler.
+    fn shutdown(&self) {
+        self.handlers().abort_all();
     }
 }
 
@@ -306,32 +489,40 @@ impl HlsServer {
 /// or wrap it in a `TlsAcceptor::accept` first (HTTPS). All HLS
 /// servers in this crate funnel through here so the TLS branch
 /// stays in one place.
-async fn spawn_handler(
+async fn serve_connection(
     socket: TcpStream,
-    peer: String,
+    peer: SocketAddr,
     tls: Option<TlsAcceptor>,
-    ring: Arc<RwLock<SegmentRing>>,
-    adaptive: Option<Arc<ferricast_core::AdaptiveBitrateState>>,
-    stats: Arc<stats::SessionStats>,
+    state: Arc<http::ServerState>,
 ) {
     let _ = socket.set_nodelay(true);
-    match tls {
-        Some(acceptor) => match acceptor.accept(socket).await {
-            Ok(tls_stream) => {
-                if let Err(e) = http::handle(peer.clone(), tls_stream, ring, adaptive, stats).await
-                {
-                    trace!(%peer, error = %e, "HLS connection ended");
+    // Detect a peer that vanished without closing (receiver powered
+    // off) within ~25 s instead of the kernel's 2 h default.
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+    if let Err(e) = socket2::SockRef::from(&socket).set_tcp_keepalive(&keepalive) {
+        trace!(%peer, error = %e, "could not enable TCP keepalive");
+    }
+    let result = match tls {
+        Some(acceptor) => {
+            match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await {
+                Ok(Ok(tls_stream)) => http::handle(peer, tls_stream, state).await,
+                Ok(Err(e)) => {
+                    trace!(%peer, error = %e, "TLS handshake failed");
+                    return;
+                }
+                Err(_) => {
+                    trace!(%peer, "TLS handshake timed out");
+                    return;
                 }
             }
-            Err(e) => {
-                trace!(%peer, error = %e, "TLS handshake failed");
-            }
-        },
-        None => {
-            if let Err(e) = http::handle(peer.clone(), socket, ring, adaptive, stats).await {
-                trace!(%peer, error = %e, "HLS connection ended");
-            }
         }
+        None => http::handle(peer, socket, state).await,
+    };
+    if let Err(e) = result {
+        trace!(%peer, error = %e, "HLS connection ended");
     }
 }
 
@@ -339,8 +530,8 @@ async fn spawn_handler(
 ///
 /// Unlike [`HlsServer`], this handle spawns its own accept loop on
 /// construction so the caller doesn't have to drive it; dropping the
-/// handle aborts the accept loop and dropping the [`mpsc::Sender`]
-/// the caller still holds shuts the segmenter down.
+/// handle stops the accept loop, every connection handler and the
+/// segmenter.
 ///
 /// Used by receiver protocols (Chromecast, …) whose capture+encode
 /// loop is already driven by the global stream manager — they don't
@@ -353,7 +544,9 @@ pub struct HlsFrameSink {
     /// builder) doesn't have to track the same option twice.
     scheme: &'static str,
     ring: Arc<RwLock<SegmentRing>>,
-    _segmenter: JoinHandle<()>,
+    startup: Startup,
+    connections: Arc<Connections>,
+    segmenter: JoinHandle<()>,
     accept: JoinHandle<()>,
 }
 
@@ -362,6 +555,10 @@ impl HlsFrameSink {
     /// HTTP accept loop, and return immediately. The HLS playlist
     /// won't have any segments yet — call [`Self::wait_first_segment`]
     /// before pointing a player at the URL.
+    ///
+    /// # Errors
+    ///
+    /// Invalid configuration or bind failure.
     pub async fn start<A: ToSocketAddrs>(
         addr: A,
         frames: mpsc::Receiver<EncodedFrame>,
@@ -377,6 +574,11 @@ impl HlsFrameSink {
     /// Use this when the caller pre-bound the port (e.g. via
     /// [`ferricast_core::bind_in_range`]) to keep the bind inside a
     /// known firewall-friendly range.
+    ///
+    /// # Errors
+    ///
+    /// Invalid configuration, or the listener's address cannot be
+    /// queried.
     pub async fn start_on_listener(
         listener: TcpListener,
         frames: mpsc::Receiver<EncodedFrame>,
@@ -384,24 +586,20 @@ impl HlsFrameSink {
         parameter_sets: Vec<u8>,
         config: HlsConfig,
     ) -> Result<Self> {
-        if config.keep_segments < 3 {
-            return Err(FerricastError::Hls(format!(
-                "keep_segments={} too small (minimum 3)",
-                config.keep_segments
-            )));
-        }
-        if (config.playlist_target_duration as f32) < config.segment_target_secs {
-            return Err(FerricastError::Hls(format!(
-                "playlist_target_duration={}s < segment_target_secs={}s",
-                config.playlist_target_duration, config.segment_target_secs
-            )));
-        }
+        config.validate()?;
 
         let local = listener.local_addr().map_err(FerricastError::from)?;
 
-        let ring = Arc::new(RwLock::new(SegmentRing::new(config.keep_segments)));
+        let ring = Arc::new(RwLock::new(SegmentRing::new(
+            config.keep_segments,
+            config.target_duration(),
+        )));
+        let state = Arc::new(http::ServerState::new(
+            ring.clone(),
+            config.adaptive.clone(),
+        )?);
+
         let segmenter_ring = ring.clone();
-        let adaptive_for_segmenter = config.adaptive.clone();
         let cfg_for_segmenter = config.clone();
         let segmenter = tokio::spawn(async move {
             if let Err(e) = segmenter::run_from_frames(
@@ -415,35 +613,17 @@ impl HlsFrameSink {
             {
                 error!(error = %e, "HLS frame-source segmenter exited");
             }
-            // Drop reference once the segmenter exits so the
-            // adaptive state can be freed.
-            drop(adaptive_for_segmenter);
         });
 
-        let accept_ring = ring.clone();
-        let accept_adaptive = config.adaptive.clone();
-        let stats = Arc::new(stats::SessionStats::new());
-        let accept_stats = stats.clone();
-        let acceptor = config.tls.clone().map(TlsAcceptor::from);
-        let scheme: &'static str = if acceptor.is_some() { "https" } else { "http" };
+        let connections = Arc::new(Connections::new(state, config.tls.clone()));
+        let scheme: &'static str = if config.tls.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        let accept_connections = connections.clone();
         let accept = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((socket, peer)) => {
-                        let r = accept_ring.clone();
-                        let a = accept_adaptive.clone();
-                        let s = accept_stats.clone();
-                        let t = acceptor.clone();
-                        tokio::spawn(async move {
-                            spawn_handler(socket, peer.to_string(), t, r, a, s).await;
-                        });
-                    }
-                    Err(e) => {
-                        error!(error = %e, "HLS frame-sink accept failed");
-                        return;
-                    }
-                }
-            }
+            accept_connections.accept_loop(&listener).await;
         });
 
         info!(
@@ -459,13 +639,16 @@ impl HlsFrameSink {
             addr: local,
             scheme,
             ring,
-            _segmenter: segmenter,
+            startup: config.startup(),
+            connections,
+            segmenter,
             accept,
         })
     }
 
     /// Bound socket address (always reflects the actual port even if
     /// the caller asked for `:0`).
+    #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
@@ -473,21 +656,42 @@ impl HlsFrameSink {
     /// `"http"` when [`HlsConfig::tls`] was `None`, `"https"` when it
     /// was set. The chromecast LOAD URL builder uses this to keep
     /// scheme + TLS toggle in one place.
+    #[must_use]
     pub fn scheme(&self) -> &'static str {
         self.scheme
     }
 
-    /// Wait until at least one segment has been pushed to the ring.
-    /// Cheap polling — segments emit within `segment_target_secs +
-    /// keyframe_lag` so this resolves in under a second on typical
-    /// streams. Returns `false` if the 30-second deadline passes
-    /// without any segment (encoder/capture pipeline failed).
-    pub async fn wait_first_segment(&self) -> bool {
-        ring::wait_for_first_segment(&self.ring).await
+    /// Path of the media playlist, `/<token>/index.m3u8`, where the
+    /// token is 128 random bits unique to this sink. Build the player
+    /// URL as `{scheme}://{host}:{port}{playlist_path}`; requests
+    /// outside the token prefix get 404.
+    #[must_use]
+    pub fn playlist_path(&self) -> String {
+        self.connections.state.token.playlist_path()
     }
 
-    /// Owned future that resolves when the first segment lands (or
-    /// after the 30-second deadline if the encoder never produces one).
+    /// Only let `ip` (plus loopback and other allowed peers) fetch from
+    /// this server; other peers get 403. Until the first call every
+    /// peer may fetch. Applies to connections already open, too.
+    pub fn allow_peer(&self, ip: IpAddr) {
+        self.connections.state.allow_peer(ip);
+    }
+
+    /// Wait until the stream is playable: [`HlsConfig::startup_segments`]
+    /// segments (default 3, RFC 8216 §6.3.3) have been produced.
+    /// Returns `false` if they don't appear within 30 s plus their
+    /// production time (encoder/capture pipeline failed).
+    pub async fn wait_first_segment(&self) -> bool {
+        self.startup.wait(&self.ring).await
+    }
+
+    /// Owned future with the same semantics as
+    /// [`Self::wait_first_segment`]: resolves `true` once
+    /// [`HlsConfig::startup_segments`] segments exist, `false` on
+    /// timeout. Despite the name it waits for the startup window, not
+    /// just the first segment, so a player pointed at the playlist
+    /// right after it resolves has the three target durations of
+    /// media it needs to start.
     ///
     /// Doesn't borrow `self`, so it can be awaited from a `tokio::spawn`
     /// task. Used by receiver protocols (Chromecast `LOAD`, …) that
@@ -495,17 +699,176 @@ impl HlsFrameSink {
     /// playable without blocking the frame-feeding code path.
     pub fn first_segment_ready(&self) -> impl Future<Output = bool> + Send + 'static {
         let ring = self.ring.clone();
-        async move { ring::wait_for_first_segment(&ring).await }
+        let startup = self.startup;
+        async move { startup.wait(&ring).await }
     }
 }
 
 impl Drop for HlsFrameSink {
     fn drop(&mut self) {
-        // Abort the accept loop so the listener fd is reclaimed.
-        // The segmenter exits on its own as soon as the caller drops
-        // their `mpsc::Sender`, so we don't have to abort it here —
-        // but we abort defensively in case the sender outlives us.
+        // Stop accepting (reclaims the listener fd), cut every open
+        // connection so keep-alive clients can't keep reading a dead
+        // ring, and stop the segmenter even if the caller still holds
+        // the frame sender.
         self.accept.abort();
-        self._segmenter.abort();
+        self.connections.shutdown();
+        self.segmenter.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_duration_comes_from_config_and_covers_segment_target() {
+        let cfg = HlsConfig {
+            segment_target_secs: 2.0,
+            playlist_target_duration: 4,
+            ..HlsConfig::default()
+        };
+        assert_eq!(cfg.target_duration(), 4);
+        let cfg = HlsConfig {
+            segment_target_secs: 4.5,
+            playlist_target_duration: 4,
+            ..HlsConfig::default()
+        };
+        assert_eq!(cfg.target_duration(), 5);
+    }
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn sink() -> (HlsFrameSink, mpsc::Sender<EncodedFrame>) {
+        let (tx, rx) = mpsc::channel(8);
+        let sink = HlsFrameSink::start(
+            "127.0.0.1:0",
+            rx,
+            None,
+            vec![0, 0, 0, 1, 0x67],
+            HlsConfig {
+                segment_target_secs: 2.0,
+                playlist_target_duration: 4,
+                ..HlsConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        (sink, tx)
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> String {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn connections_over_the_cap_get_503() {
+        let (sink, _tx) = sink().await;
+        let addr = sink.local_addr();
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+        // Let the accept loop take all of them.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Read without sending a request: the server answers 503 and
+        // closes right away.
+        let mut over = TcpStream::connect(addr).await.unwrap();
+        let mut reply = String::new();
+        over.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
+        drop(idle);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let reply = get(addr, &sink.playlist_path()).await;
+        assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_sink_closes_open_connections() {
+        let (sink, _tx) = sink().await;
+        let mut conn = TcpStream::connect(sink.local_addr()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(sink);
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .expect("handler must be aborted, not left waiting for a request");
+        assert!(matches!(read, Ok(0) | Err(_)));
+    }
+
+    #[tokio::test]
+    async fn routes_require_the_random_token() {
+        let (server, _tx) = sink().await;
+        let addr = server.local_addr();
+        let path = server.playlist_path();
+        let token = path
+            .strip_prefix('/')
+            .and_then(|p| p.strip_suffix("/index.m3u8"))
+            .unwrap();
+        assert_eq!(token.len(), 32);
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        let (other, _tx2) = sink().await;
+        assert_ne!(other.playlist_path(), path, "tokens must differ per sink");
+
+        let ok = get(addr, &path).await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        assert!(ok.contains("#EXTM3U"), "{ok}");
+        for bad in ["/index.m3u8", "/segment-0.ts", "/0123/index.m3u8", "/"] {
+            let reply = get(addr, bad).await;
+            assert!(reply.starts_with("HTTP/1.1 404"), "{bad}: {reply}");
+        }
+        let seg = get(addr, &format!("/{token}/segment-0.ts")).await;
+        // No segment yet, but the route is reachable under the token.
+        assert!(seg.starts_with("HTTP/1.1 404"), "{seg}");
+    }
+
+    fn frame(i: u64) -> EncodedFrame {
+        let key = i.is_multiple_of(60);
+        EncodedFrame {
+            codec: ferricast_core::Codec::H264,
+            data: bytes::Bytes::from(vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }, 0xAA]),
+            timestamp_us: 1_000_000 + i * 33_333,
+            is_keyframe: key,
+            duration_us: None,
+            pts_dts: (0, 0),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_is_ready_only_after_the_startup_segments() {
+        let (tx, rx) = mpsc::channel(256);
+        let sink = HlsFrameSink::start(
+            "127.0.0.1:0",
+            rx,
+            None,
+            vec![0, 0, 0, 1, 0x67],
+            HlsConfig {
+                segment_target_secs: 2.0,
+                playlist_target_duration: 4,
+                target_fps: 30,
+                ..HlsConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut ready = Box::pin(sink.first_segment_ready());
+        // Two complete segments (the keyframe at 120 closes the second).
+        for i in 0..=120 {
+            tx.send(frame(i)).await.unwrap();
+        }
+        let early = tokio::time::timeout(Duration::from_millis(300), &mut ready).await;
+        assert!(early.is_err(), "two segments must not count as ready");
+        for i in 121..=180 {
+            tx.send(frame(i)).await.unwrap();
+        }
+        let ready = tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .expect("third segment makes the stream ready");
+        assert!(ready);
     }
 }
