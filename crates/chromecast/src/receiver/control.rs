@@ -43,7 +43,8 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use ferricast_core::{
-    ControlSession, FerricastError, MediaCommand, PlaybackState, RemoteSender, Result,
+    ControlSession, FerricastError, MediaCommand, PlaybackState, PlaybackStatus, RemoteSender,
+    Result,
 };
 
 use crate::castv2::{CastMessage, DEFAULT_MEDIA_RECEIVER_APP_ID, MAX_MESSAGE_SIZE, namespace};
@@ -158,6 +159,8 @@ struct MediaState {
     content_id: String,
     content_type: String,
     is_live: bool,
+    /// Media duration in seconds, once the receiver reported it.
+    duration: Option<f64>,
     player_state: PlayerState,
     idle_reason: Option<IdleReason>,
     /// Position at `playing_since` (or the frozen position when not
@@ -196,6 +199,24 @@ impl MediaState {
             self.idle_reason = None;
         }
         self.player_state = state;
+    }
+
+    /// Takes position, duration and liveness from the pipeline: its
+    /// position replaces the locally extrapolated one (re-basing the
+    /// clock when playing), and what the media really is overrides the
+    /// sender's LOAD `streamType`.
+    fn apply(&mut self, status: &PlaybackStatus) {
+        if let Some(position_us) = status.position_us {
+            self.position = position_us as f64 / 1_000_000.0;
+            if self.playing_since.is_some() {
+                self.playing_since = Some(Instant::now());
+            }
+        }
+        self.is_live = status.is_live;
+        self.duration = status
+            .duration_us
+            .filter(|_| !status.is_live)
+            .map(|d| d as f64 / 1_000_000.0);
     }
 
     fn supported_commands(&self) -> u32 {
@@ -330,6 +351,41 @@ impl ControlSession for ChromecastReceiverControl {
     }
 
     async fn report_state(&mut self, state: PlaybackState) -> Result<()> {
+        self.publish(state, None).await
+    }
+
+    async fn report_status(&mut self, status: PlaybackStatus) -> Result<()> {
+        let state = status.state.clone();
+        self.publish(state, Some(status)).await
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        if let Some(task) = self.reader_task.take() {
+            task.abort();
+        }
+        if let Some(w) = self.writer.take() {
+            let _ = w.lock().await.shutdown().await;
+        }
+        self.commands_rx.take();
+        *self.state.lock().await = None;
+        Ok(())
+    }
+
+    fn is_alive(&self) -> bool {
+        self.reader_task.as_ref().is_some_and(|t| !t.is_finished())
+    }
+}
+
+impl ChromecastReceiverControl {
+    /// Applies a state change (and, from `report_status`, the position,
+    /// duration and liveness) to the media session and sends the
+    /// resulting `MEDIA_STATUS`, preceded by `LOAD_FAILED` when a
+    /// pending LOAD failed.
+    async fn publish(
+        &mut self,
+        state: PlaybackState,
+        status: Option<PlaybackStatus>,
+    ) -> Result<()> {
         let Some(writer) = self.writer.clone() else {
             return Ok(());
         };
@@ -367,6 +423,9 @@ impl ControlSession for ChromecastReceiverControl {
                     .map(|request_id| (request_id, reason.clone()));
             }
         }
+        if let Some(status) = status {
+            media.apply(&status);
+        }
         let request_id = s.pending_load.take();
         let mut messages = Vec::new();
         if let Some((request_id, reason)) = load_failed {
@@ -382,22 +441,6 @@ impl ControlSession for ChromecastReceiverControl {
             server_send(&writer, msg).await?;
         }
         Ok(())
-    }
-
-    async fn close(&mut self) -> Result<()> {
-        if let Some(task) = self.reader_task.take() {
-            task.abort();
-        }
-        if let Some(w) = self.writer.take() {
-            let _ = w.lock().await.shutdown().await;
-        }
-        self.commands_rx.take();
-        *self.state.lock().await = None;
-        Ok(())
-    }
-
-    fn is_alive(&self) -> bool {
-        self.reader_task.as_ref().is_some_and(|t| !t.is_finished())
     }
 }
 
@@ -814,6 +857,7 @@ async fn handle_load(
                 .clone()
                 .unwrap_or_else(|| "application/x-mpegurl".into()),
             is_live,
+            duration: None,
             player_state: PlayerState::Buffering,
             idle_reason: None,
             position: current_time,
@@ -932,6 +976,9 @@ fn build_media_status(
                     "streamType": if m.is_live { "LIVE" } else { "BUFFERED" },
                 },
             });
+            if let (Some(duration), Some(media)) = (m.duration, entry.get_mut("media")) {
+                media["duration"] = Value::from(duration);
+            }
             if let (Some(reason), Some(obj)) = (m.idle_reason, entry.as_object_mut()) {
                 obj.insert("idleReason".into(), Value::from(reason.as_str()));
             }
@@ -972,6 +1019,7 @@ mod tests {
             content_id: "http://x/a.m3u8".into(),
             content_type: "application/x-mpegurl".into(),
             is_live,
+            duration: None,
             player_state: PlayerState::Buffering,
             idle_reason: None,
             position: 3.0,
@@ -1022,6 +1070,42 @@ mod tests {
         assert_eq!(st["idleReason"], "FINISHED");
         assert_eq!(st["volume"]["level"], 0.25);
         assert_eq!(st["volume"]["muted"], true);
+    }
+
+    #[test]
+    fn reported_status_sets_position_duration_and_stream_type() {
+        let mut s = SessionState::new("sender-1".into());
+        let mut m = media(true);
+        m.set_state(PlayerState::Playing);
+        m.apply(&PlaybackStatus {
+            state: PlaybackState::Playing,
+            position_us: Some(12_500_000),
+            duration_us: Some(60_000_000),
+            is_live: false,
+        });
+        s.media = Some(m);
+        let msg = build_media_status(&s, None, super::super::Volume::default()).unwrap();
+        let v: Value = serde_json::from_str(msg.payload_utf8.as_deref().unwrap()).unwrap();
+        let st = &v["status"][0];
+        assert_eq!(st["media"]["streamType"], "BUFFERED");
+        assert_eq!(st["media"]["duration"], 60.0);
+        let at = st["currentTime"].as_f64().unwrap();
+        assert!((12.5..12.6).contains(&at), "{at}");
+        assert_ne!(
+            st["supportedMediaCommands"].as_u64().unwrap() & u64::from(CMD_SEEK),
+            0
+        );
+
+        let mut live = media(false);
+        live.apply(&PlaybackStatus {
+            state: PlaybackState::Playing,
+            position_us: None,
+            duration_us: Some(30_000_000),
+            is_live: true,
+        });
+        assert!(live.is_live);
+        assert_eq!(live.duration, None);
+        assert!((live.position - 3.0).abs() < 1e-9);
     }
 
     #[test]

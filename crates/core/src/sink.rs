@@ -39,4 +39,14 @@ pub trait FrameSink: Send {
     async fn set_volume(&mut self, _gain: f32) -> Result<()> {
         Ok(())
     }
+
+    /// Audio accepted by [`Self::push_audio`] that the output device has
+    /// not played yet, or `None` when the sink cannot tell (the default).
+    ///
+    /// The pipeline uses it to follow the sound card's clock: a device
+    /// that runs slower or faster than the system clock makes this grow
+    /// or shrink, and video is re-timed to match what is heard.
+    fn audio_backlog(&self) -> Option<std::time::Duration> {
+        None
+    }
 }

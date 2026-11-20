@@ -52,6 +52,32 @@ pub enum PlaybackState {
     Error(String),
 }
 
+/// A full status report: the coarse state plus where playback is and
+/// what is playing. Chromecast maps it onto `MEDIA_STATUS`
+/// (`playerState`, `currentTime`, `media.duration`, `streamType`).
+#[derive(Debug, Clone)]
+pub struct PlaybackStatus {
+    pub state: PlaybackState,
+    /// Current media position, when known. Receivers that keep their own
+    /// position clock re-base it on this value.
+    pub position_us: Option<u64>,
+    /// Total duration; `None` for live media or when unknown.
+    pub duration_us: Option<u64>,
+    /// Whether the media is live (no fixed end, not seekable).
+    pub is_live: bool,
+}
+
+impl From<PlaybackState> for PlaybackStatus {
+    fn from(state: PlaybackState) -> Self {
+        Self {
+            state,
+            position_us: None,
+            duration_us: None,
+            is_live: false,
+        }
+    }
+}
+
 /// Repeat mode for queued playback. Matches Chromecast
 /// `REPEAT_MODE_*` and AirPlay equivalents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,7 +213,7 @@ pub enum MediaCommand {
 /// 1. `accept` — block until a sender opens the control connection
 ///    and completes the protocol's handshake.
 /// 2. Loop: `next_command` to receive a [`MediaCommand`],
-///    `report_state` to push status back.
+///    `report_state` or `report_status` to push status back.
 /// 3. `close` — tear down the connection.
 ///
 /// Single-sender at a time on purpose. Cast / AirPlay both serialise
@@ -197,6 +223,12 @@ pub trait ControlSession: Send + Sync {
     fn accept(&mut self) -> impl Future<Output = Result<RemoteSender>> + Send;
     fn next_command(&mut self) -> impl Future<Output = Result<MediaCommand>> + Send;
     fn report_state(&mut self, state: PlaybackState) -> impl Future<Output = Result<()>> + Send;
+    /// Reports state together with position, duration and liveness. The
+    /// default forwards only the state to [`Self::report_state`], so
+    /// implementations that cannot carry the rest need not override it.
+    fn report_status(&mut self, status: PlaybackStatus) -> impl Future<Output = Result<()>> + Send {
+        self.report_state(status.state)
+    }
     fn close(&mut self) -> impl Future<Output = Result<()>> + Send;
     fn is_alive(&self) -> bool;
 }
