@@ -1,10 +1,14 @@
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+/// What a render loop should do with a frame after [`Clock::wait_for`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Due {
+    /// The frame's time has come: present it now.
     Show,
+    /// The frame is too far behind the timeline: drop it and fetch the next.
     Late,
+    /// [`Clock::stop`] was called: end the render loop.
     Stopped,
 }
 
@@ -28,6 +32,15 @@ struct State {
     stopped: bool,
 }
 
+/// Paces decoded frames against wall-clock time for an external render loop
+/// (the desktop shell drives it; nothing inside this crate does).
+///
+/// Contract: one render thread calls [`Clock::wait_for`] with each frame's
+/// timestamp, in presentation order, and acts on the returned [`Due`]. Any
+/// other thread may call [`Clock::pause`], [`Clock::resume`] and
+/// [`Clock::stop`]. The first frame, a frame earlier than the current anchor
+/// (loop restart), a frame due more than two seconds ahead (timestamp jump)
+/// and a frame after a long stall all re-anchor the timeline.
 pub struct Clock {
     state: Mutex<State>,
     changed: Condvar,
@@ -35,6 +48,8 @@ pub struct Clock {
 }
 
 impl Clock {
+    /// Creates a clock that still shows frames up to `max_lateness` behind
+    /// their due time and reports later ones as [`Due::Late`].
     pub fn new(max_lateness: Duration) -> Self {
         Self {
             state: Mutex::new(State::default()),
@@ -43,6 +58,8 @@ impl Clock {
         }
     }
 
+    /// Holds the render thread inside [`Clock::wait_for`] until
+    /// [`Clock::resume`]; the timeline re-anchors on resume.
     pub fn pause(&self) {
         let mut state = self.lock();
         state.paused = true;
@@ -53,16 +70,21 @@ impl Clock {
         self.changed.notify_all();
     }
 
+    /// Releases a paused render thread.
     pub fn resume(&self) {
         self.lock().paused = false;
         self.changed.notify_all();
     }
 
+    /// Makes every current and future [`Clock::wait_for`] return
+    /// [`Due::Stopped`].
     pub fn stop(&self) {
         self.lock().stopped = true;
         self.changed.notify_all();
     }
 
+    /// Blocks until the frame stamped `pts_us` is due (or the clock is
+    /// stopped) and says what to do with it.
     pub fn wait_for(&self, pts_us: u64) -> Due {
         let mut state = self.lock();
         loop {

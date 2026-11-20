@@ -1,9 +1,18 @@
+/// Thins a decoded stream to at most `fps` frames a second for an external
+/// consumer (the desktop shell) that cannot present faster.
+///
+/// Contract: call [`FrameLimiter::accepts`] with each frame's timestamp in
+/// presentation order and present only the accepted ones. Spacing is checked
+/// at 75% of the target period so timestamp jitter never drops frames from a
+/// stream already at the target rate; a timestamp going backwards (loop
+/// restart) is always accepted.
 pub struct FrameLimiter {
     min_spacing_us: u64,
     last: Option<u64>,
 }
 
 impl FrameLimiter {
+    /// Creates a limiter for `fps` frames a second (0 is treated as 1).
     pub fn new(fps: u32) -> Self {
         Self {
             min_spacing_us: 750_000 / u64::from(fps.max(1)),
@@ -11,6 +20,7 @@ impl FrameLimiter {
         }
     }
 
+    /// Whether the frame stamped `pts_us` should be presented.
     pub fn accepts(&mut self, pts_us: u64) -> bool {
         let due = self
             .last
