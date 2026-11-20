@@ -4,8 +4,8 @@
 #[path = "../../../tests/support/mod.rs"]
 mod support;
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use ferricast_core::{AudioCodec, Codec, MediaPacket, MediaPuller, PullSpec};
