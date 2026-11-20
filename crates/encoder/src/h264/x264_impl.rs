@@ -5,8 +5,8 @@ use yuv::{YuvChromaSubsampling, YuvPlanarImageMut, bgra_to_yuv420, rgba_to_yuv42
 
 use crate::h264::utils::extract_sps_pps;
 
-const X264_PRESET_VAR: &'static str = "FERRICAST_X264_PRESET";
-const X264_TUNE_VAR: &'static str = "FERRICAST_TUNE_PRESET";
+const X264_PRESET_VAR: &str = "FERRICAST_X264_PRESET";
+const X264_TUNE_VAR: &str = "FERRICAST_TUNE_PRESET";
 
 #[derive(Default)]
 pub struct X264Encoder {
@@ -273,13 +273,13 @@ impl VideoEncoder for X264Encoder {
         // reflected. Falls back to the cached copy when the encoder
         // isn't built yet or the call fails, so callers that probe
         // headers before the first encode still get something usable.
-        if let Some(enc) = self.encoder.as_mut() {
-            if let Ok(hdr) = enc.headers() {
-                let bytes = hdr.entirety().to_vec();
-                let fresh = extract_sps_pps(&bytes);
-                if !fresh.is_empty() {
-                    self.sps_pps = fresh;
-                }
+        if let Some(enc) = self.encoder.as_mut()
+            && let Ok(hdr) = enc.headers()
+        {
+            let bytes = hdr.entirety().to_vec();
+            let fresh = extract_sps_pps(&bytes);
+            if !fresh.is_empty() {
+                self.sps_pps = fresh;
             }
         }
         Ok(self.sps_pps.clone())

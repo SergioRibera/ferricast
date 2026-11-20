@@ -14,6 +14,7 @@ const FRAME_SAMPLES: usize = 960;
 // permits up to ~1275 bytes for the highest bitrate; 4 KiB is safe).
 const OUT_BUF: usize = 4096;
 
+#[derive(Default)]
 pub struct OpusEncoder {
     enc: Option<RawEncoder>,
     sample_rate: u32,
@@ -29,20 +30,6 @@ pub struct OpusEncoder {
 impl OpusEncoder {
     pub fn new() -> Self {
         Self::default()
-    }
-}
-
-impl Default for OpusEncoder {
-    fn default() -> Self {
-        Self {
-            enc: None,
-            sample_rate: 0,
-            channels: 0,
-            pcm_buf: Vec::new(),
-            pts_anchor_us: None,
-            samples_emitted: 0,
-            pending: Vec::new(),
-        }
     }
 }
 

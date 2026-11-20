@@ -382,7 +382,9 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
     }
 
     fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
-        let force_idr = self.frame_count % (self.cfg.keyframe_interval as u64) == 0
+        let force_idr = self
+            .frame_count
+            .is_multiple_of(u64::from(self.cfg.keyframe_interval))
             || std::mem::take(&mut self.pending_keyframe);
         let options = EncodeOptions {
             force_intra: false,
@@ -478,11 +480,9 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
         // already via this method, so we synthesise them here via
         // `nvEncGetSequenceParams` — which returns SPS/PPS for H.264
         // and VPS/SPS/PPS for HEVC.
-        let a = self.encoder.get_sequence_params().map_err(|e| {
+        self.encoder.get_sequence_params().map_err(|e| {
             FerricastError::Encoder(format!("NVENC ({}): get_sequence_params: {e}", C::NAME))
-        });
-
-        a
+        })
     }
 }
 

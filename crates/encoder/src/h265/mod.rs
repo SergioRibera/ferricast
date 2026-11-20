@@ -40,9 +40,16 @@ pub use crate::nvenc::NvencH265Encoder;
 #[cfg(feature = "vaapi-hevc")]
 pub use vaapi_impl::VaapiH265Encoder;
 
-const H265_BACKEND_VAR: &'static str = "FERRICAST_H265_BACKEND";
+const H265_BACKEND_VAR: &str = "FERRICAST_H265_BACKEND";
 
+#[derive(Default)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one long-lived instance per stream; boxing only adds a per-frame indirection \
+              (conditional: the size gap depends on which backends are compiled in)"
+)]
 pub enum H265Encoder {
+    #[default]
     Pending,
     #[cfg(feature = "vaapi-hevc")]
     Vaapi(VaapiH265Encoder),
@@ -53,12 +60,6 @@ pub enum H265Encoder {
 impl H265Encoder {
     pub fn new() -> Self {
         Self::default()
-    }
-}
-
-impl Default for H265Encoder {
-    fn default() -> Self {
-        H265Encoder::Pending
     }
 }
 

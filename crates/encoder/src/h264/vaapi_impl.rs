@@ -103,9 +103,6 @@ pub struct VaapiH264Encoder {
     vpp_config: Option<Config>,
     vpp_context: Option<Rc<Context>>,
 
-    /// One NV12 surface that we re-upload every frame as the
-    /// encoder's input.
-    input: Surface<()>,
     /// Reconstruction surfaces, alternated round-robin so the
     /// previous one can serve as the reference picture for the
     /// next P frame.
@@ -127,7 +124,6 @@ pub struct VaapiH264Encoder {
 
 #[derive(Clone)]
 struct EncoderCfg {
-    profile: VAProfile::Type,
     profile_idc: u8,
     /// `constraint_set0..5` packed in the high byte (see SPS
     /// emission).
@@ -228,7 +224,7 @@ impl VaapiH264Encoder {
         };
         info!(?profile, %vendor, "VA-API H.264 encoder selected");
 
-        let cfg = build_encoder_cfg(profile, profile_idc, constraint_flags, cabac, &cfg)?;
+        let cfg = build_encoder_cfg(profile_idc, constraint_flags, cabac, &cfg)?;
 
         // VAConfig with rate control + RT format.
         let cfg_handle = display
@@ -248,20 +244,8 @@ impl VaapiH264Encoder {
             )
             .map_err(|e| FerricastError::Encoder(format!("vaCreateConfig: {e}")))?;
 
-        // Allocate surfaces: one input + N reconstruction. All NV12.
-        let input_descs: Vec<()> = vec![()];
-        let mut input_surfaces = display
-            .create_surfaces(
-                VA_RT_FORMAT_YUV420,
-                Some(VA_FOURCC_NV12),
-                cfg.width,
-                cfg.padded_height(),
-                Some(UsageHint::USAGE_HINT_ENCODER),
-                input_descs,
-            )
-            .map_err(|e| FerricastError::Encoder(format!("create input surface: {e}")))?;
-        let input = input_surfaces.pop().expect("we asked for 1 surface");
-
+        // Allocate the reconstruction pool (NV12). Frames are uploaded
+        // straight into the recon surface that becomes the render target.
         let recon_descs: Vec<()> = (0..RECON_POOL).map(|_| ()).collect();
         let recon = display
             .create_surfaces(
@@ -346,7 +330,6 @@ impl VaapiH264Encoder {
             context,
             vpp_config,
             vpp_context,
-            input,
             recon,
             cfg,
             sps_nal,
@@ -399,7 +382,7 @@ fn open_render_node() -> Option<Rc<Display>> {
 
 fn profile_has_enc_slice(display: &Display, profile: VAProfile::Type) -> bool {
     match display.query_config_entrypoints(profile) {
-        Ok(eps) => eps.iter().any(|e| *e == VAEntrypoint::VAEntrypointEncSlice),
+        Ok(eps) => eps.contains(&VAEntrypoint::VAEntrypointEncSlice),
         Err(_) => false,
     }
 }
@@ -413,7 +396,6 @@ impl EncoderCfg {
 }
 
 fn build_encoder_cfg(
-    profile: VAProfile::Type,
     profile_idc: u8,
     constraint_flags: u8,
     cabac: bool,
@@ -421,14 +403,13 @@ fn build_encoder_cfg(
 ) -> Result<EncoderCfg> {
     let width = cfg.width.max(16);
     let height = cfg.height.max(16);
-    let width_mbs = ((width + 15) / 16) as u16;
-    let height_mbs = ((height + 15) / 16) as u16;
+    let width_mbs = width.div_ceil(16) as u16;
+    let height_mbs = height.div_ceil(16) as u16;
     let padded_h = (height_mbs as u32) * 16;
     let height_crop = (padded_h - height) / 2;
     let level_idc = pick_level(width, height, cfg.fps);
 
     Ok(EncoderCfg {
-        profile,
         profile_idc,
         constraint_flags,
         cabac,
@@ -438,7 +419,7 @@ fn build_encoder_cfg(
         height_mbs,
         height_crop,
         fps: cfg.fps.max(1),
-        bitrate_bps: (cfg.bitrate_kbps.max(1) as u32).saturating_mul(1000),
+        bitrate_bps: cfg.bitrate_kbps.max(1).saturating_mul(1000),
         keyframe_interval: cfg.keyframe_interval_frames(),
         initial_qp: 26,
         level_idc,
@@ -449,13 +430,11 @@ fn build_encoder_cfg(
 /// resolution+framerate (Annex A, Table A-1). 41 covers 1080p60;
 /// 50 covers 4K30. Anything larger we just clamp to 51.
 fn pick_level(width: u32, height: u32, fps: u32) -> u8 {
-    let mb_per_sec = ((width + 15) / 16) * ((height + 15) / 16) * fps.max(1);
+    let mb_per_sec = width.div_ceil(16) * height.div_ceil(16) * fps.max(1);
     if mb_per_sec <= 245_760 {
         31
     } else if mb_per_sec <= 522_240 {
         40
-    } else if mb_per_sec <= 522_240 && (width * height) <= 2_073_600 {
-        41
     } else if mb_per_sec <= 589_824 {
         41
     } else if mb_per_sec <= 983_040 {
@@ -604,10 +583,12 @@ fn upload_bgra_to_nv12(
         bgra_stride.max((w * 4) as usize),
         w,
         h,
-        y_plane,
-        y_stride,
-        uv_plane,
-        uv_stride,
+        yuv::Nv12Planes {
+            y: &mut *y_plane,
+            y_stride,
+            uv: &mut *uv_plane,
+            uv_stride,
+        },
     );
 
     // Zero out any padding rows so they don't leak previous frame's
@@ -637,8 +618,8 @@ fn upload_bgra_to_nv12(
 /// buffers, submits, syncs, extracts the coded bitstream.
 fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>, bool, u32, u32)> {
     let cfg = &enc.cfg;
-    let is_idr =
-        state.frame_idx % cfg.keyframe_interval == 0 || std::mem::take(&mut state.pending_keyframe);
+    let is_idr = state.frame_idx.is_multiple_of(cfg.keyframe_interval)
+        || std::mem::take(&mut state.pending_keyframe);
     let frame_num = if is_idr {
         0
     } else {

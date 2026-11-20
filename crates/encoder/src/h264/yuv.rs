@@ -19,28 +19,36 @@ use yuv::{
     bgra_to_yuv_nv12,
 };
 
-/// Convert a packed BGRA plane into the driver-allocated NV12
-/// destination planes (split-borrowed because the Y and UV regions
-/// live in the same mapped VAImage buffer).
+/// Driver-allocated NV12 destination planes (split-borrowed because
+/// the Y and UV regions live in the same mapped VAImage buffer).
+///
+/// * `y` / `y_stride` — destination luma plane.
+/// * `uv` / `uv_stride` — destination chroma plane (interleaved
+///   `U`/`V`, half height, full byte width).
+pub(crate) struct Nv12Planes<'a> {
+    pub y: &'a mut [u8],
+    pub y_stride: usize,
+    pub uv: &'a mut [u8],
+    pub uv_stride: usize,
+}
+
+/// Convert a packed BGRA plane into `dst`.
 ///
 /// * `src` / `src_stride` — input BGRA bytes; stride may exceed
 ///   `width * 4` if the source has row padding.
 /// * `width`, `height` — image dimensions in pixels. Must both be
 ///   even (chroma subsampling assumes 2×2 blocks).
-/// * `y_dst` / `y_stride` — destination luma plane.
-/// * `uv_dst` / `uv_stride` — destination chroma plane (interleaved
-///   `U`/`V`, half height, full byte width).
 pub(crate) fn bgra_to_nv12(
     src: &[u8],
     src_stride: usize,
     width: u32,
     height: u32,
-    y_dst: &mut [u8],
-    y_stride: usize,
-    uv_dst: &mut [u8],
-    uv_stride: usize,
+    dst: Nv12Planes<'_>,
 ) {
-    debug_assert!(width % 2 == 0 && height % 2 == 0, "even dims required");
+    debug_assert!(
+        width.is_multiple_of(2) && height.is_multiple_of(2),
+        "even dims required"
+    );
 
     // The yuv crate borrows both destination planes mutably inside a
     // single `YuvBiPlanarImageMut`. The driver buffer is already
@@ -48,10 +56,10 @@ pub(crate) fn bgra_to_nv12(
     // `split_at_mut`, so we wrap each as a `Borrowed` variant —
     // zero copy, same lifetimes.
     let mut bi = YuvBiPlanarImageMut::<u8> {
-        y_plane: BufferStoreMut::Borrowed(y_dst),
-        y_stride: y_stride as u32,
-        uv_plane: BufferStoreMut::Borrowed(uv_dst),
-        uv_stride: uv_stride as u32,
+        y_plane: BufferStoreMut::Borrowed(dst.y),
+        y_stride: dst.y_stride as u32,
+        uv_plane: BufferStoreMut::Borrowed(dst.uv),
+        uv_stride: dst.uv_stride as u32,
         width,
         height,
     };
@@ -90,10 +98,12 @@ mod tests {
             (w * 4) as usize,
             w,
             h,
-            &mut y,
-            w as usize,
-            &mut uv,
-            w as usize,
+            Nv12Planes {
+                y: &mut y,
+                y_stride: w as usize,
+                uv: &mut uv,
+                uv_stride: w as usize,
+            },
         );
         assert!(y.iter().all(|&v| v == 16), "Y plane should be 16 (black)");
         assert!(uv.iter().all(|&v| v == 128), "UV should be 128 (neutral)");
@@ -112,10 +122,12 @@ mod tests {
             (w * 4) as usize,
             w,
             h,
-            &mut y,
-            w as usize,
-            &mut uv,
-            w as usize,
+            Nv12Planes {
+                y: &mut y,
+                y_stride: w as usize,
+                uv: &mut uv,
+                uv_stride: w as usize,
+            },
         );
         assert!(
             y.iter().all(|&v| (233..=237).contains(&v)),

@@ -67,15 +67,22 @@ pub use vaapi_impl::VaapiH264Encoder;
 #[cfg(feature = "x264")]
 pub use x264_impl::X264Encoder;
 
-const H264_BACKEND_VAR: &'static str = "FERRICAST_H264_BACKEND";
+const H264_BACKEND_VAR: &str = "FERRICAST_H264_BACKEND";
 
 /// Backend-agnostic H.264 encoder. Variants are conditional on
 /// their feature flag — disabled backends are removed from the enum
 /// at compile time so disabling one doesn't leave dead `match`
 /// arms.
+#[derive(Default)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one long-lived instance per stream; boxing only adds a per-frame indirection \
+              (conditional: the size gap depends on which backends are compiled in)"
+)]
 pub enum H264Encoder {
     /// Pre-configure placeholder. Replaced with one of the concrete
     /// variants on first `configure()` call.
+    #[default]
     Pending,
     /// Hardware VA-API path — Intel / AMD.
     #[cfg(feature = "vaapi")]
@@ -91,12 +98,6 @@ pub enum H264Encoder {
 impl H264Encoder {
     pub fn new() -> Self {
         Self::default()
-    }
-}
-
-impl Default for H264Encoder {
-    fn default() -> Self {
-        H264Encoder::Pending
     }
 }
 

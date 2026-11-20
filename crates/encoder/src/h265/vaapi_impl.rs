@@ -77,7 +77,6 @@ pub struct VaapiH265Encoder {
     vpp_config: Option<Config>,
     vpp_context: Option<Rc<Context>>,
 
-    input: Surface<()>,
     recon: Vec<Surface<()>>,
 
     cfg: EncoderCfg,
@@ -200,19 +199,6 @@ impl VaapiH265Encoder {
             )
             .map_err(|e| FerricastError::Encoder(format!("vaCreateConfig(HEVC): {e}")))?;
 
-        let input_descs: Vec<()> = vec![()];
-        let mut input_surfaces = display
-            .create_surfaces(
-                VA_RT_FORMAT_YUV420,
-                Some(VA_FOURCC_NV12),
-                cfg.width,
-                cfg.padded_height(),
-                Some(UsageHint::USAGE_HINT_ENCODER),
-                input_descs,
-            )
-            .map_err(|e| FerricastError::Encoder(format!("create input surface: {e}")))?;
-        let input = input_surfaces.pop().expect("we asked for 1 surface");
-
         let recon_descs: Vec<()> = (0..RECON_POOL).map(|_| ()).collect();
         let recon = display
             .create_surfaces(
@@ -279,7 +265,6 @@ impl VaapiH265Encoder {
             context,
             vpp_config,
             vpp_context,
-            input,
             recon,
             cfg,
             vps_nal,
@@ -323,7 +308,7 @@ fn open_render_node() -> Option<Rc<Display>> {
 
 fn profile_has_enc_slice(display: &Display, profile: VAProfile::Type) -> bool {
     match display.query_config_entrypoints(profile) {
-        Ok(eps) => eps.iter().any(|e| *e == VAEntrypoint::VAEntrypointEncSlice),
+        Ok(eps) => eps.contains(&VAEntrypoint::VAEntrypointEncSlice),
         Err(_) => false,
     }
 }
@@ -334,8 +319,8 @@ fn build_encoder_cfg(profile_idc: u8, bit_depth: u8, cfg: &EncoderConfig) -> Res
     // CTU = 32 luma samples. Width / height counted in CTUs, rounded
     // up. The encoder's surface is the CTU-padded height; the user's
     // crop comes back through the SPS conformance window.
-    let width_ctus = ((width + 31) / 32) as u16;
-    let height_ctus = ((height + 31) / 32) as u16;
+    let width_ctus = width.div_ceil(32) as u16;
+    let height_ctus = height.div_ceil(32) as u16;
     let padded_h = (height_ctus as u32) * 32;
     let height_crop = padded_h - height;
     let level_idc = pick_level(width, height, cfg.fps);
@@ -348,7 +333,7 @@ fn build_encoder_cfg(profile_idc: u8, bit_depth: u8, cfg: &EncoderConfig) -> Res
         height_ctus,
         height_crop,
         fps: cfg.fps.max(1),
-        bitrate_bps: (cfg.bitrate_kbps.max(1) as u32).saturating_mul(1000),
+        bitrate_bps: cfg.bitrate_kbps.max(1).saturating_mul(1000),
         keyframe_interval: cfg.keyframe_interval_frames(),
         initial_qp: 26,
         level_idc,
@@ -495,10 +480,12 @@ fn upload_bgra_to_nv12(
         bgra_stride.max((w * 4) as usize),
         w,
         h,
-        y_plane,
-        y_stride,
-        uv_plane,
-        uv_stride,
+        crate::h264::yuv::Nv12Planes {
+            y: &mut *y_plane,
+            y_stride,
+            uv: &mut *uv_plane,
+            uv_stride,
+        },
     );
 
     if padded_h > h {
@@ -521,8 +508,8 @@ fn upload_bgra_to_nv12(
 
 fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>, bool, u32, i32)> {
     let cfg = &enc.cfg;
-    let is_idr =
-        state.frame_idx % cfg.keyframe_interval == 0 || std::mem::take(&mut state.pending_keyframe);
+    let is_idr = state.frame_idx.is_multiple_of(cfg.keyframe_interval)
+        || std::mem::take(&mut state.pending_keyframe);
     let poc = if is_idr {
         0
     } else {
