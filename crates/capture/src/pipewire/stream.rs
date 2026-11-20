@@ -15,10 +15,11 @@
 //!   without branching on `MODIFIER_FIXATION_REQUIRED`.
 //! * `process` drains stale buffers and processes only the newest.
 //!
-//! Buffer reading: CPU-mapped (MemFd / MemPtr) buffers are handled
-//! directly; DmaBuf with a LINEAR / INVALID modifier is `mmap`'d
-//! manually. Tiled / compressed modifiers need GPU-import and are
-//! dropped with a warning until that path is wired up.
+//! Buffer reading: CPU-mapped (MemFd / MemPtr) buffers and DmaBuf
+//! with a LINEAR / INVALID modifier are copied out before the buffer
+//! goes back to the compositor. Tiled / compressed DmaBufs are emitted
+//! as `GpuFrame`s that keep their buffer dequeued until downstream
+//! drops them (see [`super::lease`]).
 
 use std::cell::RefCell;
 use std::os::fd::{BorrowedFd, RawFd};
@@ -47,6 +48,7 @@ use pw::spa::utils::Direction;
 use pw::stream::{Stream, StreamFlags, StreamRef, StreamState};
 
 use super::format::{self, EnumFormatParams, GpuFormat, NegotiatedFormat};
+use super::lease::{BufferLeases, DequeuedBuffer, Release};
 use super::portal::PortalStream;
 use super::vulkan::VulkanImporter;
 
@@ -68,6 +70,8 @@ struct UserData {
     /// Set when we've logged the first non-empty frame forwarded
     /// downstream — the moment capture is actually working.
     first_frame_logged: bool,
+    /// Set once we've logged hitting the DmaBuf hold limit.
+    lease_limit_logged: bool,
     /// Target frame period derived from `CaptureConfig::fps`. Used
     /// to throttle Vulkan readback so we don't waste CPU on
     /// memcpy'ing 8 MB at 60 fps when the consumer only encodes at
@@ -248,6 +252,7 @@ fn run(
         shared: Arc::clone(&shared),
         first_buffer_logged: false,
         first_frame_logged: false,
+        lease_limit_logged: false,
         // CaptureConfig.fps is the manager-imposed cap (which
         // already factors in DeviceCapabilities::max_fps). Use
         // 0.95 of the period so a buffer that arrives ~one
@@ -259,6 +264,11 @@ fn run(
         importer,
     }));
     let frame_period = user_data.borrow().frame_period;
+
+    // Separate from `user_data` so the buffer callbacks never contend
+    // with a `user_data` borrow held across `update_params`.
+    let (release_tx, release_rx) = pw::channel::channel::<Release>();
+    let leases = Rc::new(RefCell::new(BufferLeases::new(release_tx)));
 
     let _listener = stream
         .add_local_listener_with_user_data(Rc::clone(&user_data))
@@ -277,10 +287,24 @@ fn run(
         .param_changed(|stream, ud, id, param| {
             handle_param_changed(stream, &mut ud.borrow_mut(), id, param);
         })
+        .add_buffer({
+            let leases = Rc::clone(&leases);
+            move |_, _, _| leases.borrow_mut().buffer_added()
+        })
+        .remove_buffer({
+            let leases = Rc::clone(&leases);
+            move |_, _, buffer| leases.borrow_mut().buffer_removed(buffer)
+        })
         .process({
             let frame_tx = frame_tx.clone();
+            let leases = Rc::clone(&leases);
             move |stream, ud| {
-                handle_process(stream, &mut ud.borrow_mut(), &frame_tx);
+                handle_process(
+                    stream,
+                    &mut ud.borrow_mut(),
+                    &mut leases.borrow_mut(),
+                    &frame_tx,
+                );
             }
         })
         .register()
@@ -294,11 +318,12 @@ fn run(
     let throttle_timer = mainloop.loop_().add_timer({
         let stream = Rc::clone(&stream);
         let user_data = Rc::clone(&user_data);
+        let leases = Rc::clone(&leases);
         let frame_tx = frame_tx.clone();
         move |_| {
             let mut ud = user_data.borrow_mut();
             if ud.deferred && !ud.is_throttled(Instant::now()) {
-                handle_process(&stream, &mut ud, &frame_tx);
+                handle_process(&stream, &mut ud, &mut leases.borrow_mut(), &frame_tx);
             }
         }
     });
@@ -334,6 +359,15 @@ fn run(
         node_id = portal.node_id,
         "stream.connect ok, entering main loop"
     );
+
+    // Re-queues buffers whose `GpuFrame`s downstream has dropped.
+    // Declared after `stream` and `_listener`, so it is detached before
+    // either is dropped and never re-queues into a destroyed stream.
+    let _release_attach = release_rx.attach(mainloop.loop_(), {
+        let stream = Rc::clone(&stream);
+        let leases = Rc::clone(&leases);
+        move |release| leases.borrow_mut().release(&stream, release)
+    });
 
     let _term_attach = term_rx.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
@@ -446,7 +480,12 @@ fn handle_param_changed(
     }
 }
 
-fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender<CapturedFrame>) {
+fn handle_process(
+    stream: &StreamRef,
+    ud: &mut UserData,
+    leases: &mut BufferLeases,
+    frame_tx: &mpsc::Sender<CapturedFrame>,
+) {
     let Some(neg) = ud.negotiated else {
         debug!("process tick before format negotiated, dropping all buffers");
         while stream.dequeue_buffer().is_some() {}
@@ -475,13 +514,10 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
     }
     ud.deferred = false;
 
-    // Drain stale buffers and keep only the newest.
-    let mut drained = 0;
-    let mut newest = None;
-    while let Some(b) = stream.dequeue_buffer() {
-        drained += 1;
-        newest = Some(b);
-    }
+    // Drain stale buffers and keep only the newest. It goes back to
+    // the compositor when `buffer` drops at the end of this callback,
+    // unless a `GpuFrame` takes a lease on it below.
+    let (newest, drained) = DequeuedBuffer::newest(stream);
     let Some(mut buffer) = newest else {
         trace!("process tick with no buffer available");
         return;
@@ -564,6 +600,10 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
     //   path but turned every frame into a wasted memcpy for the
     //   GPU encoder paths. Net: x264 picks up ~10-15 ms per frame,
     //   GPU encoders skip a whole readback. Acceptable trade.
+    //   The frame holds a lease that keeps the buffer dequeued (so
+    //   the compositor can't render into it) until every clone of the
+    //   frame is dropped; at the hold limit we read back to `Cpu`
+    //   instead (see the arm below).
     // * DmaBuf with tiled modifier + no importer → drop with
     //   warning. Should be unreachable because we wouldn't have
     //   negotiated those modifiers in the first place.
@@ -609,30 +649,21 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
             };
             let modifier = neg.modifier.unwrap_or(0);
             let raw = plane.as_raw();
-            let Ok(raw_fd) = RawFd::try_from(raw.fd) else {
-                warn!(fd = raw.fd, "DmaBuf plane has out-of-range fd");
+            let (raw_fd, raw_maxsize) = (raw.fd, raw.maxsize);
+            let Ok(raw_fd) = RawFd::try_from(raw_fd) else {
+                warn!(fd = raw_fd, "DmaBuf plane has out-of-range fd");
                 return;
             };
             if raw_fd < 0 {
                 warn!("DmaBuf plane has invalid fd");
                 return;
             }
-            // PipeWire re-queues this buffer as soon as `process`
-            // returns, and closes its fd on renegotiation / stop. The
-            // frame must therefore own its own duplicate so a
-            // consumer on another thread never imports a closed or
-            // recycled descriptor (= a different object).
-            //
-            // Known limitation: owning the fd pins the DMA-BUF
-            // *object*, not its *contents*. Once re-queued, the
-            // compositor may render the next frame into the same
-            // buffer while the encoder is still reading it, which can
-            // show up as tearing under load. Keeping the pw_buffer
-            // dequeued until the consumer drops the frame would fix
-            // that, but needs raw `pw_stream_{de,}queue_buffer`
-            // handling with buffer-generation tracking across
-            // renegotiation and risks starving the compositor's small
-            // buffer pool, so it is deliberately not done here.
+            // PipeWire closes this fd on renegotiation / stop, possibly
+            // while the frame is still alive downstream. The frame
+            // therefore owns its own duplicate so a consumer on
+            // another thread never imports a closed or recycled
+            // descriptor (= a different object). Content stability is
+            // the lease's job, below.
             // SAFETY: `raw_fd` is the live descriptor PipeWire owns
             // for this dequeued buffer; it stays open for the whole
             // `process` callback, and we only borrow it long enough to
@@ -650,8 +681,8 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
             // chunk_offset — VA-API's objects[0].size expects the
             // full fd size, and the plane offset is stored separately
             // in DmaBufPlane.offset.
-            let dmabuf_size = if raw.maxsize > 0 {
-                raw.maxsize
+            let dmabuf_size = if raw_maxsize > 0 {
+                raw_maxsize
             } else {
                 stride.saturating_mul(neg.height)
             };
@@ -662,7 +693,7 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
             // triggers `VulkanImporter::readback` via the trait. The
             // pipelined-readback we used to do here is gone — see
             // the decision-tree comment above for the trade-off.
-            CapturedFrame::Gpu(GpuFrame {
+            let frame = GpuFrame {
                 width: neg.width,
                 height: neg.height,
                 stride,
@@ -676,7 +707,45 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
                     size: dmabuf_size,
                 },
                 importer: Some(importer.clone() as Arc<dyn ferricast_core::DmaBufImporter>),
-            })
+                lease: None,
+            };
+            match leases.hold(buffer) {
+                Ok(lease) => CapturedFrame::Gpu(GpuFrame {
+                    lease: Some(lease),
+                    ..frame
+                }),
+                // Downstream already holds all buffers but the one the
+                // compositor needs to keep rendering. Dropping this
+                // frame instead could stall capture for good: the
+                // segmenter keeps its last frame for re-encoding and
+                // only lets go of it when a newer one arrives. A
+                // synchronous readback costs ~10-15 ms but emits a
+                // lease-free `Cpu` frame, which frees that slot.
+                Err(buffer) => {
+                    if ud.lease_limit_logged {
+                        trace!("DmaBuf hold limit reached, reading frame back to CPU");
+                    } else {
+                        info!(
+                            limit = leases.limit(),
+                            held = leases.held(),
+                            "DmaBuf hold limit reached, reading frame back to CPU \
+                             (consumer slower than the compositor's buffer pool)"
+                        );
+                        ud.lease_limit_logged = true;
+                    }
+                    let cpu = CapturedFrame::Gpu(frame).into_cpu();
+                    // The readback has completed; the compositor may
+                    // reuse the buffer now.
+                    drop(buffer);
+                    match cpu {
+                        Ok(raw) => CapturedFrame::Cpu(raw),
+                        Err(e) => {
+                            warn!(error = %e, "DmaBuf readback at hold limit failed — frame dropped");
+                            return;
+                        }
+                    }
+                }
+            }
         }
         other => {
             warn!(?other, "unexpected SPA buffer data type");

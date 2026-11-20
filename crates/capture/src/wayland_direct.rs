@@ -919,6 +919,7 @@ fn run_worker(
                             size: alloc.stride.saturating_mul(alloc.height),
                         },
                         importer: Some(importer),
+                        lease: None,
                     })
                 } else {
                     match mmap_bo_to_raw(&alloc) {

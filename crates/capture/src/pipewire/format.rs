@@ -26,7 +26,8 @@ use pw::spa::pod::{
     ChoiceValue, Object, Pod, Property, PropertyFlags, Value, serialize::PodSerializer,
 };
 use pw::spa::sys::{
-    SPA_META_Header, SPA_PARAM_BUFFERS_dataType, SPA_PARAM_META_size, SPA_PARAM_META_type,
+    SPA_META_Header, SPA_PARAM_BUFFERS_buffers, SPA_PARAM_BUFFERS_dataType, SPA_PARAM_META_size,
+    SPA_PARAM_META_type,
 };
 use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle, SpaTypes};
 
@@ -332,10 +333,22 @@ pub(super) fn initial_enum_format_list(
 ///
 /// The bitmask covers shm (MemFd / MemPtr) and DmaBuf so the source can
 /// pick whichever it can produce cheaply. We deliberately don't lock
-/// down `BUFFERS_buffers` / `_size` / `_stride` — letting the source
-/// pick those is what wlx-capture does and is what Mutter / KWin
-/// expect; over-specifying them sometimes leaves the source with no
-/// satisfying answer and it never starts producing frames.
+/// down `BUFFERS_size` / `_stride` — letting the source pick those is
+/// what wlx-capture does and is what Mutter / KWin expect;
+/// over-specifying them sometimes leaves the source with no satisfying
+/// answer and it never starts producing frames.
+///
+/// `BUFFERS_buffers` only states a preference: GPU frames keep their
+/// buffer dequeued while downstream reads them (see `lease`), so a
+/// deeper pool means fewer hold-limit readbacks. The range is wide
+/// enough to intersect anything a compositor offers.
+/// Preferred pool depth: the compositor's own one or two in-flight
+/// buffers, plus up to three held downstream (frame channel, encoder,
+/// segmenter's repeat frame), plus a spare.
+const PREFERRED_BUFFERS: i32 = 6;
+/// `pw_stream`'s own per-stream buffer cap.
+const MAX_BUFFERS: i32 = 64;
+
 pub(super) fn param_buffers_bytes() -> Vec<u8> {
     let data_types = (1_i32 << SpaDataType::MemFd.as_raw())
         | (1_i32 << SpaDataType::MemPtr.as_raw())
@@ -344,11 +357,25 @@ pub(super) fn param_buffers_bytes() -> Vec<u8> {
     let obj = Object {
         type_: SpaTypes::ObjectParamBuffers.as_raw(),
         id: ParamType::Buffers.as_raw(),
-        properties: vec![Property {
-            key: SPA_PARAM_BUFFERS_dataType,
-            flags: PropertyFlags::empty(),
-            value: Value::Int(data_types),
-        }],
+        properties: vec![
+            Property {
+                key: SPA_PARAM_BUFFERS_buffers,
+                flags: PropertyFlags::empty(),
+                value: Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: PREFERRED_BUFFERS,
+                        min: 1,
+                        max: MAX_BUFFERS,
+                    },
+                ))),
+            },
+            Property {
+                key: SPA_PARAM_BUFFERS_dataType,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(data_types),
+            },
+        ],
     };
     serialize(obj)
 }
