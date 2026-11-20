@@ -440,6 +440,7 @@ pub fn window_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceErr
         handle: None,
         identifiers: HashMap::new(),
         buffer: None,
+        shm_format: None,
         formats_done: false,
         status: FrameStatus::Pending,
     };
@@ -470,9 +471,15 @@ pub fn window_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceErr
         // `stopped` before `done`: the window went away.
         return Err(SourceError::NotFound(id.to_owned()));
     }
-    let info = state.buffer.ok_or_else(|| {
-        SourceError::Backend("session emitted `done` without buffer_size/shm_format".into())
+    let size = state
+        .buffer
+        .ok_or_else(|| SourceError::Backend("session emitted `done` without buffer_size".into()))?;
+    let format = state.shm_format.ok_or_else(|| {
+        SourceError::Backend(
+            "session advertised no supported wl_shm format (need 8-bit ARGB/XRGB/ABGR/XBGR)".into(),
+        )
     })?;
+    let info = BufferInfo { format, ..size };
 
     let (fd, mmap) = alloc_shm(info.size())?;
     let pool = shm.create_pool(fd.as_fd(), info.size() as i32, &qh, ());
@@ -529,7 +536,11 @@ struct WindowState {
     target_id: String,
     handle: Option<ExtForeignToplevelHandleV1>,
     identifiers: HashMap<u32, String>,
+    /// Size announced by `buffer_size`; `format` is filled from
+    /// `shm_format` once the session's `done` arrives.
     buffer: Option<BufferInfo>,
+    /// First advertised wl_shm format we support.
+    shm_format: Option<u32>,
     formats_done: bool,
     status: FrameStatus,
 }
@@ -699,15 +710,12 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for WindowState {
                     WEnum::Value(v) => v as u32,
                     WEnum::Unknown(v) => v,
                 };
-                if let Some(b) = state.buffer.as_mut() {
-                    b.format = format;
-                } else {
-                    state.buffer = Some(BufferInfo {
-                        format,
-                        width: 0,
-                        height: 0,
-                        stride: 0,
-                    });
+                // One event per advertised format, in the
+                // compositor's preference order: keep the first one we
+                // can read back instead of letting a later (e.g.
+                // 10-bit) entry overwrite it.
+                if state.shm_format.is_none() && wl_shm_format(format).is_ok() {
+                    state.shm_format = Some(format);
                 }
             }
             Event::Done => state.formats_done = true,
