@@ -67,10 +67,9 @@ use ferricast_core::SourceEnumerator;
 ///    [`WaylandSourceEnumerator`]. Falls through if the compositor
 ///    advertises neither `zwlr_foreign_toplevel_management_v1` nor
 ///    `ext_foreign_toplevel_list_v1`.
-/// 2. `DISPLAY` set → [`X11SourceEnumerator`]. Falls through on
-///    connection failure.
-/// 3. Otherwise → `ferricast_core::StubEnumerator` (reports no
-///    capabilities; pickers should defer to the OS portal).
+/// 2. Otherwise → `ferricast_core::StubEnumerator` (reports no
+///    capabilities; pickers should defer to the OS portal). This
+///    includes X11 sessions, which have no enumerator backend.
 ///
 /// Always returns `Arc<dyn SourceEnumerator>` so callers don't have
 /// to feature-gate downstream code: the trait surface stays uniform
@@ -93,10 +92,8 @@ pub fn auto_enumerator() -> Arc<dyn SourceEnumerator> {
         }
     }
 
-    {
-        if std::env::var_os("DISPLAY").is_some() {
-            panic!("X11 is not supported");
-        }
+    if std::env::var_os("DISPLAY").is_some() {
+        tracing::warn!("X11 source enumeration is not supported, using the stub enumerator");
     }
     Arc::new(ferricast_core::StubEnumerator::new())
 }
