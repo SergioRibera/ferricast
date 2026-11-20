@@ -205,6 +205,20 @@ impl CastSession for ChromecastEitherSession {
             Self::Hls(s) => s.feeds_adaptive_bitrate(),
         }
     }
+
+    fn end_reason(&self) -> Option<FerricastError> {
+        match self {
+            Self::Mirror { session, .. } => session.end_reason(),
+            Self::Hls(s) => s.end_reason(),
+        }
+    }
+
+    fn forced_keyframe_interval(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Mirror { session, .. } => session.forced_keyframe_interval(),
+            Self::Hls(s) => s.forced_keyframe_interval(),
+        }
+    }
 }
 
 #[derive(Clone, Default)]

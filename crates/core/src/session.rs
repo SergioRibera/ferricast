@@ -165,7 +165,7 @@ pub trait CastSession: Send + Sync {
     /// manager once [`Self::is_alive`] turns false:
     /// [`FerricastError::RemoteStopped`] ends the stream without
     /// reconnecting; anything else (or `None`) triggers a reconnect.
-    fn end_reason(&self) -> Option<&FerricastError> {
+    fn end_reason(&self) -> Option<FerricastError> {
         None
     }
 

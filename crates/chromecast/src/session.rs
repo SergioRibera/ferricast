@@ -546,6 +546,10 @@ impl CastSession for ChromecastSession {
     fn feeds_adaptive_bitrate(&self) -> bool {
         true
     }
+
+    fn end_reason(&self) -> Option<FerricastError> {
+        ChromecastSession::end_reason(self)
+    }
 }
 
 impl ChromecastSession {

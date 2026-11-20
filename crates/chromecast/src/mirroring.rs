@@ -541,6 +541,19 @@ impl CastSession for ChromecastMirrorSession {
     fn feeds_adaptive_bitrate(&self) -> bool {
         self.stream.as_ref().is_some_and(|s| s.feeds_adaptive)
     }
+
+    fn end_reason(&self) -> Option<FerricastError> {
+        self.failure().map(|failure| match failure {
+            MirrorFailure::RemoteStopped(why) => FerricastError::RemoteStopped(why),
+            other => FerricastError::Streaming(format!("{other:?}")),
+        })
+    }
+
+    /// RTCP picture-loss requests drive keyframes; periodic IDRs only
+    /// waste bandwidth on this path.
+    fn forced_keyframe_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// Reads the CASTv2 control channel of a mirroring session.

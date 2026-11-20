@@ -197,7 +197,7 @@ pub(crate) struct FakeSession {
     script: SessionScript,
     log: Arc<Mutex<SessionLog>>,
     frames: usize,
-    remote_end: Option<FerricastError>,
+    remote_end: bool,
 }
 
 impl CastSession for FakeSession {
@@ -235,11 +235,11 @@ impl CastSession for FakeSession {
         self.script.dies_after.is_none_or(|n| self.frames < n)
     }
 
-    fn end_reason(&self) -> Option<&FerricastError> {
-        if CastSession::is_alive(self) {
+    fn end_reason(&self) -> Option<FerricastError> {
+        if CastSession::is_alive(self) || !self.remote_end {
             return None;
         }
-        self.remote_end.as_ref()
+        Some(FerricastError::RemoteStopped("another app took over".into()))
     }
 
     fn preferred_audio_codec(&self) -> AudioCodec {
@@ -270,9 +270,7 @@ pub(crate) fn session_factory(
             .cloned()
             .unwrap_or_default();
         log.created += 1;
-        let remote_end = script
-            .dies_remotely
-            .then(|| FerricastError::RemoteStopped("another app took over".into()));
+        let remote_end = script.dies_remotely;
         Ok(Box::new(FakeSession {
             script,
             log: log_for_factory.clone(),

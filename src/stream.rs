@@ -62,7 +62,7 @@ pub(crate) trait ErasedSession: Send + Sync {
     fn send_audio_frame<'a>(&'a mut self, frame: &'a AudioFrame) -> BoxFut<'a, Result<()>>;
     fn stop(&mut self) -> BoxFut<'_, Result<()>>;
     fn is_alive(&self) -> bool;
-    fn end_reason(&self) -> Option<&FerricastError>;
+    fn end_reason(&self) -> Option<FerricastError>;
     fn poll_keyframe_request(&mut self) -> bool;
     fn preferred_audio_codec(&self) -> AudioCodec;
     fn feeds_adaptive_bitrate(&self) -> bool;
@@ -91,7 +91,7 @@ impl<T: CastSession> ErasedSession for T {
     fn is_alive(&self) -> bool {
         CastSession::is_alive(self)
     }
-    fn end_reason(&self) -> Option<&FerricastError> {
+    fn end_reason(&self) -> Option<FerricastError> {
         CastSession::end_reason(self)
     }
     fn poll_keyframe_request(&mut self) -> bool {
@@ -905,7 +905,6 @@ where
                     if !session.is_alive() {
                         return match session.end_reason() {
                             Some(FerricastError::RemoteStopped(why)) => {
-                                let why = why.clone();
                                 let _ = session.stop().await;
                                 PumpExit::End(StreamEnd::RemoteStopped(why))
                             }
