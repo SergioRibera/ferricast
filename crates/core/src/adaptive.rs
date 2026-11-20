@@ -123,12 +123,23 @@ impl AdaptiveBitrateState {
         // EMA: 7/8 history + 1/8 new sample. Same weighting as the
         // segmenter's PTS rate EMA, so users have one mental model
         // for how fast either loop adapts.
+        // The HLS server records from one task per request, so both the
+        // EMA update and the adjustment are atomic read-modify-writes:
+        // concurrent samples all land in the EMA, and only one caller
+        // per cool-down window gets to move the target.
         let sample_x100 = sample_pct.min(200).saturating_mul(100);
-        let prev = self.pressure_pct_x100.load(Ordering::Relaxed);
-        let ema = (prev.saturating_mul(7) + sample_x100) / 8;
-        self.pressure_pct_x100.store(ema, Ordering::Relaxed);
+        let fold = |prev: u32| (prev.saturating_mul(7) + sample_x100) / 8;
+        let prev = self
+            .pressure_pct_x100
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                Some(fold(prev))
+            })
+            .unwrap_or_else(|prev| prev);
+        let ema = fold(prev);
 
-        let now_ns = monotonic_ns();
+        // 0 is the "never adjusted" sentinel, so a real timestamp is at
+        // least 1.
+        let now_ns = monotonic_ns().max(1);
         let last = self.last_adjust_ns.load(Ordering::Relaxed);
         // last == 0 is the sentinel for "never adjusted yet" so the
         // very first eligible move fires without waiting out a full
@@ -152,8 +163,12 @@ impl AdaptiveBitrateState {
         if new_target == current {
             return None;
         }
+        // Claim this adjustment window; a concurrent caller that read
+        // the same `last` loses the race and leaves the target alone.
+        self.last_adjust_ns
+            .compare_exchange(last, now_ns, Ordering::AcqRel, Ordering::Relaxed)
+            .ok()?;
         self.target_kbps.store(new_target, Ordering::Relaxed);
-        self.last_adjust_ns.store(now_ns, Ordering::Relaxed);
         Some(new_target)
     }
 
@@ -312,6 +327,52 @@ mod tests {
             again.is_none(),
             "second adjustment within MIN_ADJUST_INTERVAL must be suppressed"
         );
+    }
+
+    #[test]
+    fn concurrent_samples_downshift_only_once_per_cool_down() {
+        for _ in 0..50 {
+            let s = AdaptiveBitrateState::new(4000);
+            s.pressure_pct_x100.store(9_500, Ordering::Relaxed);
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let s = Arc::clone(&s);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        s.record_pressure(95)
+                    })
+                })
+                .collect();
+            let moved = handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .count();
+            assert_eq!(moved, 1);
+            assert_eq!(s.target_kbps(), 3000);
+        }
+    }
+
+    #[test]
+    fn concurrent_samples_all_land_in_the_ema() {
+        let s = AdaptiveBitrateState::new(4000);
+        s.pressure_pct_x100.store(8_000, Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| s.record_pressure(80));
+            }
+        });
+        // A fixed point of the EMA: every update keeps it at 80 %.
+        assert_eq!(s.pressure_pct(), 80);
+        let s = AdaptiveBitrateState::new(4000);
+        std::thread::scope(|scope| {
+            for _ in 0..64 {
+                scope.spawn(|| s.record_pressure(100));
+            }
+        });
+        // 64 folds of 7/8 history: within 1 % of 100 only if none was lost.
+        assert!(s.pressure_pct() >= 99, "{}", s.pressure_pct());
     }
 
     #[test]
