@@ -546,7 +546,7 @@ impl CastSession for AirPlaySession {
                 self.reset();
                 return Err(FerricastError::Protocol("AirPlay pairing cancelled".into()));
             }
-            PairingResponse::Confirmed => {
+            PairingResponse::Confirmed | PairingResponse::Password(_) => {
                 return Err(FerricastError::Protocol(
                     "AirPlay pairing needs a PIN".into(),
                 ));

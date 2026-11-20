@@ -8,6 +8,7 @@ pub enum PairingChallenge {
         digits: u8,
     },
     None,
+    /// Ask the user for the receiver's access password.
     Credential,
 }
 
@@ -29,6 +30,8 @@ impl PairingChallenge {
 #[derive(Debug, Clone)]
 pub enum PairingResponse {
     Pin(String),
+    /// Answer to [`PairingChallenge::Credential`].
+    Password(String),
     Confirmed,
     Cancelled,
 }
