@@ -15,28 +15,41 @@ pub use ferricast_demuxer::{Color, VideoStream};
 pub use limiter::FrameLimiter;
 
 use decoder::Decoder;
-use pts::PtsQueue;
+use pts::{Presentation, PtsQueue};
 
 pub struct Player {
     demuxer: Demuxer,
     decoder: Decoder,
     pending: PtsQueue,
+    presentation: Presentation,
     ready: VecDeque<CapturedFrame>,
     drained: bool,
     software_only: bool,
+    /// Packets pulled from the demuxer since the last restart.
+    packets: usize,
+    /// Index (in `packets`) of the last keyframe pulled.
+    last_keyframe: usize,
+    /// Packets before this index are skipped without decoding while catching
+    /// up after a decoder restart.
+    skip_until: usize,
 }
 
 impl Player {
     pub fn open(path: &Path) -> Result<Self> {
         let demuxer = Demuxer::open(path)?;
         let decoder = open_decoder(&demuxer, false)?;
+        let presentation = Presentation::new(demuxer.video().presentation_start_us);
         Ok(Self {
             demuxer,
             decoder,
             pending: PtsQueue::default(),
+            presentation,
             ready: VecDeque::new(),
             drained: false,
             software_only: false,
+            packets: 0,
+            last_keyframe: 0,
+            skip_until: 0,
         })
     }
 
@@ -57,24 +70,29 @@ impl Player {
                 match self.decoder.flush() {
                     Ok(frames) => {
                         for frame in frames {
-                            let frame = self.stamped(frame);
-                            self.ready.push_back(frame);
+                            self.deliver(frame);
                         }
                     }
                     Err(error) => self.recover(error)?,
                 }
                 continue;
             };
+            let index = self.packets;
+            self.packets += 1;
+            if packet.is_keyframe {
+                self.last_keyframe = index;
+            }
+            if index < self.skip_until {
+                continue;
+            }
+            self.presentation.observe_duration(packet.duration_us);
             let pts = packet.timestamp_us;
             let reorders = self.decoder.reorders();
             if reorders {
                 self.pending.push(pts);
             }
             match self.decoder.decode(packet) {
-                Ok(Some(frame)) => {
-                    let frame = self.stamped(frame);
-                    self.ready.push_back(frame);
-                }
+                Ok(Some(frame)) => self.deliver(frame),
                 Ok(None) => {}
                 Err(error) => {
                     if reorders {
@@ -87,34 +105,58 @@ impl Player {
     }
 
     pub fn rewind(&mut self) -> Result<()> {
+        self.restart()?;
+        self.presentation.restart();
+        self.skip_until = 0;
+        Ok(())
+    }
+
+    /// Reopens the demuxer at the start with a fresh decoder, keeping the
+    /// presentation state so the caller decides what may be shown again.
+    fn restart(&mut self) -> Result<()> {
         self.demuxer.rewind()?;
         self.decoder = open_decoder(&self.demuxer, self.software_only)?;
         self.pending.clear();
         self.ready.clear();
         self.drained = false;
+        self.packets = 0;
+        self.last_keyframe = 0;
         Ok(())
     }
 
+    /// Falls back from the hardware decoder to software without replaying
+    /// what was already shown: decoding resumes at the last keyframe at or
+    /// before the failing packet, and decoded frames up to the last one
+    /// delivered are dropped until playback has caught up.
     fn recover(&mut self, error: FerricastError) -> Result<()> {
         if !self.decoder.is_hardware() {
             return Err(error);
         }
         tracing::warn!(%error, "hardware decoding failed; continuing in software");
         self.software_only = true;
-        self.rewind()
+        let resume_at = self.last_keyframe;
+        self.restart()?;
+        self.skip_until = resume_at;
+        self.presentation.resume();
+        Ok(())
     }
 
-    fn stamped(&mut self, mut frame: CapturedFrame) -> CapturedFrame {
-        if !self.decoder.reorders() {
-            return frame;
+    fn deliver(&mut self, mut frame: CapturedFrame) {
+        let pts = if self.decoder.reorders() {
+            self.pending
+                .pop_earliest()
+                .unwrap_or_else(|| self.presentation.extrapolated())
+        } else {
+            frame.timestamp_us()
+        };
+        let Some(shown_at) = self.presentation.admit(pts) else {
+            return;
+        };
+        match &mut frame {
+            CapturedFrame::Cpu(raw) => raw.timestamp_us = shown_at,
+            CapturedFrame::Gpu(gpu) => gpu.timestamp_us = shown_at,
         }
-        if let Some(pts) = self.pending.pop_earliest() {
-            match &mut frame {
-                CapturedFrame::Cpu(raw) => raw.timestamp_us = pts,
-                CapturedFrame::Gpu(gpu) => gpu.timestamp_us = pts,
-            }
-        }
-        frame
+        self.ready.push_back(frame);
     }
 }
 

@@ -19,7 +19,8 @@ pub struct Mp4Demuxer {
     framing: Framing,
     timescale: u32,
     samples: Vec<Sample>,
-    shift: i64,
+    /// Media time (ticks) that maps to timestamp 0.
+    origin: i64,
     next: usize,
 }
 
@@ -37,10 +38,20 @@ struct Sample {
 struct Tables {
     stts: Vec<(u32, u32)>,
     ctts: Vec<(u32, i32)>,
-    stsc: Vec<(u32, u32)>,
+    stsc: Vec<ChunkRun>,
     sizes: Vec<u32>,
     chunk_offsets: Vec<u64>,
     sync: Option<Vec<u32>>,
+}
+
+/// One `stsc` entry: chunks from `first_chunk` up to the next run's first
+/// chunk each hold `samples_per_chunk` samples described by stsd entry
+/// `description_index`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkRun {
+    first_chunk: u32,
+    samples_per_chunk: u32,
+    description_index: u32,
 }
 
 struct Entry {
@@ -57,6 +68,26 @@ struct Track {
     duration: u64,
     tables: Tables,
     shift: i64,
+}
+
+impl Sample {
+    fn decode_ticks(&self) -> i64 {
+        i64::try_from(self.dts).unwrap_or(i64::MAX)
+    }
+
+    fn presentation_ticks(&self) -> i64 {
+        self.decode_ticks()
+            .saturating_add(i64::from(self.cts_offset))
+    }
+}
+
+impl Tables {
+    /// Sum of every `stts` sample delta, in media ticks.
+    fn decode_duration(&self) -> u64 {
+        self.stts.iter().fold(0u64, |total, &(count, delta)| {
+            total.saturating_add(u64::from(count) * u64::from(delta))
+        })
+    }
 }
 
 struct Boxes<'a>(&'a [u8]);
@@ -86,8 +117,7 @@ impl Mp4Demuxer {
         let moov = read_moov(&file)?;
         let track = parse_moov(&moov)?;
         let file_len = file.metadata()?.len();
-        let mut samples = build_samples(&track.tables)
-            .ok_or_else(|| FerricastError::Demux("inconsistent sample tables".into()))?;
+        let mut samples = build_samples(&track.tables)?;
         if samples.is_empty() && child(&moov, b"mvex").is_some() {
             return Err(FerricastError::Demux(
                 "fragmented MP4 is not supported".into(),
@@ -102,6 +132,7 @@ impl Mp4Demuxer {
             })
             .count();
         samples.truncate(readable);
+        let origin = timeline_origin(&samples, track.shift);
         Ok(Self {
             file,
             stream: VideoStream {
@@ -109,12 +140,16 @@ impl Mp4Demuxer {
                 width: track.entry.width,
                 height: track.entry.height,
                 color: track.entry.color,
-                duration_us: Some(micros(track.duration as i64, track.timescale)),
+                duration_us: Some(micros(
+                    i64::try_from(track.duration).unwrap_or(i64::MAX),
+                    track.timescale,
+                )),
+                presentation_start_us: micros(track.shift.saturating_sub(origin), track.timescale),
             },
             framing: track.entry.framing,
             timescale: track.timescale,
             samples,
-            shift: track.shift,
+            origin,
             next: 0,
         })
     }
@@ -129,10 +164,13 @@ impl Mp4Demuxer {
         };
         let mut data = vec![0; sample.size as usize];
         self.file.read_exact_at(&mut data, sample.offset)?;
-        let (data, idr) = self.framing.annex_b(&data)?;
-        let dts = micros(sample.dts as i64 - self.shift, self.timescale);
+        let (data, idr) = self.framing.annex_b(&data, sample.sync || self.next == 0)?;
+        let dts = micros(
+            sample.decode_ticks().saturating_sub(self.origin),
+            self.timescale,
+        );
         let pts = micros(
-            sample.dts as i64 + i64::from(sample.cts_offset) - self.shift,
+            sample.presentation_ticks().saturating_sub(self.origin),
             self.timescale,
         );
         let frame = EncodedFrame {
@@ -208,11 +246,12 @@ fn parse_track(trak: &[u8]) -> Option<Track> {
     let stbl = child(child(mdia, b"minf")?, b"stbl")?;
     let stsd = child(stbl, b"stsd")?;
     let (kind, entry) = Boxes(stsd.get(8..)?).next()?;
+    let tables = parse_tables(stbl)?;
     Some(Track {
         entry: parse_entry(kind, entry)?,
         timescale,
-        duration,
-        tables: parse_tables(stbl)?,
+        duration: duration.unwrap_or_else(|| tables.decode_duration()),
+        tables,
         shift: child(trak, b"edts")
             .and_then(|edts| child(edts, b"elst"))
             .and_then(parse_elst)
@@ -220,10 +259,21 @@ fn parse_track(trak: &[u8]) -> Option<Track> {
     })
 }
 
-fn parse_mdhd(mdhd: &[u8]) -> Option<(u32, u64)> {
+/// Returns the media timescale and duration; an all-ones duration means
+/// "unknown" (ISO/IEC 14496-12 §8.4.2.3) and comes back as `None`.
+fn parse_mdhd(mdhd: &[u8]) -> Option<(u32, Option<u64>)> {
     match *mdhd.first()? {
-        1 => Some((be32(mdhd, 20)?, be64(mdhd, 24)?)),
-        _ => Some((be32(mdhd, 12)?, u64::from(be32(mdhd, 16)?))),
+        1 => {
+            let duration = be64(mdhd, 24)?;
+            Some((be32(mdhd, 20)?, (duration != u64::MAX).then_some(duration)))
+        }
+        _ => {
+            let duration = be32(mdhd, 16)?;
+            Some((
+                be32(mdhd, 12)?,
+                (duration != u32::MAX).then_some(u64::from(duration)),
+            ))
+        }
     }
 }
 
@@ -295,8 +345,11 @@ fn parse_elst(elst: &[u8]) -> Option<i64> {
 }
 
 fn parse_tables(stbl: &[u8]) -> Option<Tables> {
+    // Entry counts are capped like the sample count: a table never needs more
+    // entries than there can be samples, and the cap bounds every walk below.
     let counted = |kind: &[u8; 4]| {
-        child(stbl, kind).and_then(|body| Some((body.get(8..)?, be32(body, 4)? as usize)))
+        child(stbl, kind)
+            .and_then(|body| Some((body.get(8..)?, (be32(body, 4)? as usize).min(MAX_SAMPLES))))
     };
     let (stts, count) = counted(b"stts")?;
     let (stsc, stsc_count) = counted(b"stsc")?;
@@ -327,7 +380,7 @@ fn parse_tables(stbl: &[u8]) -> Option<Tables> {
             .into_iter()
             .map(|(count, offset)| (count, offset as i32))
             .collect(),
-        stsc: triples(stsc, stsc_count),
+        stsc: chunk_runs(stsc, stsc_count),
         sizes,
         chunk_offsets,
         sync: counted(b"stss").map(|(body, count)| words(body).take(count).collect()),
@@ -353,33 +406,64 @@ fn pairs(body: &[u8], count: usize) -> Vec<(u32, u32)> {
         .collect()
 }
 
-fn triples(body: &[u8], count: usize) -> Vec<(u32, u32)> {
+fn chunk_runs(body: &[u8], count: usize) -> Vec<ChunkRun> {
     let (entries, _) = body.as_chunks::<12>();
     entries
         .iter()
         .take(count)
-        .map(|c| {
-            (
-                u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
-                u32::from_be_bytes([c[4], c[5], c[6], c[7]]),
-            )
+        .map(|c| ChunkRun {
+            first_chunk: u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
+            samples_per_chunk: u32::from_be_bytes([c[4], c[5], c[6], c[7]]),
+            description_index: u32::from_be_bytes([c[8], c[9], c[10], c[11]]),
         })
         .collect()
 }
 
-fn build_samples(tables: &Tables) -> Option<Vec<Sample>> {
+/// Checks that `stsc` runs start at chunk 1 and that their first chunks
+/// strictly increase, which lets [`build_samples`] walk them with a single
+/// forward cursor, and that every chunk uses the one sample description
+/// that was parsed.
+fn validate_stsc(stsc: &[ChunkRun]) -> Result<()> {
+    let mut previous = 0;
+    for run in stsc {
+        let first_chunk = run.first_chunk;
+        let bad_start = previous == 0 && first_chunk != 1;
+        if bad_start || first_chunk <= previous {
+            return Err(FerricastError::Demux(format!(
+                "stsc runs must start at chunk 1 and strictly increase (found {first_chunk} after {previous})"
+            )));
+        }
+        if run.description_index != 1 {
+            return Err(FerricastError::Demux(format!(
+                "chunk {first_chunk} uses sample description {}; only a single stsd entry is supported",
+                run.description_index
+            )));
+        }
+        previous = first_chunk;
+    }
+    Ok(())
+}
+
+fn build_samples(tables: &Tables) -> Result<Vec<Sample>> {
+    validate_stsc(&tables.stsc)?;
     let mut samples = Vec::with_capacity(tables.sizes.len());
     let mut durations = expand(&tables.stts);
     let mut cts_offsets = expand(&tables.ctts);
+    let mut runs = tables.stsc.iter().peekable();
+    let mut per_chunk = None;
     let mut dts = 0u64;
-    'chunks: for (chunk, &chunk_offset) in tables.chunk_offsets.iter().enumerate() {
-        let chunk_number = u32::try_from(chunk + 1).ok()?;
-        let per_chunk = tables
-            .stsc
-            .iter()
-            .rev()
-            .find(|(first_chunk, _)| *first_chunk <= chunk_number)?
-            .1;
+    'chunks: for (chunk_number, &chunk_offset) in (1u32..).zip(&tables.chunk_offsets) {
+        if samples.len() == tables.sizes.len() {
+            break;
+        }
+        while let Some(run) = runs.next_if(|run| run.first_chunk <= chunk_number) {
+            per_chunk = Some(run.samples_per_chunk);
+        }
+        let Some(per_chunk) = per_chunk else {
+            return Err(FerricastError::Demux(format!(
+                "stsc does not cover chunk {chunk_number}"
+            )));
+        };
         let mut offset = chunk_offset;
         for _ in 0..per_chunk {
             let Some(&size) = tables.sizes.get(samples.len()) else {
@@ -401,7 +485,22 @@ fn build_samples(tables: &Tables) -> Option<Vec<Sample>> {
             dts = dts.saturating_add(u64::from(duration));
         }
     }
-    Some(samples)
+    Ok(samples)
+}
+
+/// Media time that maps to timestamp 0.
+///
+/// Normally the edit list's media time (`shift`), but when some samples
+/// present before the edit starts (pre-roll) the origin moves back to the
+/// earliest of them, so their timestamps stay distinct and non-negative
+/// instead of all clamping to 0. Consumers skip displaying anything before
+/// [`VideoStream::presentation_start_us`].
+fn timeline_origin(samples: &[Sample], shift: i64) -> i64 {
+    samples
+        .iter()
+        .map(Sample::presentation_ticks)
+        .min()
+        .map_or(shift, |earliest| earliest.min(shift))
 }
 
 fn expand<T: Copy>(runs: &[(u32, T)]) -> impl Iterator<Item = T> + '_ {
@@ -438,6 +537,16 @@ mod tests {
         out
     }
 
+    fn runs(runs: &[(u32, u32)]) -> Vec<ChunkRun> {
+        runs.iter()
+            .map(|&(first_chunk, samples_per_chunk)| ChunkRun {
+                first_chunk,
+                samples_per_chunk,
+                description_index: 1,
+            })
+            .collect()
+    }
+
     fn sample(offset: u64, size: u32, dts: u64, duration: u32, sync: bool) -> Sample {
         Sample {
             offset,
@@ -453,7 +562,7 @@ mod tests {
     fn chunk_runs_expand_to_one_offset_per_sample() {
         let tables = Tables {
             stts: vec![(5, 100)],
-            stsc: vec![(1, 2), (3, 1)],
+            stsc: runs(&[(1, 2), (3, 1)]),
             sizes: vec![10, 20, 30, 40, 50],
             chunk_offsets: vec![1000, 2000, 3000],
             ..Tables::default()
@@ -470,7 +579,7 @@ mod tests {
     fn decode_times_accumulate_across_stts_runs() {
         let tables = Tables {
             stts: vec![(2, 100), (1, 50)],
-            stsc: vec![(1, 3)],
+            stsc: runs(&[(1, 3)]),
             sizes: vec![1, 1, 1],
             chunk_offsets: vec![0],
             ..Tables::default()
@@ -486,7 +595,7 @@ mod tests {
         let tables = Tables {
             stts: vec![(2, 10)],
             ctts: vec![(1, 20), (1, -10)],
-            stsc: vec![(1, 2)],
+            stsc: runs(&[(1, 2)]),
             sizes: vec![1, 1],
             chunk_offsets: vec![0],
             ..Tables::default()
@@ -503,7 +612,7 @@ mod tests {
     fn only_listed_samples_are_sync_when_stss_is_present() {
         let tables = Tables {
             stts: vec![(3, 1)],
-            stsc: vec![(1, 3)],
+            stsc: runs(&[(1, 3)]),
             sizes: vec![1, 1, 1],
             chunk_offsets: vec![0],
             sync: Some(vec![1, 3]),
@@ -521,12 +630,129 @@ mod tests {
     fn sizes_shorter_than_the_chunk_table_end_the_samples() {
         let tables = Tables {
             stts: vec![(9, 1)],
-            stsc: vec![(1, 4)],
+            stsc: runs(&[(1, 4)]),
             sizes: vec![1, 1, 1, 1, 1],
             chunk_offsets: vec![0, 100, 200],
             ..Tables::default()
         };
         assert_eq!(build_samples(&tables).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn edit_shift_matching_the_composition_delay_keeps_the_origin() {
+        let mut first = sample(0, 1, 0, 10, true);
+        first.cts_offset = 20;
+        let mut second = sample(1, 1, 10, 10, false);
+        second.cts_offset = 30;
+        assert_eq!(timeline_origin(&[first, second], 20), 20);
+    }
+
+    #[test]
+    fn samples_before_the_edit_move_the_origin_back() {
+        let samples = [
+            sample(0, 1, 0, 10, true),
+            sample(1, 1, 10, 10, false),
+            sample(2, 1, 20, 10, false),
+        ];
+        let origin = timeline_origin(&samples, 15);
+        assert_eq!(origin, 0);
+        let start = 15 - origin;
+        let shown: Vec<_> = samples
+            .iter()
+            .map(|s| s.presentation_ticks() - origin)
+            .filter(|&ticks| ticks >= start)
+            .collect();
+        assert_eq!(shown, [20]);
+    }
+
+    #[test]
+    fn all_ones_mdhd_duration_is_unknown() {
+        let mut v0 = vec![0; 12];
+        v0.extend_from_slice(&1000u32.to_be_bytes());
+        v0.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_mdhd(&v0), Some((1000, None)));
+        let mut v1 = vec![1, 0, 0, 0];
+        v1.extend_from_slice(&[0; 16]);
+        v1.extend_from_slice(&90_000u32.to_be_bytes());
+        v1.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(parse_mdhd(&v1), Some((90_000, None)));
+        v0[16..20].copy_from_slice(&5000u32.to_be_bytes());
+        assert_eq!(parse_mdhd(&v0), Some((1000, Some(5000))));
+    }
+
+    #[test]
+    fn decode_duration_sums_the_stts_runs() {
+        let tables = Tables {
+            stts: vec![(2, 100), (3, 50)],
+            ..Tables::default()
+        };
+        assert_eq!(tables.decode_duration(), 350);
+    }
+
+    #[test]
+    fn unsorted_chunk_runs_are_rejected() {
+        let tables = Tables {
+            stsc: runs(&[(1, 1), (5, 1), (3, 1)]),
+            sizes: vec![1; 4],
+            chunk_offsets: vec![0; 4],
+            ..Tables::default()
+        };
+        assert!(build_samples(&tables).is_err());
+    }
+
+    #[test]
+    fn chunk_runs_not_starting_at_chunk_one_are_rejected() {
+        let tables = Tables {
+            stsc: runs(&[(2, 1)]),
+            sizes: vec![1; 2],
+            chunk_offsets: vec![0; 2],
+            ..Tables::default()
+        };
+        assert!(build_samples(&tables).is_err());
+    }
+
+    #[test]
+    fn chunks_using_a_second_sample_description_are_rejected() {
+        let mut stsc = runs(&[(1, 1), (2, 1)]);
+        stsc[1].description_index = 2;
+        let tables = Tables {
+            stsc,
+            sizes: vec![1; 2],
+            chunk_offsets: vec![0; 2],
+            ..Tables::default()
+        };
+        let error = build_samples(&tables).unwrap_err();
+        assert!(
+            error.to_string().contains("sample description 2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn stsc_entries_keep_their_description_index() {
+        let body = [0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 3];
+        assert_eq!(
+            chunk_runs(&body, 1),
+            [ChunkRun {
+                first_chunk: 1,
+                samples_per_chunk: 4,
+                description_index: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn many_empty_chunks_against_many_runs_finish_quickly() {
+        let chunks = 1 << 20;
+        let tables = Tables {
+            stsc: runs(&(1..=chunks).map(|chunk| (chunk, 0)).collect::<Vec<_>>()),
+            sizes: vec![1],
+            chunk_offsets: vec![0; chunks as usize],
+            ..Tables::default()
+        };
+        let started = std::time::Instant::now();
+        assert!(build_samples(&tables).unwrap().is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
@@ -551,7 +777,7 @@ mod tests {
     fn sample_offsets_near_the_end_of_u64_do_not_overflow() {
         let tables = Tables {
             stts: vec![(2, u32::MAX)],
-            stsc: vec![(1, 2)],
+            stsc: runs(&[(1, 2)]),
             sizes: vec![u32::MAX, u32::MAX],
             chunk_offsets: vec![u64::MAX - 1],
             ..Tables::default()

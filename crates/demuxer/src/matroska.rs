@@ -3,7 +3,10 @@ use std::io::BufReader;
 use std::path::Path;
 
 use ferricast_core::{Codec, EncodedFrame, FerricastError, Result};
-use matroska_demuxer::{Frame, MatrixCoefficients, MatroskaFile, Range, TrackEntry, TrackType};
+use matroska_demuxer::{
+    ContentCompAlgo, ContentEncAlgo, ContentEncodingValue, Frame, MatrixCoefficients, MatroskaFile,
+    Range, TrackEntry, TrackType,
+};
 
 use crate::nal::{Framing, LengthPrefixed};
 use crate::{Color, VideoStream};
@@ -17,6 +20,80 @@ pub struct MatroskaDemuxer {
     track: u64,
     scale_ns: u64,
     frame: Frame,
+    /// The next frame is the first one after open/rewind and must carry the
+    /// parameter sets whatever its NAL types.
+    at_start: bool,
+    /// Bytes removed from the front of every frame by header-stripping
+    /// content compression; restored before the frame is handed out.
+    stripped_header: Vec<u8>,
+}
+
+/// One `ContentEncoding` of a track, reduced to what this demuxer can undo.
+#[derive(Debug, PartialEq, Eq)]
+enum Encoding<'a> {
+    HeaderStripping(&'a [u8]),
+    /// Signed but not encrypted: the frames are untouched.
+    SignedOnly,
+    Unsupported(&'static str),
+}
+
+impl<'a> From<&'a ContentEncodingValue> for Encoding<'a> {
+    fn from(value: &'a ContentEncodingValue) -> Self {
+        match value {
+            ContentEncodingValue::Compression(compression) => match compression.algo() {
+                ContentCompAlgo::Stripping => {
+                    Encoding::HeaderStripping(compression.settings().unwrap_or_default())
+                }
+                ContentCompAlgo::Zlib => Encoding::Unsupported("zlib compression"),
+                ContentCompAlgo::Bzlib => Encoding::Unsupported("bzlib compression"),
+                ContentCompAlgo::Lzo1x => Encoding::Unsupported("lzo1x compression"),
+                ContentCompAlgo::Unknown => Encoding::Unsupported("an unknown compression"),
+            },
+            ContentEncodingValue::Encryption(encryption) => match encryption.algo() {
+                ContentEncAlgo::NotEncrypted => Encoding::SignedOnly,
+                _ => Encoding::Unsupported("encryption"),
+            },
+            ContentEncodingValue::Unknown => Encoding::Unsupported("an unknown content encoding"),
+        }
+    }
+}
+
+/// `ContentEncodingScope` bit: the transform applies to frame contents.
+const SCOPE_FRAMES: u64 = 1;
+/// `ContentEncodingScope` bit: the transform applies to `CodecPrivate`.
+const SCOPE_CODEC_PRIVATE: u64 = 2;
+
+/// Returns the bytes to prepend to every frame, or an error when the track
+/// uses an encoding this demuxer cannot undo. Encodings are given as
+/// `(order, scope, encoding)`; stripping applied in ascending order is undone
+/// by prepending the stripped headers in that same order.
+fn stripped_header<'a>(
+    encodings: impl IntoIterator<Item = (u64, u64, Encoding<'a>)>,
+) -> Result<Vec<u8>> {
+    let mut encodings: Vec<_> = encodings.into_iter().collect();
+    encodings.sort_by_key(|&(order, _, _)| order);
+    let mut header = Vec::new();
+    for (_, scope, encoding) in encodings {
+        match encoding {
+            Encoding::SignedOnly => {}
+            Encoding::HeaderStripping(_) if scope & SCOPE_CODEC_PRIVATE != 0 => {
+                return Err(FerricastError::Demux(
+                    "header-stripped CodecPrivate is not supported".into(),
+                ));
+            }
+            Encoding::HeaderStripping(bytes) => {
+                if scope & SCOPE_FRAMES != 0 {
+                    header.extend_from_slice(bytes);
+                }
+            }
+            Encoding::Unsupported(what) => {
+                return Err(FerricastError::Demux(format!(
+                    "video track uses {what}, which is not supported"
+                )));
+            }
+        }
+    }
+    Ok(header)
 }
 
 impl MatroskaDemuxer {
@@ -47,8 +124,16 @@ impl MatroskaDemuxer {
                 .info()
                 .duration()
                 .map(|ticks| (ticks * scale_ns as f64 / 1000.0) as u64),
+            presentation_start_us: 0,
         };
         let track = entry.track_number().get();
+        let stripped_header = stripped_header(
+            entry
+                .content_encodings()
+                .unwrap_or_default()
+                .iter()
+                .map(|e| (e.order(), e.scope(), Encoding::from(e.encoding()))),
+        )?;
         Ok(Self {
             file,
             stream,
@@ -56,6 +141,8 @@ impl MatroskaDemuxer {
             track,
             scale_ns,
             frame: Frame::default(),
+            at_start: true,
+            stripped_header,
         })
     }
 
@@ -71,26 +158,90 @@ impl MatroskaDemuxer {
             if self.frame.track != self.track {
                 continue;
             }
-            let (data, idr) = self.framing.annex_b(&self.frame.data)?;
-            let pts = self.frame.timestamp * self.scale_ns / 1000;
+            if !self.stripped_header.is_empty() {
+                self.frame
+                    .data
+                    .splice(0..0, self.stripped_header.iter().copied());
+            }
+            // BlockGroups carry no keyframe flag (and the library does not
+            // expose their ReferenceBlocks), so fall back to the payload.
+            let sync = self
+                .frame
+                .is_keyframe
+                .unwrap_or_else(|| payload_is_keyframe(self.stream.codec, &self.frame.data));
+            let (data, idr) = self
+                .framing
+                .annex_b(&self.frame.data, sync || self.at_start)?;
+            self.at_start = false;
+            let pts = scaled_micros(self.frame.timestamp, self.scale_ns)?;
             return Ok(Some(EncodedFrame {
                 codec: self.stream.codec,
                 data,
                 timestamp_us: pts,
-                is_keyframe: self.frame.is_keyframe.unwrap_or(false) || idr,
-                duration_us: self.frame.duration.map(|d| d * self.scale_ns / 1000),
+                is_keyframe: sync || idr,
+                duration_us: self
+                    .frame
+                    .duration
+                    .map(|d| scaled_micros(d, self.scale_ns))
+                    .transpose()?,
                 pts_dts: (pts, pts),
             }));
         }
     }
 
     pub fn rewind(&mut self) -> Result<()> {
-        self.file.seek(0).map_err(demux)
+        self.file.seek(0).map_err(demux)?;
+        self.at_start = true;
+        Ok(())
     }
 }
 
 pub(crate) fn is_matroska(head: &[u8]) -> bool {
     head.starts_with(&EBML_MAGIC)
+}
+
+/// Reads the keyframe flag from the codec's own frame header.
+///
+/// H.264/HEVC keyframes are found from their NAL types during Annex B
+/// conversion. AV1 would need OBU parsing (a sequence header followed by a
+/// KEY_FRAME frame header) and is reported as non-key here.
+fn payload_is_keyframe(codec: Codec, data: &[u8]) -> bool {
+    match codec {
+        // RFC 6386 §9.1: frame tag bit 0 clear, then the 9d 01 2a start code.
+        Codec::Vp8 => {
+            data.first().is_some_and(|tag| tag & 1 == 0)
+                && data.get(3..6) == Some(&[0x9d, 0x01, 0x2a])
+        }
+        Codec::Vp9 => vp9_is_keyframe(data),
+        Codec::H264 | Codec::H265 | Codec::Av1 => false,
+    }
+}
+
+/// VP9 uncompressed header (bitstream spec §6.2): frame_marker (2 bits, = 2),
+/// profile_low_bit, profile_high_bit, a reserved zero bit for profile 3, then
+/// show_existing_frame and frame_type (0 = KEY_FRAME).
+fn vp9_is_keyframe(data: &[u8]) -> bool {
+    let Some(&byte) = data.first() else {
+        return false;
+    };
+    let bit = |at: u32| (byte >> (7 - at)) & 1;
+    if byte >> 6 != 0b10 {
+        return false;
+    }
+    let profile = bit(3) << 1 | bit(2);
+    let show_existing_at = if profile == 3 { 5 } else { 4 };
+    bit(show_existing_at) == 0 && bit(show_existing_at + 1) == 0
+}
+
+/// Converts `ticks` of `scale_ns` nanoseconds to microseconds; both come from
+/// the file, so the product is computed wide and an unrepresentable result
+/// is a demux error rather than a silent wrap.
+fn scaled_micros(ticks: u64, scale_ns: u64) -> Result<u64> {
+    u64::try_from(u128::from(ticks) * u128::from(scale_ns) / 1000).map_err(|_| {
+        FerricastError::Demux(format!(
+            "timestamp {ticks} at {scale_ns} ns per tick does not fit in microseconds"
+        ))
+    })
 }
 
 fn demux(error: matroska_demuxer::DemuxError) -> FerricastError {
@@ -149,5 +300,68 @@ mod tests {
             0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86, 0x81
         ]));
         assert!(!is_matroska(&[0, 0, 0, 0x20, b'f', b't', b'y', b'p']));
+    }
+
+    #[test]
+    fn stripped_headers_are_restored_in_encoding_order() {
+        let header = stripped_header([
+            (1, SCOPE_FRAMES, Encoding::HeaderStripping(&[3, 4])),
+            (0, SCOPE_FRAMES, Encoding::HeaderStripping(&[1, 2])),
+            (2, SCOPE_FRAMES, Encoding::SignedOnly),
+        ])
+        .unwrap();
+        assert_eq!(header, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_track_without_encodings_needs_no_header() {
+        assert!(stripped_header([]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn compressed_or_encrypted_tracks_are_rejected() {
+        for what in ["zlib compression", "encryption"] {
+            let error =
+                stripped_header([(0, SCOPE_FRAMES, Encoding::Unsupported(what))]).unwrap_err();
+            assert!(error.to_string().contains(what), "{error}");
+        }
+        assert!(
+            stripped_header([(0, SCOPE_CODEC_PRIVATE, Encoding::HeaderStripping(&[0]))]).is_err()
+        );
+    }
+
+    #[test]
+    fn vp8_keyframes_are_read_from_the_frame_tag() {
+        let key = [0x50, 0x2d, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x00];
+        let inter = [0x51, 0x2d, 0x00, 0x00, 0x00, 0x00];
+        assert!(payload_is_keyframe(Codec::Vp8, &key));
+        assert!(!payload_is_keyframe(Codec::Vp8, &inter));
+        assert!(!payload_is_keyframe(Codec::Vp8, &[]));
+    }
+
+    #[test]
+    fn vp9_keyframes_are_read_from_the_uncompressed_header() {
+        // marker 10, profile 0, show_existing 0, frame_type 0
+        assert!(payload_is_keyframe(Codec::Vp9, &[0b1000_0010]));
+        // frame_type 1: inter frame
+        assert!(!payload_is_keyframe(Codec::Vp9, &[0b1000_0110]));
+        // show_existing_frame 1
+        assert!(!payload_is_keyframe(Codec::Vp9, &[0b1000_1000]));
+        // profile 3 has a reserved bit before show_existing_frame
+        assert!(payload_is_keyframe(Codec::Vp9, &[0b1011_0001]));
+        assert!(!payload_is_keyframe(Codec::Vp9, &[0b1011_0010]));
+        // wrong frame marker
+        assert!(!payload_is_keyframe(Codec::Vp9, &[0b0000_0000]));
+    }
+
+    #[test]
+    fn timestamps_scale_without_overflowing() {
+        assert_eq!(scaled_micros(40, 1_000_000).unwrap(), 40_000);
+        assert_eq!(
+            scaled_micros(u64::MAX, 1_000).unwrap(),
+            u64::MAX,
+            "a product past u64 is still exact"
+        );
+        assert!(scaled_micros(u64::MAX, u64::MAX).is_err());
     }
 }

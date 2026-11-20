@@ -6,8 +6,8 @@
 //! `#EXT-X-DISCONTINUITY-SEQUENCE`, `#EXT-X-DISCONTINUITY`,
 //! `#EXT-X-PROGRAM-DATE-TIME`, `#EXTINF`, plus the Low-Latency HLS
 //! additions (RFC 8216bis / Apple HLS 2nd edition):
-//! `#EXT-X-PART-INF`, `#EXT-X-SERVER-CONTROL`, `#EXT-X-PART`,
-//! `#EXT-X-PRELOAD-HINT`.
+//! `#EXT-X-PART-INF`, `#EXT-X-SERVER-CONTROL`, `#EXT-X-PART`.
+//! `#EXT-X-PRELOAD-HINT` and rendition reports are not implemented.
 //!
 //! Two playlist flavours:
 //! * **Live** — no `#EXT-X-ENDLIST`, the player keeps polling.
@@ -80,9 +80,9 @@ pub struct Part {
     /// IDR). Required by the spec — clients use it to know which
     /// parts they can start playback from.
     pub independent: bool,
-    /// Marks the part that *ends* its parent segment. Clients can
-    /// use this together with `EXTINF` to validate boundary
-    /// continuity, but it's optional and most players don't care.
+    /// Marks the part that *ends* its parent segment. Informational
+    /// only: RFC 8216bis has no attribute for it (the parent's
+    /// `EXTINF` already closes the segment), so it is not serialised.
     pub last_of_segment: bool,
 }
 
@@ -191,21 +191,16 @@ impl M3u8Writer {
         self
     }
 
-    /// Enable Low-Latency HLS. `part_target_secs` is the advertised
+    /// Enable Low-Latency HLS. `part_target_secs` is the requested
     /// `PART-TARGET` (Apple recommends 0.2–0.5 s; clients pace
     /// blocking-reload requests to ~3× this value). Setting this
-    /// also implicitly turns on `CAN-BLOCK-RELOAD=YES` and sets
-    /// reasonable defaults for the two hold-back values (3 × the
-    /// target / part-target floors). Override afterwards if needed.
+    /// also implicitly turns on `CAN-BLOCK-RELOAD=YES`. Unless set
+    /// explicitly, the hold-back values default at render time to
+    /// 3 × `TARGETDURATION` and 3 × `PART-TARGET`, so builder call
+    /// order does not matter.
     pub fn with_part_target(mut self, secs: f32) -> Self {
         self.part_target_secs = Some(secs);
         self.can_block_reload = true;
-        if self.part_hold_back_secs.is_none() {
-            self.part_hold_back_secs = Some(secs * 3.0);
-        }
-        if self.hold_back_secs.is_none() {
-            self.hold_back_secs = Some((self.target_duration as f32) * 3.0);
-        }
         self
     }
 
@@ -260,6 +255,7 @@ impl M3u8Writer {
                 segment.duration, rounded, self.target_duration
             )));
         }
+        check_uri(&segment.uri)?;
         self.segments.push(segment);
         Ok(())
     }
@@ -273,6 +269,48 @@ impl M3u8Writer {
         let mut s = String::with_capacity(128 + self.segments.len() * 64);
         self.write(&mut s)?;
         Ok(s)
+    }
+
+    fn parts(&self) -> impl Iterator<Item = &Part> {
+        self.parts_by_segment
+            .iter()
+            .flatten()
+            .chain(&self.pending_parts)
+    }
+
+    /// The `PART-TARGET` to advertise, or `None` without LL-HLS.
+    ///
+    /// Every part must last at most `PART-TARGET` (RFC 8216bis
+    /// §4.4.3.7), so the advertised value is the requested target or
+    /// the longest listed part, whichever is larger (rounded up to the
+    /// millisecond the playlist is written with).
+    ///
+    /// # Errors
+    ///
+    /// Parts listed without [`Self::with_part_target`] (they would be
+    /// emitted without `EXT-X-PART-INF`), or parts whose duration is
+    /// negative or not finite.
+    fn effective_part_target(&self) -> Result<Option<f32>, FerricastError> {
+        let mut longest = None::<f32>;
+        for part in self.parts() {
+            if !part.duration.is_finite() || part.duration < 0.0 {
+                return Err(FerricastError::M3u8(format!(
+                    "invalid part duration {:.3} for {}",
+                    part.duration, part.uri
+                )));
+            }
+            longest = Some(longest.map_or(part.duration, |l| l.max(part.duration)));
+        }
+        match (self.part_target_secs, longest) {
+            (None, None) => Ok(None),
+            (None, Some(_)) => Err(FerricastError::M3u8(
+                "parts listed without a part target (EXT-X-PART-INF)".into(),
+            )),
+            (Some(target), None) => Ok(Some(target)),
+            (Some(target), Some(longest)) => {
+                Ok(Some(target.max((longest * 1000.0).ceil() / 1000.0)))
+            }
+        }
     }
 
     fn write(&self, w: &mut String) -> Result<(), FerricastError> {
@@ -302,34 +340,26 @@ impl M3u8Writer {
         // advertises CAN-BLOCK-RELOAD and the hold-back values so
         // the client knows how to pace its blocking playlist reload
         // requests.
-        if let Some(pt) = self.part_target_secs {
+        let part_target = self.effective_part_target()?;
+        if let Some(pt) = part_target {
             writeln!(w, "#EXT-X-PART-INF:PART-TARGET={:.3}", pt).map_err(fmt_err)?;
         }
-        if self.can_block_reload
-            || self.part_hold_back_secs.is_some()
-            || self.hold_back_secs.is_some()
-        {
-            let mut control = String::from("#EXT-X-SERVER-CONTROL:");
-            let mut first = true;
+        let hold_back = self
+            .hold_back_secs
+            .or_else(|| part_target.map(|_| f32::from(self.target_duration) * 3.0));
+        let part_hold_back = self.part_hold_back_secs.or(part_target.map(|pt| pt * 3.0));
+        if self.can_block_reload || part_hold_back.is_some() || hold_back.is_some() {
+            let mut attributes = Vec::new();
             if self.can_block_reload {
-                control.push_str("CAN-BLOCK-RELOAD=YES");
-                first = false;
+                attributes.push("CAN-BLOCK-RELOAD=YES".to_owned());
             }
-            if let Some(hb) = self.hold_back_secs {
-                if !first {
-                    control.push(',');
-                }
-                let _ = write!(&mut control, "HOLD-BACK={:.3}", hb);
-                first = false;
+            if let Some(hb) = hold_back {
+                attributes.push(format!("HOLD-BACK={hb:.3}"));
             }
-            if let Some(phb) = self.part_hold_back_secs {
-                if !first {
-                    control.push(',');
-                }
-                let _ = write!(&mut control, "PART-HOLD-BACK={:.3}", phb);
+            if let Some(phb) = part_hold_back {
+                attributes.push(format!("PART-HOLD-BACK={phb:.3}"));
             }
-            control.push('\n');
-            w.push_str(&control);
+            writeln!(w, "#EXT-X-SERVER-CONTROL:{}", attributes.join(",")).map_err(fmt_err)?;
         }
 
         for (i, seg) in self.segments.iter().enumerate() {
@@ -373,17 +403,29 @@ impl M3u8Writer {
 }
 
 fn write_part_line(w: &mut String, part: &Part) -> Result<(), FerricastError> {
+    check_uri(&part.uri)?;
     let mut line = String::from("#EXT-X-PART:");
     let _ = write!(&mut line, "DURATION={:.3}", part.duration);
     let _ = write!(&mut line, ",URI=\"{}\"", part.uri);
     if part.independent {
         line.push_str(",INDEPENDENT=YES");
     }
-    if part.last_of_segment {
-        line.push_str(",GAP=NO");
-    }
+    // `GAP` is only defined with the value YES (RFC 8216bis §4.4.4.9),
+    // so nothing is written for `last_of_segment`.
     line.push('\n');
     w.push_str(&line);
+    Ok(())
+}
+
+/// Rejects URIs that would break the playlist syntax: a line break
+/// ends the URI line (or tag) early, and `"` closes the quoted-string
+/// `URI` attribute of `EXT-X-PART`.
+fn check_uri(uri: &str) -> Result<(), FerricastError> {
+    if uri.contains(['"', '\r', '\n']) {
+        return Err(FerricastError::M3u8(format!(
+            "URI {uri:?} contains a quote or line break"
+        )));
+    }
     Ok(())
 }
 
@@ -456,6 +498,61 @@ mod tests {
     }
 
     #[test]
+    fn hold_back_follows_the_final_target_duration_whatever_the_call_order() {
+        let s = M3u8Writer::live(M3u8Version::V6)
+            .with_part_target(0.5)
+            .with_target_duration(4)
+            .to_string()
+            .unwrap();
+        assert!(s.contains("HOLD-BACK=12.000"), "{s}");
+        let s = M3u8Writer::live(M3u8Version::V6)
+            .with_part_target(0.5)
+            .with_hold_back(7.0)
+            .to_string()
+            .unwrap();
+        assert!(s.contains("HOLD-BACK=7.000,PART-HOLD-BACK=1.500"), "{s}");
+    }
+
+    #[test]
+    fn parts_without_a_part_target_are_rejected() {
+        let mut w = M3u8Writer::live(M3u8Version::V6).with_target_duration(4);
+        w.add_segment(Segment::new(2.0, "a.ts")).unwrap();
+        w.attach_parts(vec![Part::new(0.5, "a.0.ts")]).unwrap();
+        assert!(w.to_string().is_err());
+        let mut w = M3u8Writer::live(M3u8Version::V6);
+        w.set_pending_parts(vec![Part::new(0.5, "b.0.ts")]);
+        assert!(w.to_string().is_err());
+    }
+
+    #[test]
+    fn part_target_covers_the_longest_part() {
+        let mut w = M3u8Writer::live(M3u8Version::V6)
+            .with_target_duration(4)
+            .with_part_target(0.5);
+        w.add_segment(Segment::new(2.0, "a.ts")).unwrap();
+        w.attach_parts(vec![Part::new(0.5, "a.0.ts"), Part::new(0.5333, "a.1.ts")])
+            .unwrap();
+        let s = w.to_string().unwrap();
+        assert!(s.contains("PART-TARGET=0.534"), "{s}");
+        assert!(s.contains("PART-HOLD-BACK=1.602"), "{s}");
+        w.set_pending_parts(vec![Part::new(f32::NAN, "b.0.ts")]);
+        assert!(w.to_string().is_err());
+    }
+
+    #[test]
+    fn uris_that_break_the_playlist_syntax_are_rejected() {
+        let mut w = M3u8Writer::live(M3u8Version::V6)
+            .with_target_duration(4)
+            .with_part_target(0.5);
+        for uri in ["a\n#EXT-X-ENDLIST", "a\r.ts"] {
+            assert!(w.add_segment(Segment::new(2.0, uri)).is_err(), "{uri:?}");
+        }
+        w.add_segment(Segment::new(2.0, "a.ts")).unwrap();
+        w.set_pending_parts(vec![Part::new(0.5, "b\".ts")]);
+        assert!(w.to_string().is_err());
+    }
+
+    #[test]
     fn ll_hls_omitted_when_not_enabled() {
         let mut w = M3u8Writer::live(M3u8Version::V3).with_target_duration(4);
         w.add_segment(Segment::new(2.0, "a.ts")).unwrap();
@@ -472,9 +569,11 @@ mod tests {
         w.add_segment(Segment::new(2.0, "a.ts")).unwrap();
         let mut p0 = Part::new(0.5, "a.0.ts");
         p0.independent = true;
-        let p1 = Part::new(0.5, "a.1.ts");
+        let mut p1 = Part::new(0.5, "a.1.ts");
+        p1.last_of_segment = true;
         w.attach_parts(vec![p0, p1]).unwrap();
         let s = w.to_string().unwrap();
+        assert!(!s.contains("GAP="), "GAP is only valid as YES");
         let p_idx = s.find("#EXT-X-PART:DURATION=0.500,URI=\"a.0.ts\"").unwrap();
         let extinf = s.find("#EXTINF:2.000").unwrap();
         assert!(p_idx < extinf, "parts must precede their parent EXTINF");

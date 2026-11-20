@@ -1,12 +1,20 @@
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+/// What a render loop should do with a frame after [`Clock::wait_for`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Due {
+    /// The frame's time has come: present it now.
     Show,
+    /// The frame is too far behind the timeline: drop it and fetch the next.
     Late,
+    /// [`Clock::stop`] was called: end the render loop.
     Stopped,
 }
+
+/// Longest a frame may wait for its turn; a frame due further ahead than
+/// this is treated as a timeline jump and re-anchors the clock instead.
+const MAX_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Plan {
@@ -24,6 +32,15 @@ struct State {
     stopped: bool,
 }
 
+/// Paces decoded frames against wall-clock time for an external render loop
+/// (the desktop shell drives it; nothing inside this crate does).
+///
+/// Contract: one render thread calls [`Clock::wait_for`] with each frame's
+/// timestamp, in presentation order, and acts on the returned [`Due`]. Any
+/// other thread may call [`Clock::pause`], [`Clock::resume`] and
+/// [`Clock::stop`]. The first frame, a frame earlier than the current anchor
+/// (loop restart), a frame due more than two seconds ahead (timestamp jump)
+/// and a frame after a long stall all re-anchor the timeline.
 pub struct Clock {
     state: Mutex<State>,
     changed: Condvar,
@@ -31,6 +48,8 @@ pub struct Clock {
 }
 
 impl Clock {
+    /// Creates a clock that still shows frames up to `max_lateness` behind
+    /// their due time and reports later ones as [`Due::Late`].
     pub fn new(max_lateness: Duration) -> Self {
         Self {
             state: Mutex::new(State::default()),
@@ -39,22 +58,33 @@ impl Clock {
         }
     }
 
+    /// Holds the render thread inside [`Clock::wait_for`] until
+    /// [`Clock::resume`]; the timeline re-anchors on resume.
     pub fn pause(&self) {
         let mut state = self.lock();
         state.paused = true;
         state.anchor = None;
+        drop(state);
+        // Wake a waiter sleeping on a frame's due time so it parks on the
+        // pause instead of showing the frame once its timeout expires.
+        self.changed.notify_all();
     }
 
+    /// Releases a paused render thread.
     pub fn resume(&self) {
         self.lock().paused = false;
         self.changed.notify_all();
     }
 
+    /// Makes every current and future [`Clock::wait_for`] return
+    /// [`Due::Stopped`].
     pub fn stop(&self) {
         self.lock().stopped = true;
         self.changed.notify_all();
     }
 
+    /// Blocks until the frame stamped `pts_us` is due (or the clock is
+    /// stopped) and says what to do with it.
     pub fn wait_for(&self, pts_us: u64) -> Due {
         let mut state = self.lock();
         loop {
@@ -112,9 +142,18 @@ fn plan(
     if pts_us < base {
         return Plan::Anchor;
     }
-    let due = wall + Duration::from_micros(pts_us - base);
+    // A forward jump in the timestamps (a gap in the file, a broken PTS)
+    // would otherwise park the render thread for the whole gap.
+    let Some(due) = wall.checked_add(Duration::from_micros(pts_us - base)) else {
+        return Plan::Anchor;
+    };
     if due > now {
-        return Plan::Wait(due - now);
+        let wait = due - now;
+        return if wait > MAX_WAIT {
+            Plan::Anchor
+        } else {
+            Plan::Wait(wait)
+        };
     }
     if now - due <= max_lateness {
         return Plan::Show;
@@ -147,6 +186,42 @@ mod tests {
         assert_eq!(
             plan(anchored(start), Some(start), start, 1_040_000, LATENESS),
             Plan::Wait(Duration::from_millis(40))
+        );
+    }
+
+    #[test]
+    fn a_forward_jump_resynchronises_instead_of_freezing() {
+        let start = Instant::now();
+        assert_eq!(
+            plan(
+                anchored(start),
+                Some(start),
+                start,
+                1_000_000 + 60_000_000,
+                LATENESS
+            ),
+            Plan::Anchor
+        );
+        assert_eq!(
+            plan(anchored(start), Some(start), start, u64::MAX, LATENESS),
+            Plan::Anchor
+        );
+    }
+
+    #[test]
+    fn pausing_holds_a_frame_that_was_waiting() {
+        let clock = Arc::new(Clock::new(LATENESS));
+        assert_eq!(clock.wait_for(0), Due::Show);
+        let (sent, received) = mpsc::channel();
+        let waiter = Arc::clone(&clock);
+        std::thread::spawn(move || sent.send(waiter.wait_for(1_500_000)));
+        std::thread::sleep(Duration::from_millis(50));
+        clock.pause();
+        assert!(received.recv_timeout(Duration::from_secs(2)).is_err());
+        clock.stop();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)),
+            Ok(Due::Stopped)
         );
     }
 

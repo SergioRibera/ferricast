@@ -46,7 +46,9 @@ pub struct AdaptiveBitrateState {
     pub ceiling_kbps: u32,
 
     /// Hard lower bound — never drop the target below this. Default
-    /// is 500 kbps; below that quality is unusable at any resolution.
+    /// is 500 kbps (below that quality is unusable at any resolution),
+    /// lowered to the initial bitrate when the stream starts below it
+    /// so the floor never exceeds the ceiling.
     pub floor_kbps: u32,
 
     /// EMA of the most recent `budget_used_pct` samples (0..=100).
@@ -87,14 +89,23 @@ impl AdaptiveBitrateState {
     /// just paid the cost of catching up.
     pub const UPSHIFT_KBPS: u32 = 200;
 
+    /// Default lower bound for the target bitrate.
+    pub const DEFAULT_FLOOR_KBPS: u32 = 500;
+
     pub fn new(initial_kbps: u32) -> Arc<Self> {
         Arc::new(Self {
             target_kbps: AtomicU32::new(initial_kbps),
             ceiling_kbps: initial_kbps,
-            floor_kbps: 500,
+            floor_kbps: Self::DEFAULT_FLOOR_KBPS.min(initial_kbps),
             pressure_pct_x100: AtomicU32::new(0),
             last_adjust_ns: AtomicU64::new(0),
         })
+    }
+
+    /// Clamps `kbps` into `[floor, ceiling]`. Never panics: should the
+    /// public bounds ever be inverted, the ceiling wins.
+    fn bounded(&self, kbps: u32) -> u32 {
+        kbps.max(self.floor_kbps).min(self.ceiling_kbps)
     }
 
     /// Encoder loop's read path. Cheap: a single relaxed atomic
@@ -112,12 +123,23 @@ impl AdaptiveBitrateState {
         // EMA: 7/8 history + 1/8 new sample. Same weighting as the
         // segmenter's PTS rate EMA, so users have one mental model
         // for how fast either loop adapts.
+        // The HLS server records from one task per request, so both the
+        // EMA update and the adjustment are atomic read-modify-writes:
+        // concurrent samples all land in the EMA, and only one caller
+        // per cool-down window gets to move the target.
         let sample_x100 = sample_pct.min(200).saturating_mul(100);
-        let prev = self.pressure_pct_x100.load(Ordering::Relaxed);
-        let ema = (prev.saturating_mul(7) + sample_x100) / 8;
-        self.pressure_pct_x100.store(ema, Ordering::Relaxed);
+        let fold = |prev: u32| (prev.saturating_mul(7) + sample_x100) / 8;
+        let prev = self
+            .pressure_pct_x100
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                Some(fold(prev))
+            })
+            .unwrap_or_else(|prev| prev);
+        let ema = fold(prev);
 
-        let now_ns = monotonic_ns();
+        // 0 is the "never adjusted" sentinel, so a real timestamp is at
+        // least 1.
+        let now_ns = monotonic_ns().max(1);
         let last = self.last_adjust_ns.load(Ordering::Relaxed);
         // last == 0 is the sentinel for "never adjusted yet" so the
         // very first eligible move fires without waiting out a full
@@ -131,7 +153,7 @@ impl AdaptiveBitrateState {
         let ema_pct = ema / 100;
         let new_target = if ema_pct >= Self::PRESSURE_DOWN_PCT {
             // Downshift: multiplicative. Round toward floor.
-            (current.saturating_mul(Self::DOWNSHIFT_NUM) / Self::DOWNSHIFT_DEN).max(self.floor_kbps)
+            self.bounded(current.saturating_mul(Self::DOWNSHIFT_NUM) / Self::DOWNSHIFT_DEN)
         } else if ema_pct <= Self::PRESSURE_UP_PCT && current < self.ceiling_kbps {
             (current.saturating_add(Self::UPSHIFT_KBPS)).min(self.ceiling_kbps)
         } else {
@@ -141,8 +163,12 @@ impl AdaptiveBitrateState {
         if new_target == current {
             return None;
         }
+        // Claim this adjustment window; a concurrent caller that read
+        // the same `last` loses the race and leaves the target alone.
+        self.last_adjust_ns
+            .compare_exchange(last, now_ns, Ordering::AcqRel, Ordering::Relaxed)
+            .ok()?;
         self.target_kbps.store(new_target, Ordering::Relaxed);
-        self.last_adjust_ns.store(now_ns, Ordering::Relaxed);
         Some(new_target)
     }
 
@@ -182,10 +208,10 @@ impl AdaptiveBitrateState {
             return None;
         } else if measured_kbps >= current {
             // 70 % of measured, clamped to the controller's bounds.
-            ((measured_kbps as u64 * 7 / 10) as u32).clamp(self.floor_kbps, self.ceiling_kbps)
+            self.bounded((u64::from(measured_kbps) * 7 / 10) as u32)
         } else {
             // Already over-budget. Drop to measured.
-            measured_kbps.clamp(self.floor_kbps, self.ceiling_kbps)
+            self.bounded(measured_kbps)
         };
         if new_target == current {
             return None;
@@ -304,6 +330,52 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_samples_downshift_only_once_per_cool_down() {
+        for _ in 0..50 {
+            let s = AdaptiveBitrateState::new(4000);
+            s.pressure_pct_x100.store(9_500, Ordering::Relaxed);
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let s = Arc::clone(&s);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        s.record_pressure(95)
+                    })
+                })
+                .collect();
+            let moved = handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .count();
+            assert_eq!(moved, 1);
+            assert_eq!(s.target_kbps(), 3000);
+        }
+    }
+
+    #[test]
+    fn concurrent_samples_all_land_in_the_ema() {
+        let s = AdaptiveBitrateState::new(4000);
+        s.pressure_pct_x100.store(8_000, Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| s.record_pressure(80));
+            }
+        });
+        // A fixed point of the EMA: every update keeps it at 80 %.
+        assert_eq!(s.pressure_pct(), 80);
+        let s = AdaptiveBitrateState::new(4000);
+        std::thread::scope(|scope| {
+            for _ in 0..64 {
+                scope.spawn(|| s.record_pressure(100));
+            }
+        });
+        // 64 folds of 7/8 history: within 1 % of 100 only if none was lost.
+        assert!(s.pressure_pct() >= 99, "{}", s.pressure_pct());
+    }
+
+    #[test]
     fn drop_to_floor_is_immediate() {
         let s = AdaptiveBitrateState::new(3000);
         let v = s.drop_to_floor();
@@ -335,6 +407,20 @@ mod tests {
         let s = AdaptiveBitrateState::new(2500);
         let new = s.observe_link_capacity_kbps(1500).unwrap();
         assert_eq!(new, 1500, "drop straight to measured");
+    }
+
+    #[test]
+    fn a_stream_starting_below_the_default_floor_never_panics_or_overshoots() {
+        let s = AdaptiveBitrateState::new(300);
+        assert_eq!(s.floor_kbps, 300);
+        assert_eq!(s.observe_link_capacity_kbps(310), None);
+        assert_eq!(s.observe_link_capacity_kbps(100), None);
+        for _ in 0..20 {
+            force_adjustable(&s);
+            s.record_pressure(100);
+        }
+        assert_eq!(s.target_kbps(), 300);
+        assert_eq!(s.drop_to_floor(), 300);
     }
 
     #[test]

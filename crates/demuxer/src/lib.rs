@@ -28,6 +28,11 @@ pub struct VideoStream {
     pub height: u32,
     pub color: Option<Color>,
     pub duration_us: Option<u64>,
+    /// Timestamp of the first frame meant to be shown. Frames before it are
+    /// pre-roll (samples ahead of an MP4 edit list's start): they must be
+    /// decoded, because later frames reference them, but not displayed.
+    /// Zero when the stream has no pre-roll.
+    pub presentation_start_us: u64,
 }
 
 pub enum Demuxer {
