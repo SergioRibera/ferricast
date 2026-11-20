@@ -2022,6 +2022,7 @@ dependencies = [
  "libc",
  "openh264",
  "openh264-sys2",
+ "opus-rs",
  "rav1d",
  "rust_h265",
  "rusty_vp9",

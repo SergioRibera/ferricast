@@ -67,6 +67,11 @@ default = [
     "airplay",
     "fdk-aac",
     "opus-rs",
+    "hevc-decode",
+    "vp8-decode",
+    "vp9-decode",
+    "av1-decode",
+    "opus-decode",
 ]
 chromecast = ["dep:ferricast-chromecast"]
 # AirPlay sender. Also enables FairPlay `fp-setup` support, which links the
@@ -95,6 +100,13 @@ nvenc-zero-copy = ["ferricast-encoder/nvenc-zero-copy", "nvenc"]
 # does hardware AAC); plenty fast for one stream. Default on so
 # `ferricast = "*"` builds with both H.264 and AAC decode wired up.
 aac = ["ferricast-decoder/aac"]
+# Pure-Rust software decoders the receiver registers for progressive
+# media (WebM, MKV, MP4): HEVC, VP8, VP9, AV1 video and Opus audio.
+hevc-decode = ["ferricast-decoder/hevc-decode"]
+vp8-decode = ["ferricast-decoder/vp8-decode"]
+vp9-decode = ["ferricast-decoder/vp9-decode"]
+av1-decode = ["ferricast-decoder/av1-decode"]
+opus-decode = ["ferricast-decoder/opus-decode"]
 # AAC-LC encode via libfdk-aac for the sender side (chromecast HLS
 # audio). Requires `libfdk-aac` on the link path — the flake's
 # devShell ships it; on Debian/Ubuntu install `libfdk-aac-dev`.

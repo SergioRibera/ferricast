@@ -39,6 +39,9 @@ pub mod aac;
 #[cfg(feature = "av1-decode")]
 mod av1;
 
+#[cfg(feature = "opus-decode")]
+mod opus;
+
 #[cfg(feature = "vp8-decode")]
 mod vp8;
 
@@ -56,6 +59,8 @@ pub use h264::H264Decoder;
     feature = "hevc-decode"
 ))]
 pub use h265::H265Decoder;
+#[cfg(feature = "opus-decode")]
+pub use opus::OpusDecoder;
 #[cfg(feature = "vp8-decode")]
 pub use vp8::Vp8Decoder;
 #[cfg(feature = "vp9-decode")]
