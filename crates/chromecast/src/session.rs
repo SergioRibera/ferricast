@@ -77,9 +77,6 @@ const AUDIO_QUEUE_DEPTH: usize = 64;
 /// and need a power cycle.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Path of the media playlist on the HLS sink. The LOAD URL and the
-/// loopback probe both derive from this one value.
-
 /// HLS segment length handed to the segmenter. 2 s segments + 4 s
 /// playlist target keep glass-to-glass around 6 s at the cost of ~2×
 /// the IDR rate (~10-15 % more bitrate at fixed quality).
