@@ -117,10 +117,10 @@ pub(super) struct WorkerHandle {
 impl WorkerHandle {
     pub(super) fn shutdown(&mut self) {
         let _ = self.terminator.send(Terminate);
-        if let Some(handle) = self.join.take() {
-            if let Err(panic) = handle.join() {
-                error!(?panic, "PipeWire worker panicked during shutdown");
-            }
+        if let Some(handle) = self.join.take()
+            && let Err(panic) = handle.join()
+        {
+            error!(?panic, "PipeWire worker panicked during shutdown");
         }
     }
 }
@@ -413,10 +413,8 @@ fn handle_param_changed(
                 }
                 None => true,
             };
-            if format_changed {
-                if let Some(imp) = ud.importer.as_ref() {
-                    imp.reset_cache();
-                }
+            if format_changed && let Some(imp) = ud.importer.as_ref() {
+                imp.reset_cache();
             }
 
             ud.negotiated = Some(neg);
