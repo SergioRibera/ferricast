@@ -6,13 +6,13 @@
 //!    hardware on NVIDIA. Gated behind `nvdec-hevc-decode`.
 //! 2. **VA-API** — opt-in via `FERRICAST_H265_DECODE_BACKEND=vaapi`.
 //!    Profile probe + surface bring-up are complete; slice
-//!    submission is the same opt-in pattern as the H.264 VAAPI
-//!    backend (engage only if you intend to drive it).
+//!    submission is not wired yet, so it is never picked unless the
+//!    variable names it.
+//! 3. **Software** via `rust_h265` behind `hevc-decode`; also the
+//!    fallback when a backend named in the variable fails to open.
 //!
-//! No software fallback: HEVC has no production-grade pure-Rust
-//! decoder, and `openh264` doesn't speak HEVC. Without one of the
-//! two GPU backends compiled in, the facade refuses to build via
-//! the `compile_error!` below.
+//! Without any of the three compiled in, the facade refuses to build
+//! via the `compile_error!` below.
 
 #[cfg(not(any(
     feature = "nvdec-hevc-decode",
@@ -34,7 +34,6 @@ mod vaapi_impl;
 use ferricast_core::{
     CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
 };
-#[allow(unused_imports)]
 use tracing::info;
 
 #[cfg(feature = "nvdec-hevc-decode")]
@@ -89,23 +88,32 @@ impl VideoDecoder for H265Decoder {
                 match NvdecH265Decoder::probe() {
                     Ok(()) => {
                         let mut d = NvdecH265Decoder::new();
-                        d.configure(config)?;
-                        info!(
-                            width = config.width,
-                            height = config.height,
-                            "H.265 decoder backend: NVDEC"
-                        );
-                        *self = H265Decoder::Nvdec(d);
-                        return Ok(());
+                        match d.configure(config) {
+                            Ok(()) => {
+                                info!(
+                                    width = config.width,
+                                    height = config.height,
+                                    "H.265 decoder backend: NVDEC"
+                                );
+                                *self = H265Decoder::Nvdec(d);
+                                return Ok(());
+                            }
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "NVDEC HEVC probed fine but would not open; trying the next backend"
+                            ),
+                        }
                     }
-                    Err(e) => info!(error = %e, "NVDEC HEVC unavailable, trying VA-API"),
+                    Err(e) => info!(error = %e, "NVDEC HEVC unavailable, trying the next backend"),
                 }
             }
         }
 
+        // Opt-in only: slice submission is not wired yet, so engaging it
+        // by default would fail every decode.
         #[cfg(feature = "vaapi-hevc-decode")]
         {
-            if var == "vaapi" || var.is_empty() {
+            if var == "vaapi" {
                 match VaapiH265Decoder::probe_with(config) {
                     Ok(mut d) => match d.configure(config) {
                         Ok(()) => {
@@ -126,7 +134,9 @@ impl VideoDecoder for H265Decoder {
 
         #[cfg(feature = "hevc-decode")]
         {
-            if var.is_empty() || var == "software" {
+            // A named hardware backend that failed above still gets a
+            // working decoder, as the H.264 facade does.
+            if var.is_empty() || matches!(var.as_str(), "software" | "nvdec" | "vaapi") {
                 info!("H.265 decoder backend: software");
                 let mut d = SoftwareH265Decoder::default();
                 d.configure(config)?;
