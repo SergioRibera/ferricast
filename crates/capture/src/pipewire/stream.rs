@@ -242,9 +242,9 @@ fn run(
             let error_tx = error_tx.clone();
             move |_, _, old, new| {
                 info!(?old, ?new, "stream state changed");
-                if let StreamState::Error(msg) = new {
-                    error!(%msg, "stream entered Error state");
-                    let _ = error_tx.try_send(msg.to_string());
+                if let Some(msg) = fatal_state_transition(&old, &new) {
+                    error!(%msg, "PipeWire stream ended");
+                    let _ = error_tx.try_send(msg);
                     mainloop.quit();
                 }
             }
@@ -274,7 +274,12 @@ fn run(
         .connect(
             Direction::Input,
             Some(portal.node_id),
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+            // DONT_RECONNECT: when the portal node goes away ("Stop
+            // sharing", window closed) the session manager must not
+            // re-link us to some other video source; the stream
+            // drops to Unconnected instead, which
+            // `fatal_state_transition` reports.
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::DONT_RECONNECT,
             pods.as_mut_slice(),
         )
         .map_err(|e| FerricastError::Capture(format!("Stream::connect: {e}")))?;
@@ -295,6 +300,21 @@ fn run(
 
     info!("PipeWire main loop exited cleanly");
     Ok(())
+}
+
+/// Error message for a stream state transition that ends the capture:
+/// an explicit `Error`, or falling back to `Unconnected` after the
+/// stream had connected (source node removed, user hit "Stop
+/// sharing"). Without the latter `next_frame` would wait forever.
+fn fatal_state_transition(old: &StreamState, new: &StreamState) -> Option<String> {
+    match (old, new) {
+        (_, StreamState::Error(msg)) => Some(msg.clone()),
+        (
+            StreamState::Connecting | StreamState::Paused | StreamState::Streaming,
+            StreamState::Unconnected,
+        ) => Some("stream disconnected (screencast source removed or sharing stopped)".into()),
+        _ => None,
+    }
 }
 
 fn handle_param_changed(
@@ -766,7 +786,22 @@ fn now_us() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::PlaneLayout;
+    use super::{PlaneLayout, StreamState, fatal_state_transition};
+
+    #[test]
+    fn unconnected_after_connect_and_errors_are_fatal() {
+        use StreamState::{Connecting, Paused, Streaming, Unconnected};
+        assert!(fatal_state_transition(&Streaming, &Unconnected).is_some());
+        assert!(fatal_state_transition(&Paused, &Unconnected).is_some());
+        assert!(fatal_state_transition(&Connecting, &Unconnected).is_some());
+        assert_eq!(
+            fatal_state_transition(&Streaming, &StreamState::Error("boom".into())).as_deref(),
+            Some("boom")
+        );
+        assert!(fatal_state_transition(&Unconnected, &Connecting).is_none());
+        assert!(fatal_state_transition(&Streaming, &Paused).is_none());
+        assert!(fatal_state_transition(&Paused, &Streaming).is_none());
+    }
 
     const LAYOUT: PlaneLayout = PlaneLayout {
         stride: 64,
