@@ -18,7 +18,7 @@ use fdk_aac::enc::{
     AudioObjectType, BitRate, ChannelMode, EncodeInfo, Encoder, EncoderParams, Transport,
 };
 use ferricast_core::{AudioCodec, AudioEncoderConfig, AudioFrame, FerricastError, Result};
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::audio_clock::{AudioClock, ClockEvent};
 
@@ -98,24 +98,38 @@ impl FdkAacEncoder {
                 self.sample_rate, self.channels, frame.sample_rate, frame.channels
             )));
         }
-        // Anchor on the first chunk (same clock origin as video) and
-        // jump forward after capture gaps so frames never go stale.
+        // Anchor on the first chunk (same clock origin as video), jump
+        // forward after capture gaps so frames never go stale, and
+        // trim input when the sample count runs ahead of capture.
         let channels = usize::from(self.channels.max(1));
+        let pcm_bytes = frame.data.as_ref();
+        let usable = pcm_bytes.len() & !1; // round down to i16 boundary
         let buffered = (self.pcm_buffer.len() / channels) as u64;
-        if let ClockEvent::Resynced { gap_us } = self.clock.observe(frame.timestamp_us, buffered) {
-            debug!(
+        let chunk = (usable / 2 / channels) as u64;
+        let event = self.clock.observe(frame.timestamp_us, buffered, chunk);
+        match event {
+            ClockEvent::Resynced { gap_us } => debug!(
                 gap_us,
                 "fdk-aac: capture gap, re-anchoring output timestamps"
-            );
+            ),
+            ClockEvent::Trimmed {
+                ahead_us,
+                report: true,
+                ..
+            } => info!(
+                ahead_us,
+                "fdk-aac: output clock ahead of capture, discarding input samples"
+            ),
+            ClockEvent::Anchored | ClockEvent::Continuous | ClockEvent::Trimmed { .. } => {}
         }
 
         // Reinterpret the raw S16LE bytes as i16 slices, append to
         // the working PCM buffer. Doing it byte-by-byte lets us cope
         // with chunk lengths that aren't a multiple of 2 (shouldn't
         // happen with PipeWire but cheap to be safe).
-        let pcm_bytes = frame.data.as_ref();
-        let usable = pcm_bytes.len() & !1; // round down to i16 boundary
-        let mut i = 0;
+        let skipped_bytes = usize::try_from(event.skip())
+            .map_or(usable, |skip| skip.saturating_mul(channels * 2).min(usable));
+        let mut i = skipped_bytes;
         while i < usable {
             let s = i16::from_le_bytes([pcm_bytes[i], pcm_bytes[i + 1]]);
             self.pcm_buffer.push(s);

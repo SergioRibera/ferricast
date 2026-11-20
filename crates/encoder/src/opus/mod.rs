@@ -3,7 +3,7 @@ use ferricast_core::{
     AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame, FerricastError, Result,
 };
 use opus_rs::{Application, OpusEncoder as RawEncoder};
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::audio_clock::{AudioClock, ClockEvent};
 
@@ -100,19 +100,34 @@ impl AudioEncoder for OpusEncoder {
         let clock = self.clock.as_mut().ok_or_else(|| {
             FerricastError::Encoder("opus-rs: encode called before configure".into())
         })?;
-        // Anchor on the first chunk and jump forward after capture gaps.
-        let buffered = (self.pcm_buf.len() / usize::from(self.channels.max(1))) as u64;
-        if let ClockEvent::Resynced { gap_us } = clock.observe(frame.timestamp_us, buffered) {
-            debug!(
+        // Anchor on the first chunk, jump forward after capture gaps and
+        // trim input when the sample count runs ahead of capture.
+        let channels = usize::from(self.channels.max(1));
+        let pcm_bytes = frame.data.as_ref();
+        let usable = pcm_bytes.len() & !1;
+        let buffered = (self.pcm_buf.len() / channels) as u64;
+        let chunk = (usable / 2 / channels) as u64;
+        let event = clock.observe(frame.timestamp_us, buffered, chunk);
+        match event {
+            ClockEvent::Resynced { gap_us } => debug!(
                 gap_us,
                 "opus-rs: capture gap, re-anchoring output timestamps"
-            );
+            ),
+            ClockEvent::Trimmed {
+                ahead_us,
+                report: true,
+                ..
+            } => info!(
+                ahead_us,
+                "opus-rs: output clock ahead of capture, discarding input samples"
+            ),
+            ClockEvent::Anchored | ClockEvent::Continuous | ClockEvent::Trimmed { .. } => {}
         }
 
         // S16LE bytes → interleaved f32 in [-1.0, 1.0].
-        let pcm_bytes = frame.data.as_ref();
-        let usable = pcm_bytes.len() & !1;
-        let mut i = 0;
+        let skipped_bytes = usize::try_from(event.skip())
+            .map_or(usable, |skip| skip.saturating_mul(channels * 2).min(usable));
+        let mut i = skipped_bytes;
         while i < usable {
             let s = i16::from_le_bytes([pcm_bytes[i], pcm_bytes[i + 1]]);
             self.pcm_buf.push(s as f32 / 32768.0);
