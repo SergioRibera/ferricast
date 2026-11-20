@@ -650,6 +650,8 @@ impl ChromecastSession {
                 content_type: "application/x-mpegurl".to_string(),
                 stream_type: Some("LIVE".to_string()),
                 duration: None,
+                hls_segment_format: None,
+                hls_video_segment_format: None,
             };
             let msg = match load_media_message(request_id, &transport_id, media) {
                 Ok(m) => m,
