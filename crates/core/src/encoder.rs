@@ -88,8 +88,7 @@ pub trait VideoEncoder: Send {
     /// overshoot `segment_target_secs` until the next natural IDR.
     ///
     /// Default is a no-op so backends that can't influence keyframe
-    /// placement (e.g. x264 via the safe `x264` crate, which doesn't
-    /// expose `i_type`) keep working — they simply rely on their
+    /// placement keep working — they simply rely on their
     /// internal interval.
     fn request_keyframe(&mut self) {}
 
@@ -104,10 +103,8 @@ pub trait VideoEncoder: Send {
     ///
     /// Returns `Ok(())` even on backends that can't honour the
     /// request — the caller should always make adjustments on a
-    /// best-effort basis. NVENC reconfigures live (no GOP gap);
-    /// x264 via the safe crate has no exposed knob and is a no-op
-    /// (the natural fallback is "screen-share users on x264 get
-    /// what they get"). Default is no-op so existing impls don't
+    /// best-effort basis. NVENC and x264 reconfigure live (no GOP
+    /// gap); VA-API keeps the no-op. Default is no-op so existing impls don't
     /// have to opt in.
     fn set_bitrate_kbps(&mut self, _kbps: u32) -> Result<()> {
         Ok(())
