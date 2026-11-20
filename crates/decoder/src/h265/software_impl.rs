@@ -5,6 +5,7 @@ use ferricast_core::{
 };
 use rust_h265::{Decoder, Frame, PixelData, parse_annex_b};
 
+use super::timestamps::Timestamps;
 use crate::nv12::{self, Colour, OutputFormat, Planar};
 
 const MAX_THREADS: usize = 4;
@@ -14,6 +15,7 @@ pub struct SoftwareH265Decoder {
     decoder: Option<Decoder>,
     ready: VecDeque<CapturedFrame>,
     format: OutputFormat,
+    timestamps: Timestamps,
 }
 
 impl VideoDecoder for SoftwareH265Decoder {
@@ -29,6 +31,7 @@ impl VideoDecoder for SoftwareH265Decoder {
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_THREADS));
         self.decoder = Some(Decoder::new().with_display_order().with_threads(threads));
         self.ready.clear();
+        self.timestamps = Timestamps::default();
         self.format = OutputFormat(config.pixel_format);
         Ok(())
     }
@@ -37,23 +40,34 @@ impl VideoDecoder for SoftwareH265Decoder {
         let decoder = self.decoder.as_mut().ok_or_else(|| {
             FerricastError::Decode("SoftwareH265Decoder::decode before configure()".into())
         })?;
-        for nal in parse_annex_b(&frame.data) {
+        let nals = parse_annex_b(&frame.data);
+        self.timestamps.observe(&nals, frame.timestamp_us);
+        for nal in &nals {
             decoder
-                .decode_nal(&nal)
+                .decode_nal(nal)
                 .map_err(|e| FerricastError::Decode(format!("h265 decode: {e}")))?;
         }
         while let Some(decoded) = decoder.next_output() {
+            // A picture nothing was noted for (an unreadable packet) keeps
+            // the time of the packet that released it.
+            let timestamp_us = self
+                .timestamps
+                .claim(decoded.pic_order_cnt)
+                .unwrap_or(frame.timestamp_us);
             self.ready
-                .push_back(picture(&decoded, frame.timestamp_us, self.format)?);
+                .push_back(picture(&decoded, timestamp_us, self.format)?);
         }
         Ok(self.ready.pop_front())
     }
 
     fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
         if let Some(decoder) = self.decoder.as_mut() {
+            let mut last = 0;
             while let Some(decoded) = decoder.flush() {
-                self.ready.push_back(picture(&decoded, 0, self.format)?);
+                last = self.timestamps.claim(decoded.pic_order_cnt).unwrap_or(last);
+                self.ready.push_back(picture(&decoded, last, self.format)?);
             }
+            self.timestamps = Timestamps::default();
         }
         Ok(self.ready.drain(..).collect())
     }

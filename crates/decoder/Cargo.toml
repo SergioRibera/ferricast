@@ -19,7 +19,7 @@ openh264-decode = ["dep:openh264"]
 aac = ["dep:symphonia"]
 vp8-decode = ["dep:vp8-decoder"]
 vp9-decode = ["dep:rusty_vp9"]
-hevc-decode = ["dep:rust_h265"]
+hevc-decode = ["dep:rust_h265", "dep:h264-reader"]
 av1-decode = ["dep:rav1d", "dep:libc"]
 # Hardware H.264 decode via VA-API. Opt-in (not in defaults) until
 # the slice-submission path is fully verified against a real
@@ -59,7 +59,8 @@ cros-libva = { git = "https://github.com/SergioRibera/cros-libva", branch = "fix
 
 # H.264 bitstream parser. Pure-Rust, no system deps. Used by the
 # VA-API backend to decode SPS / PPS so the VA buffer construction
-# has the bitstream-derived parameters it needs.
+# has the bitstream-derived parameters it needs. The software HEVC
+# backend borrows its Exp-Golomb bit reader to read picture order counts.
 h264-reader = { version = "0.7", optional = true }
 
 # NVDEC binding (same crate the encoder uses — the workspace is
