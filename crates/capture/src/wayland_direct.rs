@@ -53,6 +53,8 @@ use ferricast_core::{
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
+use crate::wayland_thumb::EventQueueExt;
+
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, WEnum,
     globals::{GlobalListContents, registry_queue_init},
@@ -443,12 +445,11 @@ impl ScreenCapture for WaylandDirectCapture {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let fps = config.fps.max(1);
 
-        // The first frame on the channel carries the negotiated
-        // size; we read it synchronously to populate `self.size`
-        // before returning so `get_screen_size()` works immediately.
-        // Worker also sends an initial `(width, height)` over a
-        // one-shot channel for that purpose.
-        let (size_tx, size_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(1);
+        // The worker sends the negotiated `(width, height)` over a
+        // oneshot before its first frame; we await it (without
+        // blocking the runtime) to populate `self.size` before
+        // returning so `get_screen_size()` works immediately.
+        let (size_tx, size_rx) = tokio::sync::oneshot::channel::<(u32, u32)>();
 
         let output_name_clone = output_name.clone();
         let join = std::thread::Builder::new()
@@ -460,9 +461,23 @@ impl ScreenCapture for WaylandDirectCapture {
             })
             .map_err(|e| FerricastError::Capture(format!("spawn: {e}")))?;
 
-        let size = size_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| {
-            FerricastError::Capture("wayland-direct: compositor didn't respond within 5s".into())
-        })?;
+        // On either error path `stop_tx` is dropped here; the worker
+        // treats a disconnected stop channel as a stop request and
+        // exits on its own, so the detached thread doesn't spin forever.
+        let size = match tokio::time::timeout(Duration::from_secs(5), size_rx).await {
+            Ok(Ok(size)) => size,
+            Ok(Err(_)) => {
+                return Err(FerricastError::Capture(
+                    "wayland-direct: worker exited before the first frame (see previous log)"
+                        .into(),
+                ));
+            }
+            Err(_) => {
+                return Err(FerricastError::Capture(
+                    "wayland-direct: compositor didn't respond within 5s".into(),
+                ));
+            }
+        };
 
         self.worker = Some(WorkerHandle {
             frames: frame_rx,
@@ -497,7 +512,9 @@ impl ScreenCapture for WaylandDirectCapture {
         if let Some(mut w) = self.worker.take() {
             let _ = w.stop.send(());
             if let Some(j) = w.join.take() {
-                let _ = j.join();
+                // The worker can sit in a bounded (≤ 2 s) Wayland wait
+                // before it sees the stop; join off the async runtime.
+                let _ = tokio::task::spawn_blocking(move || j.join()).await;
             }
         }
         Ok(())
@@ -522,12 +539,17 @@ impl ScreenCapture for WaylandDirectCapture {
 
 // ── Worker thread ─────────────────────────────────────────────────
 
+/// Budget for each compositor round (buffer offers, copy completion,
+/// dmabuf feedback). Generous: a healthy compositor answers within a
+/// frame period.
+const FRAME_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn run_worker(
     output_name: String,
     fps: u32,
     frame_tx: mpsc::Sender<CapturedFrame>,
     stop_rx: std::sync::mpsc::Receiver<()>,
-    size_tx: std::sync::mpsc::SyncSender<(u32, u32)>,
+    size_tx: tokio::sync::oneshot::Sender<(u32, u32)>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env()
         .map_err(|e| FerricastError::Capture(format!("wayland connect: {e}")))?;
@@ -551,10 +573,10 @@ fn run_worker(
         outputs: Vec::new(),
         target: None,
         frame_info: None,
+        buffer_done: false,
         status: FrameStatus::Pending,
-        size_emitted: false,
-        size_tx: Some(size_tx),
     };
+    let mut size_tx = Some(size_tx);
 
     for g in globals.contents().clone_list() {
         if g.interface == "wl_output" {
@@ -638,9 +660,12 @@ fn run_worker(
     const DMABUF_FAILURE_THRESHOLD: u32 = 3;
 
     loop {
-        // Cooperative stop — check between frames.
-        if stop_rx.try_recv().is_ok() {
-            break;
+        // Cooperative stop — check between frames. A disconnected
+        // channel means the owner is gone (dropped handle, or `start()`
+        // gave up waiting for the first frame): stop too.
+        match stop_rx.try_recv() {
+            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
         let now = Instant::now();
         if now < next_capture {
@@ -650,28 +675,33 @@ fn run_worker(
 
         // Per-frame state reset.
         state.frame_info = None;
+        state.buffer_done = false;
         state.status = FrameStatus::Pending;
 
         let frame = screencopy.capture_output(0, &target, &qh, ());
 
-        // Wait for buffer / linux_dmabuf / buffer_done events.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while state.frame_info.is_none() && Instant::now() < deadline {
-            queue
-                .blocking_dispatch(&mut state)
-                .map_err(|e| FerricastError::Capture(format!("buffer wait: {e}")))?;
-        }
-        let info = state.frame_info.clone().ok_or_else(|| {
-            FerricastError::Capture("compositor didn't announce buffer params within 2s".into())
-        })?;
+        // Wait for buffer / linux_dmabuf / buffer_done events. v3 is
+        // bound, so `buffer_done` always closes the offer list.
+        queue
+            .dispatch_until(&mut state, FRAME_EVENT_TIMEOUT, |s| {
+                s.buffer_done || s.status == FrameStatus::Failed
+            })
+            .map_err(|e| FerricastError::Capture(format!("buffer wait: {e}")))?;
+        let Some(info) = state.frame_info.clone() else {
+            frame.destroy();
+            return Err(FerricastError::Capture(
+                "compositor didn't announce buffer params within 2s".into(),
+            ));
+        };
 
-        if !state.size_emitted {
-            let _ = state
-                .size_tx
-                .as_ref()
-                .unwrap()
-                .send((info.width, info.height));
-            state.size_emitted = true;
+        if state.status == FrameStatus::Failed {
+            frame.destroy();
+            warn!("compositor failed the frame before offering buffers — dropping");
+            continue;
+        }
+
+        if let Some(tx) = size_tx.take() {
+            let _ = tx.send((info.width, info.height));
         }
 
         // Pick the transport: dmabuf if (a) the compositor offered
@@ -721,12 +751,11 @@ fn run_worker(
         let attempted_dmabuf = matches!(transport, Transport::Dmabuf(_));
 
         frame.copy(&buffer);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while state.status == FrameStatus::Pending && Instant::now() < deadline {
-            queue
-                .blocking_dispatch(&mut state)
-                .map_err(|e| FerricastError::Capture(format!("frame wait: {e}")))?;
-        }
+        queue
+            .dispatch_until(&mut state, FRAME_EVENT_TIMEOUT, |s| {
+                s.status != FrameStatus::Pending
+            })
+            .map_err(|e| FerricastError::Capture(format!("frame wait: {e}")))?;
         // The frame object is single-use: once `ready` / `failed`
         // arrived (or we gave up waiting) nothing else will happen on
         // it. Destroy it on every path, otherwise each capture leaks a
@@ -1157,9 +1186,10 @@ struct WorkerState {
     #[allow(dead_code)]
     target: Option<WlOutput>,
     frame_info: Option<FrameInfo>,
+    /// `buffer_done` seen for the in-flight frame: every offer
+    /// (`buffer` / `linux_dmabuf`) has been announced.
+    buffer_done: bool,
     status: FrameStatus,
-    size_emitted: bool,
-    size_tx: Option<std::sync::mpsc::SyncSender<(u32, u32)>>,
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for WorkerState {
@@ -1358,7 +1388,8 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for WorkerState {
             Event::BufferDone => {
                 // Compositor done advertising buffer params. If we
                 // got nothing, frame_info stays None and the worker
-                // will time out.
+                // bails out.
+                state.buffer_done = true;
             }
             Event::Ready { .. } => state.status = FrameStatus::Ready,
             Event::Failed => state.status = FrameStatus::Failed,
@@ -1494,13 +1525,10 @@ fn query_feedback(
     let _feedback = dmabuf.get_default_feedback(&fb_qh, ());
 
     let mut state = FeedbackState::default();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !state.done && std::time::Instant::now() < deadline {
-        feedback_queue
-            .blocking_dispatch(&mut state)
-            .map_err(|e| FerricastError::Capture(format!("dmabuf feedback dispatch: {e}")))?;
-    }
-    if !state.done {
+    let done = feedback_queue
+        .dispatch_until(&mut state, FRAME_EVENT_TIMEOUT, |s| s.done)
+        .map_err(|e| FerricastError::Capture(format!("dmabuf feedback dispatch: {e}")))?;
+    if !done {
         return Err(FerricastError::Capture(
             "dmabuf feedback timed out — compositor didn't send `done` within 2s".into(),
         ));

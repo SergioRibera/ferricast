@@ -35,12 +35,14 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::time::{Duration, Instant};
 
 use ferricast_core::SourceError;
 use tracing::debug;
 
 use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle, WEnum,
+    Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle, WEnum,
+    backend::WaylandError,
     globals::{GlobalListContents, registry_queue_init},
     protocol::{
         wl_buffer::WlBuffer,
@@ -700,6 +702,89 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for WindowState {
             Event::Ready => state.status = FrameStatus::Ready,
             Event::Failed { .. } => state.status = FrameStatus::Failed,
             _ => {}
+        }
+    }
+}
+
+// ── Shared support: bounded event-queue dispatch ──────────────────
+
+/// Bounded waits on a Wayland [`EventQueue`].
+///
+/// `EventQueue::blocking_dispatch` blocks until the compositor sends
+/// *something*, so a `while !done && now < deadline { blocking_dispatch }`
+/// loop never notices its deadline when the compositor goes quiet (a
+/// window closed mid-capture, a hung compositor). This polls the
+/// connection fd with the remaining budget instead, so the deadline
+/// is honoured. Shared with `wayland_direct`.
+pub(crate) trait EventQueueExt<S> {
+    /// Dispatch events until `done(state)` holds or `timeout` elapses.
+    ///
+    /// Returns `Ok(true)` when `done` became true, `Ok(false)` on
+    /// timeout.
+    ///
+    /// # Errors
+    ///
+    /// Protocol / socket errors from flushing, reading or dispatching.
+    fn dispatch_until(
+        &mut self,
+        state: &mut S,
+        timeout: Duration,
+        done: impl FnMut(&S) -> bool,
+    ) -> Result<bool, DispatchError>;
+}
+
+impl<S> EventQueueExt<S> for EventQueue<S> {
+    fn dispatch_until(
+        &mut self,
+        state: &mut S,
+        timeout: Duration,
+        mut done: impl FnMut(&S) -> bool,
+    ) -> Result<bool, DispatchError> {
+        let start = Instant::now();
+        loop {
+            self.dispatch_pending(state)?;
+            if done(state) {
+                return Ok(true);
+            }
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            self.flush()?;
+            // `None` means events are already queued: loop back to
+            // `dispatch_pending`.
+            let Some(guard) = self.prepare_read() else {
+                continue;
+            };
+            let mut pfd = libc::pollfd {
+                fd: guard.connection_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Round up so a sub-millisecond remainder still sleeps
+            // instead of busy-looping on a zero timeout.
+            let timeout_ms = i32::try_from(remaining.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+            // SAFETY: `pfd` is a valid, exclusively borrowed pollfd for
+            // the duration of the call and `nfds` is 1. The fd stays
+            // open while `guard` (which borrows the connection) lives.
+            let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(WaylandError::Io(err).into());
+            }
+            if rc == 0 {
+                // Timed out: dropping the guard cancels the read; the
+                // next iteration sees `remaining == 0` and returns.
+                continue;
+            }
+            match guard.read() {
+                Ok(_) => {}
+                Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
         }
     }
 }
