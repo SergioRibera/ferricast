@@ -157,6 +157,14 @@ impl VideoEncoder for X264Encoder {
     fn request_keyframe(&mut self) {
         self.pending_keyframe = true;
     }
+
+    fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
+        match self.session.as_mut() {
+            Some(session) => session.set_bitrate(kbps),
+            // Not configured yet: `configure()` takes the bitrate.
+            None => Ok(()),
+        }
+    }
 }
 
 impl X264Encoder {
@@ -281,7 +289,11 @@ impl Session {
         // self-contained; Annex B start codes for MPEG-TS.
         params.b_repeat_headers = 1;
         params.b_annexb = 1;
-        params.rc.i_bitrate = to_c_int(config.bitrate_kbps.max(1));
+        // Presets default to CRF, which ignores `i_bitrate` entirely.
+        // ABR with a VBV capped at the target makes the bitrate a real
+        // ceiling (≈ CBR) so a weak receiver link isn't flooded.
+        params.rc.i_rc_method = sys::X264_RC_ABR as c_int;
+        apply_bitrate(&mut params, config.bitrate_kbps);
 
         let profile = match config.max_h264_profile.unwrap_or(H264Profile::High) {
             H264Profile::Baseline => c"baseline",
@@ -356,6 +368,27 @@ impl Session {
         }))
     }
 
+    /// Retarget ABR + VBV without restarting the session.
+    fn set_bitrate(&mut self, kbps: u32) -> Result<()> {
+        let mut params = MaybeUninit::<sys::x264_param_t>::uninit();
+        // SAFETY: `raw` is live; `x264_encoder_parameters` copies the
+        // encoder's current parameters into the out-pointer in full.
+        let mut params = unsafe {
+            sys::x264_encoder_parameters(self.raw.as_ptr(), params.as_mut_ptr());
+            params.assume_init()
+        };
+        apply_bitrate(&mut params, kbps);
+        // SAFETY: `raw` is live and `params` initialised; libx264 only
+        // applies the fields that may change mid-stream (VBV was enabled
+        // at open, which bitrate reconfiguration requires).
+        if unsafe { sys::x264_encoder_reconfig(self.raw.as_ptr(), &mut params) } < 0 {
+            return Err(FerricastError::Encoder(format!(
+                "x264: reconfigure to {kbps} kbps rejected"
+            )));
+        }
+        Ok(())
+    }
+
     /// Pictures accepted but not yet emitted.
     fn delayed_frames(&self) -> c_int {
         // SAFETY: `raw` is a live encoder.
@@ -403,6 +436,16 @@ fn blank_picture() -> sys::x264_picture_t {
         sys::x264_picture_init(pic.as_mut_ptr());
         pic.assume_init()
     }
+}
+
+/// Average bitrate, peak rate and a one-second VBV buffer, all at
+/// `kbps`: the stream never bursts above the target for longer than
+/// the receiver's one-second buffering.
+fn apply_bitrate(params: &mut sys::x264_param_t, kbps: u32) {
+    let kbps = to_c_int(kbps.max(1));
+    params.rc.i_bitrate = kbps;
+    params.rc.i_vbv_max_bitrate = kbps;
+    params.rc.i_vbv_buffer_size = kbps;
 }
 
 fn to_c_int(v: u32) -> c_int {
@@ -675,6 +718,42 @@ mod tests {
     fn padded_rows_are_accepted() {
         let mut enc = configured();
         assert!(enc.encode(bgra_frame(320, 240, 1344, 0)).is_ok());
+    }
+
+    fn noise_frame(seed: u32) -> CapturedFrame {
+        let mut state = seed.wrapping_mul(2_654_435_761).max(1);
+        let buf: Vec<u8> = (0..320 * 240 * 4)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        CapturedFrame::Cpu(RawFrame {
+            width: 320,
+            height: 240,
+            stride: 1280,
+            format: PixelFormat::Bgra,
+            data: Bytes::from(buf),
+            timestamp_us: 0,
+        })
+    }
+
+    /// Pure noise at CRF would cost megabits per frame; ABR + VBV must
+    /// hold one second of it near the 500 kbps target (≈ 62 KB).
+    #[test]
+    fn bitrate_caps_incompressible_content() {
+        let mut enc = configured();
+        let total: usize = (0..30)
+            .map(|i| enc.encode(noise_frame(i + 1)).expect("encode").data.len())
+            .sum();
+        assert!(
+            total < 3 * 62_500,
+            "{total} bytes for one second at 500 kbps"
+        );
+        enc.set_bitrate_kbps(250).expect("reconfigure");
+        assert!(enc.encode(noise_frame(99)).is_ok());
     }
 
     #[test]
