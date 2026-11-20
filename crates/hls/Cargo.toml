@@ -50,3 +50,7 @@ url = { version = "2", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+[dev-dependencies]
+# `test-util` enables paused-clock tests for the timeout paths.
+tokio = { workspace = true, features = ["test-util"] }

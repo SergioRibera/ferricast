@@ -33,13 +33,10 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 /// HLS players poll the playlist every `target_duration / 2` seconds
 /// (so 2 s in our config); 30 s of silence means the client moved on.
 const KEEPALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Upper bound on how long we block a `?_HLS_msn=X&_HLS_part=Y`
-/// playlist request waiting for the ring to reach that point. RFC
-/// 8216bis §6.2.5.2 doesn't fix a number; in practice Apple's
-/// reference player gives up around 6 × PART-TARGET, so we pick a
-/// generous 10 s — that covers a couple of segment-build cycles
-/// even at the larger 4 s segment_target.
-const BLOCKING_RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// A blocking playlist reload (`?_HLS_msn=X&_HLS_part=Y`) waits at
+/// most this many target durations before answering 503
+/// (rfc8216bis §6.2.5.2).
+const BLOCKING_RELOAD_TARGET_DURATIONS: u32 = 3;
 
 /// Per-connection entry point. Loops as long as the client wants to
 /// keep the TCP connection alive (HTTP/1.1 default; opt-out via
@@ -109,15 +106,13 @@ where
                 // serving. Without this, LL-HLS clients fall back
                 // to the spec's busy-poll behaviour, which works
                 // but loses the latency benefit.
-                if let Some((msn, part)) = parse_blocking_reload(query) {
-                    let waited = wait_for_msn(&ring, msn, part, BLOCKING_RELOAD_TIMEOUT).await;
-                    tracing::debug!(
-                        %peer,
-                        msn,
-                        ?part,
-                        served = waited,
-                        "LL-HLS blocking reload"
-                    );
+                if let Some((code, reason)) = blocking_reload(&ring, query, &peer).await {
+                    write_status(&mut write_half, code, reason, b"", !client_wants_close).await?;
+                    tracing::info!(%peer, path = %request.path, status = code, "HLS");
+                    if client_wants_close {
+                        break;
+                    }
+                    continue;
                 }
                 let body = build_playlist(&ring).await?;
                 let send_body = request.method == "GET";
@@ -603,26 +598,70 @@ fn parse_part_seq_and_idx(path: &str) -> Option<(u64, u32)> {
     Some((seg.parse().ok()?, idx.parse().ok()?))
 }
 
+/// A malformed blocking-reload query; answered with 400.
+#[derive(Debug, PartialEq, Eq)]
+struct BadReloadQuery;
+
 /// Parse the `?_HLS_msn=X&_HLS_part=Y` (or just `_HLS_msn=X`) query
-/// the LL-HLS spec uses to ask for a blocking playlist reload. Any
-/// other query keys are ignored. Returns `None` when the client
-/// isn't asking for blocking semantics — caller serves the current
-/// playlist immediately in that case.
-fn parse_blocking_reload(query: &str) -> Option<(u64, Option<u32>)> {
-    if query.is_empty() {
-        return None;
-    }
+/// the LL-HLS spec uses to ask for a blocking playlist reload. Other
+/// query keys are ignored. `Ok(None)` when the client isn't asking for
+/// blocking semantics; `Err` for `_HLS_part` without `_HLS_msn` or a
+/// non-numeric value (rfc8216bis §6.2.5.2).
+fn parse_blocking_reload(
+    query: &str,
+) -> std::result::Result<Option<(u64, Option<u32>)>, BadReloadQuery> {
     let mut msn: Option<u64> = None;
     let mut part: Option<u32> = None;
-    for pair in query.split('&') {
-        let (k, v) = pair.split_once('=')?;
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         match k {
-            "_HLS_msn" => msn = v.parse().ok(),
-            "_HLS_part" => part = v.parse().ok(),
+            "_HLS_msn" => msn = Some(v.parse().map_err(|_| BadReloadQuery)?),
+            "_HLS_part" => part = Some(v.parse().map_err(|_| BadReloadQuery)?),
             _ => {}
         }
     }
-    msn.map(|m| (m, part))
+    match (msn, part) {
+        (None, Some(_)) => Err(BadReloadQuery),
+        (None, None) => Ok(None),
+        (Some(m), p) => Ok(Some((m, p))),
+    }
+}
+
+/// Handle the LL-HLS blocking-reload part of a playlist request.
+/// `None` means "serve the playlist now"; `Some((code, reason))` is
+/// an error status to answer with instead: 400 for a malformed query
+/// or an `_HLS_msn` more than two past the last segment, 503 when the
+/// requested point is not reached within three target durations
+/// (rfc8216bis §6.2.5.2).
+async fn blocking_reload(
+    ring: &Arc<RwLock<SegmentRing>>,
+    query: &str,
+    peer: &str,
+) -> Option<(u16, &'static str)> {
+    let (msn, part) = match parse_blocking_reload(query) {
+        Ok(Some(point)) => point,
+        Ok(None) => return None,
+        Err(BadReloadQuery) => return Some((400, "Bad Request")),
+    };
+    let (last_msn, target_duration) = {
+        let g = ring.read().await;
+        // The segment under construction is `next_seq`; the last
+        // complete one is the one before it.
+        (g.next_seq().checked_sub(1), g.target_duration())
+    };
+    let too_far = match last_msn {
+        Some(last) => msn > last.saturating_add(2),
+        // Nothing published yet: allow the first two segments.
+        None => msn > 1,
+    };
+    if too_far {
+        return Some((400, "Bad Request"));
+    }
+    let deadline = Duration::from_secs(u64::from(target_duration))
+        .saturating_mul(BLOCKING_RELOAD_TARGET_DURATIONS);
+    let reached = wait_for_msn(ring, msn, part, deadline).await;
+    tracing::debug!(%peer, msn, ?part, reached, "LL-HLS blocking reload");
+    (!reached).then_some((503, "Service Unavailable"))
 }
 
 /// Wait until the ring has published at least up to `(msn, part)`,
@@ -970,18 +1009,67 @@ mod tests {
 
     #[test]
     fn blocking_reload_query_parses() {
-        assert_eq!(parse_blocking_reload(""), None);
-        assert_eq!(parse_blocking_reload("foo=bar"), None);
-        assert_eq!(parse_blocking_reload("_HLS_msn=12"), Some((12, None)));
+        assert_eq!(parse_blocking_reload(""), Ok(None));
+        assert_eq!(parse_blocking_reload("foo=bar"), Ok(None));
+        assert_eq!(parse_blocking_reload("_HLS_msn=12"), Ok(Some((12, None))));
         assert_eq!(
             parse_blocking_reload("_HLS_msn=12&_HLS_part=3"),
-            Some((12, Some(3)))
+            Ok(Some((12, Some(3))))
         );
         // Order doesn't matter.
         assert_eq!(
             parse_blocking_reload("_HLS_part=3&_HLS_msn=12"),
-            Some((12, Some(3)))
+            Ok(Some((12, Some(3))))
         );
+        // _HLS_part without _HLS_msn, or garbage values, are rejected.
+        assert_eq!(parse_blocking_reload("_HLS_part=3"), Err(BadReloadQuery));
+        assert_eq!(parse_blocking_reload("_HLS_msn=x"), Err(BadReloadQuery));
+    }
+
+    fn ring_with_parts() -> Arc<RwLock<SegmentRing>> {
+        let mut ring = SegmentRing::new(6, 1);
+        ring.enable_low_latency(0.5);
+        for _ in 0..2 {
+            ring.push_pending_part(0.5, true, bytes::Bytes::from_static(&[0x47; 188]));
+            ring.push_pending_part(0.5, false, bytes::Bytes::from_static(&[0x47; 188]));
+            ring.complete_pending_segment(1.0, false);
+        }
+        Arc::new(RwLock::new(ring))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocking_reload_rejects_far_future_and_times_out_with_503() {
+        // Segments 0 and 1 are complete; 2 is under construction.
+        let ring = ring_with_parts();
+        assert_eq!(blocking_reload(&ring, "_HLS_msn=1", "t").await, None);
+        assert_eq!(
+            blocking_reload(&ring, "_HLS_part=0", "t").await,
+            Some((400, "Bad Request"))
+        );
+        // last = 1 → up to msn 3 may block; 4 is too far.
+        assert_eq!(
+            blocking_reload(&ring, "_HLS_msn=4", "t").await,
+            Some((400, "Bad Request"))
+        );
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            blocking_reload(&ring, "_HLS_msn=3", "t").await,
+            Some((503, "Service Unavailable"))
+        );
+        // Target duration 1 s → gives up after 3 s.
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn part_past_the_end_of_a_completed_segment_maps_to_the_next_one() {
+        let ring = ring_with_parts();
+        let mut g = ring.try_write().unwrap();
+        // Segment 0 has parts 0 and 1; part 2 means (1, 0), which exists.
+        assert!(g.has_reached(0, Some(2)));
+        // Segment 1 has parts 0 and 1; part 2 means (2, 0): not yet.
+        assert!(!g.has_reached(1, Some(2)));
+        g.push_pending_part(0.5, true, bytes::Bytes::from_static(&[0x47; 188]));
+        assert!(g.has_reached(1, Some(2)));
     }
 }
 

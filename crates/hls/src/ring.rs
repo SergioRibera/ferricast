@@ -282,7 +282,14 @@ impl SegmentRing {
         if let Some(seg) = self.get(msn) {
             return match part {
                 None => true,
-                Some(p) => seg.parts.iter().any(|x| x.idx >= p),
+                // A part index past the last part of a completed
+                // segment names part 0 of the next one (rfc8216bis
+                // §6.2.5.2). Classic segments have no parts at all:
+                // the completed segment satisfies any part request.
+                Some(p) if !seg.parts.is_empty() && p as usize >= seg.parts.len() => {
+                    self.has_reached(msn.saturating_add(1), Some(0))
+                }
+                Some(_) => true,
             };
         }
         if msn == self.next_seq {
