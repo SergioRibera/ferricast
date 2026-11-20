@@ -178,4 +178,12 @@ pub trait CastSession: Send + Sync {
     fn preferred_audio_codec(&self) -> AudioCodec {
         AudioCodec::Aac
     }
+
+    /// Whether this session reports link quality into the shared
+    /// [`crate::AdaptiveBitrateState`]. The manager only drops the target
+    /// bitrate to the floor on reconnect for sessions that will raise it
+    /// again; others keep their configured bitrate.
+    fn feeds_adaptive_bitrate(&self) -> bool {
+        false
+    }
 }

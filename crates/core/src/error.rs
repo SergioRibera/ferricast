@@ -32,6 +32,12 @@ pub enum FerricastError {
     #[error("Device not found: {0}")]
     DeviceNotFound(String),
 
+    /// The receiver or its user ended the session on purpose (another app
+    /// took over, "Stop casting"). Not a failure: the manager must not
+    /// reconnect.
+    #[error("Stopped by the receiver: {0}")]
+    RemoteStopped(String),
+
     #[error("Hls error: {0}")]
     Hls(String),
 
