@@ -371,33 +371,11 @@ impl<C: NvencCodec> NvencEncoder<C> {
             })?;
         Ok(())
     }
-}
 
-impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
-    const CODEC: Codec = C::FERRICAST_CODEC;
-
-    fn configure(&mut self, _config: &EncoderConfig) -> Result<()> {
-        // The `shiguredo_nvcodec::Encoder` is built fully configured
-        // by `probe_with`. A reconfigure-after-the-fact would mean
-        // tearing down the CUDA context and rebuilding the session;
-        // we don't support that today (the factory hands us a freshly-
-        // probed instance whenever the resolution changes).
-        //
-        // Drop the dmabuf cache anyway — `register_external_dmabuf`
-        // bakes the dimensions into NVENC's internal surface, so a
-        // cached `RegisteredResource` from a previous size is junk
-        // even if the fd happens to match. The cache will refill
-        // organically on the first encode at the new size.
-        #[cfg(feature = "nvenc-zero-copy")]
-        self.dmabuf_cache.clear();
-        Ok(())
-    }
-
-    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
-        let force_idr = self
-            .frame_count
-            .is_multiple_of(u64::from(self.cfg.keyframe_interval))
-            || std::mem::take(&mut self.pending_keyframe);
+    /// Submit one picture and collect its bitstream. `force_idr` is
+    /// decided by the caller so it can keep the request alive when
+    /// this fails.
+    fn encode_frame(&mut self, frame: CapturedFrame, force_idr: bool) -> Result<EncodedFrame> {
         let options = EncodeOptions {
             force_intra: false,
             force_idr,
@@ -452,6 +430,40 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
             is_keyframe,
             pts_dts: (pts, pts),
         })
+    }
+}
+
+impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
+    const CODEC: Codec = C::FERRICAST_CODEC;
+
+    fn configure(&mut self, _config: &EncoderConfig) -> Result<()> {
+        // The `shiguredo_nvcodec::Encoder` is built fully configured
+        // by `probe_with`. A reconfigure-after-the-fact would mean
+        // tearing down the CUDA context and rebuilding the session;
+        // we don't support that today (the factory hands us a freshly-
+        // probed instance whenever the resolution changes).
+        //
+        // Drop the dmabuf cache anyway — `register_external_dmabuf`
+        // bakes the dimensions into NVENC's internal surface, so a
+        // cached `RegisteredResource` from a previous size is junk
+        // even if the fd happens to match. The cache will refill
+        // organically on the first encode at the new size.
+        #[cfg(feature = "nvenc-zero-copy")]
+        self.dmabuf_cache.clear();
+        Ok(())
+    }
+
+    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
+        let force_idr = self
+            .frame_count
+            .is_multiple_of(u64::from(self.cfg.keyframe_interval))
+            || self.pending_keyframe;
+        let result = self.encode_frame(frame, force_idr);
+        // A requested IDR is only consumed by a picture NVENC actually
+        // produced, and any failure asks for a fresh IDR so the receiver
+        // never predicts across the gap.
+        self.pending_keyframe = result.is_err();
+        result
     }
 
     fn flush(self) -> Result<Vec<EncodedFrame>> {
