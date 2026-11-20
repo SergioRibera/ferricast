@@ -71,6 +71,9 @@ pub struct SegmentRing {
     /// `complete_pending_segment` moves these into the next
     /// `Segment.parts` entry.
     pending_parts: Vec<Part>,
+    /// `#EXT-X-TARGETDURATION`, fixed for the lifetime of the ring:
+    /// RFC 8216 §6.2.1 forbids changing it between playlist reloads.
+    target_duration: u8,
     /// LL-HLS PART-TARGET advertised in the playlist. `Some(_)`
     /// gates emission of LL-HLS tags. The segmenter sets this from
     /// `HlsConfig::part_target_secs`.
@@ -83,12 +86,17 @@ pub struct SegmentRing {
 }
 
 impl SegmentRing {
-    pub fn new(capacity: usize) -> Self {
+    /// Ring retaining `capacity` segments whose playlist advertises a
+    /// fixed `#EXT-X-TARGETDURATION` of `target_duration` seconds
+    /// (clamped to at least 1).
+    #[must_use]
+    pub fn new(capacity: usize, target_duration: u8) -> Self {
         Self {
             capacity,
             segments: VecDeque::with_capacity(capacity),
             next_seq: 0,
             discontinuity_seq: 0,
+            target_duration: target_duration.max(1),
             pending_parts: Vec::new(),
             part_target_secs: None,
             notify: Arc::new(Notify::new()),
@@ -106,6 +114,35 @@ impl SegmentRing {
     /// "current build" segment that doesn't have its body yet.
     pub fn next_seq(&self) -> u64 {
         self.next_seq
+    }
+
+    /// The fixed `#EXT-X-TARGETDURATION` this ring advertises.
+    #[must_use]
+    pub fn target_duration(&self) -> u8 {
+        self.target_duration
+    }
+
+    /// Clamp a segment duration so that, rounded to the nearest
+    /// integer, it never exceeds the advertised target duration
+    /// (RFC 8216 §4.3.3.1). The target is fixed, so an overlong
+    /// segment (encoder ignored the forced IDR) is reported slightly
+    /// short instead of breaking every later playlist build.
+    fn clamp_to_target(&self, duration_secs: f32) -> f32 {
+        let target = f32::from(self.target_duration);
+        if duration_secs.is_finite() && duration_secs.round() <= target {
+            return duration_secs.max(0.0);
+        }
+        tracing::warn!(
+            duration_secs,
+            target_duration = self.target_duration,
+            "HLS segment longer than EXT-X-TARGETDURATION; clamping EXTINF \
+             (encoder keyframe cadence is too slow for the configured target)"
+        );
+        if duration_secs.is_finite() {
+            target
+        } else {
+            0.0
+        }
     }
 
     pub fn pending_parts(&self) -> &[Part] {
@@ -154,6 +191,7 @@ impl SegmentRing {
         if discontinuity && !self.segments.is_empty() {
             self.discontinuity_seq = self.discontinuity_seq.saturating_add(1);
         }
+        let duration_secs = self.clamp_to_target(duration_secs);
         let seq = self.next_seq;
         self.next_seq += 1;
         self.segments.push_back(Segment {
@@ -237,19 +275,12 @@ impl SegmentRing {
     }
 
     /// Build the live media playlist from the current ring contents.
-    pub fn build_playlist(&self, min_target_duration: u8) -> Result<String, FerricastError> {
-        let observed_max = self
-            .segments
-            .iter()
-            .map(|s| s.duration_secs)
-            .filter(|d| d.is_finite() && *d > 0.0)
-            .fold(0.0_f32, f32::max);
-        let observed_ceil = if observed_max > 0.0 {
-            (observed_max.ceil() as u32).min(u8::MAX as u32) as u8
-        } else {
-            0
-        };
-        let target = min_target_duration.max(observed_ceil).max(1);
+    ///
+    /// # Errors
+    ///
+    /// Propagates playlist-writer validation failures.
+    pub fn build_playlist(&self) -> Result<String, FerricastError> {
+        let target = self.target_duration;
 
         let first_seq = self.segments.front().map(|s| s.seq).unwrap_or(0);
 

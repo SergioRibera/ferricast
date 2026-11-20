@@ -61,10 +61,10 @@ fn segment_round_trip() {
     }
 
     // Push into a ring and verify the playlist references it.
-    let mut ring = SegmentRing::new(6);
+    let mut ring = SegmentRing::new(6, 4);
     let seq = ring.push(2.5, false, Bytes::from(bytes));
     assert_eq!(seq, 0);
-    let playlist = ring.build_playlist(4).unwrap();
+    let playlist = ring.build_playlist().unwrap();
     assert!(playlist.contains("#EXTM3U"));
     assert!(playlist.contains("segment-0.ts"));
     assert!(playlist.contains("#EXTINF:2.500,"));
@@ -73,11 +73,11 @@ fn segment_round_trip() {
 
 #[test]
 fn ring_evicts_oldest_when_full() {
-    let mut ring = SegmentRing::new(3);
+    let mut ring = SegmentRing::new(3, 2);
     for _ in 0..5 {
         ring.push(1.0, false, Bytes::from_static(&[0x47; 188]));
     }
-    let playlist = ring.build_playlist(2).unwrap();
+    let playlist = ring.build_playlist().unwrap();
     // Last 3 entries kept (seqs 2, 3, 4).
     assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:2"));
     assert!(playlist.contains("segment-2.ts"));
@@ -86,32 +86,28 @@ fn ring_evicts_oldest_when_full() {
 }
 
 #[test]
-fn playlist_target_duration_adapts_to_long_segments() {
-    // Reproduces the symptom the user hit: x264 keyint=250 produces
-    // ~4 s segments while the configured min target was 4. With
-    // jitter a single 4.5 s segment used to make build_playlist
-    // error out and the HTTP handler closed the socket without
-    // writing — players saw "End of file 0KB". The ring now bumps
-    // target_duration up to ceil(max) so the playlist is always
-    // RFC 8216 §4.3.3.1-compliant.
-    let mut ring = SegmentRing::new(6);
-    ring.push(4.5, false, Bytes::from_static(&[0x47; 188]));
-    let playlist = ring
-        .build_playlist(/* min */ 4)
+fn playlist_target_duration_is_fixed_and_clamps_long_segments() {
+    // RFC 8216 §6.2.1: EXT-X-TARGETDURATION MUST NOT change between
+    // reloads. An overlong segment (encoder ignored the forced IDR)
+    // is clamped to the target instead of bumping it.
+    let mut ring = SegmentRing::new(6, 4);
+    ring.push(2.0, false, Bytes::from_static(&[0x47; 188]));
+    let before = ring.build_playlist().unwrap();
+    ring.push(4.6, false, Bytes::from_static(&[0x47; 188]));
+    let after = ring
+        .build_playlist()
         .expect("oversize segment must not fail playlist build");
-    assert!(
-        playlist.contains("#EXT-X-TARGETDURATION:5"),
-        "expected target=5 (ceil of 4.5) in:\n{playlist}"
-    );
-    assert!(playlist.contains("#EXTINF:4.500,"));
+    assert!(before.contains("#EXT-X-TARGETDURATION:4"), "{before}");
+    assert!(after.contains("#EXT-X-TARGETDURATION:4"), "{after}");
+    assert!(after.contains("#EXTINF:4.000,"), "{after}");
 }
 
 #[test]
-fn playlist_target_duration_keeps_floor_when_segments_are_short() {
-    let mut ring = SegmentRing::new(6);
-    ring.push(1.2, false, Bytes::from_static(&[0x47; 188]));
-    ring.push(1.5, false, Bytes::from_static(&[0x47; 188]));
-    let playlist = ring.build_playlist(/* min */ 4).unwrap();
-    // Floor wins because ceil(1.5)=2 < 4.
+fn playlist_target_duration_allows_rounding_down() {
+    // 4.4 rounds to 4, which is allowed under a target of 4.
+    let mut ring = SegmentRing::new(6, 4);
+    ring.push(4.4, false, Bytes::from_static(&[0x47; 188]));
+    let playlist = ring.build_playlist().unwrap();
     assert!(playlist.contains("#EXT-X-TARGETDURATION:4"));
+    assert!(playlist.contains("#EXTINF:4.400,"));
 }

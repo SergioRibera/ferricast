@@ -177,6 +177,24 @@ impl Default for HlsConfig {
     }
 }
 
+impl HlsConfig {
+    /// The fixed `#EXT-X-TARGETDURATION` the playlist advertises:
+    /// [`Self::playlist_target_duration`], raised to at least
+    /// `ceil(segment_target_secs)`. Computed once per server and never
+    /// changed afterwards (RFC 8216 §6.2.1).
+    #[must_use]
+    pub fn target_duration(&self) -> u8 {
+        let ceil = if self.segment_target_secs.is_finite() && self.segment_target_secs > 0.0 {
+            // Saturating float→int cast: a nonsensical huge target
+            // pins to u8::MAX instead of wrapping.
+            self.segment_target_secs.ceil() as u8
+        } else {
+            1
+        };
+        self.playlist_target_duration.max(ceil).max(1)
+    }
+}
+
 /// Live HLS server. [`Self::start`] spawns the capture/encode loop in
 /// the background and returns once the first segment is ready;
 /// [`Self::run`] then accepts connections forever.
@@ -220,7 +238,7 @@ impl HlsServer {
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "?".into());
 
-        let ring = Arc::new(RwLock::new(SegmentRing::new(config.keep_segments)));
+        let ring = Arc::new(RwLock::new(SegmentRing::new(config.keep_segments, config.target_duration())));
         let writer = ring.clone();
         let cfg = config.clone();
         let segmenter = tokio::spawn(async move {
@@ -399,7 +417,7 @@ impl HlsFrameSink {
 
         let local = listener.local_addr().map_err(FerricastError::from)?;
 
-        let ring = Arc::new(RwLock::new(SegmentRing::new(config.keep_segments)));
+        let ring = Arc::new(RwLock::new(SegmentRing::new(config.keep_segments, config.target_duration())));
         let segmenter_ring = ring.clone();
         let adaptive_for_segmenter = config.adaptive.clone();
         let cfg_for_segmenter = config.clone();
@@ -507,5 +525,26 @@ impl Drop for HlsFrameSink {
         // but we abort defensively in case the sender outlives us.
         self.accept.abort();
         self._segmenter.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_duration_comes_from_config_and_covers_segment_target() {
+        let cfg = HlsConfig {
+            segment_target_secs: 2.0,
+            playlist_target_duration: 4,
+            ..HlsConfig::default()
+        };
+        assert_eq!(cfg.target_duration(), 4);
+        let cfg = HlsConfig {
+            segment_target_secs: 4.5,
+            playlist_target_duration: 4,
+            ..HlsConfig::default()
+        };
+        assert_eq!(cfg.target_duration(), 5);
     }
 }

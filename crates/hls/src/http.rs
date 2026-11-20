@@ -28,7 +28,6 @@ use ferricast_core::{AdaptiveBitrateState, FerricastError, Result};
 use crate::ring::SegmentRing;
 use crate::stats::SessionStats;
 
-const PLAYLIST_TARGET_DURATION_HEADROOM: u8 = 4;
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
 /// Drop a keep-alive connection that's been idle longer than this.
 /// HLS players poll the playlist every `target_duration / 2` seconds
@@ -615,7 +614,7 @@ async fn wait_for_msn(
 
 async fn build_playlist(ring: &Arc<RwLock<SegmentRing>>) -> Result<String> {
     let g = ring.read().await;
-    g.build_playlist(PLAYLIST_TARGET_DURATION_HEADROOM)
+    g.build_playlist()
 }
 
 // ---------------------------------------------------------------------
