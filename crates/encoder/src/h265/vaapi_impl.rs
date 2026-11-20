@@ -482,7 +482,7 @@ fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         .map_err(|e| FerricastError::Encoder(format!("vaCreateBuffer(coded): {e}")))?;
 
     let mut buffers: Vec<Buffer> = Vec::with_capacity(8);
-    let mut packed_buffer_ids: Vec<VABufferID> = Vec::new();
+    let mut packed = PackedBuffers::new(&enc.display);
 
     if is_idr {
         let seq = build_seq_param(cfg);
@@ -526,8 +526,8 @@ fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         for nal in [&enc.vps_nal, &enc.sps_nal, &enc.pps_nal] {
             let (p, d) =
                 unsafe { create_packed_header(&enc.context, EncPackedHeaderType::Sequence, nal)? };
-            packed_buffer_ids.push(p);
-            packed_buffer_ids.push(d);
+            packed.ids.push(p);
+            packed.ids.push(d);
         }
     }
 
@@ -541,7 +541,7 @@ fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>
     );
 
     let mut all_ids: Vec<VABufferID> = Buffer::as_id_vec(&buffers);
-    all_ids.extend_from_slice(&packed_buffer_ids);
+    all_ids.extend_from_slice(&packed.ids);
 
     unsafe {
         let dpy = enc.display.handle();
@@ -555,7 +555,6 @@ fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>
             vaRenderPicture(dpy, ctx, all_ids.as_ptr() as *mut _, all_ids.len() as i32);
         if let Err(s) = check_status(render_status) {
             let _ = vaEndPicture(dpy, ctx);
-            destroy_packed(&enc.display, &packed_buffer_ids);
             return Err(FerricastError::Encoder(format!(
                 "vaRenderPicture(HEVC): {s:#x}"
             )));
@@ -581,8 +580,6 @@ fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         bytes = bitstream.len(),
         "VA-API HEVC encoded frame"
     );
-
-    destroy_packed(&enc.display, &packed_buffer_ids);
 
     let frame_idx_now = state.frame_idx;
     state.frame_idx += 1;
@@ -860,10 +857,31 @@ unsafe fn create_packed_header(
     Ok((p_id, d_id))
 }
 
-fn destroy_packed(display: &Rc<Display>, ids: &[VABufferID]) {
-    for id in ids {
-        unsafe {
-            let _ = vaDestroyBuffer(display.handle(), *id);
+/// Packed-header buffers created by raw FFI (cros-libva has no safe
+/// wrapper for them). Destroyed on drop so every exit path — including
+/// a failed `vaEndPicture` / `vaSyncSurface` — releases them.
+struct PackedBuffers<'a> {
+    display: &'a Display,
+    ids: Vec<VABufferID>,
+}
+
+impl<'a> PackedBuffers<'a> {
+    fn new(display: &'a Display) -> Self {
+        Self {
+            display,
+            ids: Vec::new(),
+        }
+    }
+}
+
+impl Drop for PackedBuffers<'_> {
+    fn drop(&mut self) {
+        for id in &self.ids {
+            // SAFETY: each id came from a successful `vaCreateBuffer` on
+            // this display and is destroyed exactly once, here.
+            unsafe {
+                let _ = vaDestroyBuffer(self.display.handle(), *id);
+            }
         }
     }
 }

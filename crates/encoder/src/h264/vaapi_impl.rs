@@ -609,7 +609,7 @@ fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>
     // sequence (IDR), misc (IDR), picture, packed SPS+data (IDR),
     // packed PPS+data (IDR), slice.
     let mut buffers: Vec<Buffer> = Vec::with_capacity(8);
-    let mut packed_buffer_ids: Vec<VABufferID> = Vec::new();
+    let mut packed = PackedBuffers::new(&enc.display);
 
     if is_idr {
         let seq = build_seq_param(cfg);
@@ -664,13 +664,13 @@ fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         let (sp, sd) = unsafe {
             create_packed_header(&enc.context, EncPackedHeaderType::Sequence, &enc.sps_nal)?
         };
-        packed_buffer_ids.push(sp);
-        packed_buffer_ids.push(sd);
+        packed.ids.push(sp);
+        packed.ids.push(sd);
         let (pp, pd) = unsafe {
             create_packed_header(&enc.context, EncPackedHeaderType::Picture, &enc.pps_nal)?
         };
-        packed_buffer_ids.push(pp);
-        packed_buffer_ids.push(pd);
+        packed.ids.push(pp);
+        packed.ids.push(pd);
     }
 
     let slice = build_slice_param(cfg, is_idr, state.idr_pic_id, poc_lsb, prev_ref.as_ref());
@@ -689,7 +689,7 @@ fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>
     // `Buffer::as_id_vec` is the public way to flatten a slice
     // into a `Vec<VABufferID>`.
     let mut all_ids: Vec<VABufferID> = Buffer::as_id_vec(&buffers);
-    all_ids.extend_from_slice(&packed_buffer_ids);
+    all_ids.extend_from_slice(&packed.ids);
 
     unsafe {
         let dpy = enc.display.handle();
@@ -704,7 +704,6 @@ fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         if let Err(s) = check_status(render_status) {
             // Best-effort cleanup on render failure.
             let _ = vaEndPicture(dpy, ctx);
-            destroy_packed(&enc.display, &packed_buffer_ids);
             return Err(FerricastError::Encoder(format!("vaRenderPicture: {s:#x}")));
         }
 
@@ -731,9 +730,6 @@ fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         bytes = bitstream.len(),
         "VA-API encoded frame"
     );
-
-    // Destroy the packed-header buffers we allocated by hand.
-    destroy_packed(&enc.display, &packed_buffer_ids);
 
     // The picture is in the bitstream: commit the state for the next one.
     let frame_idx_now = state.frame_idx;
@@ -1000,10 +996,31 @@ unsafe fn create_packed_header(
     Ok((p_id, d_id))
 }
 
-fn destroy_packed(display: &Rc<Display>, ids: &[VABufferID]) {
-    for id in ids {
-        unsafe {
-            let _ = vaDestroyBuffer(display.handle(), *id);
+/// Packed-header buffers created by raw FFI (cros-libva has no safe
+/// wrapper for them). Destroyed on drop so every exit path — including
+/// a failed `vaEndPicture` / `vaSyncSurface` — releases them.
+struct PackedBuffers<'a> {
+    display: &'a Display,
+    ids: Vec<VABufferID>,
+}
+
+impl<'a> PackedBuffers<'a> {
+    fn new(display: &'a Display) -> Self {
+        Self {
+            display,
+            ids: Vec::new(),
+        }
+    }
+}
+
+impl Drop for PackedBuffers<'_> {
+    fn drop(&mut self) {
+        for id in &self.ids {
+            // SAFETY: each id came from a successful `vaCreateBuffer` on
+            // this display and is destroyed exactly once, here.
+            unsafe {
+                let _ = vaDestroyBuffer(self.display.handle(), *id);
+            }
         }
     }
 }
