@@ -3,7 +3,6 @@ use ferricast_core::FerricastError;
 use std::collections::HashMap;
 use std::io::Write;
 
-
 pub const TLV_TYPE_IDENTIFIER: u8 = 0x1;
 
 pub const TLV_TYPE_STATE: u8 = 6;

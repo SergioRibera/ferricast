@@ -19,7 +19,8 @@ use x25519_dalek::PublicKey;
 use crate::{
     rtsp::{RtspManager, RtspResponse},
     tlv::{
-        self, TLV_TYPE_ENCRYPTED_DATA, TLV_TYPE_IDENTIFIER, TLV_TYPE_METHOD, TLV_TYPE_PROOF, TLV_TYPE_PUBLIC_KEY, TLV_TYPE_SALT, TLV_TYPE_SIGNATURE, TLV_TYPE_STATE
+        self, TLV_TYPE_ENCRYPTED_DATA, TLV_TYPE_IDENTIFIER, TLV_TYPE_METHOD, TLV_TYPE_PROOF,
+        TLV_TYPE_PUBLIC_KEY, TLV_TYPE_SALT, TLV_TYPE_SIGNATURE, TLV_TYPE_STATE,
     },
 };
 
@@ -50,7 +51,7 @@ pub async fn pair_pin(
     manager: &mut RtspManager,
     write_half: &mut WriteHalf<'_>,
     buf_reader: &mut BufReader<ReadHalf<'_>>,
-    uuid: &Uuid
+    uuid: &Uuid,
 ) -> Result<(), FerricastError> {
     let mut csprng = OsRng;
     let mut signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
@@ -58,7 +59,7 @@ pub async fn pair_pin(
     let ed_public_key = signing_key.verifying_key().to_bytes();
 
     let mut pin = String::new();
- 
+
     if !matches!(
         challenge,
         PairingChallenge::None | PairingChallenge::Credential
@@ -86,9 +87,8 @@ pub async fn pair_pin(
         pin = String::from_utf8(b).unwrap().trim().to_string();
     }
 
-
     tracing::info!("Pin Pair Setup");
-    
+
     pin_pair_setup(
         signing_key.clone(),
         &ed_public_key,
@@ -96,17 +96,15 @@ pub async fn pair_pin(
         write_half,
         buf_reader,
         pin,
-        uuid
+        uuid,
     )
-        .await?;
+    .await?;
 
     tracing::info!("Pin Pair Verify");
 
-    pin_pair_verify(signing_key, manager, write_half, buf_reader, uuid)
-        .await?;
+    pin_pair_verify(signing_key, manager, write_half, buf_reader, uuid).await?;
 
     tracing::info!("Done");
-    
 
     Ok(())
 }
@@ -118,7 +116,7 @@ pub async fn pin_pair_setup(
     write_half: &mut WriteHalf<'_>,
     buf_reader: &mut BufReader<ReadHalf<'_>>,
     pin: String,
-    id: &Uuid
+    id: &Uuid,
 ) -> Result<(), FerricastError> {
     let m1 = tlv::encode(vec![(TLV_TYPE_METHOD, &[0x0]), (TLV_TYPE_STATE, &[0x01])])?;
 
@@ -297,13 +295,11 @@ pub async fn pin_pair_setup(
     let m4 = res.content()?;
     let m4 = tlv::decode(m4)?;
 
-    let m4_proof = m4.get(&TLV_TYPE_PROOF)
-        .ok_or(FerricastError::Protocol("Invalid TLV, no proof".to_string()))?;
-
-
+    let m4_proof = m4.get(&TLV_TYPE_PROOF).ok_or(FerricastError::Protocol(
+        "Invalid TLV, no proof".to_string(),
+    ))?;
 
     tracing::info!("M4!");
-
 
     let mut m2_proof_input = Vec::new();
 
@@ -314,20 +310,29 @@ pub async fn pin_pair_setup(
     let m2_proof_expected = Sha512::digest(&m2_proof_input);
 
     if m2_proof_expected.as_slice() != m4_proof {
-        return Err(FerricastError::Protocol("server proof mismatch".to_string()));
+        return Err(FerricastError::Protocol(
+            "server proof mismatch".to_string(),
+        ));
     }
 
-
- 
     let k_bytes = K.as_slice();
 
-    let session_key = hkdf(k_bytes, b"Pair-Setup-Encrypt-Salt", b"Pair-Setup-Encrypt-Info", 32)?;
-    let sig_key = hkdf(k_bytes, b"Pair-Setup-Controller-Sign-Salt", b"Pair-Setup-Controller-Sign-Info", 32)?;
-
+    let session_key = hkdf(
+        k_bytes,
+        b"Pair-Setup-Encrypt-Salt",
+        b"Pair-Setup-Encrypt-Info",
+        32,
+    )?;
+    let sig_key = hkdf(
+        k_bytes,
+        b"Pair-Setup-Controller-Sign-Salt",
+        b"Pair-Setup-Controller-Sign-Info",
+        32,
+    )?;
 
     let mut sig_input = Vec::new();
 
-    sig_input.extend_from_slice(&sig_key);  
+    sig_input.extend_from_slice(&sig_key);
     sig_input.extend_from_slice(&id.into_bytes());
     sig_input.extend_from_slice(client_public_key);
 
@@ -336,19 +341,19 @@ pub async fn pin_pair_setup(
     let body = tlv::encode(vec![
         (TLV_TYPE_IDENTIFIER, &id.into_bytes()),
         (TLV_TYPE_PUBLIC_KEY, client_public_key),
-        (TLV_TYPE_SIGNATURE, &signature.to_bytes())
+        (TLV_TYPE_SIGNATURE, &signature.to_bytes()),
     ])?;
 
-    let aead = ChaCha20Poly1305::new_from_slice(&session_key)
-        .map_err(|e| FerricastError::Protocol(format!("Failed to create ChaCha20Poly1305, {:?}", e)))?;
+    let aead = ChaCha20Poly1305::new_from_slice(&session_key).map_err(|e| {
+        FerricastError::Protocol(format!("Failed to create ChaCha20Poly1305, {:?}", e))
+    })?;
 
-    
     let mut nonce = vec![0_u8; 12];
     nonce[4..].copy_from_slice(b"PS-Msg05");
 
-    let encrypted = aead.encrypt(Nonce::from_slice(&nonce), body.as_slice())
+    let encrypted = aead
+        .encrypt(Nonce::from_slice(&nonce), body.as_slice())
         .map_err(|e| FerricastError::Protocol(format!("Failed to encrypt TLV msg, {:?}", e)))?;
-   
 
     let m5 = tlv::encode(vec![
         (TLV_TYPE_ENCRYPTED_DATA, &encrypted),
@@ -374,19 +379,16 @@ pub async fn pin_pair_setup(
     println!("M6: {:?}", m6);
     println!("Shared Secret: {:?}", K);
 
-
-
     Ok(())
 }
-
 
 async fn pin_pair_verify(
     signing_key: ed25519_dalek::SigningKey,
     manager: &mut RtspManager,
     write_half: &mut WriteHalf<'_>,
     buf_reader: &mut BufReader<ReadHalf<'_>>,
-    uuid: &Uuid   
-) -> Result<(), FerricastError> { 
+    uuid: &Uuid,
+) -> Result<(), FerricastError> {
     let mut os_rng = OsRng;
     let client_static_secret = x25519_dalek::StaticSecret::random_from_rng(&mut os_rng);
 
@@ -394,10 +396,11 @@ async fn pin_pair_verify(
 
     let v1 = tlv::encode(vec![
         (TLV_TYPE_STATE, &[0x1]),
-        (TLV_TYPE_PUBLIC_KEY, client_public.as_bytes())
+        (TLV_TYPE_PUBLIC_KEY, client_public.as_bytes()),
     ])?;
 
-    manager.builder()
+    manager
+        .builder()
         .post()
         .path("/pair-verify".to_string())
         .content_type("application/octet-stream".to_string())
@@ -410,37 +413,54 @@ async fn pin_pair_verify(
     let v2 = res.content()?;
     let v2 = tlv::decode(v2)?;
 
-    let server_key_data = v2.get(&TLV_TYPE_PUBLIC_KEY).ok_or(FerricastError::Protocol("Invalid Response from Airplay Server".to_string()))?;
+    let server_key_data = v2
+        .get(&TLV_TYPE_PUBLIC_KEY)
+        .ok_or(FerricastError::Protocol(
+            "Invalid Response from Airplay Server".to_string(),
+        ))?;
 
     println!("{:?}", v2.get(&TLV_TYPE_ENCRYPTED_DATA));
-    
-    let server_encrypted = v2.get(&TLV_TYPE_ENCRYPTED_DATA).ok_or(FerricastError::Protocol("Invalid Response from airplay server".to_string()))?;
+
+    let server_encrypted = v2
+        .get(&TLV_TYPE_ENCRYPTED_DATA)
+        .ok_or(FerricastError::Protocol(
+            "Invalid Response from airplay server".to_string(),
+        ))?;
 
     if server_key_data.len() < 32 {
-        return Err(FerricastError::Protocol("Invalid Server Key Data".to_string()));
+        return Err(FerricastError::Protocol(
+            "Invalid Server Key Data".to_string(),
+        ));
     }
 
-    info!("Server Key {:?} Server Encrypted Data {:?}", server_key_data, server_encrypted);
+    info!(
+        "Server Key {:?} Server Encrypted Data {:?}",
+        server_key_data, server_encrypted
+    );
 
     let s_pk: [u8; 32] = (&server_key_data[..32]).try_into().unwrap();
 
-
-    
     let server_public_key = PublicKey::from(s_pk);
 
     let shared = client_static_secret.diffie_hellman(&server_public_key);
 
-    let verify_key = hkdf(shared.as_bytes(), b"Pair-Verify-Encrypt-Salt", b"Pair-Verify-Encrypt-Info", 32)?;
+    let verify_key = hkdf(
+        shared.as_bytes(),
+        b"Pair-Verify-Encrypt-Salt",
+        b"Pair-Verify-Encrypt-Info",
+        32,
+    )?;
 
-    
-    let aead = ChaCha20Poly1305::new_from_slice(&verify_key)
-        .map_err(|e| FerricastError::Protocol(format!("Failed to create ChaCha20Poly1305, {:?}", e)))?;
+    let aead = ChaCha20Poly1305::new_from_slice(&verify_key).map_err(|e| {
+        FerricastError::Protocol(format!("Failed to create ChaCha20Poly1305, {:?}", e))
+    })?;
 
     let mut nonce = vec![0_u8; 12];
     nonce[4..].copy_from_slice(b"PV-Msg02");
 
-    
-    let server_decrypted = aead.decrypt(Nonce::from_slice(&nonce), server_encrypted.as_slice()).map_err(|e| FerricastError::Protocol(format!("Invalid Server Encrypted info {:?}", e)))?;
+    let server_decrypted = aead
+        .decrypt(Nonce::from_slice(&nonce), server_encrypted.as_slice())
+        .map_err(|e| FerricastError::Protocol(format!("Invalid Server Encrypted info {:?}", e)))?;
 
     let client_id_bytes = uuid.as_bytes();
 
@@ -448,19 +468,19 @@ async fn pin_pair_verify(
 
     sig_input.extend_from_slice(client_public.as_bytes());
     sig_input.extend_from_slice(client_id_bytes);
-    sig_input.extend_from_slice(server_public_key.as_bytes());  
+    sig_input.extend_from_slice(server_public_key.as_bytes());
 
     let signature = signing_key.sign(sig_input.as_slice());
 
-
     let tlv_body = tlv::encode(vec![
         (TLV_TYPE_IDENTIFIER, client_id_bytes),
-        (TLV_TYPE_SIGNATURE, &signature.to_bytes())
+        (TLV_TYPE_SIGNATURE, &signature.to_bytes()),
     ])?;
-    
+
     let nonce = Nonce::from_slice(b"PV-Msg03");
 
-    let encrypted = aead.encrypt(nonce, tlv_body.as_slice())
+    let encrypted = aead
+        .encrypt(nonce, tlv_body.as_slice())
         .map_err(|e| FerricastError::Protocol(format!("Failed to Encrypt tlv body {:?}", e)))?;
 
     let v3 = tlv::encode(vec![
@@ -468,25 +488,25 @@ async fn pin_pair_verify(
         (TLV_TYPE_ENCRYPTED_DATA, &encrypted),
     ])?;
 
-    
-    manager.builder()
+    manager
+        .builder()
         .post()
         .path("/pair-verify".to_string())
         .content_type("application/octet-stream".to_string())
         .body(v3)
-        .write(write_half).await?;
+        .write(write_half)
+        .await?;
 
     let res = RtspResponse::read(buf_reader).await?;
 
     let v4 = res.content()?;
     let v4 = tlv::decode(v4);
 
-    
     info!("Pin pair verified!");
-    
+
     println!("{:?}", v4);
-    
-    Ok(())    
+
+    Ok(())
 }
 
 fn pad_to(data: Vec<u8>, size: usize) -> Vec<u8> {
