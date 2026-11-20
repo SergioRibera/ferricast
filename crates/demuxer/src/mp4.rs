@@ -86,8 +86,7 @@ impl Mp4Demuxer {
         let moov = read_moov(&file)?;
         let track = parse_moov(&moov)?;
         let file_len = file.metadata()?.len();
-        let mut samples = build_samples(&track.tables)
-            .ok_or_else(|| FerricastError::Demux("inconsistent sample tables".into()))?;
+        let mut samples = build_samples(&track.tables)?;
         if samples.is_empty() && child(&moov, b"mvex").is_some() {
             return Err(FerricastError::Demux(
                 "fragmented MP4 is not supported".into(),
@@ -295,8 +294,12 @@ fn parse_elst(elst: &[u8]) -> Option<i64> {
 }
 
 fn parse_tables(stbl: &[u8]) -> Option<Tables> {
+    // Entry counts are capped like the sample count: a table never needs more
+    // entries than there can be samples, and the cap bounds every walk below.
     let counted = |kind: &[u8; 4]| {
-        child(stbl, kind).and_then(|body| Some((body.get(8..)?, be32(body, 4)? as usize)))
+        child(stbl, kind).and_then(|body| {
+            Some((body.get(8..)?, (be32(body, 4)? as usize).min(MAX_SAMPLES)))
+        })
     };
     let (stts, count) = counted(b"stts")?;
     let (stsc, stsc_count) = counted(b"stsc")?;
@@ -367,19 +370,44 @@ fn triples(body: &[u8], count: usize) -> Vec<(u32, u32)> {
         .collect()
 }
 
-fn build_samples(tables: &Tables) -> Option<Vec<Sample>> {
+/// Checks that `stsc` runs start at chunk 1 and that their first chunks
+/// strictly increase, which lets [`build_samples`] walk them with a single
+/// forward cursor.
+fn validate_stsc(stsc: &[(u32, u32)]) -> Result<()> {
+    let mut previous = 0;
+    for &(first_chunk, _) in stsc {
+        let bad_start = previous == 0 && first_chunk != 1;
+        if bad_start || first_chunk <= previous {
+            return Err(FerricastError::Demux(format!(
+                "stsc runs must start at chunk 1 and strictly increase (found {first_chunk} after {previous})"
+            )));
+        }
+        previous = first_chunk;
+    }
+    Ok(())
+}
+
+fn build_samples(tables: &Tables) -> Result<Vec<Sample>> {
+    validate_stsc(&tables.stsc)?;
     let mut samples = Vec::with_capacity(tables.sizes.len());
     let mut durations = expand(&tables.stts);
     let mut cts_offsets = expand(&tables.ctts);
+    let mut runs = tables.stsc.iter().peekable();
+    let mut per_chunk = None;
     let mut dts = 0u64;
-    'chunks: for (chunk, &chunk_offset) in tables.chunk_offsets.iter().enumerate() {
-        let chunk_number = u32::try_from(chunk + 1).ok()?;
-        let per_chunk = tables
-            .stsc
-            .iter()
-            .rev()
-            .find(|(first_chunk, _)| *first_chunk <= chunk_number)?
-            .1;
+    'chunks: for (chunk_number, &chunk_offset) in (1u32..).zip(&tables.chunk_offsets) {
+        if samples.len() == tables.sizes.len() {
+            break;
+        }
+        while let Some(&(_, count)) = runs.next_if(|(first_chunk, _)| *first_chunk <= chunk_number)
+        {
+            per_chunk = Some(count);
+        }
+        let Some(per_chunk) = per_chunk else {
+            return Err(FerricastError::Demux(format!(
+                "stsc does not cover chunk {chunk_number}"
+            )));
+        };
         let mut offset = chunk_offset;
         for _ in 0..per_chunk {
             let Some(&size) = tables.sizes.get(samples.len()) else {
@@ -401,7 +429,7 @@ fn build_samples(tables: &Tables) -> Option<Vec<Sample>> {
             dts = dts.saturating_add(u64::from(duration));
         }
     }
-    Some(samples)
+    Ok(samples)
 }
 
 fn expand<T: Copy>(runs: &[(u32, T)]) -> impl Iterator<Item = T> + '_ {
@@ -527,6 +555,42 @@ mod tests {
             ..Tables::default()
         };
         assert_eq!(build_samples(&tables).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn unsorted_chunk_runs_are_rejected() {
+        let tables = Tables {
+            stsc: vec![(1, 1), (5, 1), (3, 1)],
+            sizes: vec![1; 4],
+            chunk_offsets: vec![0; 4],
+            ..Tables::default()
+        };
+        assert!(build_samples(&tables).is_err());
+    }
+
+    #[test]
+    fn chunk_runs_not_starting_at_chunk_one_are_rejected() {
+        let tables = Tables {
+            stsc: vec![(2, 1)],
+            sizes: vec![1; 2],
+            chunk_offsets: vec![0; 2],
+            ..Tables::default()
+        };
+        assert!(build_samples(&tables).is_err());
+    }
+
+    #[test]
+    fn many_empty_chunks_against_many_runs_finish_quickly() {
+        let chunks = 1 << 20;
+        let tables = Tables {
+            stsc: (1..=chunks).map(|chunk| (chunk, 0)).collect(),
+            sizes: vec![1],
+            chunk_offsets: vec![0; chunks as usize],
+            ..Tables::default()
+        };
+        let started = std::time::Instant::now();
+        assert!(build_samples(&tables).unwrap().is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
