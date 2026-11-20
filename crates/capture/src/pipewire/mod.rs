@@ -15,7 +15,6 @@ mod format;
 mod lease;
 mod portal;
 mod stream;
-mod vulkan;
 
 use std::sync::{Arc, RwLock};
 

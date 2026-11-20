@@ -50,7 +50,7 @@ use pw::stream::{Stream, StreamFlags, StreamRef, StreamState};
 use super::format::{self, EnumFormatParams, GpuFormat, NegotiatedFormat};
 use super::lease::{BufferLeases, DequeuedBuffer, Release};
 use super::portal::PortalStream;
-use super::vulkan::VulkanImporter;
+use crate::vulkan::VulkanImporter;
 
 pub(super) type SharedFormat = Arc<RwLock<Option<NegotiatedFormat>>>;
 
@@ -213,7 +213,7 @@ fn run(
     // Try to bring Vulkan up — gives us GPU-supported DRM modifiers
     // for the EnumFormat advertise and a real DmaBuf import path in
     // `process`. Soft-failure: we log and keep going with SHM only.
-    let importer = match VulkanImporter::new() {
+    let importer = match VulkanImporter::new(None) {
         Ok(imp) => Some(Arc::new(imp)),
         Err(e) => {
             warn!(error = %e, "Vulkan unavailable, falling back to SHM-only capture");
@@ -229,7 +229,9 @@ fn run(
         Some(imp) => format::SUPPORTED_FORMATS
             .iter()
             .filter_map(|f| {
-                let mods = imp.supported_modifiers(*f);
+                let mods = format::pixel_format(*f)
+                    .map(|p| imp.supported_modifiers(p))
+                    .unwrap_or_default();
                 if mods.is_empty() {
                     None
                 } else {

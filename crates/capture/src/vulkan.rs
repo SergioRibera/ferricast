@@ -1,18 +1,20 @@
-//! Vulkan-backed DmaBuf importer.
+//! Vulkan-backed DmaBuf importer, shared by the capture backends.
 //!
 //! Why this module exists: PipeWire's screencast on Mutter / KWin
 //! prefers DmaBuf for performance, but the buffers come back with
 //! GPU-vendor-specific DRM format modifiers (tiled, compressed). We
 //! can't `mmap` those for CPU read — every byte we'd see would be
 //! garbage. The fix is to import the dmabuf into a `VkImage`, blit it
-//! to a linearly-laid-out staging buffer, and `mmap` *that*.
+//! to a linearly-laid-out staging buffer, and `mmap` *that*. The
+//! wayland-direct backend attaches the same importer to its
+//! `GpuFrame`s so CPU encoders can read them back.
 //!
 //! Public surface:
 //!
 //! * [`VulkanImporter::new`] — try to bring up Vulkan. Returns `Err`
 //!   on systems without a loader / driver / required extensions, in
-//!   which case [`super::stream`] falls back to SHM-only EnumFormat
-//!   advertising.
+//!   which case the capture backend falls back to CPU frames (the
+//!   PipeWire worker to SHM-only EnumFormat advertising).
 //! * [`VulkanImporter::supported_modifiers`] — the actual DRM
 //!   modifiers the GPU can produce/consume for a given pixel format.
 //!   Used to populate the EnumFormat pod's `VideoModifier` choice.
@@ -43,7 +45,6 @@ use std::sync::Mutex;
 use ash::vk;
 use bytes::Bytes;
 use ferricast_core::{DmaBufImporter, DmaBufPlane, FerricastError, PixelFormat, Result};
-use pipewire::spa::param::video::VideoFormat;
 use tracing::{debug, warn};
 
 /// Public handle. The mutable per-frame state lives behind a
@@ -195,10 +196,16 @@ impl VulkanImporter {
     ///   + `VK_EXT_external_memory_dma_buf`
     /// * Logical device creation failed
     ///
+    /// `compositor_device` is the `dev_t` of the GPU the compositor
+    /// allocates its DMA-BUFs on (`linux-dmabuf` feedback
+    /// `main_device`), when the caller knows it: the matching Vulkan
+    /// device is preferred, unless `FERRICAST_DRM_RENDER_NODE`
+    /// overrides it.
+    ///
     /// The capture worker treats this as a soft failure and falls
-    /// back to SHM-only EnumFormat advertising.
-    pub(crate) fn new() -> Result<Self> {
-        let inner = init::build()?;
+    /// back to CPU frames.
+    pub(crate) fn new(compositor_device: Option<u64>) -> Result<Self> {
+        let inner = init::build(compositor_device)?;
         let state = State::create(&inner)?;
         Ok(Self {
             inner,
@@ -206,11 +213,11 @@ impl VulkanImporter {
         })
     }
 
-    /// DRM modifiers the GPU can import/export for the given video
-    /// format. Pass these to PipeWire's `VideoModifier` choice in the
-    /// EnumFormat pod.
-    pub(crate) fn supported_modifiers(&self, format: VideoFormat) -> Vec<u64> {
-        let Some(vk_format) = format::video_format_to_vk(format) else {
+    /// DRM modifiers the GPU can import and read back for the given
+    /// pixel format. PipeWire passes these to its `VideoModifier`
+    /// choice in the EnumFormat pod.
+    pub(crate) fn supported_modifiers(&self, format: PixelFormat) -> Vec<u64> {
+        let Some(vk_format) = format::pixel_format_to_vk(format) else {
             debug!(?format, "no VkFormat mapping, treating as unsupported");
             return Vec::new();
         };

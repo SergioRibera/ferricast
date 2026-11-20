@@ -3,8 +3,9 @@
 //! Streams a monitor (and, later, a toplevel) by talking
 //! `zwlr_screencopy_unstable_v1` directly to the compositor. The
 //! frames arrive in a DMA-BUF we allocated via `gbm`, the encoder
-//! consumes that fd zero-copy (VA-API VPP, NVENC once vendored), and
-//! a Vulkan importer is attached for x264-style readback fallback.
+//! consumes that fd zero-copy (VA-API VPP, NVENC), and the shared
+//! Vulkan importer ([`crate::vulkan`]) is attached for x264-style
+//! readback fallback.
 //!
 //! ## Why a separate backend from PipeWire?
 //!
@@ -30,14 +31,20 @@
 //!
 //! ## Transport
 //!
-//! - **Preferred**: `linux_dmabuf` event. We allocate a single
-//!   gbm bo per buffer slot with the LINEAR modifier (universal),
-//!   wrap it as `wl_buffer` via `zwp_linux_dmabuf_v1`, and hand it
-//!   to the compositor. Frames emit as `CapturedFrame::Gpu`.
+//! - **Preferred**: `linux_dmabuf` event. LINEAR gbm bos (universal)
+//!   from a small pool ([`pool`]), each wrapped once as a `wl_buffer`
+//!   via `zwp_linux_dmabuf_v1` and reused across frames. With the
+//!   shared Vulkan importer up, frames emit as `CapturedFrame::Gpu`
+//!   holding a lease on their bo, which keeps the compositor out of it
+//!   until every downstream clone is gone. Without the importer, or
+//!   when the output needs re-orienting (rotated / y-inverted — GPU
+//!   frames can't be), the bo is read back and emits as
+//!   `CapturedFrame::Cpu`.
 //! - **Fallback**: `buffer` event (wl_shm). Allocates a memfd pool,
 //!   reads back. Emits `CapturedFrame::Cpu`. Used when the
 //!   compositor doesn't advertise `linux_dmabuf` for the frame
-//!   (rare on modern hardware but possible on llvmpipe / nested).
+//!   (rare on modern hardware but possible on llvmpipe / nested),
+//!   and for single frames while downstream holds every pooled bo.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -47,12 +54,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ferricast_core::{
-    CaptureConfig, CaptureSource, CapturedFrame, DmaBufImporter, DmaBufPlane, FerricastError,
-    GpuFrame, PixelFormat, RawFrame, Result, ScreenCapture,
+    CaptureConfig, CaptureSource, CapturedFrame, DmaBufFd, DmaBufImporter, DmaBufPlane,
+    FerricastError, GpuFrame, PixelFormat, RawFrame, Result, ScreenCapture,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
+mod pool;
+
+use self::pool::{BufferPool, Pick, PoolKey, SlotIdx};
+use crate::vulkan::VulkanImporter;
 use crate::wayland_thumb::{EventQueueExt, Orientation};
 
 use wayland_client::{
@@ -272,11 +283,11 @@ impl DmabufAllocator {
         //
         // For non-LINEAR modifiers we'd need a Vulkan blit step
         // (tiled→linear on the GPU) followed by readback. That's
-        // what `VulkanImporter` from `pipewire/vulkan/` does;
-        // hoisting it out of the pipewire submodule is the next
-        // step to support GBM allocations that have to be tiled.
-        // Until then: if LINEAR+RENDERING can't allocate, fail
-        // the dmabuf path so sticky-disable promotes us to shm.
+        // what `crate::vulkan::VulkanImporter` does, but the CPU
+        // fallbacks here (no importer, re-orientation) `mmap` the
+        // bo, so allocation stays LINEAR-only. Until those read back
+        // through Vulkan too: if LINEAR+RENDERING can't allocate,
+        // fail the dmabuf path so sticky-disable promotes us to shm.
         let linear = u64::from(Modifier::Linear);
         for modifier_u64 in &wanted {
             if *modifier_u64 != linear {
@@ -411,6 +422,10 @@ pub struct WaylandDirectCapture {
     worker: Option<WorkerHandle>,
     fps: u32,
     size: (usize, usize),
+    // Format of the last delivered frame: the worker picks Bgra or Rgba
+    // from whatever the compositor offers, so it is only known once a
+    // frame arrives.
+    pixel_format: Option<PixelFormat>,
 }
 
 impl WaylandDirectCapture {
@@ -516,11 +531,13 @@ impl ScreenCapture for WaylandDirectCapture {
             .worker
             .as_mut()
             .ok_or_else(|| FerricastError::Capture("wayland-direct: not started".into()))?;
-        worker
+        let frame = worker
             .frames
             .recv()
             .await
-            .ok_or_else(|| FerricastError::Capture("wayland-direct: worker hung up".into()))
+            .ok_or_else(|| FerricastError::Capture("wayland-direct: worker hung up".into()))?;
+        self.pixel_format = Some(frame.pixel_format());
+        Ok(frame)
     }
 
     async fn stop(&mut self) -> Result<()> {
@@ -540,7 +557,7 @@ impl ScreenCapture for WaylandDirectCapture {
     }
 
     fn get_pixel_format(&self) -> PixelFormat {
-        PixelFormat::Bgra
+        self.pixel_format.unwrap_or(PixelFormat::Bgra)
     }
 
     fn get_screen_size(&self) -> (usize, usize) {
@@ -662,22 +679,20 @@ fn run_worker(
              fall back to wl_shm after a few rejected frames)"
         );
     }
-    let allocator = DmabufAllocator::open(feedback_info.as_ref().and_then(|i| i.main_device))
-        .ok()
-        .map(|mut a| {
-            if let Some(info) = feedback_info {
-                a.accepted = info.accepted;
-            }
-            a
-        });
-    let importer = if cfg!(feature = "pipewire") {
-        // Reuse the Vulkan importer if pipewire is built in. Without
-        // it, CapturedFrame::Gpu still emits but `into_cpu()` will
-        // fail — only matters for the x264 path.
-        try_build_importer()
-    } else {
-        None
-    };
+    let main_device = feedback_info.as_ref().and_then(|i| i.main_device);
+    let allocator = DmabufAllocator::open(main_device).ok().map(|mut a| {
+        if let Some(info) = feedback_info {
+            a.accepted = info.accepted;
+        }
+        a
+    });
+    // One importer per session, like the PipeWire worker; only worth
+    // bringing up when there are dmabufs to hand downstream.
+    let mut gpu_path = allocator.as_ref().and_then(|_| GpuPath::build(main_device));
+    // Declared after the connection so its `wl_buffer`s are destroyed
+    // before the connection goes away.
+    let mut pool: BufferPool<PooledBuffer> = BufferPool::default();
+    let mut pool_exhausted_warned = false;
 
     let frame_period = Duration::from_micros(1_000_000 / fps as u64);
     let mut next_capture = Instant::now();
@@ -787,46 +802,86 @@ fn run_worker(
                     .into(),
             ));
         }
-        let (buffer, transport) = if let (Some(offer), Some(alloc), Some(dmabuf_proxy)) =
+        // The dmabuf for this frame comes from the pool: a free buffer,
+        // a new one while under the cap, or — every buffer still leased
+        // downstream — none, and this frame goes through wl_shm. Never
+        // drop it for back-pressure: the HLS segmenter repeats its last
+        // frame, so a capture that skips frames can stall the stream.
+        let mut transport = None;
+        if let (Some(offer), Some(alloc), Some(dmabuf_proxy)) =
             (dmabuf_offer, allocator.as_ref(), dmabuf.as_ref())
         {
-            match make_dmabuf_buffer(alloc, dmabuf_proxy, &qh, offer) {
-                Ok((buf, tx)) => (buf, Transport::Dmabuf(tx)),
-                Err(e) => {
-                    // Alloc-time failure (gbm rejected our format /
-                    // modifier / RENDERING combo). Increment the
-                    // sticky-disable counter from this side too —
-                    // otherwise the per-frame "trying dmabuf,
-                    // falling back to shm" cycle just keeps
-                    // spamming logs while doing wasted work. Once
-                    // we've failed N allocs in a row, flip
-                    // dmabuf_disabled and stop trying.
-                    dmabuf_consecutive_failures = dmabuf_consecutive_failures.saturating_add(1);
-                    if dmabuf_consecutive_failures >= DMABUF_FAILURE_THRESHOLD && !dmabuf_disabled {
-                        dmabuf_disabled = true;
-                        warn!(
-                            %e,
-                            consecutive = dmabuf_consecutive_failures,
-                            "gbm refused {DMABUF_FAILURE_THRESHOLD} dmabuf allocs in a row \
-                             (typical on NVIDIA where LINEAR+RENDERING is rejected and the \
-                             driver only offers vendor-tiled modifiers we can't mmap) — \
-                             switching this session to wl_shm transport."
-                        );
+            let key = PoolKey {
+                width: offer.width,
+                height: offer.height,
+                fourcc: offer.format,
+            };
+            if pool.reconfigure(key)
+                && let Some(gpu) = gpu_path.as_ref()
+            {
+                // The old buffers are going away; drop their cached
+                // `VkImage`s (as the PipeWire worker does on
+                // renegotiation).
+                gpu.importer.reset_cache();
+            }
+            match pool.pick() {
+                Pick::Free(idx) => transport = Some(Transport::Dmabuf(idx)),
+                Pick::Grow => match make_dmabuf_buffer(alloc, dmabuf_proxy, &qh, offer) {
+                    Ok(buf) => transport = Some(Transport::Dmabuf(pool.insert(buf))),
+                    Err(e) => {
+                        // Alloc-time failure (gbm rejected our format /
+                        // modifier / RENDERING combo). Increment the
+                        // sticky-disable counter from this side too —
+                        // otherwise the per-frame "trying dmabuf,
+                        // falling back to shm" cycle just keeps
+                        // spamming logs while doing wasted work. Once
+                        // we've failed N allocs in a row, flip
+                        // dmabuf_disabled and stop trying.
+                        dmabuf_consecutive_failures = dmabuf_consecutive_failures.saturating_add(1);
+                        if dmabuf_consecutive_failures >= DMABUF_FAILURE_THRESHOLD
+                            && !dmabuf_disabled
+                        {
+                            dmabuf_disabled = true;
+                            warn!(
+                                %e,
+                                consecutive = dmabuf_consecutive_failures,
+                                "gbm refused {DMABUF_FAILURE_THRESHOLD} dmabuf allocs in a row \
+                                 (typical on NVIDIA where LINEAR+RENDERING is rejected and the \
+                                 driver only offers vendor-tiled modifiers we can't mmap) — \
+                                 switching this session to wl_shm transport."
+                            );
+                        } else {
+                            warn!(%e, "dmabuf allocation failed, falling back to shm for this frame");
+                        }
+                    }
+                },
+                Pick::Exhausted => {
+                    if std::mem::replace(&mut pool_exhausted_warned, true) {
+                        debug!("every pooled dmabuf is still leased — wl_shm for this frame");
                     } else {
-                        warn!(%e, "dmabuf allocation failed, falling back to shm for this frame");
+                        warn!(
+                            buffers = pool.alive(),
+                            "wayland-direct: downstream holds every pooled dmabuf — capturing \
+                             through wl_shm until one is released (logged once)"
+                        );
                     }
-                    if !shm_supported {
-                        warn!("no usable wl_shm offer to fall back to — dropping frame");
-                        frame.destroy();
-                        continue;
-                    }
-                    let (buf, tx) = make_shm_buffer(&shm, &qh, &info)?;
-                    (buf, Transport::Shm(tx))
                 }
             }
-        } else {
-            let (buf, tx) = make_shm_buffer(&shm, &qh, &info)?;
-            (buf, Transport::Shm(tx))
+        }
+        let transport = match transport {
+            Some(transport) => transport,
+            None if shm_supported => Transport::Shm(make_shm_buffer(&shm, &qh, &info)?),
+            None => {
+                warn!("no usable wl_shm offer to fall back to — dropping frame");
+                frame.destroy();
+                continue;
+            }
+        };
+        let Some(buffer) = transport.wl_buffer(&pool) else {
+            // Unreachable: the index came from `pick` / `insert` just above.
+            warn!("wayland-direct: pooled buffer vanished — dropping frame");
+            frame.destroy();
+            continue;
         };
         let attempted_dmabuf = matches!(transport, Transport::Dmabuf(_));
 
@@ -848,7 +903,10 @@ fn run_worker(
             // path is the one rejecting frames. shm failures are
             // a different problem (compositor bug, OOM) and don't
             // benefit from flipping the dmabuf knob.
-            if attempted_dmabuf {
+            if let Transport::Dmabuf(idx) = transport {
+                // Don't hand a buffer the compositor just refused back
+                // to it; the next frame allocates a fresh one.
+                drop(pool.discard(idx));
                 dmabuf_consecutive_failures = dmabuf_consecutive_failures.saturating_add(1);
                 if dmabuf_consecutive_failures >= DMABUF_FAILURE_THRESHOLD && !dmabuf_disabled {
                     dmabuf_disabled = true;
@@ -862,7 +920,6 @@ fn run_worker(
                 }
             }
             warn!(?state.status, "frame not ready — dropping");
-            buffer.destroy();
             continue;
         }
         // Successful frame: a dmabuf success means the path is
@@ -872,103 +929,72 @@ fn run_worker(
         if attempted_dmabuf {
             dmabuf_consecutive_failures = 0;
         }
+
+        // The compositor hands us the framebuffer in its native
+        // orientation; undo `Y_INVERT` and the output transform so the
+        // receiver sees what the user sees. Only CPU frames can be
+        // re-oriented (there is no GPU rotate step), so a frame that
+        // needs it never leaves as a `GpuFrame`.
+        let orientation = state.frame_orientation();
         let captured = match transport {
-            Transport::Dmabuf(alloc) => {
-                // Two cases for what we hand the encoder:
+            Transport::Dmabuf(idx) => {
+                // Two shapes for what we hand the encoder:
                 //
-                //   1. Vulkan importer present → emit `Gpu` with
-                //      the fd attached. GPU encoders (VA-API VPP,
-                //      future NVENC zero-copy) consume the fd
-                //      directly; CPU encoders trigger
-                //      `into_cpu()` which routes through the
-                //      importer's Vulkan readback.
-                //   2. No importer → `CapturedFrame::Gpu` with
-                //      `importer: None` would just blow up at the
-                //      encoder's `into_cpu()` call (the user's
-                //      most recent bug: "GpuFrame has no DmaBuf
-                //      importer attached"). So we mmap the bo via
-                //      gbm here and emit `Cpu` straight away.
-                //      `gbm_bo_map(READ)` is allowed on LINEAR
-                //      bos including ones flagged RENDERING; the
-                //      driver may return a staging copy on
-                //      non-coherent hosts, but the bytes are the
-                //      same. We pay one CPU memcpy that the
-                //      encoder would have paid anyway via Vulkan
-                //      readback — net the same end-to-end cost,
-                //      and it gets the path working today on
-                //      hosts where we haven't hoisted the Vulkan
-                //      importer out of the pipewire submodule yet.
-                if let Some(importer) = importer.clone() {
-                    // Minimal compile fix for the owned `DmaBufFd` plane type.
-                    let Ok(fd) = ferricast_core::DmaBufFd::dup(alloc.fd.as_fd()) else {
-                        warn!("wayland-direct: dup(dmabuf fd) failed — dropping frame");
-                        buffer.destroy();
+                //   1. `Gpu`: the pooled dmabuf itself, leased until
+                //      every clone of the frame is gone, with the
+                //      Vulkan importer attached. GPU encoders (VA-API
+                //      VPP, NVENC) import the fd directly; CPU encoders
+                //      call `into_cpu()`, which reads it back through
+                //      Vulkan.
+                //   2. `Cpu`: no importer, a layout it can't read, or
+                //      an orientation to undo. Read the LINEAR buffer
+                //      back here via `mmap` (see `mmap_bo_to_raw`) —
+                //      one memcpy the encoder would have paid anyway.
+                let gpu = match gpu_path.as_mut() {
+                    Some(_) if !orientation.is_identity() => {
+                        if !std::mem::replace(&mut gpu_orientation_warned, true) {
+                            warn!(
+                                ?orientation,
+                                "wayland-direct: output is rotated / y-inverted and GPU \
+                                 frames can't be re-oriented — emitting CPU frames"
+                            );
+                        }
+                        None
+                    }
+                    Some(gpu) => gpu.frame(&pool, idx),
+                    None => None,
+                };
+                if let Some(gpu) = gpu {
+                    CapturedFrame::Gpu(gpu)
+                } else {
+                    let Some(pooled) = pool.get(idx) else {
+                        warn!("wayland-direct: pooled buffer vanished — dropping frame");
                         continue;
                     };
-                    CapturedFrame::Gpu(GpuFrame {
-                        width: alloc.width,
-                        height: alloc.height,
-                        stride: alloc.stride,
-                        format: alloc.format,
-                        timestamp_us: now_us(),
-                        plane: DmaBufPlane {
-                            fd,
-                            offset: 0,
-                            stride: alloc.stride,
-                            modifier: alloc.modifier,
-                            size: alloc.stride.saturating_mul(alloc.height),
-                        },
-                        importer: Some(importer),
-                        lease: None,
-                    })
-                } else {
-                    match mmap_bo_to_raw(&alloc) {
-                        Ok(raw) => CapturedFrame::Cpu(raw),
+                    match mmap_bo_to_raw(&pooled.alloc) {
+                        Ok(raw) => CapturedFrame::Cpu(orient_raw_frame(raw, orientation)),
                         Err(e) => {
-                            warn!(
-                                %e,
-                                "wayland-direct: gbm_bo_map readback failed — dropping frame"
-                            );
-                            buffer.destroy();
+                            warn!(%e, "wayland-direct: dmabuf readback failed — dropping frame");
                             continue;
                         }
                     }
                 }
             }
-            Transport::Shm(shm_buf) => CapturedFrame::Cpu(RawFrame {
-                width: shm_buf.width,
-                height: shm_buf.height,
-                stride: shm_buf.stride,
-                format: shm_buf.pixel_format,
-                data: Bytes::copy_from_slice(shm_buf.mmap.as_slice()),
-                timestamp_us: now_us(),
-            }),
-        };
-        buffer.destroy();
-
-        // The compositor hands us the framebuffer in its native
-        // orientation; undo `Y_INVERT` and the output transform so the
-        // receiver sees what the user sees.
-        let orientation = state.frame_orientation();
-        let captured = match captured {
-            CapturedFrame::Cpu(raw) => CapturedFrame::Cpu(orient_raw_frame(raw, orientation)),
-            CapturedFrame::Gpu(gpu) => {
-                // A GPU frame goes to the encoder untouched — there is
-                // no GPU-side rotate step yet. Unreachable today
-                // (`try_build_importer` returns `None`, so dmabufs are
-                // read back to CPU above), hence log instead of fixing.
-                if !orientation.is_identity() && !gpu_orientation_warned {
-                    gpu_orientation_warned = true;
-                    warn!(
-                        ?orientation,
-                        "wayland-direct: output is rotated / y-inverted but GPU frames \
-                         can't be re-oriented — the stream will appear transformed"
-                    );
-                }
-                CapturedFrame::Gpu(gpu)
-            }
+            Transport::Shm(shm_buf) => CapturedFrame::Cpu(orient_raw_frame(
+                RawFrame {
+                    width: shm_buf.width,
+                    height: shm_buf.height,
+                    stride: shm_buf.stride,
+                    format: shm_buf.pixel_format,
+                    data: Bytes::copy_from_slice(shm_buf.mmap.as_slice()),
+                    timestamp_us: now_us(),
+                },
+                orientation,
+            )),
         };
 
+        // A full channel drops the frame here, which also ends its
+        // lease: the buffer is free for the next capture.
         if frame_tx.try_send(captured).is_err() {
             trace!("consumer behind — dropping frame");
         }
@@ -1009,19 +1035,127 @@ fn orient_raw_frame(raw: RawFrame, orientation: Orientation) -> RawFrame {
     }
 }
 
-fn try_build_importer() -> Option<Arc<dyn DmaBufImporter>> {
-    // The Vulkan importer lives in the pipewire sub-module today and
-    // is gated behind that feature. When pipewire is also enabled,
-    // we reach for it; otherwise CapturedFrame::Gpu goes out with
-    // `importer: None` and x264 fallback fails. A follow-up should
-    // hoist `VulkanImporter` up to a shared module so wayland-direct
-    // alone can readback for CPU encoders.
-    None
+/// Zero-copy output: the Vulkan importer attached to every `GpuFrame`
+/// (so CPU encoders can still `into_cpu()` it) and the modifiers it
+/// can read back. Without it dmabuf frames are read back to CPU on the
+/// capture thread instead.
+struct GpuPath {
+    importer: Arc<VulkanImporter>,
+    bgra_modifiers: Vec<u64>,
+    rgba_modifiers: Vec<u64>,
+    unreadable_warned: bool,
 }
 
+impl GpuPath {
+    /// Bring the importer up on the compositor's GPU
+    /// (`compositor_device` from `linux-dmabuf` feedback, when known).
+    /// `None`, logged, when Vulkan is unusable here.
+    fn build(compositor_device: Option<u64>) -> Option<Self> {
+        let importer = match VulkanImporter::new(compositor_device) {
+            Ok(importer) => importer,
+            Err(e) => {
+                warn!(
+                    %e,
+                    "wayland-direct: Vulkan importer unavailable — dmabuf frames are read \
+                     back to CPU on the capture thread"
+                );
+                return None;
+            }
+        };
+        let path = Self {
+            bgra_modifiers: importer.supported_modifiers(PixelFormat::Bgra),
+            rgba_modifiers: importer.supported_modifiers(PixelFormat::Rgba),
+            importer: Arc::new(importer),
+            unreadable_warned: false,
+        };
+        info!(
+            bgra_modifiers = path.bgra_modifiers.len(),
+            rgba_modifiers = path.rgba_modifiers.len(),
+            "wayland-direct: Vulkan importer ready — dmabuf frames go downstream zero-copy"
+        );
+        Some(path)
+    }
+
+    /// Whether the importer can read a buffer back, so a CPU encoder
+    /// handed the `GpuFrame` won't fail on `into_cpu()`.
+    fn can_read_back(&self, format: PixelFormat, modifier: u64) -> bool {
+        let modifiers = match format {
+            PixelFormat::Bgra => &self.bgra_modifiers,
+            PixelFormat::Rgba => &self.rgba_modifiers,
+            PixelFormat::Nv12 | PixelFormat::I420 => return false,
+        };
+        modifiers.contains(&modifier)
+    }
+
+    /// Lease the pooled buffer at `idx` into a `GpuFrame` owning a
+    /// `dup` of its fd. `None` (logged) when the buffer can't go
+    /// downstream; the caller then reads it back to CPU.
+    fn frame(&mut self, pool: &BufferPool<PooledBuffer>, idx: SlotIdx) -> Option<GpuFrame> {
+        let alloc = &pool.get(idx)?.alloc;
+        if !self.can_read_back(alloc.format, alloc.modifier) {
+            if !std::mem::replace(&mut self.unreadable_warned, true) {
+                warn!(
+                    format = ?alloc.format,
+                    modifier = format!("0x{:016x}", alloc.modifier),
+                    "wayland-direct: Vulkan can't read this dmabuf layout back — \
+                     emitting CPU frames"
+                );
+            }
+            return None;
+        }
+        let fd = match DmaBufFd::dup(alloc.fd.as_fd()) {
+            Ok(fd) => fd,
+            Err(e) => {
+                warn!(%e, "wayland-direct: dup(dmabuf fd) failed — CPU readback for this frame");
+                return None;
+            }
+        };
+        let lease = pool.lease(idx)?;
+        Some(GpuFrame {
+            width: alloc.width,
+            height: alloc.height,
+            stride: alloc.stride,
+            format: alloc.format,
+            timestamp_us: now_us(),
+            plane: DmaBufPlane {
+                fd,
+                offset: 0,
+                stride: alloc.stride,
+                modifier: alloc.modifier,
+                size: alloc.stride.saturating_mul(alloc.height),
+            },
+            importer: Some(Arc::clone(&self.importer) as Arc<dyn DmaBufImporter>),
+            lease: Some(lease),
+        })
+    }
+}
+
+/// A pooled dmabuf plus the `wl_buffer` the compositor knows it as;
+/// both live as long as the pool keeps the slot.
+struct PooledBuffer {
+    alloc: AllocatedBuffer,
+    wl_buffer: WlBuffer,
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        self.wl_buffer.destroy();
+    }
+}
+
+/// Where this frame's screencopy lands.
 enum Transport {
-    Dmabuf(AllocatedBuffer),
+    Dmabuf(SlotIdx),
     Shm(ShmBuffer),
+}
+
+impl Transport {
+    fn wl_buffer(&self, pool: &BufferPool<PooledBuffer>) -> Option<WlBuffer> {
+        match self {
+            Self::Dmabuf(idx) => pool.get(*idx).map(|b| b.wl_buffer.clone()),
+            Self::Shm(shm) => Some(shm.wl_buffer.clone()),
+        }
+    }
 }
 
 fn make_dmabuf_buffer(
@@ -1029,7 +1163,7 @@ fn make_dmabuf_buffer(
     dmabuf: &ZwpLinuxDmabufV1,
     qh: &QueueHandle<WorkerState>,
     offer: &DmabufOffer,
-) -> Result<(WlBuffer, AllocatedBuffer)> {
+) -> Result<PooledBuffer> {
     let fourcc = drm_fourcc::DrmFourcc::try_from(offer.format).map_err(|_| {
         FerricastError::Capture(format!("unknown DRM fourcc 0x{:08x}", offer.format))
     })?;
@@ -1070,10 +1204,15 @@ fn make_dmabuf_buffer(
         (),
     );
     params.destroy();
-    Ok((wl_buf, buf))
+    Ok(PooledBuffer {
+        alloc: buf,
+        wl_buffer: wl_buf,
+    })
 }
 
+/// One-shot wl_shm buffer; its `wl_buffer` is destroyed on drop.
 struct ShmBuffer {
+    wl_buffer: WlBuffer,
     _fd: OwnedFd,
     mmap: MmapRegion,
     width: u32,
@@ -1082,11 +1221,17 @@ struct ShmBuffer {
     pixel_format: PixelFormat,
 }
 
+impl Drop for ShmBuffer {
+    fn drop(&mut self) {
+        self.wl_buffer.destroy();
+    }
+}
+
 fn make_shm_buffer(
     shm: &WlShm,
     qh: &QueueHandle<WorkerState>,
     info: &FrameInfo,
-) -> Result<(WlBuffer, ShmBuffer)> {
+) -> Result<ShmBuffer> {
     let Some(offer) = info.shm.as_ref() else {
         return Err(FerricastError::Capture(
             "compositor didn't offer wl_shm format for this frame".into(),
@@ -1114,17 +1259,15 @@ fn make_shm_buffer(
         (),
     );
     pool.destroy();
-    Ok((
-        wl_buf,
-        ShmBuffer {
-            _fd: fd,
-            mmap,
-            width: info.width,
-            height: info.height,
-            stride,
-            pixel_format,
-        },
-    ))
+    Ok(ShmBuffer {
+        wl_buffer: wl_buf,
+        _fd: fd,
+        mmap,
+        width: info.width,
+        height: info.height,
+        stride,
+        pixel_format,
+    })
 }
 
 fn now_us() -> u64 {
@@ -1135,11 +1278,10 @@ fn now_us() -> u64 {
         .unwrap_or(0)
 }
 
-/// Read a freshly-captured dmabuf back to host bytes. Used when no
-/// Vulkan importer is available to attach to a `CapturedFrame::Gpu`
-/// — without an importer the encoder's `into_cpu()` call would fail
-/// at the wire, and the failure mode is worse than paying for one
-/// mmap copy.
+/// Read a freshly-captured dmabuf back to host bytes. Used when the
+/// frame can't leave as a `CapturedFrame::Gpu`: no Vulkan importer
+/// to attach (the encoder's `into_cpu()` would fail), a layout it
+/// can't read, or an orientation to undo on the CPU.
 ///
 /// We *don't* go through `gbm_bo_map` here. That call has been
 /// observed to return `EAGAIN` ("Resource temporarily unavailable")

@@ -292,7 +292,7 @@ fn enum_format_shm(params: &EnumFormatParams) -> Vec<u8> {
 }
 
 /// `(VideoFormat, modifiers)` pair that the GPU has agreed to import.
-/// Built up by [`super::stream`] from [`super::vulkan::VulkanImporter`]
+/// Built up by [`super::stream`] from [`crate::vulkan::VulkanImporter`]
 /// at connect time and passed in here.
 pub(super) struct GpuFormat {
     pub format: VideoFormat,
