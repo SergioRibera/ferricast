@@ -220,11 +220,26 @@ where
                         let produced_at = s.produced_at;
                         // Resolve any Range request. Clients that don't
                         // ask just get the full body.
-                        let (start, end) =
-                            resolve_range(request.range, total_len).unwrap_or((0, total_len));
-                        let slice = &s.data[start..end];
+                        let reply = resolve_range(request.range, total_len);
+                        let (start, end) = match reply {
+                            RangeReply::Partial { start, end } => (start, end),
+                            RangeReply::Full | RangeReply::Unsatisfiable => (0, total_len),
+                        };
+                        let slice = s.data.get(start..end).unwrap_or_default();
                         let len = slice.len();
-                        if let Some(_r) = request.range {
+                        if reply == RangeReply::Unsatisfiable {
+                            write_range_not_satisfiable(
+                                &mut write_half,
+                                total_len,
+                                !client_wants_close,
+                            )
+                            .await?;
+                            tracing::info!(%peer, path = %request.path, status = 416, "HLS");
+                            if client_wants_close {
+                                break;
+                            }
+                            continue;
+                        } else if let RangeReply::Partial { .. } = reply {
                             write_partial_content(
                                 &mut write_half,
                                 "video/mp2t",
@@ -527,26 +542,43 @@ fn parse_range(value: &str) -> Option<(u64, Option<u64>)> {
     Some((start, end))
 }
 
-/// Convert a parsed Range header into a half-open byte interval `[a, b)`
-/// over the segment body, clamping to its actual length. Returns
-/// `None` if the range is entirely outside the body (caller should
-/// then fall back to a 200 full-body response — strict HTTP would
-/// say 416, but Chromecast HLS players don't rely on Range strictness
-/// and falling back is the more forgiving choice).
-fn resolve_range(range: Option<(u64, Option<u64>)>, total: usize) -> Option<(usize, usize)> {
-    let (start, end) = range?;
-    let total64 = total as u64;
-    if start >= total64 {
-        return None;
-    }
-    let last = match end {
-        Some(e) => e.min(total64.saturating_sub(1)),
-        None => total64.saturating_sub(1),
+/// How a segment GET answers its (optional) `Range` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeReply {
+    /// No usable range: 200 with the whole body. Covers both "no
+    /// header" and a syntactically invalid one (`last < first`), which
+    /// RFC 9110 §14.2 says to ignore.
+    Full,
+    /// 206 with the half-open byte interval `[start, end)`.
+    Partial { start: usize, end: usize },
+    /// 416: the first byte is past the end of the body.
+    Unsatisfiable,
+}
+
+/// Resolve a parsed Range header against a body of `total` bytes,
+/// clamping the last byte to the body length.
+fn resolve_range(range: Option<(u64, Option<u64>)>, total: usize) -> RangeReply {
+    let Some((start, end)) = range else {
+        return RangeReply::Full;
     };
-    if last < start {
-        return None;
+    if let Some(e) = end
+        && e < start
+    {
+        return RangeReply::Full;
     }
-    Some((start as usize, (last + 1) as usize))
+    let total64 = u64::try_from(total).unwrap_or(u64::MAX);
+    if start >= total64 {
+        return RangeReply::Unsatisfiable;
+    }
+    let last = end.map_or(total64 - 1, |e| e.min(total64 - 1));
+    // Both bounds are < total, which is a usize.
+    match (usize::try_from(start), usize::try_from(last)) {
+        (Ok(start), Ok(last)) => RangeReply::Partial {
+            start,
+            end: last + 1,
+        },
+        _ => RangeReply::Full,
+    }
 }
 
 fn is_segment_path(path: &str) -> bool {
@@ -698,6 +730,20 @@ where
     if send_body {
         w.write_all(body).await?;
     }
+    Ok(())
+}
+
+/// 416 for a range starting past the end of a `total`-byte body, with
+/// the `Content-Range: bytes */total` header RFC 9110 §15.5.17 asks for.
+async fn write_range_not_satisfiable<W>(w: &mut W, total: usize, keep_alive: bool) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut head = String::with_capacity(256);
+    head.push_str("HTTP/1.1 416 Range Not Satisfiable\r\n");
+    write_common(&mut head, "text/plain", 0, false, true, keep_alive);
+    head.push_str(&format!("Content-Range: bytes */{total}\r\n\r\n"));
+    w.write_all(head.as_bytes()).await?;
     Ok(())
 }
 
@@ -879,11 +925,22 @@ mod tests {
 
     #[test]
     fn resolve_range_clamps_to_body() {
-        assert_eq!(resolve_range(Some((0, Some(9))), 1000), Some((0, 10)));
-        assert_eq!(resolve_range(Some((0, Some(9999))), 1000), Some((0, 1000)));
-        assert_eq!(resolve_range(Some((100, None)), 1000), Some((100, 1000)));
-        // Start past EOF → None (caller falls back to 200 full body).
-        assert_eq!(resolve_range(Some((10_000, None)), 1000), None);
+        let partial = |start, end| RangeReply::Partial { start, end };
+        assert_eq!(resolve_range(Some((0, Some(9))), 1000), partial(0, 10));
+        assert_eq!(resolve_range(Some((0, Some(9999))), 1000), partial(0, 1000));
+        assert_eq!(resolve_range(Some((100, None)), 1000), partial(100, 1000));
+        assert_eq!(resolve_range(None, 1000), RangeReply::Full);
+        // last < first is syntactically invalid: ignored.
+        assert_eq!(resolve_range(Some((10, Some(5))), 1000), RangeReply::Full);
+        // Start past EOF → 416.
+        assert_eq!(
+            resolve_range(Some((10_000, None)), 1000),
+            RangeReply::Unsatisfiable
+        );
+        assert_eq!(
+            resolve_range(Some((1000, Some(1999))), 1000),
+            RangeReply::Unsatisfiable
+        );
     }
 
     #[test]
@@ -951,5 +1008,23 @@ mod request_limit_tests {
         assert_eq!(req.path, "/a/index.m3u8");
         assert!(req.connection_close);
         assert_eq!(req.range, Some((0, Some(9))));
+    }
+}
+
+#[cfg(test)]
+mod range_reply_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsatisfiable_range_reply_carries_total_length() {
+        let mut out = Vec::new();
+        write_range_not_satisfiable(&mut out, 1234, true)
+            .await
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"));
+        assert!(text.contains("Content-Range: bytes */1234\r\n"));
+        assert!(text.contains("Content-Length: 0\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
     }
 }
