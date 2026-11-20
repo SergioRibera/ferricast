@@ -8,6 +8,10 @@ pub enum Due {
     Stopped,
 }
 
+/// Longest a frame may wait for its turn; a frame due further ahead than
+/// this is treated as a timeline jump and re-anchors the clock instead.
+const MAX_WAIT: Duration = Duration::from_secs(2);
+
 #[derive(Debug, PartialEq, Eq)]
 enum Plan {
     Anchor,
@@ -43,6 +47,10 @@ impl Clock {
         let mut state = self.lock();
         state.paused = true;
         state.anchor = None;
+        drop(state);
+        // Wake a waiter sleeping on a frame's due time so it parks on the
+        // pause instead of showing the frame once its timeout expires.
+        self.changed.notify_all();
     }
 
     pub fn resume(&self) {
@@ -112,9 +120,18 @@ fn plan(
     if pts_us < base {
         return Plan::Anchor;
     }
-    let due = wall + Duration::from_micros(pts_us - base);
+    // A forward jump in the timestamps (a gap in the file, a broken PTS)
+    // would otherwise park the render thread for the whole gap.
+    let Some(due) = wall.checked_add(Duration::from_micros(pts_us - base)) else {
+        return Plan::Anchor;
+    };
     if due > now {
-        return Plan::Wait(due - now);
+        let wait = due - now;
+        return if wait > MAX_WAIT {
+            Plan::Anchor
+        } else {
+            Plan::Wait(wait)
+        };
     }
     if now - due <= max_lateness {
         return Plan::Show;
@@ -147,6 +164,36 @@ mod tests {
         assert_eq!(
             plan(anchored(start), Some(start), start, 1_040_000, LATENESS),
             Plan::Wait(Duration::from_millis(40))
+        );
+    }
+
+    #[test]
+    fn a_forward_jump_resynchronises_instead_of_freezing() {
+        let start = Instant::now();
+        assert_eq!(
+            plan(anchored(start), Some(start), start, 1_000_000 + 60_000_000, LATENESS),
+            Plan::Anchor
+        );
+        assert_eq!(
+            plan(anchored(start), Some(start), start, u64::MAX, LATENESS),
+            Plan::Anchor
+        );
+    }
+
+    #[test]
+    fn pausing_holds_a_frame_that_was_waiting() {
+        let clock = Arc::new(Clock::new(LATENESS));
+        assert_eq!(clock.wait_for(0), Due::Show);
+        let (sent, received) = mpsc::channel();
+        let waiter = Arc::clone(&clock);
+        std::thread::spawn(move || sent.send(waiter.wait_for(1_500_000)));
+        std::thread::sleep(Duration::from_millis(50));
+        clock.pause();
+        assert!(received.recv_timeout(Duration::from_secs(2)).is_err());
+        clock.stop();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)),
+            Ok(Due::Stopped)
         );
     }
 
