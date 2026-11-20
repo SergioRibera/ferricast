@@ -4,10 +4,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::daemon::PickerRequest;
+use crate::daemon::{PickerRequest, SharedManager};
 use crate::picker;
 use crate::receiver_window;
 
@@ -42,7 +41,7 @@ pub enum AppChannel {
 impl RadioChannel<AppState> for AppChannel {}
 
 pub struct FerricastApp {
-    pub stream_manager: Arc<Mutex<StreamManager>>,
+    pub stream_manager: SharedManager,
     pub radio_station: RadioStation<AppState, AppChannel>,
     /// Receiver for picker requests coming from the daemon's
     /// D-Bus path (e.g. `--background` mode where there's no
@@ -180,7 +179,7 @@ impl App for FerricastApp {
                                         move || {
                                             let sm = sm.clone();
                                             spawn(async move {
-                                                let sm = sm.lock().await;
+                                                let sm = sm.read().await;
                                                 if let Err(e) = sm.stop_stream(device_id).await {
                                                     tracing::error!(%e, ?device_id, "stop_stream");
                                                 }

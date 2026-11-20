@@ -16,7 +16,7 @@ use ferricast::{ManagerEvent, SourceChange, SourceEnumerator};
 use ferricast_dbus::{
     ActiveStreamDto, BUS_NAME, DeviceDto, MonitorInfoDto, OBJECT_PATH, SourceDto, WindowInfoDto,
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedValue, Value};
@@ -226,6 +226,12 @@ fn window_to_dto(w: ferricast::WindowInfo) -> WindowInfoDto {
 /// listens on the corresponding `mpsc::Receiver`, opens the picker
 /// window, and replies through the embedded oneshot. `None` reply
 /// means the user cancelled.
+/// The manager shared by the window, the D-Bus service and the
+/// picker. Stream and discovery calls take the read lock and run
+/// concurrently (the manager locks internally); the write lock is only
+/// for receiver start-up and shutdown.
+pub type SharedManager = Arc<RwLock<StreamManager>>;
+
 pub struct PickerRequest {
     pub device_id: Uuid,
     pub reply: tokio::sync::oneshot::Sender<Option<SourceDto>>,
@@ -233,7 +239,7 @@ pub struct PickerRequest {
 
 /// Object exported on the bus. The manager is shared with the rest
 /// of the app (the Freya window holds the same `Arc`), which is why
-/// it's behind a mutex. The enumerator is read-only — its own
+/// see [`SharedManager`] for the locking. The enumerator is read-only — its own
 /// internal locking handles concurrent access.
 ///
 /// `picker_req_tx` is only `Some` when the binary was launched in
@@ -243,7 +249,7 @@ pub struct PickerRequest {
 /// fast instead of hanging waiting for a picker that can never
 /// open.
 pub struct ManagerService {
-    pub manager: Arc<Mutex<StreamManager>>,
+    pub manager: SharedManager,
     pub enumerator: Arc<dyn SourceEnumerator>,
     pub picker_req_tx: Option<tokio::sync::mpsc::Sender<PickerRequest>>,
 }
@@ -307,7 +313,7 @@ impl ManagerService {
             return Ok(uuid);
         }
         let needle = ident.to_lowercase();
-        let m = self.manager.lock().await;
+        let m = self.manager.read().await;
         for d in m.devices().await {
             if d.name.to_lowercase() == needle {
                 return Ok(d.id);
@@ -322,18 +328,20 @@ impl ManagerService {
 #[zbus::interface(name = "rs.sergioribera.ferricast.Manager1")]
 impl ManagerService {
     async fn list_devices(&self) -> zbus::fdo::Result<Vec<DeviceDto>> {
-        let m = self.manager.lock().await;
+        let m = self.manager.read().await;
         Ok(m.devices().await.iter().map(device_to_dto).collect())
     }
 
     async fn list_active_streams(&self) -> zbus::fdo::Result<Vec<ActiveStreamDto>> {
-        // `StreamManager` doesn't expose the active-stream map yet;
-        // we keep this method around so the wire contract is stable
-        // and add the backing accessor in a follow-up. For now,
-        // return empty — clients should rely on StreamStarted /
-        // StreamStopped signals to track liveness.
-        let _ = self.manager.lock().await;
-        Ok(Vec::new())
+        // Includes streams that are still starting.
+        let m = self.manager.read().await;
+        Ok(m.active_streams()
+            .into_iter()
+            .map(|d| ActiveStreamDto {
+                device_id: d.id.to_string(),
+                device_name: d.name,
+            })
+            .collect())
     }
 
     async fn start_stream(&self, device_id: String, source: SourceDto) -> zbus::fdo::Result<()> {
@@ -385,7 +393,7 @@ impl ManagerService {
             );
         }
 
-        let m = self.manager.lock().await;
+        let m = self.manager.read().await;
         let capture = NativeCapture::new();
         let encoder = H264Encoder::default();
         let config = if source.audio() {
@@ -417,7 +425,7 @@ impl ManagerService {
 
     async fn stop_stream(&self, device_id: String) -> zbus::fdo::Result<()> {
         let id = self.resolve(&device_id).await?;
-        let m = self.manager.lock().await;
+        let m = self.manager.read().await;
         m.stop_stream(id)
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -426,7 +434,7 @@ impl ManagerService {
 
     #[zbus(property)]
     async fn protocols(&self) -> Vec<String> {
-        let m = self.manager.lock().await;
+        let m = self.manager.read().await;
         m.registered_protocols()
             .into_iter()
             .map(|s| s.to_string())
@@ -626,7 +634,7 @@ impl ManagerService {
 /// D-Bus signal, optionally also forwarding it to `forward_tx` for
 /// in-process consumers like the GUI.
 pub async fn start(
-    manager: Arc<Mutex<StreamManager>>,
+    manager: SharedManager,
     enumerator: Arc<dyn SourceEnumerator>,
     event_rx: mpsc::Receiver<ManagerEvent>,
     forward_tx: Option<mpsc::Sender<ManagerEvent>>,

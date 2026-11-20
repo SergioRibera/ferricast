@@ -6,12 +6,12 @@ use clap::Parser;
 use ferricast::ManagerEvent;
 use ferricast::prelude::*;
 use freya::{prelude::*, radio::*};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 use crate::app::ReceiverWindowReq;
-use crate::daemon::PickerRequest;
+use crate::daemon::{PickerRequest, SharedManager};
 
 mod app;
 mod cli;
@@ -139,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
             }
         })
         .build_with_events();
-    let manager = Arc::new(Mutex::new(manager));
+    let manager: SharedManager = Arc::new(tokio::sync::RwLock::new(manager));
 
     // Source enumerator: picks wlroots → x11 → stub at runtime. The
     // daemon doesn't need to know which backend it is — the trait
@@ -182,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let sm = manager.clone();
         tokio::spawn(async move {
-            if let Err(e) = sm.lock().await.start_discovery().await {
+            if let Err(e) = sm.read().await.start_discovery().await {
                 tracing::error!(%e, "Failed to start discovery");
             } else {
                 tracing::info!("Discovery started for all protocols");
@@ -196,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let sm = manager.clone();
         tokio::spawn(async move {
-            if let Err(e) = sm.lock().await.start_receivers().await {
+            if let Err(e) = sm.write().await.start_receivers().await {
                 tracing::error!(%e, "Failed to start receivers");
             } else {
                 tracing::info!("Receivers advertising on the LAN");
@@ -226,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn run_window(
-    stream_manager: Arc<Mutex<StreamManager>>,
+    stream_manager: SharedManager,
     mut ui_rx: mpsc::Receiver<ManagerEvent>,
     picker_rx: mpsc::Receiver<PickerRequest>,
     receiver_window_rx: mpsc::Receiver<ReceiverWindowReq>,

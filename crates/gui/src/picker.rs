@@ -39,11 +39,12 @@ use ferricast::prelude::*;
 use ferricast_dbus::{MonitorInfoDto, SourceDto, WindowInfoDto};
 use freya::prelude::*;
 use freya::winit::window::WindowLevel;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::client;
+use crate::daemon::SharedManager;
 
 // ── Entry point used by the main app ──────────────────────────────
 
@@ -108,7 +109,7 @@ pub fn open_picker_for_dto(platform: Platform, reply_tx: oneshot::Sender<Option<
 /// confirms. Convenience wrapper used by the main app's share
 /// buttons. The daemon path uses [`open_picker_for_dto`] directly
 /// because it does the start_stream work itself.
-pub fn open_picker(platform: Platform, stream_manager: Arc<Mutex<StreamManager>>, device_id: Uuid) {
+pub fn open_picker(platform: Platform, stream_manager: SharedManager, device_id: Uuid) {
     let (tx, rx) = oneshot::channel::<Option<SourceDto>>();
     open_picker_for_dto(platform, tx);
     spawn(async move {
@@ -125,13 +126,13 @@ pub fn open_picker(platform: Platform, stream_manager: Arc<Mutex<StreamManager>>
 /// `daemon::resolve_source` does over D-Bus but stays in-process
 /// since we already hold the `StreamManager`.
 async fn start_stream_with_dto(
-    stream_manager: Arc<Mutex<StreamManager>>,
+    stream_manager: SharedManager,
     device_id: Uuid,
     source: SourceDto,
 ) -> Result<()> {
     let cap_source = dto_to_capture_source(&source);
     let audio = source.audio();
-    let sm = stream_manager.lock().await;
+    let sm = stream_manager.read().await;
     let capture = NativeCapture::new();
     let encoder = H264Encoder::default();
     let config = if audio {
