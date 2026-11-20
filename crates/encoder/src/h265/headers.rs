@@ -24,19 +24,21 @@ pub(super) struct StreamParams {
     /// Main tier — every decoder we care about supports it; High tier
     /// only unlocks higher bitrate caps we don't approach.
     pub tier_flag: u8,
+    /// Coded picture size (`pic_width/height_in_luma_samples`); must be
+    /// a multiple of MinCbSizeY.
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    /// Output of [`crate::h264::headers::FrameCrop`] equivalent —
-    /// HEVC encodes the cropping window as offsets in *luma samples*
-    /// (already in pixels, no 2× scaling like H.264's frame_crop).
+    /// Crops the coded size back to the visible picture.
     pub conformance_window: Option<ConformanceWindow>,
     pub bit_depth_luma_minus8: u8,
     pub bit_depth_chroma_minus8: u8,
     pub max_num_ref_frames: u32,
 }
 
-/// Conformance cropping window in luma samples (§7.4.3.2.1).
+/// Conformance cropping window (§7.4.3.2.1). Offsets count chroma
+/// samples: luma offset = SubWidthC (or SubHeightC) × value, i.e. ×2
+/// in 4:2:0.
 #[derive(Clone, Copy)]
 pub(super) struct ConformanceWindow {
     pub left: u32,

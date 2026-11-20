@@ -98,9 +98,6 @@ struct EncoderCfg {
     /// CTU = 32 luma samples. Width / height in CTUs (rounded up).
     width_ctus: u16,
     height_ctus: u16,
-    /// Conformance-window crop in luma samples needed when `height`
-    /// isn't a multiple of the CTU size.
-    height_crop: u32,
     fps: u32,
     bitrate_bps: u32,
     keyframe_interval: u32,
@@ -111,15 +108,32 @@ struct EncoderCfg {
 }
 
 impl EncoderCfg {
-    /// CTU-aligned encoded height. The user-visible height may be
-    /// smaller and is communicated via the SPS conformance window.
-    fn padded_height(&self) -> u32 {
-        (self.height_ctus as u32) * 32
+    /// CTU-aligned encoded width. A multiple of 32, hence of MinCbSizeY
+    /// (8) as `pic_width_in_luma_samples` requires; the visible width
+    /// comes back through the SPS conformance window.
+    fn padded_width(&self) -> u32 {
+        u32::from(self.width_ctus) * 32
     }
 
-    /// Size of the surfaces the encoder reads from.
+    /// CTU-aligned encoded height; see [`Self::padded_width`].
+    fn padded_height(&self) -> u32 {
+        u32::from(self.height_ctus) * 32
+    }
+
+    /// Size of the surfaces the encoder reads from — and the picture
+    /// size signalled in the SPS.
     fn coded_size(&self) -> (u32, u32) {
-        (self.width, self.padded_height())
+        (self.padded_width(), self.padded_height())
+    }
+
+    /// Right / bottom conformance-window offsets trimming the CTU
+    /// padding back to `width × height`. They count chroma samples
+    /// (SubWidthC = SubHeightC = 2 in 4:2:0, §7.4.3.2.1). `None` when
+    /// the picture is CTU-aligned.
+    fn conformance_offsets(&self) -> Option<(u32, u32)> {
+        let right = (self.padded_width() - self.width) / 2;
+        let bottom = (self.padded_height() - self.height) / 2;
+        (right > 0 || bottom > 0).then_some((right, bottom))
     }
 }
 
@@ -214,7 +228,7 @@ impl VaapiH265Encoder {
             .create_surfaces(
                 VA_RT_FORMAT_YUV420,
                 Some(VA_FOURCC_NV12),
-                cfg.width,
+                cfg.padded_width(),
                 cfg.padded_height(),
                 Some(UsageHint::USAGE_HINT_ENCODER),
                 recon_descs,
@@ -224,7 +238,7 @@ impl VaapiH265Encoder {
         let context = display
             .create_context(
                 &cfg_handle,
-                cfg.width,
+                cfg.padded_width(),
                 cfg.padded_height(),
                 Some(&recon),
                 /* progressive = */ true,
@@ -235,19 +249,17 @@ impl VaapiH265Encoder {
             profile_idc: cfg.profile_idc,
             level_idc: cfg.level_idc,
             tier_flag: 0,
-            width: cfg.width,
-            height: cfg.height,
+            width: cfg.padded_width(),
+            height: cfg.padded_height(),
             fps: cfg.fps,
-            conformance_window: if cfg.height_crop > 0 {
-                Some(ConformanceWindow {
+            conformance_window: cfg.conformance_offsets().map(|(right, bottom)| {
+                ConformanceWindow {
                     left: 0,
-                    right: 0,
+                    right,
                     top: 0,
-                    bottom: cfg.height_crop,
-                })
-            } else {
-                None
-            },
+                    bottom,
+                }
+            }),
             bit_depth_luma_minus8: cfg.bit_depth_luma_minus8,
             bit_depth_chroma_minus8: cfg.bit_depth_chroma_minus8,
             max_num_ref_frames: 1,
@@ -294,7 +306,7 @@ fn build_vpp(display: &Rc<Display>, cfg: &EncoderCfg) -> Result<(Config, Rc<Cont
         )
         .map_err(|e| FerricastError::Encoder(format!("vaCreateConfig(VPP): {e}")))?;
     let context = display
-        .create_context::<()>(&config, cfg.width, cfg.padded_height(), None, true)
+        .create_context::<()>(&config, cfg.padded_width(), cfg.padded_height(), None, true)
         .map_err(|e| FerricastError::Encoder(format!("vaCreateContext(VPP): {e}")))?;
     Ok((config, context))
 }
@@ -331,10 +343,13 @@ fn build_encoder_cfg(profile_idc: u8, bit_depth: u8, cfg: &EncoderConfig) -> Res
     // crop comes back through the SPS conformance window.
     let width_ctus = width.div_ceil(32) as u16;
     let height_ctus = height.div_ceil(32) as u16;
-    let padded_h = (height_ctus as u32) * 32;
-    let height_crop = padded_h - height;
     let bitrate_bps = cfg.bitrate_kbps.max(1).saturating_mul(1000);
-    let level_idc = pick_level(width, height, cfg.fps.max(1), bitrate_bps);
+    let level_idc = pick_level(
+        u32::from(width_ctus) * 32,
+        u32::from(height_ctus) * 32,
+        cfg.fps.max(1),
+        bitrate_bps,
+    );
 
     Ok(EncoderCfg {
         profile_idc,
@@ -342,7 +357,6 @@ fn build_encoder_cfg(profile_idc: u8, bit_depth: u8, cfg: &EncoderConfig) -> Res
         height,
         width_ctus,
         height_ctus,
-        height_crop,
         fps: cfg.fps.max(1),
         bitrate_bps,
         keyframe_interval: cfg.keyframe_interval_frames(),
@@ -644,8 +658,10 @@ fn build_seq_param(cfg: &EncoderCfg) -> EncSequenceParameterBufferHEVC {
         cfg.keyframe_interval,
         /* ip_period */ 1,
         cfg.bitrate_bps,
-        cfg.width as u16,
-        cfg.height as u16,
+        // pic_width/height_in_luma_samples: the padded size, matching
+        // the packed SPS.
+        u16::try_from(cfg.padded_width()).unwrap_or(u16::MAX),
+        u16::try_from(cfg.padded_height()).unwrap_or(u16::MAX),
         &seq_fields,
         /* log2_min_luma_coding_block_size_minus3 */ 0,
         /* log2_diff_max_min_luma_coding_block_size */ 3,
@@ -1052,6 +1068,26 @@ mod tests {
         assert_eq!(pick_level(1280, 736, 30, 5_000_000), 93);
         assert_eq!(pick_level(3840, 2176, 30, 20_000_000), 150);
         assert_eq!(pick_level(3840, 2176, 60, 20_000_000), 153);
+    }
+
+    fn geometry(width: u32, height: u32) -> ((u32, u32), Option<(u32, u32)>) {
+        let cfg = EncoderConfig {
+            width,
+            height,
+            codec: Codec::H265,
+            ..EncoderConfig::default()
+        };
+        let enc = build_encoder_cfg(HEVC_PROFILE_MAIN_IDC, 0, &cfg).unwrap();
+        (enc.coded_size(), enc.conformance_offsets())
+    }
+
+    #[test]
+    fn coded_size_is_ctu_aligned_and_cropped_once() {
+        assert_eq!(geometry(1280, 704), ((1280, 704), None));
+        // 1080 → 1088: 8 luma rows = 4 chroma rows.
+        assert_eq!(geometry(1920, 1080), ((1920, 1088), Some((0, 4))));
+        // 1366 → 1376: 10 luma columns = 5 chroma columns.
+        assert_eq!(geometry(1366, 768), ((1376, 768), Some((5, 0))));
     }
 
     #[test]
