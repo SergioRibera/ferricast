@@ -33,6 +33,7 @@ use ferricast_core::{
 
 use crate::config_ext::EncoderConfigExt;
 use crate::frame_view::FrameView;
+use crate::scale::{FrameScaler, FrameSize};
 use shiguredo_nvcodec::{
     BufferFormat, CodecConfig, EncodeOptions, Encoder as NvEncoder, EncoderCodec,
     EncoderConfig as NvCfg, H264EncoderConfig, H264Profile as NvH264Profile, PictureType, Preset,
@@ -154,6 +155,8 @@ pub struct NvencEncoder<C: NvencCodec> {
     /// Scratch for repacking row-padded CPU frames into the tight
     /// layout NVENC's host upload expects. Reused across frames.
     repack: Vec<u8>,
+    /// Fits frames whose size differs from the session into it.
+    scaler: FrameScaler,
     /// `NvEncRegisterResource` is expensive (driver round-trip plus
     /// `cuExternalMemoryImport`), so we cache the registration
     /// keyed by `(fd, modifier, dims)`. PipeWire and our wayland-direct
@@ -296,6 +299,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
             frame_count: 0,
             pending_keyframe: false,
             repack: Vec::new(),
+            scaler: FrameScaler::default(),
             #[cfg(feature = "nvenc-zero-copy")]
             dmabuf_cache: HashMap::new(),
             requested: cfg,
@@ -303,7 +307,10 @@ impl<C: NvencCodec> NvencEncoder<C> {
         })
     }
 
-    fn encode_cpu(&mut self, raw: &RawFrame, options: &EncodeOptions) -> Result<()> {
+    fn encode_cpu(&mut self, raw: RawFrame, options: &EncodeOptions) -> Result<()> {
+        let raw = self
+            .scaler
+            .fit(raw, FrameSize::new(self.cfg.width, self.cfg.height))?;
         if raw.format != self.cfg.pixel_format {
             // The session was opened for one byte order; feeding the
             // other would silently swap red and blue.
@@ -314,7 +321,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
                 self.cfg.pixel_format
             )));
         }
-        let view = FrameView::new(raw, self.cfg.width, self.cfg.height)?;
+        let view = FrameView::new(&raw, self.cfg.width, self.cfg.height)?;
         // NVENC's CPU path takes tightly packed rows (`inputPitch` is
         // derived from the width), so padded frames are repacked.
         let host = view.tight_rows(&mut self.repack);
@@ -403,6 +410,14 @@ impl<C: NvencCodec> NvencEncoder<C> {
         #[cfg(feature = "nvenc-zero-copy")]
         {
             match frame {
+                // NVENC cannot scale its input: a DMA-BUF of another size
+                // goes through the CPU scaler.
+                CapturedFrame::Gpu(g)
+                    if g.width != self.cfg.width || g.height != self.cfg.height =>
+                {
+                    let raw = CapturedFrame::Gpu(g).into_cpu()?;
+                    self.encode_cpu(raw, &options)?;
+                }
                 CapturedFrame::Gpu(g) => {
                     if let Err(e) = self.encode_dmabuf(&g, &options) {
                         // Soft fall-back: log and try the CPU path
@@ -412,18 +427,18 @@ impl<C: NvencCodec> NvencEncoder<C> {
                         // sticky.
                         warn!(codec = C::NAME, %e, "NVENC dmabuf path failed; falling back to CPU readback for this frame");
                         let raw = CapturedFrame::Gpu(g).into_cpu()?;
-                        self.encode_cpu(&raw, &options)?;
+                        self.encode_cpu(raw, &options)?;
                     }
                 }
                 CapturedFrame::Cpu(raw) => {
-                    self.encode_cpu(&raw, &options)?;
+                    self.encode_cpu(raw, &options)?;
                 }
             }
         }
         #[cfg(not(feature = "nvenc-zero-copy"))]
         {
             let raw = frame.into_cpu()?;
-            self.encode_cpu(&raw, &options)?;
+            self.encode_cpu(raw, &options)?;
         }
 
         let nv_frame = self.encoder.next_frame().ok_or_else(|| {

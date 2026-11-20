@@ -33,6 +33,9 @@ const VA_FOURCC_NV12: u32 = 0x3231_564E; // 'N','V','1','2'
 /// matrix the CPU path and the SPS VUI use.
 pub(crate) const VPP_INPUT_STANDARD: u8 = 8; // VAProcColorStandardSRGB
 pub(crate) const VPP_OUTPUT_STANDARD: u8 = 2; // VAProcColorStandardBT709
+/// `output_background_color` (ARGB) for the part of the VPP destination
+/// the picture does not cover: opaque black letterbox bars.
+pub(crate) const VPP_BACKGROUND_BLACK: u32 = 0xff00_0000;
 
 /// Full-range RGB in.
 pub(crate) fn vpp_input_colour() -> ProcColorProperties {
