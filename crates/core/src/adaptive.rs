@@ -46,7 +46,9 @@ pub struct AdaptiveBitrateState {
     pub ceiling_kbps: u32,
 
     /// Hard lower bound — never drop the target below this. Default
-    /// is 500 kbps; below that quality is unusable at any resolution.
+    /// is 500 kbps (below that quality is unusable at any resolution),
+    /// lowered to the initial bitrate when the stream starts below it
+    /// so the floor never exceeds the ceiling.
     pub floor_kbps: u32,
 
     /// EMA of the most recent `budget_used_pct` samples (0..=100).
@@ -87,14 +89,23 @@ impl AdaptiveBitrateState {
     /// just paid the cost of catching up.
     pub const UPSHIFT_KBPS: u32 = 200;
 
+    /// Default lower bound for the target bitrate.
+    pub const DEFAULT_FLOOR_KBPS: u32 = 500;
+
     pub fn new(initial_kbps: u32) -> Arc<Self> {
         Arc::new(Self {
             target_kbps: AtomicU32::new(initial_kbps),
             ceiling_kbps: initial_kbps,
-            floor_kbps: 500,
+            floor_kbps: Self::DEFAULT_FLOOR_KBPS.min(initial_kbps),
             pressure_pct_x100: AtomicU32::new(0),
             last_adjust_ns: AtomicU64::new(0),
         })
+    }
+
+    /// Clamps `kbps` into `[floor, ceiling]`. Never panics: should the
+    /// public bounds ever be inverted, the ceiling wins.
+    fn bounded(&self, kbps: u32) -> u32 {
+        kbps.max(self.floor_kbps).min(self.ceiling_kbps)
     }
 
     /// Encoder loop's read path. Cheap: a single relaxed atomic
@@ -131,7 +142,7 @@ impl AdaptiveBitrateState {
         let ema_pct = ema / 100;
         let new_target = if ema_pct >= Self::PRESSURE_DOWN_PCT {
             // Downshift: multiplicative. Round toward floor.
-            (current.saturating_mul(Self::DOWNSHIFT_NUM) / Self::DOWNSHIFT_DEN).max(self.floor_kbps)
+            self.bounded(current.saturating_mul(Self::DOWNSHIFT_NUM) / Self::DOWNSHIFT_DEN)
         } else if ema_pct <= Self::PRESSURE_UP_PCT && current < self.ceiling_kbps {
             (current.saturating_add(Self::UPSHIFT_KBPS)).min(self.ceiling_kbps)
         } else {
@@ -182,10 +193,10 @@ impl AdaptiveBitrateState {
             return None;
         } else if measured_kbps >= current {
             // 70 % of measured, clamped to the controller's bounds.
-            ((measured_kbps as u64 * 7 / 10) as u32).clamp(self.floor_kbps, self.ceiling_kbps)
+            self.bounded((u64::from(measured_kbps) * 7 / 10) as u32)
         } else {
             // Already over-budget. Drop to measured.
-            measured_kbps.clamp(self.floor_kbps, self.ceiling_kbps)
+            self.bounded(measured_kbps)
         };
         if new_target == current {
             return None;
@@ -335,6 +346,20 @@ mod tests {
         let s = AdaptiveBitrateState::new(2500);
         let new = s.observe_link_capacity_kbps(1500).unwrap();
         assert_eq!(new, 1500, "drop straight to measured");
+    }
+
+    #[test]
+    fn a_stream_starting_below_the_default_floor_never_panics_or_overshoots() {
+        let s = AdaptiveBitrateState::new(300);
+        assert_eq!(s.floor_kbps, 300);
+        assert_eq!(s.observe_link_capacity_kbps(310), None);
+        assert_eq!(s.observe_link_capacity_kbps(100), None);
+        for _ in 0..20 {
+            force_adjustable(&s);
+            s.record_pressure(100);
+        }
+        assert_eq!(s.target_kbps(), 300);
+        assert_eq!(s.drop_to_floor(), 300);
     }
 
     #[test]
