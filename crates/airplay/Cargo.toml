@@ -39,4 +39,4 @@ ferricast-fairplay = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ferricast-encoder = { workspace = true, features = ["x264"] }
+ferricast-encoder = { workspace = true, features = ["x264", "fdk-aac"] }

@@ -1,11 +1,14 @@
-//! Mirror a synthetic test pattern to an AirPlay receiver by address.
+//! Mirror a synthetic test pattern and a 440 Hz tone to an AirPlay
+//! receiver by address.
 //!
 //! ```text
-//! cargo run -p ferricast-airplay --features fairplay --example mirror_to -- 192.168.1.20:7000 [seconds] [--pin]
+//! cargo run -p ferricast-airplay --features fairplay --example mirror_to -- 192.168.1.20:7000 [seconds] [--pin] [--password[=<pw>]] [--no-audio]
 //! ```
 //!
 //! `--pin` treats the receiver as PIN-protected (UxPlay `-pin`); the PIN
-//! shown by the receiver is then read from stdin.
+//! shown by the receiver is then read from stdin. `--password` marks it as
+//! password-protected (UxPlay `-pw`); without `=<pw>` the password is read
+//! from stdin when the receiver asks for it.
 
 use std::collections::HashMap;
 use std::io::BufRead as _;
@@ -16,14 +19,17 @@ use bytes::Bytes;
 use ferricast_airplay::AirPlaySession;
 use ferricast_core::device::{AirplayConfig, Features, Flags};
 use ferricast_core::{
-    CapturedFrame, CastSession, Codec, ConnectOutcome, Device, DeviceCapabilities, EncoderConfig,
-    PairingResponse, PixelFormat, RawFrame, StreamConfig, VideoEncoder,
+    AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame, AudioStreamConfig, CapturedFrame,
+    CastSession, Codec, ConnectOutcome, Device, DeviceCapabilities, EncoderConfig,
+    PairingChallenge, PairingResponse, PixelFormat, RawFrame, StreamConfig, VideoEncoder,
 };
+use ferricast_encoder::aac::{ELD_SAMPLE_RATE, FdkEldEncoder};
 use ferricast_encoder::h264::X264Encoder;
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 const FPS: u32 = 30;
+const TONE_HZ: f64 = 440.0;
 
 fn pattern(frame: u32) -> Bytes {
     let mut data = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
@@ -42,11 +48,28 @@ fn pattern(frame: u32) -> Bytes {
     Bytes::from(data)
 }
 
+/// `count` stereo S16LE samples of the test tone, starting at sample `start`.
+fn tone(start: u64, count: u64) -> Bytes {
+    let mut out = Vec::with_capacity(count as usize * 4);
+    for n in start..start + count {
+        let t = n as f64 / f64::from(ELD_SAMPLE_RATE);
+        let v = ((2.0 * std::f64::consts::PI * TONE_HZ * t).sin() * 6000.0) as i16;
+        out.extend_from_slice(&v.to_le_bytes());
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    Bytes::from(out)
+}
+
 fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_micros() as u64
+}
+
+fn read_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    println!("{prompt}");
+    Ok(std::io::stdin().lock().lines().next().ok_or("no input")??)
 }
 
 #[tokio::main]
@@ -61,10 +84,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let addr: SocketAddr = args
         .first()
-        .ok_or("usage: mirror_to <ip:port> [seconds] [--pin]")?
+        .ok_or("usage: mirror_to <ip:port> [seconds] [--pin] [--password[=<pw>]] [--no-audio]")?
         .parse()?;
     let seconds: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
     let pin = args.iter().any(|a| a == "--pin");
+    let password = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--password"))
+        .map(|rest| rest.strip_prefix('=').map(str::to_owned));
+    let audio = !args.iter().any(|a| a == "--no-audio");
 
     let device = Device {
         id: uuid::Uuid::new_v4(),
@@ -80,7 +108,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             airplay_config: Some(AirplayConfig {
                 // What UxPlay advertises.
                 features: Features::parse_txt("0x5A7FFEE6,0x0").unwrap(),
-                flags: if pin {
+                // UxPlay advertises `pw=true` for both `-pin` and `-pw`.
+                flags: if pin || password.is_some() {
                     Flags::PASSWORD_REQUIRED
                 } else {
                     Flags::empty()
@@ -94,9 +123,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut session = AirPlaySession::default();
     if let ConnectOutcome::PairingRequired(challenge) = session.connect(&device).await? {
-        println!("receiver asks for {challenge:?}; type the PIN it shows:");
-        let pin = std::io::stdin().lock().lines().next().ok_or("no PIN")??;
-        session.submit_pairing(PairingResponse::Pin(pin)).await?;
+        let response = match challenge {
+            PairingChallenge::Credential => match password.clone().flatten() {
+                Some(pw) => PairingResponse::Password(pw),
+                None => PairingResponse::Password(read_line(
+                    "receiver asks for its password; type it:",
+                )?),
+            },
+            other => PairingResponse::Pin(read_line(&format!(
+                "receiver asks for {other:?}; type the PIN it shows:"
+            ))?),
+        };
+        session.submit_pairing(response).await?;
     }
 
     let config = StreamConfig {
@@ -105,6 +143,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fps: FPS,
         bitrate_kbps: 3000,
         codec: Codec::H264,
+        audio: audio.then(|| AudioStreamConfig {
+            codec: AudioCodec::AacEld,
+            sample_rate: ELD_SAMPLE_RATE,
+            ..Default::default()
+        }),
         ..Default::default()
     };
     session.setup_stream(&config).await?;
@@ -119,25 +162,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pixel_format: PixelFormat::Bgra,
         ..Default::default()
     })?;
+    let mut audio_encoder = FdkEldEncoder::new();
+    audio_encoder.configure(&AudioEncoderConfig {
+        codec: AudioCodec::AacEld,
+        sample_rate: ELD_SAMPLE_RATE,
+        channels: 2,
+        bitrate_kbps: 128,
+    })?;
 
+    let start_us = now_us();
+    let mut samples_sent = 0_u64;
+    let mut audio_frames = 0_u64;
     let mut tick = tokio::time::interval(Duration::from_secs(1) / FPS);
     for n in 0..seconds * FPS {
         tick.tick().await;
+        let now = now_us();
         let frame = CapturedFrame::Cpu(RawFrame {
             width: WIDTH,
             height: HEIGHT,
             stride: WIDTH * 4,
             format: PixelFormat::Bgra,
             data: pattern(n),
-            timestamp_us: now_us(),
+            timestamp_us: now,
         });
         let encoded = encoder.encode(frame)?;
         session.send_frame(&encoded).await?;
+
+        if audio {
+            // Feed the tone up to the current time, stamped like capture.
+            let due = (now - start_us) * u64::from(ELD_SAMPLE_RATE) / 1_000_000;
+            let count = due.saturating_sub(samples_sent);
+            audio_encoder.encode(&AudioFrame {
+                codec: AudioCodec::Pcm,
+                data: tone(samples_sent, count),
+                timestamp_us: start_us + samples_sent * 1_000_000 / u64::from(ELD_SAMPLE_RATE),
+                sample_rate: ELD_SAMPLE_RATE,
+                channels: 2,
+            })?;
+            samples_sent = due;
+            for aac in audio_encoder.take_output() {
+                session.send_audio_frame(&aac).await?;
+                audio_frames += 1;
+            }
+        }
         if !session.is_alive() {
             return Err("receiver dropped the session".into());
         }
     }
     session.stop().await?;
-    println!("sent {} frames", seconds * FPS);
+    println!(
+        "sent {} video frames, {audio_frames} audio frames",
+        seconds * FPS
+    );
     Ok(())
 }
