@@ -78,6 +78,18 @@ pub(super) struct PumpParts {
     pub(super) start_us: u64,
     /// Where playback is, in media time; read by the session for status.
     pub(super) position: Arc<AtomicU64>,
+    /// How packet timestamps relate to media time.
+    pub(super) timeline: Timeline,
+}
+
+/// How packet timestamps relate to the media position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Timeline {
+    /// Timestamps are media time (progressive files start at zero).
+    MediaTime,
+    /// Timestamps have an arbitrary origin (MPEG-TS), so the position is
+    /// counted from the start or seek target.
+    Offset,
 }
 
 pub(super) async fn run(parts: PumpParts, cmd_rx: mpsc::Receiver<PumpCmd>) -> PumpEnd {
@@ -89,7 +101,7 @@ pub(super) async fn run(parts: PumpParts, cmd_rx: mpsc::Receiver<PumpCmd>) -> Pu
         cmd_rx,
         playing: parts.playing,
         clock: Clock::new(AUDIO_LEAD),
-        position: Position::new(parts.position, parts.start_us),
+        position: Position::new(parts.position, parts.start_us, parts.timeline),
         audio_primed: false,
         input: Input::Open,
         late_drops: 0,
@@ -111,16 +123,18 @@ pub(super) async fn run(parts: PumpParts, cmd_rx: mpsc::Receiver<PumpCmd>) -> Pu
 /// reached when the timeline restarted.
 struct Position {
     shared: Arc<AtomicU64>,
+    timeline: Timeline,
     base_us: u64,
     /// PTS of the first item presented since the base was set.
     first_pts: Option<u64>,
 }
 
 impl Position {
-    fn new(shared: Arc<AtomicU64>, start_us: u64) -> Self {
+    fn new(shared: Arc<AtomicU64>, start_us: u64, timeline: Timeline) -> Self {
         shared.store(start_us, Ordering::Relaxed);
         Self {
             shared,
+            timeline,
             base_us: start_us,
             first_pts: None,
         }
@@ -142,6 +156,11 @@ impl Position {
     /// Records that the item with `pts_us` is being presented, `behind`
     /// before it is actually seen or heard.
     fn presented(&mut self, pts_us: u64, behind: Duration) {
+        if self.timeline == Timeline::MediaTime {
+            let at = pts_us.saturating_sub(behind.as_micros() as u64);
+            self.shared.store(at, Ordering::Relaxed);
+            return;
+        }
         let first = *self.first_pts.get_or_insert(pts_us);
         let elapsed = pts_us
             .saturating_sub(first)

@@ -20,7 +20,7 @@ use ferricast_core::{
 };
 use ferricast_demuxer::ProgressivePuller;
 
-use super::pump::{self, PumpCmd, PumpEnd, PumpParts};
+use super::pump::{self, PumpCmd, PumpEnd, PumpParts, Timeline};
 use super::{
     ErasedAudioDecoder, ErasedControlSession, ErasedPuller, ErasedVideoDecoder, PipelineCtx,
 };
@@ -127,6 +127,7 @@ struct Prepared {
     info: MediaInfo,
     /// Media position playback starts from.
     start_us: u64,
+    timeline: Timeline,
     video_dec: Option<Box<dyn ErasedVideoDecoder>>,
     audio_dec: Option<Box<dyn ErasedAudioDecoder>>,
     sink: Box<dyn FrameSink>,
@@ -458,6 +459,7 @@ impl Session {
                     gain: self.volume.gain(),
                     start_us: prepared.start_us,
                     position,
+                    timeline: prepared.timeline,
                 };
                 self.pump = Some(PumpHandle {
                     cmd_tx,
@@ -544,14 +546,15 @@ fn progressive() -> Box<dyn ErasedPuller> {
 async fn open(
     mut puller: Box<dyn ErasedPuller>,
     url: &str,
-) -> Result<(Box<dyn ErasedPuller>, MediaInfo)> {
+    timeline: Timeline,
+) -> Result<(Box<dyn ErasedPuller>, MediaInfo, Timeline)> {
     let info = puller
         .open(PullSpec {
             url: url.to_string(),
             headers: HashMap::new(),
         })
         .await?;
-    Ok((puller, info))
+    Ok((puller, info, timeline))
 }
 
 /// Resolves a LOAD: opens the puller, picks decoders, and only then
@@ -560,21 +563,23 @@ async fn open(
 async fn load(ctx: &PipelineCtx, remote: &RemoteSender, request: LoadRequest) -> Result<Prepared> {
     let kind = MediaKind::classify(&request.url, request.content_type.as_deref());
     tracing::info!(url = %request.url, content_type = ?request.content_type, ?kind, "receiver: loading");
-    let (mut puller, info) = match kind {
-        MediaKind::Hls => open((ctx.create_puller)()?, &request.url).await?,
-        MediaKind::Progressive => open(progressive(), &request.url).await?,
+    let (mut puller, info, timeline) = match kind {
+        MediaKind::Hls => open((ctx.create_puller)()?, &request.url, Timeline::Offset).await?,
+        MediaKind::Progressive => open(progressive(), &request.url, Timeline::MediaTime).await?,
         // No type and no telling extension: HLS first, then a plain file.
-        MediaKind::Unknown => match open((ctx.create_puller)()?, &request.url).await {
-            Ok(opened) => opened,
-            Err(hls) => match open(progressive(), &request.url).await {
+        MediaKind::Unknown => {
+            match open((ctx.create_puller)()?, &request.url, Timeline::Offset).await {
                 Ok(opened) => opened,
-                Err(file) => {
-                    return Err(FerricastError::Pull(format!(
-                        "neither an HLS playlist ({hls}) nor a playable file ({file})"
-                    )));
-                }
-            },
-        },
+                Err(hls) => match open(progressive(), &request.url, Timeline::MediaTime).await {
+                    Ok(opened) => opened,
+                    Err(file) => {
+                        return Err(FerricastError::Pull(format!(
+                            "neither an HLS playlist ({hls}) nor a playable file ({file})"
+                        )));
+                    }
+                },
+            }
+        }
         MediaKind::Dash => {
             return Err(FerricastError::Pull(
                 "MPEG-DASH streams are not supported".into(),
@@ -645,6 +650,7 @@ async fn load(ctx: &PipelineCtx, remote: &RemoteSender, request: LoadRequest) ->
         puller,
         info,
         start_us,
+        timeline,
         video_dec,
         audio_dec,
         sink,
