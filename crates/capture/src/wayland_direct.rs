@@ -53,6 +53,8 @@ use ferricast_core::{
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
+use crate::wayland_thumb::{EventQueueExt, Orientation};
+
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, WEnum,
     globals::{GlobalListContents, registry_queue_init},
@@ -67,7 +69,7 @@ use wayland_client::{
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
     zwp_linux_dmabuf_feedback_v1::{self, ZwpLinuxDmabufFeedbackV1},
-    zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+    zwp_linux_dmabuf_v1::{self, ZwpLinuxDmabufV1},
 };
 use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_manager_v1::ZxdgOutputManagerV1,
@@ -185,6 +187,7 @@ impl DmabufAllocator {
         width: u32,
         height: u32,
         fourcc: drm_fourcc::DrmFourcc,
+        format: PixelFormat,
     ) -> Result<AllocatedBuffer> {
         // Allocation strategy now goes through the compositor's
         // advertised modifier set first (via linux-dmabuf-v1
@@ -341,18 +344,18 @@ impl DmabufAllocator {
         })?;
 
         let modifier = u64::from(bo.modifier());
-        let stride = bo.stride() as u32;
+        let stride = bo.stride();
         let fd: OwnedFd = bo
             .fd()
             .map_err(|e| FerricastError::Capture(format!("gbm fd: {e}")))?;
         Ok(AllocatedBuffer {
-            bo,
+            _bo: bo,
             fd,
             width,
             height,
             stride,
             modifier,
-            fourcc,
+            format,
         })
     }
 }
@@ -361,32 +364,49 @@ impl DmabufAllocator {
 /// (drop releases the memory) and exposes the fd for wl_buffer
 /// wrapping + downstream consumption.
 struct AllocatedBuffer {
-    /// Held to keep the buffer alive while the wl_buffer + the
-    /// downstream `CapturedFrame` reference it. Also used as the
-    /// handle for `gbm_bo_map` when we have to read the bytes
-    /// back for a CPU encoder.
-    bo: gbm::BufferObject<()>,
+    /// Never read: held so the memory stays alive while the
+    /// wl_buffer and the exported `fd` reference it (readback goes
+    /// through the fd, see `mmap_bo_to_raw`).
+    _bo: gbm::BufferObject<()>,
     fd: OwnedFd,
     width: u32,
     height: u32,
     stride: u32,
     modifier: u64,
-    fourcc: drm_fourcc::DrmFourcc,
+    /// Byte order of the allocation, resolved from the fourcc by
+    /// [`dmabuf_pixel_format`] (which also rejects unsupported ones).
+    format: PixelFormat,
 }
 
-impl AllocatedBuffer {
-    fn pixel_format(&self) -> PixelFormat {
-        // We always allocate one of these two — see `pick_fourcc`.
-        match self.fourcc {
-            drm_fourcc::DrmFourcc::Argb8888 => PixelFormat::Bgra,
-            drm_fourcc::DrmFourcc::Abgr8888 => PixelFormat::Rgba,
-            _ => PixelFormat::Bgra,
-        }
+/// Memory byte order of the DRM fourccs we can hand downstream.
+/// Only 4×8-bit RGB packings: 10-bit (`XRGB2101010`, …) and other
+/// layouts would be misread as BGRA/RGBA by every encoder.
+/// X-variants carry an undefined alpha byte, which consumers ignore.
+fn dmabuf_pixel_format(fourcc: drm_fourcc::DrmFourcc) -> Option<PixelFormat> {
+    use drm_fourcc::DrmFourcc;
+    match fourcc {
+        DrmFourcc::Argb8888 | DrmFourcc::Xrgb8888 => Some(PixelFormat::Bgra),
+        DrmFourcc::Abgr8888 | DrmFourcc::Xbgr8888 => Some(PixelFormat::Rgba),
+        _ => None,
+    }
+}
+
+/// `wl_shm` formats we can read back, with their memory byte order.
+/// Note `wl_shm` codes 0/1 are ARGB/XRGB8888; every other code is the
+/// DRM fourcc.
+fn shm_pixel_format(raw: u32) -> Option<(wl_shm::Format, PixelFormat)> {
+    match raw {
+        0 => Some((wl_shm::Format::Argb8888, PixelFormat::Bgra)),
+        1 => Some((wl_shm::Format::Xrgb8888, PixelFormat::Bgra)),
+        0x3432_4241 => Some((wl_shm::Format::Abgr8888, PixelFormat::Rgba)),
+        0x3432_5258 => Some((wl_shm::Format::Xbgr8888, PixelFormat::Rgba)),
+        _ => None,
     }
 }
 
 // ── ScreenCapture wrapper ─────────────────────────────────────────
 
+#[derive(Default)]
 pub struct WaylandDirectCapture {
     worker: Option<WorkerHandle>,
     fps: u32,
@@ -394,12 +414,9 @@ pub struct WaylandDirectCapture {
 }
 
 impl WaylandDirectCapture {
+    #[must_use]
     pub fn new() -> Self {
-        Self {
-            worker: None,
-            fps: 0,
-            size: (0, 0),
-        }
+        Self::default()
     }
 }
 
@@ -443,12 +460,11 @@ impl ScreenCapture for WaylandDirectCapture {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let fps = config.fps.max(1);
 
-        // The first frame on the channel carries the negotiated
-        // size; we read it synchronously to populate `self.size`
-        // before returning so `get_screen_size()` works immediately.
-        // Worker also sends an initial `(width, height)` over a
-        // one-shot channel for that purpose.
-        let (size_tx, size_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(1);
+        // The worker sends the negotiated `(width, height)` over a
+        // oneshot before its first frame; we await it (without
+        // blocking the runtime) to populate `self.size` before
+        // returning so `get_screen_size()` works immediately.
+        let (size_tx, size_rx) = tokio::sync::oneshot::channel::<(u32, u32)>();
 
         let output_name_clone = output_name.clone();
         let join = std::thread::Builder::new()
@@ -460,9 +476,23 @@ impl ScreenCapture for WaylandDirectCapture {
             })
             .map_err(|e| FerricastError::Capture(format!("spawn: {e}")))?;
 
-        let size = size_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| {
-            FerricastError::Capture("wayland-direct: compositor didn't respond within 5s".into())
-        })?;
+        // On either error path `stop_tx` is dropped here; the worker
+        // treats a disconnected stop channel as a stop request and
+        // exits on its own, so the detached thread doesn't spin forever.
+        let size = match tokio::time::timeout(Duration::from_secs(5), size_rx).await {
+            Ok(Ok(size)) => size,
+            Ok(Err(_)) => {
+                return Err(FerricastError::Capture(
+                    "wayland-direct: worker exited before the first frame (see previous log)"
+                        .into(),
+                ));
+            }
+            Err(_) => {
+                return Err(FerricastError::Capture(
+                    "wayland-direct: compositor didn't respond within 5s".into(),
+                ));
+            }
+        };
 
         self.worker = Some(WorkerHandle {
             frames: frame_rx,
@@ -497,7 +527,9 @@ impl ScreenCapture for WaylandDirectCapture {
         if let Some(mut w) = self.worker.take() {
             let _ = w.stop.send(());
             if let Some(j) = w.join.take() {
-                let _ = j.join();
+                // The worker can sit in a bounded (≤ 2 s) Wayland wait
+                // before it sees the stop; join off the async runtime.
+                let _ = tokio::task::spawn_blocking(move || j.join()).await;
             }
         }
         Ok(())
@@ -522,12 +554,17 @@ impl ScreenCapture for WaylandDirectCapture {
 
 // ── Worker thread ─────────────────────────────────────────────────
 
+/// Budget for each compositor round (buffer offers, copy completion,
+/// dmabuf feedback). Generous: a healthy compositor answers within a
+/// frame period.
+const FRAME_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn run_worker(
     output_name: String,
     fps: u32,
     frame_tx: mpsc::Sender<CapturedFrame>,
     stop_rx: std::sync::mpsc::Receiver<()>,
-    size_tx: std::sync::mpsc::SyncSender<(u32, u32)>,
+    size_tx: tokio::sync::oneshot::Sender<(u32, u32)>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env()
         .map_err(|e| FerricastError::Capture(format!("wayland connect: {e}")))?;
@@ -551,10 +588,12 @@ fn run_worker(
         outputs: Vec::new(),
         target: None,
         frame_info: None,
+        buffer_done: false,
         status: FrameStatus::Pending,
-        size_emitted: false,
-        size_tx: Some(size_tx),
+        y_invert: false,
+        dmabuf_v3_modifiers: HashMap::new(),
     };
+    let mut size_tx = Some(size_tx);
 
     for g in globals.contents().clone_list() {
         if g.interface == "wl_output" {
@@ -564,7 +603,11 @@ fn run_worker(
             if let Some(om) = xdg_om.as_ref() {
                 om.get_xdg_output(&out, &qh, ());
             }
-            state.outputs.push((out, None));
+            state.outputs.push(OutputSlot {
+                proxy: out,
+                name: None,
+                transform: wl_output::Transform::Normal,
+            });
         }
     }
     queue
@@ -574,8 +617,8 @@ fn run_worker(
     let target = state
         .outputs
         .iter()
-        .find(|(_, n)| n.as_deref() == Some(output_name.as_str()))
-        .map(|(o, _)| o.clone())
+        .find(|o| o.name.as_deref() == Some(output_name.as_str()))
+        .map(|o| o.proxy.clone())
         .ok_or_else(|| FerricastError::Capture(format!("no output named {output_name:?}")))?;
     state.target = Some(target.clone());
 
@@ -589,7 +632,22 @@ fn run_worker(
     // gbm picked isn't in the compositor's accept-list. Feedback
     // is best-effort: a v3 compositor doesn't have it and we fall
     // back to "open first available node, allocate LINEAR, hope".
-    let feedback_info = dmabuf.as_ref().and_then(|d| query_feedback(&conn, d).ok());
+    let feedback_info = dmabuf.as_ref().and_then(|d| {
+        if d.version() >= 4 {
+            query_feedback(&conn, d).ok()
+        } else {
+            // v3: no feedback object (`get_default_feedback` is a v4
+            // request — sending it on v3 is a protocol error). The
+            // global announced its (format, modifier) pairs via
+            // `modifier` events during the output roundtrip above;
+            // there is no main_device, so allocation falls back to the
+            // first usable render node.
+            Some(FeedbackInfo {
+                main_device: None,
+                accepted: std::mem::take(&mut state.dmabuf_v3_modifiers),
+            })
+        }
+    });
     if let Some(info) = feedback_info.as_ref() {
         info!(
             main_device = format!("0x{:016x}", info.main_device.unwrap_or(0)),
@@ -636,11 +694,15 @@ fn run_worker(
     let mut dmabuf_disabled = false;
     let mut dmabuf_consecutive_failures: u32 = 0;
     const DMABUF_FAILURE_THRESHOLD: u32 = 3;
+    let mut gpu_orientation_warned = false;
 
     loop {
-        // Cooperative stop — check between frames.
-        if stop_rx.try_recv().is_ok() {
-            break;
+        // Cooperative stop — check between frames. A disconnected
+        // channel means the owner is gone (dropped handle, or `start()`
+        // gave up waiting for the first frame): stop too.
+        match stop_rx.try_recv() {
+            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
         let now = Instant::now();
         if now < next_capture {
@@ -650,38 +712,81 @@ fn run_worker(
 
         // Per-frame state reset.
         state.frame_info = None;
+        state.buffer_done = false;
         state.status = FrameStatus::Pending;
+        state.y_invert = false;
 
         let frame = screencopy.capture_output(0, &target, &qh, ());
 
-        // Wait for buffer / linux_dmabuf / buffer_done events.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while state.frame_info.is_none() && Instant::now() < deadline {
-            queue
-                .blocking_dispatch(&mut state)
-                .map_err(|e| FerricastError::Capture(format!("buffer wait: {e}")))?;
-        }
-        let info = state.frame_info.clone().ok_or_else(|| {
-            FerricastError::Capture("compositor didn't announce buffer params within 2s".into())
-        })?;
+        // Wait for buffer / linux_dmabuf / buffer_done events. v3 is
+        // bound, so `buffer_done` always closes the offer list.
+        queue
+            .dispatch_until(&mut state, FRAME_EVENT_TIMEOUT, |s| {
+                s.buffer_done || s.status == FrameStatus::Failed
+            })
+            .map_err(|e| FerricastError::Capture(format!("buffer wait: {e}")))?;
+        let Some(info) = state.frame_info.clone() else {
+            frame.destroy();
+            return Err(FerricastError::Capture(
+                "compositor didn't announce buffer params within 2s".into(),
+            ));
+        };
 
-        if !state.size_emitted {
-            let _ = state
-                .size_tx
-                .as_ref()
-                .unwrap()
-                .send((info.width, info.height));
-            state.size_emitted = true;
+        if state.status == FrameStatus::Failed {
+            frame.destroy();
+            warn!("compositor failed the frame before offering buffers — dropping");
+            continue;
         }
 
-        // Pick the transport: dmabuf if (a) the compositor offered
-        // it on this frame, (b) we have an allocator, and (c) the
-        // sticky-disable hasn't kicked in yet. Otherwise wl_shm
-        // fallback.
+        if let Some(tx) = size_tx.take() {
+            // Report the size frames come out with *after* the
+            // orientation correction below (90°/270° swap the axes).
+            let size = if state.frame_orientation().swaps_axes() {
+                (info.height, info.width)
+            } else {
+                (info.width, info.height)
+            };
+            let _ = tx.send(size);
+        }
+
+        // Only offers in a format we can hand downstream count
+        // (8-bit RGB packings — a 10-bit offer would be misread).
+        let dmabuf_supported = info.dmabuf.as_ref().is_some_and(|o| {
+            drm_fourcc::DrmFourcc::try_from(o.format)
+                .ok()
+                .and_then(dmabuf_pixel_format)
+                .is_some()
+        });
+        let shm_supported = info
+            .shm
+            .as_ref()
+            .is_some_and(|o| shm_pixel_format(o.format).is_some());
+        if !dmabuf_supported && !shm_supported {
+            frame.destroy();
+            return Err(FerricastError::Capture(format!(
+                "compositor offered no supported buffer format (dmabuf fourcc={:?}, \
+                 wl_shm format={:?}); only 8-bit ARGB/XRGB/ABGR/XBGR are supported",
+                info.dmabuf.as_ref().map(|o| format!("0x{:08x}", o.format)),
+                info.shm.as_ref().map(|o| format!("0x{:08x}", o.format)),
+            )));
+        }
+
+        // Pick the transport: dmabuf if (a) the compositor offered a
+        // supported format on this frame, (b) we have an allocator,
+        // and (c) the sticky-disable hasn't kicked in yet. Otherwise
+        // wl_shm fallback.
         let dmabuf_offer = info
             .dmabuf
             .as_ref()
-            .filter(|_| allocator.is_some() && !dmabuf_disabled);
+            .filter(|_| dmabuf_supported && allocator.is_some() && !dmabuf_disabled);
+        if dmabuf_offer.is_none() && !shm_supported {
+            frame.destroy();
+            return Err(FerricastError::Capture(
+                "dmabuf transport unavailable (no allocator or disabled after repeated \
+                 failures) and the wl_shm offer uses an unsupported format"
+                    .into(),
+            ));
+        }
         let (buffer, transport) = if let (Some(offer), Some(alloc), Some(dmabuf_proxy)) =
             (dmabuf_offer, allocator.as_ref(), dmabuf.as_ref())
         {
@@ -710,6 +815,11 @@ fn run_worker(
                     } else {
                         warn!(%e, "dmabuf allocation failed, falling back to shm for this frame");
                     }
+                    if !shm_supported {
+                        warn!("no usable wl_shm offer to fall back to — dropping frame");
+                        frame.destroy();
+                        continue;
+                    }
                     let (buf, tx) = make_shm_buffer(&shm, &qh, &info)?;
                     (buf, Transport::Shm(tx))
                 }
@@ -721,12 +831,17 @@ fn run_worker(
         let attempted_dmabuf = matches!(transport, Transport::Dmabuf(_));
 
         frame.copy(&buffer);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while state.status == FrameStatus::Pending && Instant::now() < deadline {
-            queue
-                .blocking_dispatch(&mut state)
-                .map_err(|e| FerricastError::Capture(format!("frame wait: {e}")))?;
-        }
+        queue
+            .dispatch_until(&mut state, FRAME_EVENT_TIMEOUT, |s| {
+                s.status != FrameStatus::Pending
+            })
+            .map_err(|e| FerricastError::Capture(format!("frame wait: {e}")))?;
+        // The frame object is single-use: once `ready` / `failed`
+        // arrived (or we gave up waiting) nothing else will happen on
+        // it. Destroy it on every path, otherwise each capture leaks a
+        // protocol object on both sides of the connection (~108k/hour
+        // at 30 fps).
+        frame.destroy();
         if state.status != FrameStatus::Ready {
             // Record per-transport consecutive failures so the
             // sticky-disable above only fires when the *dmabuf*
@@ -788,7 +903,7 @@ fn run_worker(
                         width: alloc.width,
                         height: alloc.height,
                         stride: alloc.stride,
-                        format: alloc.pixel_format(),
+                        format: alloc.format,
                         timestamp_us: now_us(),
                         plane: DmaBufPlane {
                             fd: alloc.fd.as_raw_fd(),
@@ -824,11 +939,67 @@ fn run_worker(
         };
         buffer.destroy();
 
+        // The compositor hands us the framebuffer in its native
+        // orientation; undo `Y_INVERT` and the output transform so the
+        // receiver sees what the user sees.
+        let orientation = state.frame_orientation();
+        let captured = match captured {
+            CapturedFrame::Cpu(raw) => CapturedFrame::Cpu(orient_raw_frame(raw, orientation)),
+            CapturedFrame::Gpu(gpu) => {
+                // A GPU frame goes to the encoder untouched — there is
+                // no GPU-side rotate step yet. Unreachable today
+                // (`try_build_importer` returns `None`, so dmabufs are
+                // read back to CPU above), hence log instead of fixing.
+                if !orientation.is_identity() && !gpu_orientation_warned {
+                    gpu_orientation_warned = true;
+                    warn!(
+                        ?orientation,
+                        "wayland-direct: output is rotated / y-inverted but GPU frames \
+                         can't be re-oriented — the stream will appear transformed"
+                    );
+                }
+                CapturedFrame::Gpu(gpu)
+            }
+        };
+
         if frame_tx.try_send(captured).is_err() {
             trace!("consumer behind — dropping frame");
         }
     }
     Ok(())
+}
+
+/// Re-orient a CPU frame (see [`Orientation`]). Identity is free;
+/// otherwise this costs a repack plus one full-frame pixel shuffle,
+/// paid only on rotated / y-inverted outputs. The result is tightly
+/// packed (`stride == width * 4`) with width/height swapped for
+/// 90°/270° transforms.
+fn orient_raw_frame(raw: RawFrame, orientation: Orientation) -> RawFrame {
+    if orientation.is_identity() {
+        return raw;
+    }
+    let row_bytes = raw.width as usize * 4;
+    let stride = (raw.stride as usize).max(row_bytes).max(1);
+    let mut packed = Vec::with_capacity(row_bytes * raw.height as usize);
+    for row in raw.data.chunks(stride).take(raw.height as usize) {
+        let Some(pixels) = row.get(..row_bytes) else {
+            break;
+        };
+        packed.extend_from_slice(pixels);
+    }
+    // Pixel moves only, so BGRA bytes ride through an `RgbaImage` fine.
+    let Some(img) = image::RgbaImage::from_raw(raw.width, raw.height, packed) else {
+        warn!("wayland-direct: frame shorter than declared — emitting it un-oriented");
+        return raw;
+    };
+    let img = orientation.apply(img);
+    RawFrame {
+        width: img.width(),
+        height: img.height(),
+        stride: img.width() * 4,
+        data: Bytes::from(img.into_raw()),
+        ..raw
+    }
 }
 
 fn try_build_importer() -> Option<Arc<dyn DmaBufImporter>> {
@@ -855,7 +1026,9 @@ fn make_dmabuf_buffer(
     let fourcc = drm_fourcc::DrmFourcc::try_from(offer.format).map_err(|_| {
         FerricastError::Capture(format!("unknown DRM fourcc 0x{:08x}", offer.format))
     })?;
-    let buf = alloc.alloc(offer.width, offer.height, fourcc)?;
+    let format = dmabuf_pixel_format(fourcc)
+        .ok_or_else(|| FerricastError::Capture(format!("unsupported dmabuf fourcc {fourcc:?}")))?;
+    let buf = alloc.alloc(offer.width, offer.height, fourcc, format)?;
     // The compositor only finds out about a bad params combo at
     // `copy()` time (it emits `failed` on the frame), so logging
     // what we negotiated here is the only way to diagnose
@@ -907,20 +1080,19 @@ fn make_shm_buffer(
     qh: &QueueHandle<WorkerState>,
     info: &FrameInfo,
 ) -> Result<(WlBuffer, ShmBuffer)> {
-    let size = info
-        .shm
-        .as_ref()
-        .map(|s| s.stride * info.height)
-        .unwrap_or(0);
-    let stride = info
-        .shm
-        .as_ref()
-        .map(|s| s.stride)
-        .unwrap_or(info.width * 4);
-    let shm_fmt = info.shm.as_ref().map(|s| s.format).unwrap_or(0);
-    if size == 0 {
+    let Some(offer) = info.shm.as_ref() else {
         return Err(FerricastError::Capture(
             "compositor didn't offer wl_shm format for this frame".into(),
+        ));
+    };
+    let (wl_format, pixel_format) = shm_pixel_format(offer.format).ok_or_else(|| {
+        FerricastError::Capture(format!("unsupported wl_shm format 0x{:08x}", offer.format))
+    })?;
+    let stride = offer.stride;
+    let size = stride.saturating_mul(info.height);
+    if size == 0 {
+        return Err(FerricastError::Capture(
+            "compositor offered an empty wl_shm buffer".into(),
         ));
     }
     let (fd, mmap) = alloc_memfd(size as usize)?;
@@ -930,12 +1102,11 @@ fn make_shm_buffer(
         info.width as i32,
         info.height as i32,
         stride as i32,
-        wl_shm_format(shm_fmt)?,
+        wl_format,
         qh,
         (),
     );
     pool.destroy();
-    let pixel_format = wl_shm_format_to_pixel(shm_fmt);
     Ok((
         wl_buf,
         ShmBuffer {
@@ -947,25 +1118,6 @@ fn make_shm_buffer(
             pixel_format,
         },
     ))
-}
-
-fn wl_shm_format(raw: u32) -> Result<wl_shm::Format> {
-    match raw {
-        0 => Ok(wl_shm::Format::Argb8888),
-        1 => Ok(wl_shm::Format::Xrgb8888),
-        0x34324241 => Ok(wl_shm::Format::Abgr8888),
-        0x34325258 => Ok(wl_shm::Format::Xbgr8888),
-        other => Err(FerricastError::Capture(format!(
-            "unsupported wl_shm format 0x{other:08x}"
-        ))),
-    }
-}
-
-fn wl_shm_format_to_pixel(raw: u32) -> PixelFormat {
-    match raw {
-        0x34324241 | 0x34325258 => PixelFormat::Rgba,
-        _ => PixelFormat::Bgra,
-    }
 }
 
 fn now_us() -> u64 {
@@ -1008,7 +1160,7 @@ fn mmap_bo_to_raw(alloc: &AllocatedBuffer) -> std::result::Result<RawFrame, Ferr
     let h = alloc.height as usize;
     let dst_stride = w * 4;
     let size = map_stride * h;
-    let format = alloc.pixel_format();
+    let format = alloc.format;
 
     dma_buf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ)
         .map_err(|e| FerricastError::Capture(format!("dma_buf_sync(START|READ): {e}")))?;
@@ -1143,17 +1295,46 @@ enum FrameStatus {
     Failed,
 }
 
+struct OutputSlot {
+    proxy: WlOutput,
+    name: Option<String>,
+    /// Latest `geometry.transform`; the compositor re-sends it when
+    /// the user rotates the display mid-stream.
+    transform: wl_output::Transform,
+}
+
 struct WorkerState {
-    outputs: Vec<(WlOutput, Option<String>)>,
-    /// Stashed for diagnostics so we can log "started capturing
-    /// $name" without re-querying. Held for `Drop` ordering — the
-    /// proxy survives until the worker thread ends.
-    #[allow(dead_code)]
+    outputs: Vec<OutputSlot>,
+    /// The output being captured; its live transform decides how
+    /// each frame is re-oriented.
     target: Option<WlOutput>,
     frame_info: Option<FrameInfo>,
+    /// `buffer_done` seen for the in-flight frame: every offer
+    /// (`buffer` / `linux_dmabuf`) has been announced.
+    buffer_done: bool,
     status: FrameStatus,
-    size_emitted: bool,
-    size_tx: Option<std::sync::mpsc::SyncSender<(u32, u32)>>,
+    /// `Y_INVERT` from the in-flight frame's `flags` event.
+    y_invert: bool,
+    /// `(fourcc → modifiers)` from the v3 `zwp_linux_dmabuf_v1.modifier`
+    /// events. Only populated when the global is bound below v4 (v4
+    /// compositors use the feedback object instead).
+    dmabuf_v3_modifiers: HashMap<u32, Vec<u64>>,
+}
+
+impl WorkerState {
+    /// Orientation correction for the in-flight frame: its
+    /// `Y_INVERT` flag plus the target output's current transform.
+    fn frame_orientation(&self) -> Orientation {
+        let transform = self
+            .target
+            .as_ref()
+            .and_then(|t| self.outputs.iter().find(|o| &o.proxy == t))
+            .map_or(wl_output::Transform::Normal, |o| o.transform);
+        Orientation {
+            transform,
+            y_invert: self.y_invert,
+        }
+    }
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for WorkerState {
@@ -1176,13 +1357,20 @@ impl Dispatch<WlOutput, ()> for WorkerState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Name { name } = event {
-            for (out, slot) in &mut state.outputs {
-                if out == proxy {
-                    *slot = Some(name.clone());
-                    break;
-                }
+        let Some(slot) = state.outputs.iter_mut().find(|o| &o.proxy == proxy) else {
+            return;
+        };
+        match event {
+            wl_output::Event::Name { name } => slot.name = Some(name),
+            wl_output::Event::Geometry { transform, .. } => {
+                // An unknown (future) transform falls back to Normal:
+                // a mis-rotated stream beats a dropped one.
+                slot.transform = match transform {
+                    WEnum::Value(t) => t,
+                    WEnum::Unknown(_) => wl_output::Transform::Normal,
+                };
             }
+            _ => {}
         }
     }
 }
@@ -1210,11 +1398,8 @@ impl Dispatch<ZxdgOutputV1, ()> for WorkerState {
             // xdg-output `name` fills in for wl_output v3- (no
             // Name event there). Best-effort: assign to the first
             // output that doesn't have a name yet.
-            for (_, slot) in &mut state.outputs {
-                if slot.is_none() {
-                    *slot = Some(name.clone());
-                    break;
-                }
+            if let Some(slot) = state.outputs.iter_mut().find(|o| o.name.is_none()) {
+                slot.name = Some(name);
             }
         }
     }
@@ -1254,13 +1439,27 @@ impl Dispatch<WlBuffer, ()> for WorkerState {
 }
 impl Dispatch<ZwpLinuxDmabufV1, ()> for WorkerState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &ZwpLinuxDmabufV1,
-        _: <ZwpLinuxDmabufV1 as Proxy>::Event,
+        event: <ZwpLinuxDmabufV1 as Proxy>::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        // v3 advertises its accept-list here; v4 compositors no longer
+        // send these and use the feedback object instead.
+        if let zwp_linux_dmabuf_v1::Event::Modifier {
+            format,
+            modifier_hi,
+            modifier_lo,
+        } = event
+        {
+            let modifier = (u64::from(modifier_hi) << 32) | u64::from(modifier_lo);
+            let list = state.dmabuf_v3_modifiers.entry(format).or_default();
+            if !list.contains(&modifier) {
+                list.push(modifier);
+            }
+        }
     }
 }
 impl Dispatch<ZwpLinuxBufferParamsV1, ()> for WorkerState {
@@ -1352,7 +1551,14 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for WorkerState {
             Event::BufferDone => {
                 // Compositor done advertising buffer params. If we
                 // got nothing, frame_info stays None and the worker
-                // will time out.
+                // bails out.
+                state.buffer_done = true;
+            }
+            Event::Flags { flags } => {
+                state.y_invert = match flags {
+                    WEnum::Value(f) => f.contains(zwlr_screencopy_frame_v1::Flags::YInvert),
+                    WEnum::Unknown(bits) => bits & 1 != 0,
+                };
             }
             Event::Ready { .. } => state.status = FrameStatus::Ready,
             Event::Failed => state.status = FrameStatus::Failed,
@@ -1481,20 +1687,16 @@ fn query_feedback(
     let fb_qh = feedback_queue.handle();
 
     // `get_default_feedback` only exists since version 4 of the
-    // dmabuf global. If we bound a lower version the request just
-    // wouldn't be in the proxy's API surface — we wouldn't reach
-    // this function at all (the caller filters on `dmabuf.version()`
-    // implicitly via the bind range).
+    // dmabuf global; the caller only gets here when
+    // `dmabuf.version() >= 4` (sending it on v3 is a protocol error
+    // that kills the connection).
     let _feedback = dmabuf.get_default_feedback(&fb_qh, ());
 
     let mut state = FeedbackState::default();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !state.done && std::time::Instant::now() < deadline {
-        feedback_queue
-            .blocking_dispatch(&mut state)
-            .map_err(|e| FerricastError::Capture(format!("dmabuf feedback dispatch: {e}")))?;
-    }
-    if !state.done {
+    let done = feedback_queue
+        .dispatch_until(&mut state, FRAME_EVENT_TIMEOUT, |s| s.done)
+        .map_err(|e| FerricastError::Capture(format!("dmabuf feedback dispatch: {e}")))?;
+    if !done {
         return Err(FerricastError::Capture(
             "dmabuf feedback timed out — compositor didn't send `done` within 2s".into(),
         ));
@@ -1506,7 +1708,7 @@ fn query_feedback(
     let mut accepted: HashMap<u32, Vec<u64>> = HashMap::new();
     if let (Some(fd), Some(main_dev)) = (state.format_table_fd.as_ref(), state.main_device) {
         let table_size = state.format_table_size as usize;
-        if table_size > 0 && table_size % 16 == 0 {
+        if table_size > 0 && table_size.is_multiple_of(16) {
             let ptr = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
@@ -1659,4 +1861,76 @@ fn decode_dev_t(device: &[u8]) -> Option<u64> {
     Some(u64::from_ne_bytes([
         device[0], device[1], device[2], device[3], device[4], device[5], device[6], device[7],
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(width: u32, height: u32, stride: u32, data: Vec<u8>) -> RawFrame {
+        RawFrame {
+            width,
+            height,
+            stride,
+            format: PixelFormat::Bgra,
+            data: Bytes::from(data),
+            timestamp_us: 7,
+        }
+    }
+
+    #[test]
+    fn identity_orientation_keeps_frame_untouched() {
+        let frame = raw(1, 1, 8, vec![1, 2, 3, 4, 0, 0, 0, 0]);
+        let out = orient_raw_frame(frame, Orientation::default());
+        assert_eq!(out.stride, 8);
+        assert_eq!(out.data.len(), 8);
+    }
+
+    #[test]
+    fn y_invert_flips_rows_and_drops_stride_padding() {
+        // 1×2, stride 8 (4 bytes of padding per row).
+        let frame = raw(
+            1,
+            2,
+            8,
+            vec![1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 0],
+        );
+        let out = orient_raw_frame(
+            frame,
+            Orientation {
+                transform: wl_output::Transform::Normal,
+                y_invert: true,
+            },
+        );
+        assert_eq!((out.width, out.height, out.stride), (1, 2, 4));
+        assert_eq!(out.data.as_ref(), &[2, 2, 2, 2, 1, 1, 1, 1]);
+        assert_eq!(out.timestamp_us, 7);
+    }
+
+    #[test]
+    fn rotation_by_90_swaps_axes() {
+        // 2×1 row [A, B] rotated clockwise → 1×2 column [A; B].
+        let frame = raw(2, 1, 8, vec![1, 1, 1, 1, 2, 2, 2, 2]);
+        let orientation = Orientation {
+            transform: wl_output::Transform::_90,
+            y_invert: false,
+        };
+        assert!(orientation.swaps_axes());
+        let out = orient_raw_frame(frame, orientation);
+        assert_eq!((out.width, out.height, out.stride), (1, 2, 4));
+        assert_eq!(out.data.as_ref(), &[1, 1, 1, 1, 2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn short_buffer_is_emitted_unoriented() {
+        let frame = raw(2, 2, 8, vec![0; 8]);
+        let out = orient_raw_frame(
+            frame,
+            Orientation {
+                transform: wl_output::Transform::_180,
+                y_invert: false,
+            },
+        );
+        assert_eq!((out.width, out.height, out.data.len()), (2, 2, 8));
+    }
 }

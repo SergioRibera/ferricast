@@ -35,12 +35,14 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::time::{Duration, Instant};
 
 use ferricast_core::SourceError;
 use tracing::debug;
 
 use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle, WEnum,
+    Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle, WEnum,
+    backend::WaylandError,
     globals::{GlobalListContents, registry_queue_init},
     protocol::{
         wl_buffer::WlBuffer,
@@ -86,12 +88,18 @@ impl BufferInfo {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum FrameStatus {
+    #[default]
     Pending,
     Ready,
     Failed,
 }
+
+/// Upper bound for each compositor round-trip of a thumbnail capture.
+/// A healthy compositor answers within a frame; this only bounds the
+/// thread when the source vanishes mid-capture.
+const THUMB_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ── Monitor thumbnails (wlr-screencopy) ───────────────────────────
 
@@ -150,12 +158,17 @@ pub fn monitor_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceEr
     // Wait for the `buffer` event so we know which shm format to
     // allocate. Some compositors also emit `linux_dmabuf` and
     // `buffer_done`; we only need the wl_shm side.
-    while state.buffer.is_none() {
-        queue
-            .blocking_dispatch(&mut state)
-            .map_err(|e| SourceError::Backend(format!("buffer wait: {e}")))?;
-    }
-    let info = state.buffer.unwrap();
+    queue
+        .dispatch_until(&mut state, THUMB_EVENT_TIMEOUT, |s| {
+            s.buffer.is_some() || s.status == FrameStatus::Failed
+        })
+        .map_err(|e| SourceError::Backend(format!("buffer wait: {e}")))?;
+    let Some(info) = state.buffer else {
+        frame.destroy();
+        return Err(SourceError::Backend(
+            "compositor didn't announce a wl_shm buffer for the screencopy frame".into(),
+        ));
+    };
 
     let (fd, mmap) = alloc_shm(info.size())?;
     let pool = shm.create_pool(fd.as_fd(), info.size() as i32, &qh, ());
@@ -170,15 +183,23 @@ pub fn monitor_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceEr
     );
     frame.copy(&buffer);
 
-    while state.status == FrameStatus::Pending {
-        queue
-            .blocking_dispatch(&mut state)
-            .map_err(|e| SourceError::Backend(format!("frame wait: {e}")))?;
-    }
-    if state.status == FrameStatus::Failed {
-        return Err(SourceError::Backend(
-            "compositor returned `failed` for screencopy frame".into(),
-        ));
+    queue
+        .dispatch_until(&mut state, THUMB_EVENT_TIMEOUT, |s| {
+            s.status != FrameStatus::Pending
+        })
+        .map_err(|e| SourceError::Backend(format!("frame wait: {e}")))?;
+    match state.status {
+        FrameStatus::Ready => {}
+        FrameStatus::Failed => {
+            return Err(SourceError::Backend(
+                "compositor returned `failed` for screencopy frame".into(),
+            ));
+        }
+        FrameStatus::Pending => {
+            return Err(SourceError::Backend(
+                "screencopy frame not ready in time".into(),
+            ));
+        }
     }
 
     let png = encode_png(
@@ -242,12 +263,6 @@ struct OutputEntry {
 /// even though wayland-client's `WEnum<Transform>` is `!Copy`. Keeps
 /// the per-orientation match arms in one place too.
 type WlTransform = wl_output::Transform;
-
-impl Default for FrameStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 impl Dispatch<WlRegistry, GlobalListContents> for MonitorState {
     fn event(
@@ -420,18 +435,18 @@ pub fn window_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceErr
         handle: None,
         identifiers: HashMap::new(),
         buffer: None,
+        shm_format: None,
         formats_done: false,
         status: FrameStatus::Pending,
     };
 
     // Roundtrip until we've seen `done` on the matching toplevel
     // handle (which guarantees `identifier` was delivered first).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    while state.handle.is_none() && std::time::Instant::now() < deadline {
-        queue
-            .blocking_dispatch(&mut state)
-            .map_err(|e| SourceError::Backend(format!("toplevel wait: {e}")))?;
-    }
+    queue
+        .dispatch_until(&mut state, Duration::from_millis(500), |s| {
+            s.handle.is_some()
+        })
+        .map_err(|e| SourceError::Backend(format!("toplevel wait: {e}")))?;
     let handle = state
         .handle
         .clone()
@@ -439,14 +454,27 @@ pub fn window_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceErr
 
     let source = toplevel_src_mgr.create_source(&handle, &qh, ());
     let session = capture_mgr.create_session(&source, CaptureOptions::empty(), &qh, ());
-    while !state.formats_done {
-        queue
-            .blocking_dispatch(&mut state)
-            .map_err(|e| SourceError::Backend(format!("session wait: {e}")))?;
+    let formats_done = queue
+        .dispatch_until(&mut state, THUMB_EVENT_TIMEOUT, |s| s.formats_done)
+        .map_err(|e| SourceError::Backend(format!("session wait: {e}")))?;
+    if !formats_done {
+        return Err(SourceError::Backend(
+            "ext-image-copy session didn't announce buffer constraints in time".into(),
+        ));
     }
-    let info = state.buffer.ok_or_else(|| {
-        SourceError::Backend("session emitted `done` without buffer_size/shm_format".into())
+    if state.status == FrameStatus::Failed {
+        // `stopped` before `done`: the window went away.
+        return Err(SourceError::NotFound(id.to_owned()));
+    }
+    let size = state
+        .buffer
+        .ok_or_else(|| SourceError::Backend("session emitted `done` without buffer_size".into()))?;
+    let format = state.shm_format.ok_or_else(|| {
+        SourceError::Backend(
+            "session advertised no supported wl_shm format (need 8-bit ARGB/XRGB/ABGR/XBGR)".into(),
+        )
     })?;
+    let info = BufferInfo { format, ..size };
 
     let (fd, mmap) = alloc_shm(info.size())?;
     let pool = shm.create_pool(fd.as_fd(), info.size() as i32, &qh, ());
@@ -464,15 +492,23 @@ pub fn window_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceErr
     frame.attach_buffer(&buffer);
     frame.capture();
 
-    while state.status == FrameStatus::Pending {
-        queue
-            .blocking_dispatch(&mut state)
-            .map_err(|e| SourceError::Backend(format!("frame wait: {e}")))?;
-    }
-    if state.status == FrameStatus::Failed {
-        return Err(SourceError::Backend(
-            "compositor returned `failed` for ext-image-copy frame".into(),
-        ));
+    queue
+        .dispatch_until(&mut state, THUMB_EVENT_TIMEOUT, |s| {
+            s.status != FrameStatus::Pending
+        })
+        .map_err(|e| SourceError::Backend(format!("frame wait: {e}")))?;
+    match state.status {
+        FrameStatus::Ready => {}
+        FrameStatus::Failed => {
+            return Err(SourceError::Backend(
+                "compositor returned `failed` for ext-image-copy frame".into(),
+            ));
+        }
+        FrameStatus::Pending => {
+            return Err(SourceError::Backend(
+                "ext-image-copy frame not ready in time (window closed?)".into(),
+            ));
+        }
     }
 
     // Window thumbnails come from `ext-image-copy-capture-v1`, which
@@ -495,7 +531,11 @@ struct WindowState {
     target_id: String,
     handle: Option<ExtForeignToplevelHandleV1>,
     identifiers: HashMap<u32, String>,
+    /// Size announced by `buffer_size`; `format` is filled from
+    /// `shm_format` once the session's `done` arrives.
     buffer: Option<BufferInfo>,
+    /// First advertised wl_shm format we support.
+    shm_format: Option<u32>,
     formats_done: bool,
     status: FrameStatus,
 }
@@ -665,15 +705,12 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for WindowState {
                     WEnum::Value(v) => v as u32,
                     WEnum::Unknown(v) => v,
                 };
-                if let Some(b) = state.buffer.as_mut() {
-                    b.format = format;
-                } else {
-                    state.buffer = Some(BufferInfo {
-                        format,
-                        width: 0,
-                        height: 0,
-                        stride: 0,
-                    });
+                // One event per advertised format, in the
+                // compositor's preference order: keep the first one we
+                // can read back instead of letting a later (e.g.
+                // 10-bit) entry overwrite it.
+                if state.shm_format.is_none() && wl_shm_format(format).is_ok() {
+                    state.shm_format = Some(format);
                 }
             }
             Event::Done => state.formats_done = true,
@@ -700,6 +737,90 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for WindowState {
             Event::Ready => state.status = FrameStatus::Ready,
             Event::Failed { .. } => state.status = FrameStatus::Failed,
             _ => {}
+        }
+    }
+}
+
+// ── Shared support: bounded event-queue dispatch ──────────────────
+
+/// Bounded waits on a Wayland [`EventQueue`].
+///
+/// `EventQueue::blocking_dispatch` blocks until the compositor sends
+/// *something*, so a `while !done && now < deadline { blocking_dispatch }`
+/// loop never notices its deadline when the compositor goes quiet (a
+/// window closed mid-capture, a hung compositor). This polls the
+/// connection fd with the remaining budget instead, so the deadline
+/// is honoured. Shared with `wayland_direct`.
+pub(crate) trait EventQueueExt<S> {
+    /// Dispatch events until `done(state)` holds or `timeout` elapses.
+    ///
+    /// Returns `Ok(true)` when `done` became true, `Ok(false)` on
+    /// timeout.
+    ///
+    /// # Errors
+    ///
+    /// Protocol / socket errors from flushing, reading or dispatching.
+    fn dispatch_until(
+        &mut self,
+        state: &mut S,
+        timeout: Duration,
+        done: impl FnMut(&S) -> bool,
+    ) -> Result<bool, DispatchError>;
+}
+
+impl<S> EventQueueExt<S> for EventQueue<S> {
+    fn dispatch_until(
+        &mut self,
+        state: &mut S,
+        timeout: Duration,
+        mut done: impl FnMut(&S) -> bool,
+    ) -> Result<bool, DispatchError> {
+        let start = Instant::now();
+        loop {
+            self.dispatch_pending(state)?;
+            if done(state) {
+                return Ok(true);
+            }
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            self.flush()?;
+            // `None` means events are already queued: loop back to
+            // `dispatch_pending`.
+            let Some(guard) = self.prepare_read() else {
+                continue;
+            };
+            let mut pfd = libc::pollfd {
+                fd: guard.connection_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // Round up so a sub-millisecond remainder still sleeps
+            // instead of busy-looping on a zero timeout.
+            let timeout_ms =
+                i32::try_from(remaining.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+            // SAFETY: `pfd` is a valid, exclusively borrowed pollfd for
+            // the duration of the call and `nfds` is 1. The fd stays
+            // open while `guard` (which borrows the connection) lives.
+            let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(WaylandError::Io(err).into());
+            }
+            if rc == 0 {
+                // Timed out: dropping the guard cancels the read; the
+                // next iteration sees `remaining == 0` and returns.
+                continue;
+            }
+            match guard.read() {
+                Ok(_) => {}
+                Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
         }
     }
 }
@@ -795,15 +916,18 @@ fn wl_shm_format(raw: u32) -> Result<wl_shm::Format, SourceError> {
     }
 }
 
-/// Orientation hints for [`encode_png`]. `transform` is the wl_output
-/// transform of the captured monitor (rotated displays come out
-/// sideways from the framebuffer otherwise); `y_invert` is the
-/// `Y_INVERT` bit from the screencopy `flags` event (some
-/// compositors emit pixels bottom-up).
-#[derive(Clone, Copy)]
-struct Orientation {
-    transform: wl_output::Transform,
-    y_invert: bool,
+/// How a captured output framebuffer must be re-oriented to match
+/// what the user sees. `transform` is the wl_output transform of the
+/// captured monitor (rotated displays come out sideways from the
+/// framebuffer otherwise); `y_invert` is the `Y_INVERT` bit from the
+/// screencopy `flags` event (some compositors emit pixels bottom-up).
+///
+/// Shared with `wayland_direct`, whose CPU path applies the same
+/// correction to every streamed frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Orientation {
+    pub(crate) transform: wl_output::Transform,
+    pub(crate) y_invert: bool,
 }
 
 impl Default for Orientation {
@@ -812,6 +936,39 @@ impl Default for Orientation {
             transform: wl_output::Transform::Normal,
             y_invert: false,
         }
+    }
+}
+
+impl Orientation {
+    /// `true` when [`Self::apply`] would return the image unchanged.
+    pub(crate) fn is_identity(self) -> bool {
+        !self.y_invert && self.transform == wl_output::Transform::Normal
+    }
+
+    /// `true` when [`Self::apply`] swaps width and height.
+    pub(crate) fn swaps_axes(self) -> bool {
+        use wl_output::Transform;
+        matches!(
+            self.transform,
+            Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270
+        )
+    }
+
+    /// Apply `Y_INVERT` first (it's defined on the buffer's
+    /// framebuffer axis), then the wl_output transform — the
+    /// composition the compositor applies before scanning out to the
+    /// user's eye, so rotated + inverted captures come out the way
+    /// the user sees them.
+    ///
+    /// Channel order is irrelevant here (pure pixel moves), so the
+    /// `RgbaImage` may just as well hold BGRA bytes.
+    pub(crate) fn apply(self, img: image::RgbaImage) -> image::RgbaImage {
+        let img = if self.y_invert {
+            image::imageops::flip_vertical(&img)
+        } else {
+            img
+        };
+        apply_wl_transform(img, self.transform)
     }
 }
 
@@ -850,19 +1007,9 @@ fn encode_png(
     }
     drop(mmap);
 
-    let mut img = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+    let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
         .ok_or_else(|| SourceError::Backend("rgba from_raw failed".into()))?;
-
-    // Apply Y_INVERT first (it's defined on the buffer's framebuffer
-    // axis), then the wl_output transform — which is the
-    // composition the compositor would apply before scanning out to
-    // the user's eye. Doing them in the same order the spec describes
-    // means rotated + inverted captures (some VR / mobile-ish
-    // displays) come out the way the user sees them.
-    if orientation.y_invert {
-        img = image::imageops::flip_vertical(&img);
-    }
-    img = apply_wl_transform(img, orientation.transform);
+    let img = orientation.apply(img);
 
     let (final_w, final_h) = (img.width(), img.height());
     let (tw, th) = crate::fit_box(final_w, final_h, max_w, max_h);
@@ -889,16 +1036,16 @@ fn encode_png(
 /// per the wayland spec — same operation order as wlroots' renderer.
 fn apply_wl_transform(img: image::RgbaImage, transform: wl_output::Transform) -> image::RgbaImage {
     use image::imageops as ops;
-    use wl_output::Transform::*;
+    use wl_output::Transform;
     match transform {
-        Normal => img,
-        _90 => ops::rotate90(&img),
-        _180 => ops::rotate180(&img),
-        _270 => ops::rotate270(&img),
-        Flipped => ops::flip_horizontal(&img),
-        Flipped90 => ops::rotate90(&ops::flip_horizontal(&img)),
-        Flipped180 => ops::rotate180(&ops::flip_horizontal(&img)),
-        Flipped270 => ops::rotate270(&ops::flip_horizontal(&img)),
+        Transform::Normal => img,
+        Transform::_90 => ops::rotate90(&img),
+        Transform::_180 => ops::rotate180(&img),
+        Transform::_270 => ops::rotate270(&img),
+        Transform::Flipped => ops::flip_horizontal(&img),
+        Transform::Flipped90 => ops::rotate90(&ops::flip_horizontal(&img)),
+        Transform::Flipped180 => ops::rotate180(&ops::flip_horizontal(&img)),
+        Transform::Flipped270 => ops::rotate270(&ops::flip_horizontal(&img)),
         // Future-proof: an unknown variant lands here. Treat as
         // Normal so the thumbnail is still readable, just at the
         // wrong orientation — better than dropping the frame.

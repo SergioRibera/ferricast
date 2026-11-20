@@ -112,6 +112,9 @@ struct State {
     /// and lets us cross-reference from toplevel `output_enter`
     /// events without juggling proxy lifetimes.
     outputs: HashMap<u32, (WlOutput, OutputData)>,
+    /// Registry global name → wl_output protocol id, so a
+    /// `global_remove` (monitor unplugged) can find the entry to drop.
+    output_globals: HashMap<u32, u32>,
     xdg_outputs: HashMap<u32, ZxdgOutputV1>,
     /// Toplevels announced via `zwlr_foreign_toplevel_management_v1`
     /// (wlroots / Hyprland / sway / Wayfire / …). Richer than the
@@ -144,12 +147,37 @@ struct State {
 }
 
 impl State {
+    /// Drop the wl_output bound from registry global `name` (monitor
+    /// unplugged / disabled). Unknown names belong to other globals
+    /// and are ignored.
+    fn remove_output_global(&mut self, name: u32) {
+        let Some(id) = self.output_globals.remove(&name) else {
+            return;
+        };
+        if let Some(xdg) = self.xdg_outputs.remove(&id) {
+            xdg.destroy();
+        }
+        if let Some((output, _)) = self.outputs.remove(&id)
+            && output.version() >= 3
+        {
+            // `release` is the v3+ destructor; older versions have
+            // none and the proxy just goes inert.
+            output.release();
+        }
+        for (_, t) in self.wlr_toplevels.values_mut() {
+            t.outputs.remove(&id);
+        }
+        debug!(global = name, output_id = id, "wl_output removed");
+        self.monitors_dirty = true;
+        self.windows_dirty = true;
+    }
+
     fn recompute(&mut self) {
         if !self.monitors_dirty && !self.windows_dirty {
             return;
         }
         let mut snap = Snapshot::default();
-        for (_, (_, o)) in &self.outputs {
+        for (_, o) in self.outputs.values() {
             if !o.ready {
                 continue;
             }
@@ -286,17 +314,17 @@ impl WaylandSourceEnumerator {
 
         // Bind every existing wl_output upfront so we don't miss
         // events for monitors that were present before we
-        // connected. New ones come in via the registry handler.
+        // connected. New ones come in via the registry handler. The
+        // `outputs` entry itself is created lazily by the first
+        // wl_output event (which also binds the xdg-output).
+        let mut output_globals = HashMap::new();
         for g in globals.contents().clone_list() {
             if g.interface == "wl_output" {
                 let output =
                     globals
                         .registry()
                         .bind::<WlOutput, _, _>(g.name, g.version.min(4), &qh, ());
-                let mut data = OutputData::default();
-                // Trigger xdg-output binding for this wl_output if
-                // possible — populated lazily inside dispatch.
-                let _ = (output, &mut data);
+                output_globals.insert(g.name, output.id().protocol_id());
             }
         }
 
@@ -305,6 +333,7 @@ impl WaylandSourceEnumerator {
 
         let mut state = State {
             outputs: HashMap::new(),
+            output_globals,
             xdg_outputs: HashMap::new(),
             wlr_toplevels: HashMap::new(),
             ext_toplevels: HashMap::new(),
@@ -456,19 +485,20 @@ impl Dispatch<WlRegistry, GlobalListContents> for State {
         qh: &QueueHandle<Self>,
     ) {
         use wayland_client::protocol::wl_registry::Event;
-        if let Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            if interface == "wl_output" {
+        match event {
+            Event::Global {
+                name,
+                interface,
+                version,
+            } if interface == "wl_output" => {
                 let out = registry.bind::<WlOutput, _, _>(name, version.min(4), qh, ());
-                state
-                    .outputs
-                    .insert(out.id().protocol_id(), (out, OutputData::default()));
+                let id = out.id().protocol_id();
+                state.output_globals.insert(name, id);
+                state.outputs.insert(id, (out, OutputData::default()));
                 state.monitors_dirty = true;
             }
+            Event::GlobalRemove { name } => state.remove_output_global(name),
+            _ => {}
         }
     }
 }
@@ -483,6 +513,11 @@ impl Dispatch<WlOutput, ()> for State {
         qh: &QueueHandle<Self>,
     ) {
         let id = proxy.id().protocol_id();
+        // Events still in flight for an output whose global was just
+        // removed must not resurrect its entry.
+        if !state.output_globals.values().any(|&live| live == id) {
+            return;
+        }
         let entry = state
             .outputs
             .entry(id)
@@ -496,16 +531,14 @@ impl Dispatch<WlOutput, ()> for State {
                     entry.1.model = Some(model);
                 }
             }
-            wl_output::Event::Mode { refresh, flags, .. } => {
-                // Only the *current* mode counts. wlroots flags the
-                // current one with `current` in the mode flags.
+            // Only the *current* mode counts. wlroots flags the
+            // current one with `current` in the mode flags.
+            wl_output::Event::Mode { refresh, flags, .. }
                 if flags
                     .into_result()
-                    .map(|f| f.contains(wl_output::Mode::Current))
-                    .unwrap_or(false)
-                {
-                    entry.1.refresh_mhz = refresh;
-                }
+                    .is_ok_and(|f| f.contains(wl_output::Mode::Current)) =>
+            {
+                entry.1.refresh_mhz = refresh;
             }
             wl_output::Event::Scale { factor } => {
                 entry.1.scale = factor;
@@ -523,11 +556,11 @@ impl Dispatch<WlOutput, ()> for State {
             _ => {}
         }
         // Bind xdg-output lazily once the manager is around.
-        if !state.xdg_outputs.contains_key(&id) {
-            if let Some(mgr) = state.xdg_output_manager.as_ref() {
-                let xo = mgr.get_xdg_output(proxy, qh, id);
-                state.xdg_outputs.insert(id, xo);
-            }
+        if !state.xdg_outputs.contains_key(&id)
+            && let Some(mgr) = state.xdg_output_manager.as_ref()
+        {
+            let xo = mgr.get_xdg_output(proxy, qh, id);
+            state.xdg_outputs.insert(id, xo);
         }
     }
 }
@@ -565,15 +598,11 @@ impl Dispatch<ZxdgOutputV1, u32> for State {
                 entry.1.logical_w = width;
                 entry.1.logical_h = height;
             }
-            zxdg_output_v1::Event::Name { name } => {
-                if entry.1.name.is_none() {
-                    entry.1.name = Some(name);
-                }
+            zxdg_output_v1::Event::Name { name } if entry.1.name.is_none() => {
+                entry.1.name = Some(name);
             }
-            zxdg_output_v1::Event::Description { description } => {
-                if entry.1.description.is_none() {
-                    entry.1.description = Some(description);
-                }
+            zxdg_output_v1::Event::Description { description } if entry.1.description.is_none() => {
+                entry.1.description = Some(description);
             }
             zxdg_output_v1::Event::Done => {
                 state.monitors_dirty = true;

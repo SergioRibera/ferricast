@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use ferricast_core::{
     AudioCapture, AudioCaptureConfig, AudioCodec, AudioFrame, AudioMuteHandle, AudioSource,
     FerricastError, Result,
@@ -65,10 +65,10 @@ struct NegotiatedAudio {
 impl AudioWorkerHandle {
     fn shutdown(&mut self) {
         let _ = self.terminator.send(Terminate);
-        if let Some(h) = self.join.take() {
-            if let Err(panic) = h.join() {
-                error!(?panic, "PipeWire audio worker panicked during shutdown");
-            }
+        if let Some(h) = self.join.take()
+            && let Err(panic) = h.join()
+        {
+            error!(?panic, "PipeWire audio worker panicked during shutdown");
         }
     }
 }
@@ -168,8 +168,9 @@ fn spawn_worker(
     mute: AudioMuteHandle,
 ) -> Result<AudioWorkerHandle> {
     // Moderate buffer: 32 chunks × ~21 ms ≈ 680 ms. The PipeWire
-    // callback runs on an RT thread that can't block; `try_send`
-    // returning `Full` is the only realistic backpressure response.
+    // callback runs on the stream's main loop, which must not block;
+    // `try_send` returning `Full` is the only realistic backpressure
+    // response.
     // 32 is large enough to ride out short supervisor stalls (HTTP
     // read locks, segment-close ring writes) without holding so
     // many chunks in flight that, once the supervisor catches up,
@@ -222,14 +223,77 @@ struct UserData {
     /// (drops we should hear).
     log_sample_counter: u64,
     log_last_at: Option<std::time::Instant>,
-    /// Internal sample counter used to derive a strictly-monotonic
-    /// PTS in microseconds. We anchor it to the first buffer's
-    /// `now_us()` so audio shares a clock origin with the screen
-    /// capture path (both end up rooted in `SystemTime::now()`),
-    /// then advance by `samples / sample_rate` per buffer so PTS
-    /// is exact in 1/sample-rate ticks (rounding to µs).
-    pts_anchor_us: Option<u64>,
+    pts: PtsClock,
+}
+
+/// Max |sample-count PTS − wall clock| tolerated before re-anchoring.
+/// Normal delivery jitter is well under one ~21 ms quantum; 100 ms is
+/// far above that yet below the HLS segmenter's 300 ms staleness cut
+/// (`MAX_AUDIO_STALENESS_US`), so a stream that fell behind gets
+/// pulled back before its frames start being dropped as stale.
+const PTS_REANCHOR_THRESHOLD_US: u64 = 100_000;
+
+/// Chunk timestamps for the PCM stream.
+///
+/// Anchored to `now_us()` (wall clock, `UNIX_EPOCH`) so audio shares
+/// a clock origin with the screen-capture path, then advanced by
+/// `samples / sample_rate` per chunk so deltas are exact in
+/// 1/sample-rate ticks. Counting samples alone never notices that the
+/// stream paused (sink idle / suspended, xrun) or that the sound
+/// card's clock drifts against the system clock (~50 ppm ≈ 180 ms/h),
+/// so whenever the counted PTS strays more than
+/// [`PTS_REANCHOR_THRESHOLD_US`] from the wall clock the anchor is
+/// reset to "now".
+#[derive(Debug, Default)]
+struct PtsClock {
+    anchor_us: Option<u64>,
     samples_since_anchor: u64,
+}
+
+/// Result of [`PtsClock::stamp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    timestamp_us: u64,
+    /// `Some(counted − wall)` in µs when this chunk re-anchored the
+    /// clock (positive: counted PTS was ahead of the wall clock).
+    reanchored_from_drift_us: Option<i64>,
+}
+
+impl PtsClock {
+    /// Timestamp a chunk of `samples` frames that arrived at
+    /// `now_us`, then advance the clock past it.
+    fn stamp(&mut self, samples: u64, sample_rate: u32, now_us: u64) -> Stamp {
+        let rate = u64::from(sample_rate.max(1));
+        let mut reanchored_from_drift_us = None;
+        let timestamp_us = match self.anchor_us {
+            Some(anchor) => {
+                let counted = anchor
+                    .saturating_add(self.samples_since_anchor.saturating_mul(1_000_000) / rate);
+                let drift = i128::from(counted) - i128::from(now_us);
+                if drift.unsigned_abs() > u128::from(PTS_REANCHOR_THRESHOLD_US) {
+                    reanchored_from_drift_us = Some(i64::try_from(drift).unwrap_or(if drift > 0 {
+                        i64::MAX
+                    } else {
+                        i64::MIN
+                    }));
+                    self.anchor_us = Some(now_us);
+                    self.samples_since_anchor = 0;
+                    now_us
+                } else {
+                    counted
+                }
+            }
+            None => {
+                self.anchor_us = Some(now_us);
+                now_us
+            }
+        };
+        self.samples_since_anchor = self.samples_since_anchor.saturating_add(samples);
+        Stamp {
+            timestamp_us,
+            reanchored_from_drift_us,
+        }
+    }
 }
 
 fn run_loop(
@@ -285,8 +349,7 @@ fn run_loop(
         first_frame_logged: false,
         log_sample_counter: 0,
         log_last_at: None,
-        pts_anchor_us: None,
-        samples_since_anchor: 0,
+        pts: PtsClock::default(),
     };
 
     let _listener = stream
@@ -314,11 +377,18 @@ fn run_loop(
     let pod = build_audio_format_pod(config.sample_rate, config.channels);
     let mut pods = [pod_view(&pod)];
 
+    // No `RT_PROCESS`: with it, `process` runs on PipeWire's data
+    // thread while `param_changed` runs on this main-loop thread, and
+    // both get `&mut UserData` — aliased mutable access across threads.
+    // `handle_process` also allocates, logs and `try_send`s, none of
+    // which is RT-safe. Without the flag PipeWire invokes `process`
+    // on the main loop too; at ~21 ms quanta the extra hop is
+    // irrelevant.
     stream
         .connect(
             pw::spa::utils::Direction::Input,
             None,
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
             pods.as_mut_slice(),
         )
         .map_err(|e| FerricastError::Capture(format!("audio Stream::connect: {e}")))?;
@@ -436,29 +506,46 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
     }
     let bytes = owned.freeze();
 
-    let samples_in_chunk = (bytes.len() / BYTES_PER_SAMPLE / ud.channels.max(1) as usize) as u64;
+    // Carry the *negotiated* rate/channels on every frame, not the
+    // values we requested. PipeWire is free to land on something
+    // close-but-not-equal (e.g. 44.1 kHz against a 44.1 kHz sink
+    // even though we asked for 48 kHz); the consumer side reads
+    // these per-frame fields to configure its AAC encoder
+    // accordingly so the ADTS header advertises the right
+    // sample-rate index. The PTS math below uses them too, otherwise
+    // a rate mismatch would read as constant drift. Falls back to the
+    // requested values when `param_changed` hasn't run yet (= first
+    // chunk delivered before the format callback, unusual but cheap
+    // to guard).
+    let negotiated_rate = ud.negotiated.sample_rate.load(Ordering::Relaxed);
+    let negotiated_channels = ud.negotiated.channels.load(Ordering::Relaxed) as u16;
+    let frame_rate = if negotiated_rate > 0 {
+        negotiated_rate
+    } else {
+        ud.sample_rate
+    };
+    let frame_channels = if negotiated_channels > 0 {
+        negotiated_channels
+    } else {
+        ud.channels
+    };
+
+    let samples_in_chunk = (bytes.len() / BYTES_PER_SAMPLE / frame_channels.max(1) as usize) as u64;
     if samples_in_chunk == 0 {
         return;
     }
 
-    // Anchor on first buffer so the audio PTS shares an origin with
-    // `now_us()` (the screen capture's `timestamp_us` source). After
-    // anchoring, derive every subsequent PTS from the accumulated
-    // sample count — that keeps audio frame deltas exact (no
-    // wall-clock jitter) while still being co-monotonic with video.
-    let timestamp_us = match ud.pts_anchor_us {
-        Some(anchor) => {
-            let off_us =
-                ud.samples_since_anchor.saturating_mul(1_000_000) / ud.sample_rate.max(1) as u64;
-            anchor.saturating_add(off_us)
-        }
-        None => {
-            let now = now_us();
-            ud.pts_anchor_us = Some(now);
-            now
-        }
-    };
-    ud.samples_since_anchor = ud.samples_since_anchor.saturating_add(samples_in_chunk);
+    // Sample-count PTS on the wall-clock base shared with video,
+    // re-anchored on gaps / drift (see `PtsClock`).
+    let stamp = ud.pts.stamp(samples_in_chunk, frame_rate, now_us());
+    if let Some(drift_us) = stamp.reanchored_from_drift_us {
+        info!(
+            drift_us,
+            "audio: sample-count PTS strayed from the wall clock (stream gap, xrun or \
+             clock drift) — re-anchored"
+        );
+    }
+    let timestamp_us = stamp.timestamp_us;
     ud.log_sample_counter = ud.log_sample_counter.saturating_add(samples_in_chunk);
 
     if !ud.first_frame_logged {
@@ -509,30 +596,9 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
         }
     }
 
-    // Carry the *negotiated* rate/channels on every frame, not the
-    // values we requested. PipeWire is free to land on something
-    // close-but-not-equal (e.g. 44.1 kHz against a 44.1 kHz sink
-    // even though we asked for 48 kHz); the consumer side reads
-    // these per-frame fields to configure its AAC encoder
-    // accordingly so the ADTS header advertises the right
-    // sample-rate index. Falls back to the requested values when
-    // `param_changed` hasn't run yet (= first chunk delivered
-    // before the format callback, unusual but cheap to guard).
-    let negotiated_rate = ud.negotiated.sample_rate.load(Ordering::Relaxed);
-    let negotiated_channels = ud.negotiated.channels.load(Ordering::Relaxed) as u16;
-    let frame_rate = if negotiated_rate > 0 {
-        negotiated_rate
-    } else {
-        ud.sample_rate
-    };
-    let frame_channels = if negotiated_channels > 0 {
-        negotiated_channels
-    } else {
-        ud.channels
-    };
     let frame = AudioFrame {
         codec: AudioCodec::Pcm,
-        data: Bytes::from(bytes),
+        data: bytes,
         timestamp_us,
         sample_rate: frame_rate,
         channels: frame_channels,
@@ -635,9 +701,76 @@ fn build_audio_format_pod(sample_rate: u32, channels: u16) -> Vec<u8> {
         .into_inner()
 }
 
+/// Wall clock (`UNIX_EPOCH`) in µs. Deliberately not
+/// `CLOCK_MONOTONIC` despite the `AudioCapture` trait doc: the HLS
+/// segmenter's staleness filter compares audio timestamps against
+/// `SystemTime::now()`, and video (`wayland_direct::now_us`) uses the
+/// same base. Change all three together or none.
 fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RATE: u32 = 48_000;
+    /// 1024 samples at 48 kHz.
+    const CHUNK: u64 = 1024;
+    const CHUNK_US: u64 = 21_333;
+
+    #[test]
+    fn first_chunk_anchors_to_now() {
+        let mut clock = PtsClock::default();
+        let stamp = clock.stamp(CHUNK, RATE, 5_000_000);
+        assert_eq!(stamp.timestamp_us, 5_000_000);
+        assert_eq!(stamp.reanchored_from_drift_us, None);
+    }
+
+    #[test]
+    fn steady_stream_follows_sample_count_not_jittery_wall() {
+        let mut clock = PtsClock::default();
+        clock.stamp(CHUNK, RATE, 1_000_000);
+        // Arrives 3 ms late: PTS still comes from the sample count.
+        let stamp = clock.stamp(CHUNK, RATE, 1_000_000 + CHUNK_US + 3_000);
+        assert_eq!(stamp.timestamp_us, 1_000_000 + CHUNK_US);
+        assert_eq!(stamp.reanchored_from_drift_us, None);
+    }
+
+    #[test]
+    fn gap_reanchors_to_now() {
+        let mut clock = PtsClock::default();
+        clock.stamp(CHUNK, RATE, 1_000_000);
+        // Sink went idle for 2 s.
+        let now = 3_000_000;
+        let stamp = clock.stamp(CHUNK, RATE, now);
+        assert_eq!(stamp.timestamp_us, now);
+        assert!(stamp.reanchored_from_drift_us.is_some_and(|d| d < 0));
+        // Continues from the new anchor.
+        let next = clock.stamp(CHUNK, RATE, now + CHUNK_US);
+        assert_eq!(next.timestamp_us, now + CHUNK_US);
+        assert_eq!(next.reanchored_from_drift_us, None);
+    }
+
+    #[test]
+    fn counted_clock_ahead_of_wall_reanchors() {
+        let mut clock = PtsClock::default();
+        clock.stamp(48_000 * 10, RATE, 0);
+        // 10 s of samples delivered after only 9.8 s of wall time.
+        let stamp = clock.stamp(CHUNK, RATE, 9_800_000);
+        assert_eq!(stamp.timestamp_us, 9_800_000);
+        assert_eq!(stamp.reanchored_from_drift_us, Some(200_000));
+    }
+
+    #[test]
+    fn drift_within_threshold_is_tolerated() {
+        let mut clock = PtsClock::default();
+        clock.stamp(48_000 * 10, RATE, 0);
+        let stamp = clock.stamp(CHUNK, RATE, 10_000_000 + PTS_REANCHOR_THRESHOLD_US);
+        assert_eq!(stamp.timestamp_us, 10_000_000);
+        assert_eq!(stamp.reanchored_from_drift_us, None);
+    }
 }
