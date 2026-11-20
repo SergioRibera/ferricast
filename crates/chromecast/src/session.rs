@@ -511,10 +511,12 @@ impl CastSession for ChromecastSession {
         };
         self.last_end = state.end();
 
-        // Best-effort STOP + CLOSE, skipped when the channel is already
-        // dead. If the user or another app ended our session, our app
-        // is gone and a STOP could only hit somebody else's.
-        if state.is_alive() {
+        // Best-effort STOP + CLOSE so a failed stream doesn't leave the
+        // receiver app on screen. Skipped when the channel is broken, or
+        // when the user or another app ended our session: our app is
+        // gone then and a STOP could only hit somebody else's.
+        let remote_ended = matches!(self.last_end, Some(SessionEnd::Remote(_)));
+        if !remote_ended && !state.writer.is_broken() {
             let stop_id = state.request_id.fetch_add(1, Ordering::Relaxed);
             if let Ok(stop_msg) = stop_app_message(stop_id, &state.session_id)
                 && let Err(e) = wire::send(&state.writer, &stop_msg).await

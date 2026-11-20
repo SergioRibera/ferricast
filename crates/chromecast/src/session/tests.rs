@@ -106,6 +106,19 @@ impl FakeConn {
         }
     }
 
+    /// Types of every message until the sender closes the connection.
+    async fn drain(&mut self) -> Vec<String> {
+        let mut types = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(msg) = self.recv().await {
+                types.push(ty(&msg));
+            }
+        })
+        .await
+        .expect("sender kept the connection open");
+        types
+    }
+
     async fn recv(&mut self) -> Option<CastMessage> {
         wire::recv(&mut self.reader, &mut self.buf)
             .await
@@ -202,7 +215,7 @@ async fn heartbeat_flows_both_ways() {
 #[tokio::test]
 async fn another_app_taking_over_ends_with_remote_stop() {
     let fake = FakeCast::start().await;
-    let (mut session, conn) = connected(&fake).await;
+    let (mut session, mut conn) = connected(&fake).await;
 
     conn.send_receiver_status(
         &json!([{"appId": "233637DE", "transportId": "yt", "sessionId": "yt-1"}]),
@@ -219,6 +232,19 @@ async fn another_app_taking_over_ends_with_remote_stop() {
         session.end_reason(),
         Some(FerricastError::RemoteStopped(_))
     ));
+    // The new app must not receive a STOP from us.
+    let sent = conn.drain().await;
+    assert!(!sent.iter().any(|t| t == "STOP"), "{sent:?}");
+}
+
+#[tokio::test]
+async fn stop_tears_down_our_app() {
+    let fake = FakeCast::start().await;
+    let (mut session, mut conn) = connected(&fake).await;
+    session.stop().await.unwrap();
+    let sent = conn.drain().await;
+    assert!(sent.iter().any(|t| t == "STOP"), "{sent:?}");
+    assert!(session.end_reason().is_none());
 }
 
 #[tokio::test]
