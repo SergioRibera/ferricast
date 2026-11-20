@@ -193,7 +193,13 @@ mod tests {
     fn a_forward_jump_resynchronises_instead_of_freezing() {
         let start = Instant::now();
         assert_eq!(
-            plan(anchored(start), Some(start), start, 1_000_000 + 60_000_000, LATENESS),
+            plan(
+                anchored(start),
+                Some(start),
+                start,
+                1_000_000 + 60_000_000,
+                LATENESS
+            ),
             Plan::Anchor
         );
         assert_eq!(

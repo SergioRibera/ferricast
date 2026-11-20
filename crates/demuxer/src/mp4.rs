@@ -165,8 +165,14 @@ impl Mp4Demuxer {
         let mut data = vec![0; sample.size as usize];
         self.file.read_exact_at(&mut data, sample.offset)?;
         let (data, idr) = self.framing.annex_b(&data, sample.sync || self.next == 0)?;
-        let dts = micros(sample.decode_ticks().saturating_sub(self.origin), self.timescale);
-        let pts = micros(sample.presentation_ticks().saturating_sub(self.origin), self.timescale);
+        let dts = micros(
+            sample.decode_ticks().saturating_sub(self.origin),
+            self.timescale,
+        );
+        let pts = micros(
+            sample.presentation_ticks().saturating_sub(self.origin),
+            self.timescale,
+        );
         let frame = EncodedFrame {
             codec: self.stream.codec,
             data,
@@ -342,9 +348,8 @@ fn parse_tables(stbl: &[u8]) -> Option<Tables> {
     // Entry counts are capped like the sample count: a table never needs more
     // entries than there can be samples, and the cap bounds every walk below.
     let counted = |kind: &[u8; 4]| {
-        child(stbl, kind).and_then(|body| {
-            Some((body.get(8..)?, (be32(body, 4)? as usize).min(MAX_SAMPLES)))
-        })
+        child(stbl, kind)
+            .and_then(|body| Some((body.get(8..)?, (be32(body, 4)? as usize).min(MAX_SAMPLES))))
     };
     let (stts, count) = counted(b"stts")?;
     let (stsc, stsc_count) = counted(b"stsc")?;
@@ -717,7 +722,10 @@ mod tests {
             ..Tables::default()
         };
         let error = build_samples(&tables).unwrap_err();
-        assert!(error.to_string().contains("sample description 2"), "{error}");
+        assert!(
+            error.to_string().contains("sample description 2"),
+            "{error}"
+        );
     }
 
     #[test]
