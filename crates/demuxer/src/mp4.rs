@@ -19,7 +19,8 @@ pub struct Mp4Demuxer {
     framing: Framing,
     timescale: u32,
     samples: Vec<Sample>,
-    shift: i64,
+    /// Media time (ticks) that maps to timestamp 0.
+    origin: i64,
     next: usize,
 }
 
@@ -67,6 +68,17 @@ struct Track {
     duration: u64,
     tables: Tables,
     shift: i64,
+}
+
+impl Sample {
+    fn decode_ticks(&self) -> i64 {
+        i64::try_from(self.dts).unwrap_or(i64::MAX)
+    }
+
+    fn presentation_ticks(&self) -> i64 {
+        self.decode_ticks()
+            .saturating_add(i64::from(self.cts_offset))
+    }
 }
 
 impl Tables {
@@ -120,6 +132,7 @@ impl Mp4Demuxer {
             })
             .count();
         samples.truncate(readable);
+        let origin = timeline_origin(&samples, track.shift);
         Ok(Self {
             file,
             stream: VideoStream {
@@ -131,11 +144,12 @@ impl Mp4Demuxer {
                     i64::try_from(track.duration).unwrap_or(i64::MAX),
                     track.timescale,
                 )),
+                presentation_start_us: micros(track.shift.saturating_sub(origin), track.timescale),
             },
             framing: track.entry.framing,
             timescale: track.timescale,
             samples,
-            shift: track.shift,
+            origin,
             next: 0,
         })
     }
@@ -151,11 +165,8 @@ impl Mp4Demuxer {
         let mut data = vec![0; sample.size as usize];
         self.file.read_exact_at(&mut data, sample.offset)?;
         let (data, idr) = self.framing.annex_b(&data, sample.sync || self.next == 0)?;
-        let dts = micros(sample.dts as i64 - self.shift, self.timescale);
-        let pts = micros(
-            sample.dts as i64 + i64::from(sample.cts_offset) - self.shift,
-            self.timescale,
-        );
+        let dts = micros(sample.decode_ticks().saturating_sub(self.origin), self.timescale);
+        let pts = micros(sample.presentation_ticks().saturating_sub(self.origin), self.timescale);
         let frame = EncodedFrame {
             codec: self.stream.codec,
             data,
@@ -472,6 +483,21 @@ fn build_samples(tables: &Tables) -> Result<Vec<Sample>> {
     Ok(samples)
 }
 
+/// Media time that maps to timestamp 0.
+///
+/// Normally the edit list's media time (`shift`), but when some samples
+/// present before the edit starts (pre-roll) the origin moves back to the
+/// earliest of them, so their timestamps stay distinct and non-negative
+/// instead of all clamping to 0. Consumers skip displaying anything before
+/// [`VideoStream::presentation_start_us`].
+fn timeline_origin(samples: &[Sample], shift: i64) -> i64 {
+    samples
+        .iter()
+        .map(Sample::presentation_ticks)
+        .min()
+        .map_or(shift, |earliest| earliest.min(shift))
+}
+
 fn expand<T: Copy>(runs: &[(u32, T)]) -> impl Iterator<Item = T> + '_ {
     runs.iter()
         .flat_map(|&(count, value)| std::iter::repeat_n(value, count as usize))
@@ -605,6 +631,33 @@ mod tests {
             ..Tables::default()
         };
         assert_eq!(build_samples(&tables).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn edit_shift_matching_the_composition_delay_keeps_the_origin() {
+        let mut first = sample(0, 1, 0, 10, true);
+        first.cts_offset = 20;
+        let mut second = sample(1, 1, 10, 10, false);
+        second.cts_offset = 30;
+        assert_eq!(timeline_origin(&[first, second], 20), 20);
+    }
+
+    #[test]
+    fn samples_before_the_edit_move_the_origin_back() {
+        let samples = [
+            sample(0, 1, 0, 10, true),
+            sample(1, 1, 10, 10, false),
+            sample(2, 1, 20, 10, false),
+        ];
+        let origin = timeline_origin(&samples, 15);
+        assert_eq!(origin, 0);
+        let start = 15 - origin;
+        let shown: Vec<_> = samples
+            .iter()
+            .map(|s| s.presentation_ticks() - origin)
+            .filter(|&ticks| ticks >= start)
+            .collect();
+        assert_eq!(shown, [20]);
     }
 
     #[test]

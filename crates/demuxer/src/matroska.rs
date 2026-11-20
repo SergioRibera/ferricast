@@ -50,6 +50,7 @@ impl MatroskaDemuxer {
                 .info()
                 .duration()
                 .map(|ticks| (ticks * scale_ns as f64 / 1000.0) as u64),
+            presentation_start_us: 0,
         };
         let track = entry.track_number().get();
         Ok(Self {
