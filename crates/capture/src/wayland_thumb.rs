@@ -95,6 +95,11 @@ enum FrameStatus {
     Failed,
 }
 
+/// Upper bound for each compositor round-trip of a thumbnail capture.
+/// A healthy compositor answers within a frame; this only bounds the
+/// thread when the source vanishes mid-capture.
+const THUMB_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+
 // ── Monitor thumbnails (wlr-screencopy) ───────────────────────────
 
 pub fn monitor_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceError> {
@@ -152,12 +157,17 @@ pub fn monitor_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceEr
     // Wait for the `buffer` event so we know which shm format to
     // allocate. Some compositors also emit `linux_dmabuf` and
     // `buffer_done`; we only need the wl_shm side.
-    while state.buffer.is_none() {
-        queue
-            .blocking_dispatch(&mut state)
-            .map_err(|e| SourceError::Backend(format!("buffer wait: {e}")))?;
-    }
-    let info = state.buffer.unwrap();
+    queue
+        .dispatch_until(&mut state, THUMB_EVENT_TIMEOUT, |s| {
+            s.buffer.is_some() || s.status == FrameStatus::Failed
+        })
+        .map_err(|e| SourceError::Backend(format!("buffer wait: {e}")))?;
+    let Some(info) = state.buffer else {
+        frame.destroy();
+        return Err(SourceError::Backend(
+            "compositor didn't announce a wl_shm buffer for the screencopy frame".into(),
+        ));
+    };
 
     let (fd, mmap) = alloc_shm(info.size())?;
     let pool = shm.create_pool(fd.as_fd(), info.size() as i32, &qh, ());
@@ -172,15 +182,23 @@ pub fn monitor_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceEr
     );
     frame.copy(&buffer);
 
-    while state.status == FrameStatus::Pending {
-        queue
-            .blocking_dispatch(&mut state)
-            .map_err(|e| SourceError::Backend(format!("frame wait: {e}")))?;
-    }
-    if state.status == FrameStatus::Failed {
-        return Err(SourceError::Backend(
-            "compositor returned `failed` for screencopy frame".into(),
-        ));
+    queue
+        .dispatch_until(&mut state, THUMB_EVENT_TIMEOUT, |s| {
+            s.status != FrameStatus::Pending
+        })
+        .map_err(|e| SourceError::Backend(format!("frame wait: {e}")))?;
+    match state.status {
+        FrameStatus::Ready => {}
+        FrameStatus::Failed => {
+            return Err(SourceError::Backend(
+                "compositor returned `failed` for screencopy frame".into(),
+            ));
+        }
+        FrameStatus::Pending => {
+            return Err(SourceError::Backend(
+                "screencopy frame not ready in time".into(),
+            ));
+        }
     }
 
     let png = encode_png(
@@ -428,12 +446,11 @@ pub fn window_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceErr
 
     // Roundtrip until we've seen `done` on the matching toplevel
     // handle (which guarantees `identifier` was delivered first).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    while state.handle.is_none() && std::time::Instant::now() < deadline {
-        queue
-            .blocking_dispatch(&mut state)
-            .map_err(|e| SourceError::Backend(format!("toplevel wait: {e}")))?;
-    }
+    queue
+        .dispatch_until(&mut state, Duration::from_millis(500), |s| {
+            s.handle.is_some()
+        })
+        .map_err(|e| SourceError::Backend(format!("toplevel wait: {e}")))?;
     let handle = state
         .handle
         .clone()
@@ -441,10 +458,17 @@ pub fn window_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceErr
 
     let source = toplevel_src_mgr.create_source(&handle, &qh, ());
     let session = capture_mgr.create_session(&source, CaptureOptions::empty(), &qh, ());
-    while !state.formats_done {
-        queue
-            .blocking_dispatch(&mut state)
-            .map_err(|e| SourceError::Backend(format!("session wait: {e}")))?;
+    let formats_done = queue
+        .dispatch_until(&mut state, THUMB_EVENT_TIMEOUT, |s| s.formats_done)
+        .map_err(|e| SourceError::Backend(format!("session wait: {e}")))?;
+    if !formats_done {
+        return Err(SourceError::Backend(
+            "ext-image-copy session didn't announce buffer constraints in time".into(),
+        ));
+    }
+    if state.status == FrameStatus::Failed {
+        // `stopped` before `done`: the window went away.
+        return Err(SourceError::NotFound(id.to_owned()));
     }
     let info = state.buffer.ok_or_else(|| {
         SourceError::Backend("session emitted `done` without buffer_size/shm_format".into())
@@ -466,15 +490,23 @@ pub fn window_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceErr
     frame.attach_buffer(&buffer);
     frame.capture();
 
-    while state.status == FrameStatus::Pending {
-        queue
-            .blocking_dispatch(&mut state)
-            .map_err(|e| SourceError::Backend(format!("frame wait: {e}")))?;
-    }
-    if state.status == FrameStatus::Failed {
-        return Err(SourceError::Backend(
-            "compositor returned `failed` for ext-image-copy frame".into(),
-        ));
+    queue
+        .dispatch_until(&mut state, THUMB_EVENT_TIMEOUT, |s| {
+            s.status != FrameStatus::Pending
+        })
+        .map_err(|e| SourceError::Backend(format!("frame wait: {e}")))?;
+    match state.status {
+        FrameStatus::Ready => {}
+        FrameStatus::Failed => {
+            return Err(SourceError::Backend(
+                "compositor returned `failed` for ext-image-copy frame".into(),
+            ));
+        }
+        FrameStatus::Pending => {
+            return Err(SourceError::Backend(
+                "ext-image-copy frame not ready in time (window closed?)".into(),
+            ));
+        }
     }
 
     // Window thumbnails come from `ext-image-copy-capture-v1`, which
