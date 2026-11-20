@@ -24,7 +24,7 @@ use uuid::Uuid;
 use ferricast_core::{
     AdvertiseInfo, Advertiser, AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame,
     CapturedFrame, Codec, ControlSession, DecodedAudio, DecoderConfig, EncodedFrame, FrameSink,
-    MediaCommand, MediaInfo, MediaPacket, MediaPuller, PlaybackState, PullSpec, ReceiverProtocol,
+    MediaCommand, MediaInfo, MediaPacket, MediaPuller, PlaybackStatus, PullSpec, ReceiverProtocol,
     RemoteSender, Result, VideoDecoder,
 };
 
@@ -54,7 +54,7 @@ impl<T: Advertiser> ErasedAdvertiser for T {
 trait ErasedControlSession: Send + Sync {
     fn accept(&mut self) -> BoxFut<'_, Result<RemoteSender>>;
     fn next_command(&mut self) -> BoxFut<'_, Result<MediaCommand>>;
-    fn report_state(&mut self, state: PlaybackState) -> BoxFut<'_, Result<()>>;
+    fn report_status(&mut self, status: PlaybackStatus) -> BoxFut<'_, Result<()>>;
     fn close(&mut self) -> BoxFut<'_, Result<()>>;
 }
 
@@ -65,8 +65,8 @@ impl<T: ControlSession> ErasedControlSession for T {
     fn next_command(&mut self) -> BoxFut<'_, Result<MediaCommand>> {
         Box::pin(ControlSession::next_command(self))
     }
-    fn report_state(&mut self, state: PlaybackState) -> BoxFut<'_, Result<()>> {
-        Box::pin(ControlSession::report_state(self, state))
+    fn report_status(&mut self, status: PlaybackStatus) -> BoxFut<'_, Result<()>> {
+        Box::pin(ControlSession::report_status(self, status))
     }
     fn close(&mut self) -> BoxFut<'_, Result<()>> {
         Box::pin(ControlSession::close(self))

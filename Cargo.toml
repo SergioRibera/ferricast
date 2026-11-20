@@ -131,6 +131,8 @@ ferricast-core.workspace = true
 ferricast-capture.workspace = true
 ferricast-encoder.workspace = true
 ferricast-decoder.workspace = true
+# Progressive (MP4/WebM/MKV over HTTP) playback for receivers.
+ferricast-demuxer = { workspace = true, features = ["http"] }
 ferricast-hls.workspace = true
 ferricast-airplay = { workspace = true, optional = true }
 ferricast-chromecast = { workspace = true, optional = true }

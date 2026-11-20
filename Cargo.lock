@@ -1890,6 +1890,7 @@ dependencies = [
  "ferricast-chromecast",
  "ferricast-core",
  "ferricast-decoder",
+ "ferricast-demuxer",
  "ferricast-encoder",
  "ferricast-hls",
  "rustls",

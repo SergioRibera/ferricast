@@ -16,8 +16,9 @@ use uuid::Uuid;
 
 use ferricast_core::{
     AudioDecoderConfig, DecoderConfig, FerricastError, FrameSink, MediaCommand, MediaInfo,
-    PixelFormat, PlaybackState, PullSpec, RemoteSender, Result,
+    PixelFormat, PlaybackState, PlaybackStatus, PullSpec, RemoteSender, Result,
 };
+use ferricast_demuxer::ProgressivePuller;
 
 use super::pump::{self, PumpCmd, PumpEnd, PumpParts};
 use super::{
@@ -124,6 +125,8 @@ struct LoadRequest {
 struct Prepared {
     puller: Box<dyn ErasedPuller>,
     info: MediaInfo,
+    /// Media position playback starts from.
+    start_us: u64,
     video_dec: Option<Box<dyn ErasedVideoDecoder>>,
     audio_dec: Option<Box<dyn ErasedAudioDecoder>>,
     sink: Box<dyn FrameSink>,
@@ -187,6 +190,16 @@ pub(super) struct Session {
     /// A SEEK received while the LOAD was still resolving.
     seek_when_loaded: Option<u64>,
     volume: Volume,
+    /// The loaded media, kept for status reports after the pump ends.
+    media: Option<LoadedMedia>,
+}
+
+/// What status reports say about the loaded media.
+struct LoadedMedia {
+    duration_us: Option<u64>,
+    is_live: bool,
+    /// Written by the pump.
+    position: Arc<AtomicU64>,
 }
 
 impl Session {
@@ -214,6 +227,7 @@ impl Session {
                 level: 1.0,
                 muted: false,
             },
+            media: None,
         }
     }
 
@@ -257,8 +271,17 @@ impl Session {
     }
 
     async fn report(&mut self, state: PlaybackState) {
-        if let Err(e) = self.control.report_state(state.clone()).await {
-            tracing::debug!(%e, "receiver: report_state failed");
+        let status = match (&self.media, &state) {
+            (Some(media), _) if !matches!(state, PlaybackState::Error(_)) => PlaybackStatus {
+                state: state.clone(),
+                position_us: Some(media.position.load(Ordering::Relaxed)),
+                duration_us: media.duration_us,
+                is_live: media.is_live,
+            },
+            _ => PlaybackStatus::from(state.clone()),
+        };
+        if let Err(e) = self.control.report_status(status).await {
+            tracing::debug!(%e, "receiver: report_status failed");
         }
         self.event(ManagerEvent::ReceiverStateChanged {
             receiver_id: self.receiver_id,
@@ -319,6 +342,7 @@ impl Session {
             } => {
                 self.loading = None;
                 self.stop_pump().await;
+                self.media = None;
                 self.play_when_loaded = autoplay;
                 self.seek_when_loaded = None;
                 self.ctx.playback.claim(self.seq, &self.notice_tx);
@@ -398,10 +422,13 @@ impl Session {
     async fn on_loaded(&mut self, loaded: Result<Prepared>) {
         match loaded {
             Ok(mut prepared) => {
-                if let Some(position_us) = self.seek_when_loaded.take()
-                    && let Err(e) = prepared.puller.seek(position_us).await
-                {
-                    tracing::warn!(%e, "receiver: seek requested while loading failed");
+                if let Some(position_us) = self.seek_when_loaded.take() {
+                    match prepared.puller.seek(position_us).await {
+                        Ok(()) => prepared.start_us = position_us,
+                        Err(e) => {
+                            tracing::warn!(%e, "receiver: seek requested while loading failed");
+                        }
+                    }
                 }
                 let info = prepared.info.clone();
                 tracing::info!(
@@ -415,6 +442,12 @@ impl Session {
                     info,
                 })
                 .await;
+                let position = Arc::new(AtomicU64::new(prepared.start_us));
+                self.media = Some(LoadedMedia {
+                    duration_us: prepared.info.duration_us,
+                    is_live: prepared.info.is_live,
+                    position: position.clone(),
+                });
                 let (cmd_tx, cmd_rx) = mpsc::channel(16);
                 let parts = PumpParts {
                     puller: prepared.puller,
@@ -423,6 +456,8 @@ impl Session {
                     sink: prepared.sink,
                     playing: self.play_when_loaded,
                     gain: self.volume.gain(),
+                    start_us: prepared.start_us,
+                    position,
                 };
                 self.pump = Some(PumpHandle {
                     cmd_tx,
@@ -437,6 +472,7 @@ impl Session {
             }
             Err(e) => {
                 tracing::warn!(%e, "receiver: LOAD failed");
+                self.media = None;
                 self.ctx.playback.release(self.seq);
                 self.report(PlaybackState::Error(e.to_string())).await;
             }
@@ -500,14 +536,45 @@ async fn join_pump(pump: &mut Option<PumpHandle>) -> PumpEnd {
     }
 }
 
+fn progressive() -> Box<dyn ErasedPuller> {
+    Box::new(ProgressivePuller::default())
+}
+
+/// Opens `url` with `puller`.
+async fn open(
+    mut puller: Box<dyn ErasedPuller>,
+    url: &str,
+) -> Result<(Box<dyn ErasedPuller>, MediaInfo)> {
+    let info = puller
+        .open(PullSpec {
+            url: url.to_string(),
+            headers: HashMap::new(),
+        })
+        .await?;
+    Ok((puller, info))
+}
+
 /// Resolves a LOAD: opens the puller, picks decoders, and only then
 /// asks the application for a sink, so nothing opens for media that
 /// cannot play.
 async fn load(ctx: &PipelineCtx, remote: &RemoteSender, request: LoadRequest) -> Result<Prepared> {
     let kind = MediaKind::classify(&request.url, request.content_type.as_deref());
     tracing::info!(url = %request.url, content_type = ?request.content_type, ?kind, "receiver: loading");
-    match kind {
-        MediaKind::Hls | MediaKind::Unknown => {}
+    let (mut puller, info) = match kind {
+        MediaKind::Hls => open((ctx.create_puller)()?, &request.url).await?,
+        MediaKind::Progressive => open(progressive(), &request.url).await?,
+        // No type and no telling extension: HLS first, then a plain file.
+        MediaKind::Unknown => match open((ctx.create_puller)()?, &request.url).await {
+            Ok(opened) => opened,
+            Err(hls) => match open(progressive(), &request.url).await {
+                Ok(opened) => opened,
+                Err(file) => {
+                    return Err(FerricastError::Pull(format!(
+                        "neither an HLS playlist ({hls}) nor a playable file ({file})"
+                    )));
+                }
+            },
+        },
         MediaKind::Dash => {
             return Err(FerricastError::Pull(
                 "MPEG-DASH streams are not supported".into(),
@@ -518,26 +585,11 @@ async fn load(ctx: &PipelineCtx, remote: &RemoteSender, request: LoadRequest) ->
                 "Smooth Streaming is not supported".into(),
             ));
         }
-        MediaKind::Progressive => {
-            return Err(FerricastError::Pull(format!(
-                "progressive media ({}) is not supported, only HLS",
-                request
-                    .content_type
-                    .as_deref()
-                    .unwrap_or("by file extension")
-            )));
-        }
-    }
-
-    let mut puller = (ctx.create_puller)()?;
-    let info = puller
-        .open(PullSpec {
-            url: request.url,
-            headers: HashMap::new(),
-        })
-        .await?;
+    };
+    let mut start_us = 0;
     if let Some(start) = request.start_time_us.filter(|&s| s > 0 && !info.is_live) {
         puller.seek(start).await?;
+        start_us = start;
     }
 
     let video_dec = info
@@ -592,6 +644,7 @@ async fn load(ctx: &PipelineCtx, remote: &RemoteSender, request: LoadRequest) ->
     Ok(Prepared {
         puller,
         info,
+        start_us,
         video_dec,
         audio_dec,
         sink,

@@ -20,7 +20,11 @@
 //! timeline re-anchors on discontinuities, seeks, resume after pause,
 //! stalls and timestamp jumps.
 
+mod clock;
+
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -30,6 +34,7 @@ use ferricast_core::{
 };
 
 use super::{ErasedAudioDecoder, ErasedPuller, ErasedVideoDecoder};
+use clock::Clock;
 
 /// Audio queued ahead of its presentation time; also the start-up
 /// delay of every timeline.
@@ -39,8 +44,6 @@ const MAX_VIDEO_LATENESS: Duration = Duration::from_millis(100);
 /// Output this late means a stall (slow network, suspended process):
 /// re-anchor instead of racing to catch up.
 const RESYNC_LATENESS: Duration = Duration::from_secs(1);
-/// Output due further ahead than this is a timestamp jump.
-const MAX_AHEAD: Duration = Duration::from_secs(5);
 /// Compressed packets queued per stream at most. Bounds read-ahead
 /// when one stream runs dry (an audio track shorter than the video).
 const MAX_QUEUED_PACKETS: usize = 600;
@@ -71,6 +74,10 @@ pub(super) struct PumpParts {
     pub(super) sink: Box<dyn FrameSink>,
     pub(super) playing: bool,
     pub(super) gain: f32,
+    /// Media position the playback starts from (LOAD start time).
+    pub(super) start_us: u64,
+    /// Where playback is, in media time; read by the session for status.
+    pub(super) position: Arc<AtomicU64>,
 }
 
 pub(super) async fn run(parts: PumpParts, cmd_rx: mpsc::Receiver<PumpCmd>) -> PumpEnd {
@@ -81,7 +88,8 @@ pub(super) async fn run(parts: PumpParts, cmd_rx: mpsc::Receiver<PumpCmd>) -> Pu
         sink: parts.sink,
         cmd_rx,
         playing: parts.playing,
-        clock: Clock::default(),
+        clock: Clock::new(AUDIO_LEAD),
+        position: Position::new(parts.position, parts.start_us),
         audio_primed: false,
         input: Input::Open,
         late_drops: 0,
@@ -97,38 +105,49 @@ pub(super) async fn run(parts: PumpParts, cmd_rx: mpsc::Receiver<PumpCmd>) -> Pu
     end
 }
 
-/// Maps PTS to wall-clock presentation instants.
-#[derive(Default)]
-struct Clock {
-    anchor: Option<(Instant, u64)>,
+/// Media position of what is being presented. Container timestamps
+/// need not start at zero (MPEG-TS rarely does), so the position is
+/// counted from a known base: the start or seek target, or the position
+/// reached when the timeline restarted.
+struct Position {
+    shared: Arc<AtomicU64>,
+    base_us: u64,
+    /// PTS of the first item presented since the base was set.
+    first_pts: Option<u64>,
 }
 
-impl Clock {
-    fn reset(&mut self) {
-        self.anchor = None;
-    }
-
-    fn anchor_at(&mut self, pts_us: u64) {
-        self.anchor = Some((Instant::now() + AUDIO_LEAD, pts_us));
-    }
-
-    /// Presentation instant of `pts_us`, re-anchoring on jumps.
-    fn due(&mut self, pts_us: u64) -> Instant {
-        let now = Instant::now();
-        let (t0, p0) = *self.anchor.get_or_insert((now + AUDIO_LEAD, pts_us));
-        let due = if pts_us >= p0 {
-            t0.checked_add(Duration::from_micros(pts_us - p0))
-        } else {
-            t0.checked_sub(Duration::from_micros(p0 - pts_us))
-        };
-        match due {
-            Some(d) if d <= now + MAX_AHEAD => d,
-            _ => {
-                tracing::debug!(pts_us, "pump: timestamp jump — re-anchoring");
-                self.anchor = Some((now + AUDIO_LEAD, pts_us));
-                now + AUDIO_LEAD
-            }
+impl Position {
+    fn new(shared: Arc<AtomicU64>, start_us: u64) -> Self {
+        shared.store(start_us, Ordering::Relaxed);
+        Self {
+            shared,
+            base_us: start_us,
+            first_pts: None,
         }
+    }
+
+    /// Continues from the current position on a new timeline.
+    fn restart(&mut self) {
+        self.base_us = self.shared.load(Ordering::Relaxed);
+        self.first_pts = None;
+    }
+
+    /// Restarts at `position_us` (a seek).
+    fn jump(&mut self, position_us: u64) {
+        self.base_us = position_us;
+        self.first_pts = None;
+        self.shared.store(position_us, Ordering::Relaxed);
+    }
+
+    /// Records that the item with `pts_us` is being presented, `behind`
+    /// before it is actually seen or heard.
+    fn presented(&mut self, pts_us: u64, behind: Duration) {
+        let first = *self.first_pts.get_or_insert(pts_us);
+        let elapsed = pts_us
+            .saturating_sub(first)
+            .saturating_sub(behind.as_micros() as u64);
+        self.shared
+            .store(self.base_us.saturating_add(elapsed), Ordering::Relaxed);
     }
 }
 
@@ -254,6 +273,7 @@ struct Pump {
     cmd_rx: mpsc::Receiver<PumpCmd>,
     playing: bool,
     clock: Clock,
+    position: Position,
     /// Silence was queued for the current timeline.
     audio_primed: bool,
     input: Input,
@@ -297,8 +317,7 @@ impl Pump {
             let read = self.playing && self.input == Input::Open && starved && !queues_full;
             // Anchor only once every stream has something ready, so
             // the earliest PTS of either stream starts the timeline.
-            let can_present =
-                self.playing && !nothing_ready && (self.clock.anchor.is_some() || !read);
+            let can_present = self.playing && !nothing_ready && (self.clock.is_anchored() || !read);
             let next = if can_present { self.next_due() } else { None };
 
             tokio::select! {
@@ -358,6 +377,7 @@ impl Pump {
 
     fn restart_timeline(&mut self) {
         self.clock.reset();
+        self.position.restart();
         self.audio_primed = false;
     }
 
@@ -365,13 +385,14 @@ impl Pump {
     fn next_due(&mut self) -> Option<(Instant, Which)> {
         let video_pts = self.video.as_ref().and_then(Stream::front_pts);
         let audio_pts = self.audio.as_ref().and_then(Stream::front_pts);
-        if self.clock.anchor.is_none() {
+        let now = Instant::now();
+        if !self.clock.is_anchored() {
             let first = video_pts.into_iter().chain(audio_pts).min()?;
-            self.clock.anchor_at(first);
+            self.clock.anchor_at(first, now);
         }
-        let video = video_pts.map(|p| (self.clock.due(p), Which::Video));
+        let video = video_pts.map(|p| (self.clock.due(p, now), Which::Video));
         let audio = audio_pts.map(|p| {
-            let due = self.clock.due(p);
+            let due = self.clock.due(p, now);
             (due.checked_sub(AUDIO_LEAD).unwrap_or(due), Which::Audio)
         });
         match (video, audio) {
@@ -403,6 +424,7 @@ impl Pump {
                 }
                 self.input = Input::Open;
                 self.restart_timeline();
+                self.position.jump(position_us);
             }
             Some(PumpCmd::Volume(gain)) => {
                 if let Err(e) = self.sink.set_volume(gain).await {
@@ -426,7 +448,8 @@ impl Pump {
                 let Some(frame) = stream.ready.pop_front() else {
                     return;
                 };
-                let late = lateness(self.clock.due(frame.timestamp_us()));
+                let pts = frame.timestamp_us();
+                let late = lateness(self.clock.due(pts, Instant::now()));
                 if late > RESYNC_LATENESS {
                     tracing::debug!(?late, "pump: stalled — re-anchoring");
                     stream.ready.push_front(frame);
@@ -437,6 +460,7 @@ impl Pump {
                     self.late_drops += 1;
                     return;
                 }
+                self.position.presented(pts, Duration::ZERO);
                 if let Err(e) = self.sink.push_video(frame).await {
                     tracing::warn!(%e, "pump: sink.push_video failed");
                 }
@@ -448,7 +472,8 @@ impl Pump {
                 let Some(pcm) = stream.ready.pop_front() else {
                     return;
                 };
-                let due = self.clock.due(pcm.timestamp_us);
+                let now = Instant::now();
+                let due = self.clock.due(pcm.timestamp_us, now);
                 let late = lateness(due.checked_sub(AUDIO_LEAD).unwrap_or(due));
                 if late > RESYNC_LATENESS {
                     tracing::debug!(?late, "pump: audio stalled — re-anchoring");
@@ -456,11 +481,18 @@ impl Pump {
                     self.restart_timeline();
                     return;
                 }
-                if !self.audio_primed {
+                if self.audio_primed {
+                    if let Some(backlog) = self.sink.audio_backlog() {
+                        self.clock.follow_audio(backlog, now);
+                    }
+                } else {
                     self.audio_primed = true;
                     if let Err(e) = self.sink.push_audio(silence(&pcm, AUDIO_LEAD)).await {
                         tracing::warn!(%e, "pump: sink.push_audio failed");
                     }
+                }
+                if self.video.is_none() {
+                    self.position.presented(pcm.timestamp_us, AUDIO_LEAD);
                 }
                 if let Err(e) = self.sink.push_audio(pcm).await {
                     tracing::warn!(%e, "pump: sink.push_audio failed");
@@ -494,28 +526,6 @@ fn silence(like: &DecodedAudio, duration: Duration) -> DecodedAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clock_maps_pts_offsets_to_wall_offsets() {
-        let mut clock = Clock::default();
-        let t0 = clock.due(10_000_000);
-        let t1 = clock.due(10_500_000);
-        assert_eq!(t1 - t0, Duration::from_millis(500));
-        // Slightly earlier PTS (audio before the first video) maps
-        // before the anchor.
-        let t_early = clock.due(9_900_000);
-        assert_eq!(t0 - t_early, Duration::from_millis(100));
-    }
-
-    #[test]
-    fn clock_reanchors_on_forward_jumps() {
-        let mut clock = Clock::default();
-        let t0 = clock.due(0);
-        let jumped = clock.due(3_600_000_000);
-        assert!(jumped < t0 + MAX_AHEAD);
-        let next = clock.due(3_600_040_000);
-        assert_eq!(next - jumped, Duration::from_millis(40));
-    }
 
     #[test]
     fn silence_matches_format_and_duration() {
