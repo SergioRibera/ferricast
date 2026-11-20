@@ -30,10 +30,10 @@ use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
 
 use ferricast_core::{
-    AudioFrame, CapturedFrame, EncodedFrame, FerricastError, ScreenCapture, VideoEncoder,
+    AudioFrame, CapturedFrame, Codec, EncodedFrame, FerricastError, ScreenCapture, VideoEncoder,
 };
 use ferricast_muxer::Muxer;
-use ferricast_muxer::mpeg_ts::MpegTs;
+use ferricast_muxer::mpeg_ts::{MpegTs, in_band_parameter_sets};
 
 use crate::HlsConfig;
 use crate::ring::SegmentRing;
@@ -146,6 +146,8 @@ where
         let started = Instant::now();
         let mut requested_idr = false;
         let mut frames_in_segment: u64 = 0;
+        // Carry whatever codec the encoder produces (H.264 or HEVC).
+        muxer = std::mem::take(&mut muxer).with_video_codec(first.codec)?;
         push_frame(&mut muxer, &first, pts_us)?;
         pts_us = pts_us.saturating_add(effective_frame_period_us);
         frames_in_segment += 1;
@@ -402,6 +404,7 @@ pub async fn run_from_frames(
         .with_silent_audio(config.inject_silent_audio && !external_audio_enabled)
         .with_external_audio(external_audio_enabled);
     muxer.config(parameter_sets.clone())?;
+    let mut stream_format = StreamFormat::default();
 
     // Both audio and video timestamps come from `SystemTime::UNIX_EPOCH`
     // (see `pipewire_audio::now_us` and `wayland_direct::now_us`), so
@@ -454,6 +457,22 @@ pub async fn run_from_frames(
                     }
                 }
             },
+        };
+
+        // Configure the muxer for the stream the frames actually carry
+        // (codec, parameter sets). A change after the first segment
+        // starts a discontinuity: the decoder must be reset.
+        let segment_discontinuity = match stream_format.observe(&first) {
+            FormatChange::Same => false,
+            FormatChange::Initial => {
+                muxer = std::mem::take(&mut muxer).with_video_codec(first.codec)?;
+                false
+            }
+            FormatChange::Changed => {
+                info!(codec = %first.codec, "video stream format changed; marking discontinuity");
+                muxer = std::mem::take(&mut muxer).with_video_codec(first.codec)?;
+                true
+            }
         };
 
         let mut frames_in_segment: u64 = 0;
@@ -512,7 +531,13 @@ pub async fn run_from_frames(
                 SegEvent::Video(Some(encoded)) => {
                     let video_pts_us = encoded.timestamp_us.saturating_sub(origin);
                     let span_us = video_pts_us.saturating_sub(segment_start_pts_us);
-                    if encoded.is_keyframe && cut.accepts(span_us) {
+                    // A keyframe that changes the stream format (new
+                    // SPS/PPS after an encoder reconfigure, other
+                    // codec) always starts a new segment so the
+                    // discontinuity lands on a segment boundary.
+                    if encoded.is_keyframe
+                        && (cut.accepts(span_us) || stream_format.differs(&encoded))
+                    {
                         closing_span_us = Some(span_us);
                         pending = Some(encoded);
                         break;
@@ -653,7 +678,7 @@ pub async fn run_from_frames(
                     .push_pending_part(part_dur, first_part_of_segment, final_drain);
             }
             let mut ring = ring.write().await;
-            let seq = ring.complete_pending_segment(elapsed.as_secs_f32(), false);
+            let seq = ring.complete_pending_segment(elapsed.as_secs_f32(), segment_discontinuity);
             let size = ring.get(seq).map_or(0, |s| s.data.len());
             (size, seq)
         } else {
@@ -662,7 +687,7 @@ pub async fn run_from_frames(
             let seq = ring
                 .write()
                 .await
-                .push(elapsed.as_secs_f32(), false, final_drain);
+                .push(elapsed.as_secs_f32(), segment_discontinuity, final_drain);
             (size, seq)
         };
 
@@ -966,5 +991,133 @@ mod part_tests {
         for d in &parts {
             assert!(*d <= 0.5 && *d > 0.4, "part {d} s in:\n{playlist}");
         }
+    }
+}
+
+/// Codec and in-band parameter sets of the video stream, used to spot
+/// format changes (encoder reconfigured for a new resolution, codec
+/// switch) that require a discontinuity.
+#[derive(Debug, Default)]
+struct StreamFormat {
+    codec: Option<Codec>,
+    parameter_sets: Option<Vec<u8>>,
+}
+
+/// Outcome of [`StreamFormat::observe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormatChange {
+    /// First keyframe of the stream.
+    Initial,
+    Same,
+    Changed,
+}
+
+impl StreamFormat {
+    /// Whether keyframe `frame` carries a format different from the
+    /// one recorded so far. Keyframes without in-band parameter sets
+    /// only compare the codec.
+    fn differs(&self, frame: &EncodedFrame) -> bool {
+        let Some(codec) = self.codec else {
+            return false;
+        };
+        if codec != frame.codec {
+            return true;
+        }
+        match (
+            &self.parameter_sets,
+            in_band_parameter_sets(frame.codec, &frame.data),
+        ) {
+            (Some(known), Some(new)) => *known != new,
+            _ => false,
+        }
+    }
+
+    /// Record the format of keyframe `frame`, which starts a segment.
+    fn observe(&mut self, frame: &EncodedFrame) -> FormatChange {
+        let change = if self.codec.is_none() {
+            FormatChange::Initial
+        } else if self.differs(frame) {
+            FormatChange::Changed
+        } else {
+            FormatChange::Same
+        };
+        if self.codec != Some(frame.codec) {
+            // A new codec invalidates the old parameter sets even if
+            // this keyframe carries none.
+            self.parameter_sets = None;
+        }
+        self.codec = Some(frame.codec);
+        if let Some(sets) = in_band_parameter_sets(frame.codec, &frame.data) {
+            self.parameter_sets = Some(sets);
+        }
+        change
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::pipeline_tests::{frame, segment};
+    use super::*;
+
+    fn with_sps(mut f: EncodedFrame, level: u8) -> EncodedFrame {
+        let mut data = vec![0, 0, 0, 1, 0x67, 0x42, 0x00, level, 0, 0, 0, 1, 0x68, 0xCE];
+        data.extend_from_slice(&f.data);
+        f.data = Bytes::from(data);
+        f
+    }
+
+    fn config() -> HlsConfig {
+        HlsConfig {
+            segment_target_secs: 2.0,
+            playlist_target_duration: 4,
+            target_fps: 30,
+            ..HlsConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn new_parameter_sets_close_the_segment_with_a_discontinuity() {
+        let period = 33_333u64;
+        let frames: Vec<_> = (0..150u64)
+            .map(|i| {
+                let f = frame(1_000_000 + i * period, i % 60 == 0 || i == 90);
+                match i {
+                    0 | 60 => with_sps(f, 0x1F),
+                    // Encoder reconfigured mid-GOP: IDR with a new SPS.
+                    90 | 120 => with_sps(f, 0x28),
+                    _ => f,
+                }
+            })
+            .collect();
+        let ring = segment(frames, config()).await;
+        let playlist = ring.build_playlist().unwrap();
+        let lines: Vec<&str> = playlist.lines().collect();
+        let disc = lines
+            .iter()
+            .position(|l| *l == "#EXT-X-DISCONTINUITY")
+            .unwrap_or_else(|| panic!("no discontinuity in:\n{playlist}"));
+        // Segment 1 (frames 60..90) was cut short by the new SPS and
+        // segment 2 (from frame 90) carries the discontinuity tag.
+        assert!(lines[disc + 2].ends_with("segment-2.ts"), "{playlist}");
+        assert!(playlist.contains("#EXTINF:1.000,"), "{playlist}");
+        assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY\n").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn hevc_frames_are_muxed_as_hevc() {
+        let frames: Vec<_> = (0..70u64)
+            .map(|i| {
+                let mut f = frame(1_000_000 + i * 33_333, i % 60 == 0);
+                f.codec = Codec::H265;
+                f.data = Bytes::from_static(&[0, 0, 0, 1, 0x26, 0x01, 0xAF]);
+                f
+            })
+            .collect();
+        let ring = segment(frames, config()).await;
+        let seg = ring.get(0).expect("first segment");
+        // PMT is the second TS packet; its stream_type byte for the
+        // video ES sits at offset 4 (header) + 1 (pointer) + 12.
+        let pmt = &seg.data[188..376];
+        assert_eq!(pmt[4 + 1 + 12], 0x24, "HEVC stream_type expected");
     }
 }
