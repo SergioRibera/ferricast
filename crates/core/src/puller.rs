@@ -63,12 +63,16 @@ pub struct AudioStreamInfo {
 /// One demuxed packet. Video and audio share a single stream so the
 /// caller sees them in the same order the source produced them,
 /// which keeps A/V sync trivial — both go through their decoder in
-/// arrival order and the [`crate::sink::FrameSink`] handles
-/// presentation timing.
+/// arrival order and the consumer paces presentation by PTS.
 #[derive(Debug, Clone)]
 pub enum MediaPacket {
     Video(EncodedFrame),
     Audio(AudioFrame),
+    /// The timeline restarts: packets after this one carry timestamps
+    /// unrelated to the ones before (seek, HLS `EXT-X-DISCONTINUITY`,
+    /// a live source that restarted). Consumers re-anchor their
+    /// presentation clock on the next packet.
+    Discontinuity,
     /// Stream ended cleanly. After this `next` should not be called;
     /// doing so returns [`crate::error::FerricastError::Pull`].
     Eos,

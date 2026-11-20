@@ -660,6 +660,7 @@ async fn run_pump(
                         Err(e) => tracing::warn!(%e, "pump: audio decode failed"),
                     }
                 }
+                Ok(MediaPacket::Discontinuity) => {}
                 Ok(MediaPacket::Eos) => {
                     let _ = event_tx
                         .send(ManagerEvent::ReceiverStateChanged {
