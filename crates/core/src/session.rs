@@ -186,4 +186,15 @@ pub trait CastSession: Send + Sync {
     fn feeds_adaptive_bitrate(&self) -> bool {
         false
     }
+
+    /// Wall-clock interval at which the manager forces an IDR, on top of
+    /// the encoder's own GOP. Segment-based transports (HLS) need one
+    /// per segment even when capture stalls; transports with receiver
+    /// feedback (RTP + PLI) should return `None`, since unrequested IDRs
+    /// only cost bitrate and show up as periodic quality pulses.
+    ///
+    /// Default: every 2 s, matching the HLS segment target.
+    fn forced_keyframe_interval(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(2))
+    }
 }
