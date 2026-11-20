@@ -35,6 +35,7 @@ ctr = "0.9"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 ferricast-fairplay = { workspace = true, optional = true }
+md-5 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

@@ -6,6 +6,7 @@
 
 mod audio;
 mod crypto;
+mod digest;
 pub mod discovery;
 mod fairplay;
 mod mirror;

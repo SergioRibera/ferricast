@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use ferricast_core::device::{AirPlayPairing, AirplayConfig};
+use ferricast_core::device::{AirPlayPairing, AirplayConfig, Flags};
 use ferricast_core::{
     AudioCodec, AudioFrame, CastSession, Codec, ConnectOutcome, Device, EncodedFrame,
     FerricastError, PairingChallenge, PairingResponse, Result, StreamConfig,
@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 
 use crate::audio::{self, AudioStream, PayloadCipher, STREAM_TYPE_AUDIO};
 use crate::crypto::sha512_16;
+use crate::digest::DigestChallenge;
 use crate::fairplay;
 use crate::mirror::{MirrorStream, stream_cipher};
 use crate::ntp::TimingServer;
@@ -41,6 +42,8 @@ enum State {
     Disconnected,
     /// Pair-setup needs the PIN the receiver is showing.
     AwaitingPin,
+    /// Paired; the receiver also wants its access password.
+    AwaitingPassword,
     /// Paired and verified; ready for `setup_stream`.
     Paired,
     Streaming,
@@ -72,6 +75,26 @@ struct Link {
     mode: AirPlayPairing,
     /// `rtsp://<local ip>/<session id>` request URI.
     session_uri: String,
+    /// Access password for `SETUP` (password-protected receivers).
+    password: Option<Password>,
+}
+
+/// Access password and where it came from.
+#[derive(Clone)]
+struct Password {
+    value: String,
+    /// Read from the credential store rather than typed by the user.
+    stored: bool,
+}
+
+/// How the receiver controls access, from the `sf` status flags of its
+/// RAOP TXT record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// PIN shown on the receiver, entered in pair-setup.
+    Pin,
+    /// Password checked with HTTP Digest authentication on `SETUP`.
+    Password,
 }
 
 /// An AirPlay screen-mirroring session.
@@ -268,10 +291,72 @@ impl AirPlaySession {
         Ok(())
     }
 
+    /// Send the first `SETUP`, answering a Digest challenge with `password`.
+    /// A password the receiver accepts is remembered. A challenge without a
+    /// password, or a rejected password, is remembered as "wants a
+    /// password", so the next `connect` asks the user for it.
+    async fn authorized_setup(
+        &self,
+        rtsp: &mut RtspClient,
+        uri: &str,
+        body: &[u8],
+        password: Option<&Password>,
+        device_id: &str,
+    ) -> Result<RtspResponse> {
+        let reply = rtsp
+            .request("SETUP", uri, Some(CONTENT_BPLIST), body)
+            .await?;
+        if reply.status != 401 {
+            return reply.ensure_success("SETUP");
+        }
+        let challenge = reply
+            .header("WWW-Authenticate")
+            .and_then(DigestChallenge::parse)
+            .ok_or_else(|| {
+                FerricastError::Protocol("SETUP: 401 without a Digest challenge".into())
+            })?;
+        let remember_required = || {
+            if let Err(e) = self.store.save_password(device_id, None) {
+                warn!(error = %e, "cannot record that the AirPlay receiver wants a password");
+            }
+        };
+        let Some(password) = password else {
+            remember_required();
+            return Err(FerricastError::Protocol(
+                "the AirPlay receiver requires a password; connect again to enter it".into(),
+            ));
+        };
+        let authorization = challenge.authorization("SETUP", uri, &password.value);
+        let reply = rtsp
+            .request_with(
+                "SETUP",
+                uri,
+                Some(CONTENT_BPLIST),
+                body,
+                &[("Authorization", &authorization)],
+            )
+            .await?;
+        if reply.status == 401 {
+            remember_required();
+            return Err(FerricastError::Protocol(
+                "the AirPlay receiver rejected the password".into(),
+            ));
+        }
+        let reply = reply.ensure_success("SETUP")?;
+        if !password.stored
+            && let Err(e) = self.store.save_password(device_id, Some(&password.value))
+        {
+            warn!(error = %e, "cannot store the AirPlay password; it will be asked again");
+        }
+        info!("AirPlay receiver accepted the password");
+        Ok(reply)
+    }
+
     async fn start_stream(&mut self, config: &StreamConfig) -> Result<Stream> {
         let identity = self.identity();
         let link = self.link()?;
         let (rtsp, uri) = (link.rtsp.clone(), link.session_uri.clone());
+        let (password, device_id) = (link.password.clone(), link.device_id.clone());
         let mut guard = rtsp.lock().await;
 
         let fp = fairplay::setup(&mut guard).await?;
@@ -303,10 +388,15 @@ impl AirPlaySession {
         setup.insert("ekey".into(), Value::Data(fp.ekey));
         let eiv: [u8; 16] = rand::random();
         setup.insert("eiv".into(), Value::Data(eiv.to_vec()));
-        let reply = guard
-            .request("SETUP", &uri, Some(CONTENT_BPLIST), &bplist(setup)?)
-            .await?
-            .ensure_success("SETUP")?;
+        let reply = self
+            .authorized_setup(
+                &mut guard,
+                &uri,
+                &bplist(setup)?,
+                password.as_ref(),
+                &device_id,
+            )
+            .await?;
         debug!(reply = ?reply_dict(&reply, "SETUP").ok(), "SETUP session reply");
 
         // Keep the id below 2^63: receivers parse it into signed integers.
@@ -374,6 +464,65 @@ impl AirPlaySession {
             _feedback: TaskGuard(feedback),
         })
     }
+}
+
+/// Value of `key` in a DNS-SD TXT record (length-prefixed `key=value`
+/// strings).
+fn txt_value<'a>(txt: &'a [u8], key: &str) -> Option<&'a str> {
+    let mut rest = txt;
+    while let Some((&len, tail)) = rest.split_first() {
+        let (entry, next) = tail.split_at_checked(usize::from(len))?;
+        rest = next;
+        if let Ok(entry) = std::str::from_utf8(entry)
+            && let Some((k, v)) = entry.split_once('=')
+            && k.eq_ignore_ascii_case(key)
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Access control announced by the `sf` status flags of a RAOP TXT record.
+fn access_from_raop_txt(txt: &[u8]) -> Option<Access> {
+    let sf = txt_value(txt, "sf")?;
+    let bits =
+        u32::from_str_radix(sf.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
+    let flags = Flags::from_bits_retain(bits);
+    if flags.contains(Flags::PIN_REQUIRED) {
+        Some(Access::Pin)
+    } else if flags.contains(Flags::PASSWORD_REQUIRED) {
+        Some(Access::Password)
+    } else {
+        None
+    }
+}
+
+/// Ask the receiver for its RAOP TXT record (`GET /info` with the
+/// `txtRAOP` qualifier, as UxPlay answers it) and read its access control.
+/// `None` when the receiver does not answer or announces none.
+async fn probe_access(rtsp: &mut RtspClient) -> Option<Access> {
+    let mut body = Dictionary::new();
+    body.insert(
+        "qualifier".into(),
+        Value::Array(vec![Value::String("txtRAOP".into())]),
+    );
+    let reply = rtsp
+        .request("GET", "/info", Some(CONTENT_BPLIST), &bplist(body).ok()?)
+        .await
+        .inspect_err(|e| debug!(error = %e, "GET /info failed"))
+        .ok()?;
+    if !reply.is_success() {
+        debug!(status = reply.status, "GET /info refused");
+        return None;
+    }
+    let access = reply_dict(&reply, "GET /info")
+        .ok()?
+        .get("txtRAOP")
+        .and_then(Value::as_data)
+        .and_then(access_from_raop_txt);
+    debug!(?access, "receiver access control");
+    access
 }
 
 /// UDP socket in `config.port_range`, or on an ephemeral port.
@@ -508,13 +657,43 @@ impl CastSession for AirPlaySession {
             mode.hkp_header(),
         )
         .await?;
-        let outcome = match self.pair(&mut rtsp, &device_id, mode).await {
+        // Receivers advertise `pw=true` for both a PIN and a password. The
+        // `sf` flags of their RAOP record tell the two apart when they are
+        // set (UxPlay 1.73 always reports 0x4); otherwise a receiver is known
+        // to want a password once a `SETUP` was challenged. Password-protected
+        // receivers pair without a PIN and check the password on `SETUP`.
+        let known_password = self.store.password(&device_id);
+        let password_protected = mode == AirPlayPairing::LegacyPin
+            && (known_password.is_some()
+                || probe_access(&mut rtsp).await == Some(Access::Password));
+        let mode = if password_protected {
+            AirPlayPairing::Legacy
+        } else {
+            mode
+        };
+        let mut outcome = match self.pair(&mut rtsp, &device_id, mode).await {
             Ok(o) => o,
             Err(e) => {
                 self.reset();
                 return Err(e);
             }
         };
+        let mut password = None;
+        if password_protected {
+            match known_password.flatten() {
+                Some(value) => {
+                    password = Some(Password {
+                        value,
+                        stored: true,
+                    });
+                }
+                None => outcome = ConnectOutcome::PairingRequired(PairingChallenge::Credential),
+            }
+            info!(
+                stored = password.is_some(),
+                "AirPlay receiver requires a password"
+            );
+        }
         let session_uri = format!(
             "rtsp://{}/{}",
             rtsp.local_addr().ip(),
@@ -525,9 +704,13 @@ impl CastSession for AirPlaySession {
             device_id,
             mode,
             session_uri,
+            password,
         });
-        self.state = match outcome {
+        self.state = match &outcome {
             ConnectOutcome::Ready => State::Paired,
+            ConnectOutcome::PairingRequired(PairingChallenge::Credential) => {
+                State::AwaitingPassword
+            }
             ConnectOutcome::PairingRequired(_) => State::AwaitingPin,
         };
         self.alive.store(true, Ordering::Relaxed);
@@ -535,18 +718,39 @@ impl CastSession for AirPlaySession {
     }
 
     async fn submit_pairing(&mut self, response: PairingResponse) -> Result<()> {
-        if self.state != State::AwaitingPin {
+        if !matches!(self.state, State::AwaitingPin | State::AwaitingPassword) {
             return Err(FerricastError::Protocol(
-                "AirPlay session is not waiting for a PIN".into(),
+                "AirPlay session is not waiting for a PIN or password".into(),
             ));
         }
-        let pin = match response {
-            PairingResponse::Pin(pin) => pin,
-            PairingResponse::Cancelled => {
+        let pin = match (self.state, response) {
+            (_, PairingResponse::Cancelled) => {
                 self.reset();
                 return Err(FerricastError::Protocol("AirPlay pairing cancelled".into()));
             }
-            PairingResponse::Confirmed | PairingResponse::Password(_) => {
+            (State::AwaitingPassword, PairingResponse::Password(value)) => {
+                if value.is_empty() {
+                    return Err(FerricastError::Protocol(
+                        "the AirPlay password is empty".into(),
+                    ));
+                }
+                // The receiver checks it on the first `SETUP`.
+                if let Some(link) = self.link.as_mut() {
+                    link.password = Some(Password {
+                        value,
+                        stored: false,
+                    });
+                }
+                self.state = State::Paired;
+                return Ok(());
+            }
+            (State::AwaitingPassword, _) => {
+                return Err(FerricastError::Protocol(
+                    "this AirPlay receiver needs its password".into(),
+                ));
+            }
+            (_, PairingResponse::Pin(pin)) => pin,
+            (_, PairingResponse::Confirmed | PairingResponse::Password(_)) => {
                 return Err(FerricastError::Protocol(
                     "AirPlay pairing needs a PIN".into(),
                 ));
@@ -696,5 +900,67 @@ impl Drop for AirPlaySession {
         if self.state != State::Disconnected {
             debug!(state = ?self.state, "AirPlay session dropped without stop()");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn txt(entries: &[&str]) -> Vec<u8> {
+        entries
+            .iter()
+            .flat_map(|e| {
+                let mut v = vec![u8::try_from(e.len()).unwrap()];
+                v.extend_from_slice(e.as_bytes());
+                v
+            })
+            .collect()
+    }
+
+    #[test]
+    fn raop_status_flags_tell_pin_from_password() {
+        // UxPlay 1.73: `-pin` → sf=0x8c, `-pw` → sf=0x84, neither → sf=0x4.
+        let base = ["ch=2", "cn=0,1,2,3", "pw=true"];
+        let with_sf = |sf: &str| {
+            let mut e = base.to_vec();
+            e.push(sf);
+            txt(&e)
+        };
+        assert_eq!(access_from_raop_txt(&with_sf("sf=0x8c")), Some(Access::Pin));
+        assert_eq!(
+            access_from_raop_txt(&with_sf("sf=0x84")),
+            Some(Access::Password)
+        );
+        assert_eq!(access_from_raop_txt(&with_sf("sf=0x4")), None);
+        assert_eq!(access_from_raop_txt(&txt(&base)), None);
+        // A truncated record yields what was readable before the cut.
+        let mut cut = with_sf("sf=0x84");
+        cut.truncate(cut.len() - 2);
+        assert_eq!(access_from_raop_txt(&cut), None);
+    }
+
+    #[test]
+    fn reply_stream_port_picks_the_matching_stream() {
+        let stream = |t: u64, port: u64| {
+            let mut d = Dictionary::new();
+            d.insert("type".into(), Value::Integer(t.into()));
+            d.insert("dataPort".into(), Value::Integer(port.into()));
+            Value::Dictionary(d)
+        };
+        let mut reply = Dictionary::new();
+        reply.insert(
+            "streams".into(),
+            Value::Array(vec![stream(110, 7100), stream(96, 6000)]),
+        );
+        assert_eq!(
+            reply_stream_port(&reply, STREAM_TYPE_AUDIO, "dataPort"),
+            Some(6000)
+        );
+        assert_eq!(
+            reply_stream_port(&reply, STREAM_TYPE_MIRROR, "dataPort"),
+            Some(7100)
+        );
+        assert_eq!(reply_stream_port(&reply, 96, "controlPort"), None);
     }
 }
