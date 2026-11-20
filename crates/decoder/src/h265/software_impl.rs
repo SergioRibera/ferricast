@@ -1,12 +1,11 @@
 use std::collections::VecDeque;
 
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, PixelFormat, RawFrame,
-    Result, VideoDecoder,
+    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
 };
 use rust_h265::{Decoder, Frame, PixelData, parse_annex_b};
 
-use crate::nv12::{self, Planar};
+use crate::nv12::{self, Colour, OutputFormat, Planar};
 
 const MAX_THREADS: usize = 4;
 
@@ -14,6 +13,7 @@ const MAX_THREADS: usize = 4;
 pub struct SoftwareH265Decoder {
     decoder: Option<Decoder>,
     ready: VecDeque<CapturedFrame>,
+    format: OutputFormat,
 }
 
 impl VideoDecoder for SoftwareH265Decoder {
@@ -29,6 +29,7 @@ impl VideoDecoder for SoftwareH265Decoder {
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_THREADS));
         self.decoder = Some(Decoder::new().with_display_order().with_threads(threads));
         self.ready.clear();
+        self.format = OutputFormat(config.pixel_format);
         Ok(())
     }
 
@@ -42,7 +43,8 @@ impl VideoDecoder for SoftwareH265Decoder {
                 .map_err(|e| FerricastError::Decode(format!("h265 decode: {e}")))?;
         }
         while let Some(decoded) = decoder.next_output() {
-            self.ready.push_back(picture(&decoded, frame.timestamp_us)?);
+            self.ready
+                .push_back(picture(&decoded, frame.timestamp_us, self.format)?);
         }
         Ok(self.ready.pop_front())
     }
@@ -50,14 +52,14 @@ impl VideoDecoder for SoftwareH265Decoder {
     fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
         if let Some(decoder) = self.decoder.as_mut() {
             while let Some(decoded) = decoder.flush() {
-                self.ready.push_back(picture(&decoded, 0)?);
+                self.ready.push_back(picture(&decoded, 0, self.format)?);
             }
         }
         Ok(self.ready.drain(..).collect())
     }
 }
 
-fn picture(decoded: &Frame, timestamp_us: u64) -> Result<CapturedFrame> {
+fn picture(decoded: &Frame, timestamp_us: u64, format: OutputFormat) -> Result<CapturedFrame> {
     let short = || FerricastError::Decode("h265 returned short planes".into());
     if decoded.chroma_format_idc != 1 {
         return Err(FerricastError::Decode(format!(
@@ -87,12 +89,15 @@ fn picture(decoded: &Frame, timestamp_us: u64) -> Result<CapturedFrame> {
         uv_stride: chroma_width,
     })
     .ok_or_else(short)?;
-    Ok(CapturedFrame::Cpu(RawFrame {
-        width: decoded.width,
-        height: decoded.height,
-        stride: stride as u32,
-        format: PixelFormat::Nv12,
+    // rust_h265 does not expose the VUI colour description.
+    nv12::deliver(
         data,
+        stride,
+        (width, height),
         timestamp_us,
-    }))
+        format.0,
+        Colour::guess(height),
+    )
+    .map(CapturedFrame::Cpu)
+    .ok_or_else(short)
 }
