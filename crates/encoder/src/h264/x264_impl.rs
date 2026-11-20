@@ -289,6 +289,13 @@ impl Session {
         // self-contained; Annex B start codes for MPEG-TS.
         params.b_repeat_headers = 1;
         params.b_annexb = 1;
+        // The RGB → YUV conversion is BT.709 limited range; say so in
+        // the VUI instead of letting decoders guess (H.273 code 1 =
+        // BT.709 for primaries, transfer and matrix).
+        params.vui.b_fullrange = 0;
+        params.vui.i_colorprim = 1;
+        params.vui.i_transfer = 1;
+        params.vui.i_colmatrix = 1;
         // Presets default to CRF, which ignores `i_bitrate` entirely.
         // ABR with a VBV capped at the target makes the bitrate a real
         // ceiling (≈ CBR) so a weak receiver link isn't flooded.
@@ -530,7 +537,7 @@ impl I420Scratch {
                 src.data(),
                 stride,
                 yuv::YuvRange::Limited,
-                yuv::YuvStandardMatrix::Bt601,
+                yuv::YuvStandardMatrix::Bt709,
                 yuv::YuvConversionMode::Balanced,
             )
             .map_err(|e| FerricastError::Encoding(format!("x264: BGRA → I420: {e}"))),
@@ -539,7 +546,7 @@ impl I420Scratch {
                 src.data(),
                 stride,
                 yuv::YuvRange::Limited,
-                yuv::YuvStandardMatrix::Bt601,
+                yuv::YuvStandardMatrix::Bt709,
                 yuv::YuvConversionMode::Balanced,
             )
             .map_err(|e| FerricastError::Encoding(format!("x264: RGBA → I420: {e}"))),

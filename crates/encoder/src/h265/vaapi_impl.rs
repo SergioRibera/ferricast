@@ -37,6 +37,9 @@ use super::headers::{self, ConformanceWindow, StreamParams};
 use crate::config_ext::EncoderConfigExt;
 use crate::frame_view::FrameView;
 use crate::gop::GopState;
+use crate::h264::yuv::{
+    VPP_INPUT_STANDARD, VPP_OUTPUT_STANDARD, vpp_input_colour, vpp_output_colour,
+};
 
 const RENDER_NODES: &[&str] = &[
     "/dev/dri/renderD128",
@@ -1063,12 +1066,12 @@ impl VaapiH265Encoder {
         let pipe = ProcPipelineParameterBuffer::new(
             imported.id(),
             None,
-            0_u8,
+            VPP_INPUT_STANDARD,
             // Visible area only; the default (whole surface) would
             // stretch the frame into the CTU padding.
             Some(self.cfg.visible_region()),
             0,
-            0_u8,
+            VPP_OUTPUT_STANDARD,
             0,
             0,
             None,
@@ -1080,8 +1083,8 @@ impl VaapiH265Encoder {
             None,
             0,
             0,
-            ProcColorProperties::default(),
-            ProcColorProperties::default(),
+            vpp_input_colour(),
+            vpp_output_colour(),
             0,
             None,
         );

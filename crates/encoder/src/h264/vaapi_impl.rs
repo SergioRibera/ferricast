@@ -40,8 +40,12 @@ use ferricast_core::{
 };
 use tracing::{debug, info, trace, warn};
 
-use super::headers::{self, FrameCrop, PpsParams, SpsParams, VuiParams, profile};
-use super::yuv;
+use super::headers::{
+    self, ColourDescription, FrameCrop, PpsParams, SpsParams, VuiParams, profile,
+};
+use super::yuv::{
+    self, VPP_INPUT_STANDARD, VPP_OUTPUT_STANDARD, vpp_input_colour, vpp_output_colour,
+};
 use crate::config_ext::EncoderConfigExt;
 use crate::frame_view::FrameView;
 use crate::gop::GopState;
@@ -316,6 +320,7 @@ impl VaapiH264Encoder {
                 num_units_in_tick: 1,
                 time_scale: 2 * cfg.fps,
                 fixed_frame_rate_flag: true,
+                colour: Some(ColourDescription::BT709_LIMITED),
             }),
         });
         let pps_nal = headers::build_pps(&PpsParams {
@@ -1232,13 +1237,13 @@ impl VaapiH264Encoder {
         // `run_encode` will pass to `vaBeginPicture`.
         let pipe = ProcPipelineParameterBuffer::new(
             imported.id(),
-            None,                            // surface_region = full
-            0_u8,                            // VAProcColorStandardNone — driver picks BT.601/709.
+            None, // surface_region = full
+            VPP_INPUT_STANDARD,
             Some(self.cfg.visible_region()), // never stretch into the MB padding
             0,                               // output_background_color
-            0_u8,                            // VAProcColorStandardNone — driver picks BT.601/709.
-            0,                               // pipeline_flags
-            0,                               // filter_flags
+            VPP_OUTPUT_STANDARD,
+            0, // pipeline_flags
+            0, // filter_flags
             None,
             None,
             None,
@@ -1248,8 +1253,8 @@ impl VaapiH264Encoder {
             None,
             0, // input_surface_flag
             0, // output_surface_flag
-            ProcColorProperties::default(),
-            ProcColorProperties::default(),
+            vpp_input_colour(),
+            vpp_output_colour(),
             0,
             None,
         );

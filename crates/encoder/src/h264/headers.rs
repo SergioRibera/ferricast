@@ -61,6 +61,28 @@ pub(super) struct VuiParams {
     pub num_units_in_tick: u32,
     pub time_scale: u32,
     pub fixed_frame_rate_flag: bool,
+    /// `video_signal_type` + `colour_description`; `None` leaves them
+    /// unsignalled.
+    pub colour: Option<ColourDescription>,
+}
+
+/// Colour signalling (E.2.1) using ITU-T H.273 code points.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ColourDescription {
+    pub full_range: bool,
+    pub colour_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coefficients: u8,
+}
+
+impl ColourDescription {
+    /// What the RGB → YUV conversion produces: BT.709, limited range.
+    pub(crate) const BT709_LIMITED: Self = Self {
+        full_range: false,
+        colour_primaries: 1,
+        transfer_characteristics: 1,
+        matrix_coefficients: 1,
+    };
 }
 
 /// Build the SPS NAL byte stream (Annex B). `nal_ref_idc=3` is the
@@ -144,8 +166,21 @@ fn write_vui(w: &mut BitWriter, v: &VuiParams) {
     w.write_flag(false);
     // overscan_info_present_flag u(1) = 0
     w.write_flag(false);
-    // video_signal_type_present_flag u(1) = 0
-    w.write_flag(false);
+    // video_signal_type_present_flag u(1)
+    if let Some(c) = v.colour {
+        w.write_flag(true);
+        // video_format u(3) = 5 (unspecified)
+        w.write_bits(5, 3);
+        // video_full_range_flag u(1)
+        w.write_flag(c.full_range);
+        // colour_description_present_flag u(1) = 1
+        w.write_flag(true);
+        w.write_bits(u32::from(c.colour_primaries), 8);
+        w.write_bits(u32::from(c.transfer_characteristics), 8);
+        w.write_bits(u32::from(c.matrix_coefficients), 8);
+    } else {
+        w.write_flag(false);
+    }
     // chroma_loc_info_present_flag u(1) = 0
     w.write_flag(false);
     // timing_info_present_flag u(1) = 1
@@ -260,12 +295,32 @@ mod tests {
                 num_units_in_tick: 1,
                 time_scale: 60,
                 fixed_frame_rate_flag: true,
+                colour: Some(ColourDescription::BT709_LIMITED),
             }),
         });
         assert_eq!(&sps[..4], &[0x00, 0x00, 0x00, 0x01], "Annex B prefix");
         // header byte: nal_ref_idc=3 (top 2 bits=11 in 0bX_XXX_XXXXX after the
         // forbidden_zero_bit), nal_unit_type=7. So byte = (3<<5)|7 = 0x67.
         assert_eq!(sps[4], 0x67, "SPS NAL header");
+    }
+
+    /// aspect=0, overscan=0, video_signal_type=1, format=5 (101),
+    /// full_range=0, colour_description=1 → 0b0011_0101, then
+    /// primaries / transfer / matrix = 1.
+    #[test]
+    fn vui_signals_bt709_limited() {
+        let mut w = BitWriter::new();
+        write_vui(
+            &mut w,
+            &VuiParams {
+                num_units_in_tick: 1,
+                time_scale: 60,
+                fixed_frame_rate_flag: true,
+                colour: Some(ColourDescription::BT709_LIMITED),
+            },
+        );
+        let bytes = w.finish_rbsp();
+        assert_eq!(&bytes[..4], &[0x35, 1, 1, 1]);
     }
 
     #[test]

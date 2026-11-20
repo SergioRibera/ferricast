@@ -265,8 +265,19 @@ fn write_vui(w: &mut BitWriter, p: &StreamParams) {
     w.write_bits(0, 1);
     // overscan_info_present_flag u(1) = 0
     w.write_bits(0, 1);
-    // video_signal_type_present_flag u(1) = 0
+    // video_signal_type_present_flag u(1) = 1: the RGB → YUV upload is
+    // BT.709 limited range, signalled with H.273 code points.
+    w.write_bits(1, 1);
+    // video_format u(3) = 5 (unspecified)
+    w.write_bits(5, 3);
+    // video_full_range_flag u(1) = 0
     w.write_bits(0, 1);
+    // colour_description_present_flag u(1) = 1
+    w.write_bits(1, 1);
+    // colour_primaries, transfer_characteristics, matrix_coeffs u(8) = 1 (BT.709)
+    w.write_bits(1, 8);
+    w.write_bits(1, 8);
+    w.write_bits(1, 8);
     // chroma_loc_info_present_flag u(1) = 0
     w.write_bits(0, 1);
     // neutral_chroma_indication_flag u(1) = 0

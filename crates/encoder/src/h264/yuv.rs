@@ -6,13 +6,17 @@
 //! with SSE4.2/AVX2/RDM, which matters at 60 fps or 1440p+ when
 //! capture and encode are competing for the same cores.
 //!
-//! BT.601 limited range — the convention every H.264/HEVC decoder
-//! defaults to when `colour_primaries` / `matrix_coefficients` aren't
-//! signalled in VUI. Limited range (`Y` ∈ [16,235], `UV` ∈ [16,240])
-//! is what every receiver in our matrix (Chromecast, Miracast,
-//! AirPlay) expects on the wire.
+//! BT.709 limited range (`Y` ∈ [16,235], `UV` ∈ [16,240]), the same
+//! matrix the x264 path uses and what HD receivers (Chromecast
+//! included) assume. The SPS VUI signals it explicitly
+//! (`colour_primaries` = `transfer_characteristics` =
+//! `matrix_coefficients` = 1, `video_full_range_flag` = 0) so no
+//! decoder has to guess.
 
-use cros_libva::{Image, Surface, VA_LSB_FIRST, VAImageFormat};
+use cros_libva::{
+    Image, ProcColorProperties, Surface, VA_LSB_FIRST, VA_SOURCE_RANGE_FULL,
+    VA_SOURCE_RANGE_REDUCED, VAImageFormat,
+};
 use ferricast_core::{FerricastError, PixelFormat, Result};
 use yuv::{
     BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvRange, YuvStandardMatrix,
@@ -23,6 +27,23 @@ use crate::frame_view::FrameView;
 
 /// Standard NV12 V4L2 / DRM fourcc reused across libva.
 const VA_FOURCC_NV12: u32 = 0x3231_564E; // 'N','V','1','2'
+
+/// `VAProcColorStandardType` (va_vpp.h) for the GPU colour conversion:
+/// the captured DMA-BUF is sRGB, the encoder input BT.709 — the same
+/// matrix the CPU path and the SPS VUI use.
+pub(crate) const VPP_INPUT_STANDARD: u8 = 8; // VAProcColorStandardSRGB
+pub(crate) const VPP_OUTPUT_STANDARD: u8 = 2; // VAProcColorStandardBT709
+
+/// Full-range RGB in.
+pub(crate) fn vpp_input_colour() -> ProcColorProperties {
+    ProcColorProperties::new(0, VA_SOURCE_RANGE_FULL as u8, 0, 0, 0)
+}
+
+/// Limited-range BT.709 out (H.273 code 1 for primaries / transfer /
+/// matrix), matching the VUI.
+pub(crate) fn vpp_output_colour() -> ProcColorProperties {
+    ProcColorProperties::new(0, VA_SOURCE_RANGE_REDUCED as u8, 1, 1, 1)
+}
 
 /// Limited-range black: luma 16, neutral chroma 128.
 const PAD_LUMA: u8 = 16;
@@ -65,7 +86,7 @@ impl Nv12Planes<'_> {
                 src.data(),
                 src_stride,
                 YuvRange::Limited,
-                YuvStandardMatrix::Bt601,
+                YuvStandardMatrix::Bt709,
                 YuvConversionMode::Balanced,
             ),
             PixelFormat::Rgba => rgba_to_yuv_nv12(
@@ -73,7 +94,7 @@ impl Nv12Planes<'_> {
                 src.data(),
                 src_stride,
                 YuvRange::Limited,
-                YuvStandardMatrix::Bt601,
+                YuvStandardMatrix::Bt709,
                 YuvConversionMode::Balanced,
             ),
             other @ (PixelFormat::Nv12 | PixelFormat::I420) => {
