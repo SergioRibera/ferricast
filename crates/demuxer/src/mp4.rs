@@ -37,10 +37,20 @@ struct Sample {
 struct Tables {
     stts: Vec<(u32, u32)>,
     ctts: Vec<(u32, i32)>,
-    stsc: Vec<(u32, u32)>,
+    stsc: Vec<ChunkRun>,
     sizes: Vec<u32>,
     chunk_offsets: Vec<u64>,
     sync: Option<Vec<u32>>,
+}
+
+/// One `stsc` entry: chunks from `first_chunk` up to the next run's first
+/// chunk each hold `samples_per_chunk` samples described by stsd entry
+/// `description_index`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkRun {
+    first_chunk: u32,
+    samples_per_chunk: u32,
+    description_index: u32,
 }
 
 struct Entry {
@@ -330,7 +340,7 @@ fn parse_tables(stbl: &[u8]) -> Option<Tables> {
             .into_iter()
             .map(|(count, offset)| (count, offset as i32))
             .collect(),
-        stsc: triples(stsc, stsc_count),
+        stsc: chunk_runs(stsc, stsc_count),
         sizes,
         chunk_offsets,
         sync: counted(b"stss").map(|(body, count)| words(body).take(count).collect()),
@@ -356,30 +366,37 @@ fn pairs(body: &[u8], count: usize) -> Vec<(u32, u32)> {
         .collect()
 }
 
-fn triples(body: &[u8], count: usize) -> Vec<(u32, u32)> {
+fn chunk_runs(body: &[u8], count: usize) -> Vec<ChunkRun> {
     let (entries, _) = body.as_chunks::<12>();
     entries
         .iter()
         .take(count)
-        .map(|c| {
-            (
-                u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
-                u32::from_be_bytes([c[4], c[5], c[6], c[7]]),
-            )
+        .map(|c| ChunkRun {
+            first_chunk: u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
+            samples_per_chunk: u32::from_be_bytes([c[4], c[5], c[6], c[7]]),
+            description_index: u32::from_be_bytes([c[8], c[9], c[10], c[11]]),
         })
         .collect()
 }
 
 /// Checks that `stsc` runs start at chunk 1 and that their first chunks
 /// strictly increase, which lets [`build_samples`] walk them with a single
-/// forward cursor.
-fn validate_stsc(stsc: &[(u32, u32)]) -> Result<()> {
+/// forward cursor, and that every chunk uses the one sample description
+/// that was parsed.
+fn validate_stsc(stsc: &[ChunkRun]) -> Result<()> {
     let mut previous = 0;
-    for &(first_chunk, _) in stsc {
+    for run in stsc {
+        let first_chunk = run.first_chunk;
         let bad_start = previous == 0 && first_chunk != 1;
         if bad_start || first_chunk <= previous {
             return Err(FerricastError::Demux(format!(
                 "stsc runs must start at chunk 1 and strictly increase (found {first_chunk} after {previous})"
+            )));
+        }
+        if run.description_index != 1 {
+            return Err(FerricastError::Demux(format!(
+                "chunk {first_chunk} uses sample description {}; only a single stsd entry is supported",
+                run.description_index
             )));
         }
         previous = first_chunk;
@@ -399,9 +416,8 @@ fn build_samples(tables: &Tables) -> Result<Vec<Sample>> {
         if samples.len() == tables.sizes.len() {
             break;
         }
-        while let Some(&(_, count)) = runs.next_if(|(first_chunk, _)| *first_chunk <= chunk_number)
-        {
-            per_chunk = Some(count);
+        while let Some(run) = runs.next_if(|run| run.first_chunk <= chunk_number) {
+            per_chunk = Some(run.samples_per_chunk);
         }
         let Some(per_chunk) = per_chunk else {
             return Err(FerricastError::Demux(format!(
@@ -466,6 +482,16 @@ mod tests {
         out
     }
 
+    fn runs(runs: &[(u32, u32)]) -> Vec<ChunkRun> {
+        runs.iter()
+            .map(|&(first_chunk, samples_per_chunk)| ChunkRun {
+                first_chunk,
+                samples_per_chunk,
+                description_index: 1,
+            })
+            .collect()
+    }
+
     fn sample(offset: u64, size: u32, dts: u64, duration: u32, sync: bool) -> Sample {
         Sample {
             offset,
@@ -481,7 +507,7 @@ mod tests {
     fn chunk_runs_expand_to_one_offset_per_sample() {
         let tables = Tables {
             stts: vec![(5, 100)],
-            stsc: vec![(1, 2), (3, 1)],
+            stsc: runs(&[(1, 2), (3, 1)]),
             sizes: vec![10, 20, 30, 40, 50],
             chunk_offsets: vec![1000, 2000, 3000],
             ..Tables::default()
@@ -498,7 +524,7 @@ mod tests {
     fn decode_times_accumulate_across_stts_runs() {
         let tables = Tables {
             stts: vec![(2, 100), (1, 50)],
-            stsc: vec![(1, 3)],
+            stsc: runs(&[(1, 3)]),
             sizes: vec![1, 1, 1],
             chunk_offsets: vec![0],
             ..Tables::default()
@@ -514,7 +540,7 @@ mod tests {
         let tables = Tables {
             stts: vec![(2, 10)],
             ctts: vec![(1, 20), (1, -10)],
-            stsc: vec![(1, 2)],
+            stsc: runs(&[(1, 2)]),
             sizes: vec![1, 1],
             chunk_offsets: vec![0],
             ..Tables::default()
@@ -531,7 +557,7 @@ mod tests {
     fn only_listed_samples_are_sync_when_stss_is_present() {
         let tables = Tables {
             stts: vec![(3, 1)],
-            stsc: vec![(1, 3)],
+            stsc: runs(&[(1, 3)]),
             sizes: vec![1, 1, 1],
             chunk_offsets: vec![0],
             sync: Some(vec![1, 3]),
@@ -549,7 +575,7 @@ mod tests {
     fn sizes_shorter_than_the_chunk_table_end_the_samples() {
         let tables = Tables {
             stts: vec![(9, 1)],
-            stsc: vec![(1, 4)],
+            stsc: runs(&[(1, 4)]),
             sizes: vec![1, 1, 1, 1, 1],
             chunk_offsets: vec![0, 100, 200],
             ..Tables::default()
@@ -560,7 +586,7 @@ mod tests {
     #[test]
     fn unsorted_chunk_runs_are_rejected() {
         let tables = Tables {
-            stsc: vec![(1, 1), (5, 1), (3, 1)],
+            stsc: runs(&[(1, 1), (5, 1), (3, 1)]),
             sizes: vec![1; 4],
             chunk_offsets: vec![0; 4],
             ..Tables::default()
@@ -571,7 +597,7 @@ mod tests {
     #[test]
     fn chunk_runs_not_starting_at_chunk_one_are_rejected() {
         let tables = Tables {
-            stsc: vec![(2, 1)],
+            stsc: runs(&[(2, 1)]),
             sizes: vec![1; 2],
             chunk_offsets: vec![0; 2],
             ..Tables::default()
@@ -580,10 +606,37 @@ mod tests {
     }
 
     #[test]
+    fn chunks_using_a_second_sample_description_are_rejected() {
+        let mut stsc = runs(&[(1, 1), (2, 1)]);
+        stsc[1].description_index = 2;
+        let tables = Tables {
+            stsc,
+            sizes: vec![1; 2],
+            chunk_offsets: vec![0; 2],
+            ..Tables::default()
+        };
+        let error = build_samples(&tables).unwrap_err();
+        assert!(error.to_string().contains("sample description 2"), "{error}");
+    }
+
+    #[test]
+    fn stsc_entries_keep_their_description_index() {
+        let body = [0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 3];
+        assert_eq!(
+            chunk_runs(&body, 1),
+            [ChunkRun {
+                first_chunk: 1,
+                samples_per_chunk: 4,
+                description_index: 3,
+            }]
+        );
+    }
+
+    #[test]
     fn many_empty_chunks_against_many_runs_finish_quickly() {
         let chunks = 1 << 20;
         let tables = Tables {
-            stsc: (1..=chunks).map(|chunk| (chunk, 0)).collect(),
+            stsc: runs(&(1..=chunks).map(|chunk| (chunk, 0)).collect::<Vec<_>>()),
             sizes: vec![1],
             chunk_offsets: vec![0; chunks as usize],
             ..Tables::default()
@@ -615,7 +668,7 @@ mod tests {
     fn sample_offsets_near_the_end_of_u64_do_not_overflow() {
         let tables = Tables {
             stts: vec![(2, u32::MAX)],
-            stsc: vec![(1, 2)],
+            stsc: runs(&[(1, 2)]),
             sizes: vec![u32::MAX, u32::MAX],
             chunk_offsets: vec![u64::MAX - 1],
             ..Tables::default()
