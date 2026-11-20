@@ -37,7 +37,7 @@ pub mod puller;
 pub use puller::HlsPuller;
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
@@ -299,6 +299,13 @@ impl HlsServer {
     #[must_use]
     pub fn playlist_path(&self) -> String {
         self.connections.state.token.playlist_path()
+    }
+
+    /// Only let `ip` (plus loopback and other allowed peers) fetch from
+    /// this server; other peers get 403. Until the first call every
+    /// peer may fetch. Applies to connections already open, too.
+    pub fn allow_peer(&self, ip: IpAddr) {
+        self.connections.state.allow_peer(ip);
     }
 
     /// Accept a single connection and dispatch it to a per-connection
@@ -588,6 +595,13 @@ impl HlsFrameSink {
     #[must_use]
     pub fn playlist_path(&self) -> String {
         self.connections.state.token.playlist_path()
+    }
+
+    /// Only let `ip` (plus loopback and other allowed peers) fetch from
+    /// this server; other peers get 403. Until the first call every
+    /// peer may fetch. Applies to connections already open, too.
+    pub fn allow_peer(&self, ip: IpAddr) {
+        self.connections.state.allow_peer(ip);
     }
 
     /// Wait until at least one segment has been pushed to the ring.

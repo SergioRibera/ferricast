@@ -16,8 +16,8 @@
 //! parse the few headers we care about (`Connection`, `Range`)
 //! manually.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -101,6 +101,9 @@ pub(crate) struct ServerState {
     pub(crate) adaptive: Option<Arc<AdaptiveBitrateState>>,
     pub(crate) stats: SessionStats,
     pub(crate) token: UrlToken,
+    /// Peers allowed to fetch besides loopback; empty = everyone.
+    /// Canonical form (IPv4-mapped IPv6 folded to IPv4).
+    allowed_peers: std::sync::RwLock<Vec<IpAddr>>,
 }
 
 impl ServerState {
@@ -116,7 +119,35 @@ impl ServerState {
             adaptive,
             stats: SessionStats::new(),
             token: UrlToken::generate()?,
+            allowed_peers: std::sync::RwLock::new(Vec::new()),
         })
+    }
+
+    /// Restrict fetching to the given peer (plus loopback and any
+    /// other allowed peer). Until the first call every peer may fetch.
+    pub(crate) fn allow_peer(&self, ip: IpAddr) {
+        let ip = ip.to_canonical();
+        let mut allowed = self
+            .allowed_peers
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !allowed.contains(&ip) {
+            allowed.push(ip);
+        }
+    }
+
+    /// Whether `ip` may fetch: always for loopback, otherwise when no
+    /// allowlist is set or `ip` is on it.
+    fn peer_allowed(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        if ip.is_loopback() {
+            return true;
+        }
+        let allowed = self
+            .allowed_peers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        allowed.is_empty() || allowed.contains(&ip)
     }
 }
 
@@ -136,6 +167,7 @@ where
     let ring = &state.ring;
     let adaptive = state.adaptive.as_ref();
     let stats = &state.stats;
+    let peer_ip = peer.ip();
     let peer = peer.to_string();
     let (read_half, mut write_half) = tokio::io::split(io);
     let mut reader = BufReader::new(read_half);
@@ -161,6 +193,14 @@ where
                 break;
             }
         };
+
+        // Checked per request: the allowlist may be set after this
+        // connection was accepted.
+        if !state.peer_allowed(peer_ip) {
+            tracing::warn!(%peer, path = %request.path, "HLS request from a peer that is not allowed");
+            let _ = write_status(&mut write_half, 403, "Forbidden", b"", false).await;
+            break;
+        }
 
         let client_wants_close = request.connection_close;
         let send_start = Instant::now();
@@ -1200,5 +1240,68 @@ mod range_reply_tests {
         assert!(text.contains("Content-Range: bytes */1234\r\n"));
         assert!(text.contains("Content-Length: 0\r\n"));
         assert!(text.ends_with("\r\n\r\n"));
+    }
+}
+
+#[cfg(test)]
+mod allowlist_tests {
+    use super::*;
+
+    fn state() -> Arc<ServerState> {
+        let ring = Arc::new(RwLock::new(SegmentRing::new(6, 4)));
+        Arc::new(ServerState::new(ring, None).unwrap())
+    }
+
+    async fn request_from(state: &Arc<ServerState>, peer: &str) -> String {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let path = state.token.playlist_path();
+        let task = tokio::spawn(handle(peer.parse().unwrap(), server, state.clone()));
+        client
+            .write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut out = String::new();
+        client.read_to_string(&mut out).await.unwrap();
+        let _ = task.await;
+        out
+    }
+
+    #[tokio::test]
+    async fn allowlist_admits_only_allowed_peers_and_loopback() {
+        let state = state();
+        // No allowlist: everyone may fetch.
+        assert!(
+            request_from(&state, "192.168.1.50:4000")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        state.allow_peer("192.168.1.30".parse().unwrap());
+        let denied = request_from(&state, "192.168.1.50:4000").await;
+        assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+        assert!(
+            denied.contains("Access-Control-Allow-Origin: *"),
+            "{denied}"
+        );
+        assert!(
+            request_from(&state, "192.168.1.30:4000")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        // IPv4-mapped IPv6 form of the allowed peer.
+        assert!(
+            request_from(&state, "[::ffff:192.168.1.30]:4000")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        assert!(
+            request_from(&state, "127.0.0.1:4000")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
+        assert!(
+            request_from(&state, "[::1]:4000")
+                .await
+                .starts_with("HTTP/1.1 200")
+        );
     }
 }
