@@ -19,7 +19,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 
@@ -419,21 +419,46 @@ struct Request {
     range: Option<(u64, Option<u64>)>,
 }
 
+/// Read one `\n`-terminated line, consuming at most `budget` bytes
+/// (decremented by what was read). The cap applies *while* reading, so
+/// a client that never sends a newline cannot grow the buffer past
+/// the request limit. `Ok(None)` on a clean EOF before any byte.
+async fn read_line_bounded<R>(
+    reader: &mut BufReader<R>,
+    budget: &mut usize,
+) -> Result<Option<String>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::new();
+    // `take` stops at the budget; one extra byte distinguishes
+    // "exactly at the limit" from "over it".
+    let limit = u64::try_from(*budget).unwrap_or(u64::MAX).saturating_add(1);
+    let n = (&mut *reader)
+        .take(limit)
+        .read_until(b'\n', &mut buf)
+        .await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if n > *budget {
+        return Err(FerricastError::Hls("request headers too long".into()));
+    }
+    *budget -= n;
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| FerricastError::Hls("request is not valid UTF-8".into()))
+}
+
 async fn read_request<R>(reader: &mut BufReader<R>) -> Result<Request>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut first_line = String::new();
-    let mut total = 0usize;
-    let n = reader.read_line(&mut first_line).await?;
-    if n == 0 {
+    let mut budget = MAX_REQUEST_BYTES;
+    let Some(first_line) = read_line_bounded(reader, &mut budget).await? else {
         return Err(FerricastError::Hls("client closed before request".into()));
-    }
-    total += n;
-    if total > MAX_REQUEST_BYTES {
-        return Err(FerricastError::Hls("request line too long".into()));
-    }
-    let line = first_line.trim_end_matches(|c| c == '\r' || c == '\n');
+    };
+    let line = first_line.trim_end_matches(['\r', '\n']);
     let mut parts = line.splitn(3, ' ');
     let method = parts
         .next()
@@ -449,15 +474,9 @@ where
     let mut range: Option<(u64, Option<u64>)> = None;
 
     loop {
-        let mut hdr = String::new();
-        let n = reader.read_line(&mut hdr).await?;
-        if n == 0 {
+        let Some(hdr) = read_line_bounded(reader, &mut budget).await? else {
             break;
-        }
-        total += n;
-        if total > MAX_REQUEST_BYTES {
-            return Err(FerricastError::Hls("request headers too long".into()));
-        }
+        };
         if hdr == "\r\n" || hdr == "\n" {
             break;
         }
@@ -906,5 +925,31 @@ mod tests {
             parse_blocking_reload("_HLS_part=3&_HLS_msn=12"),
             Some((12, Some(3)))
         );
+    }
+}
+
+#[cfg(test)]
+mod request_limit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_without_newline_is_rejected_at_the_limit() {
+        // An endless header line: must error out instead of buffering.
+        let mut input = b"GET /index.m3u8 HTTP/1.1\r\nX: ".to_vec();
+        input.extend(std::iter::repeat_n(b'a', MAX_REQUEST_BYTES * 4));
+        let mut reader = BufReader::new(&input[..]);
+        let err = read_request(&mut reader).await.err().expect("must fail");
+        assert!(err.to_string().contains("too long"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn normal_request_parses() {
+        let input = b"GET /a/index.m3u8 HTTP/1.1\r\nRange: bytes=0-9\r\nConnection: close\r\n\r\n";
+        let mut reader = BufReader::new(&input[..]);
+        let req = read_request(&mut reader).await.unwrap();
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/a/index.m3u8");
+        assert!(req.connection_close);
+        assert_eq!(req.range, Some((0, Some(9))));
     }
 }
