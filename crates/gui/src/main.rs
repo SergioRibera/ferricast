@@ -65,12 +65,17 @@ async fn main() -> anyhow::Result<()> {
     let (receiver_window_tx, receiver_window_rx) = mpsc::channel::<ReceiverWindowReq>(16);
     let receiver_window_tx_factory = receiver_window_tx.clone();
 
-    let mut manager_builder = StreamManager::builder()
-        .with_chromecast()
-        .with_airplay()
-        .with_chromecast_receiver()
-        .with_h264_decoder()
-        .with_aac_decoder();
+    let manager_builder = StreamManager::builder();
+    #[cfg(feature = "chromecast")]
+    let manager_builder = manager_builder.with_chromecast();
+    #[cfg(feature = "airplay")]
+    let manager_builder = manager_builder.with_airplay();
+    #[cfg(feature = "chromecast")]
+    let manager_builder = manager_builder.with_chromecast_receiver();
+    let manager_builder = manager_builder.with_h264_decoder();
+    #[cfg(feature = "aac")]
+    let manager_builder = manager_builder.with_aac_decoder();
+    let mut manager_builder = manager_builder;
 
     if let (Some(min), Some(max)) = (args.port_min, args.port_max) {
         if max < min {
