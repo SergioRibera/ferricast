@@ -26,6 +26,7 @@ pub(super) struct Sps {
     pub log2_max_frame_num: u32,
     pub poc: PocKind,
     pub max_num_ref_frames: u32,
+    pub gaps_allowed: bool,
     pub frame_mbs_only: bool,
     pub width_mbs: u32,
     pub height_mbs: u32,
@@ -34,6 +35,9 @@ pub(super) struct Sps {
     pub num_reorder_frames: Option<u32>,
     pub max_dec_frame_buffering: Option<u32>,
     pub scaling_matrix_present: bool,
+    /// VUI `matrix_coefficients`, when the colour description is present.
+    pub matrix_coefficients: Option<u8>,
+    pub full_range: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,19 +60,48 @@ pub(super) struct Pps {
     pub scaling_matrix_present: bool,
 }
 
+/// Largest picture dimension the backend accepts, in macroblocks
+/// (8192 pixels, the H.264 level 6.2 ceiling).
+pub(super) const MAX_DIMENSION_MBS: u32 = 8192 / 16;
+/// Spec ceiling for `max_num_ref_frames` and the DPB size (A.3.1).
+pub(super) const MAX_DPB_FRAMES: u32 = 16;
+/// Spec ceiling for `log2_max_frame_num` and `log2_max_pic_order_cnt_lsb`.
+const MAX_LOG2: u32 = 16;
+/// Spec ceiling for `num_ref_frames_in_pic_order_cnt_cycle`.
+const MAX_POC_CYCLE: usize = 255;
+
+/// Why a stream cannot go through the VA-API backend even though it is
+/// valid H.264; another backend may still decode it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Unsupported(pub &'static str);
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VA-API H.264: {} is not supported", self.0)
+    }
+}
+
+impl std::error::Error for Unsupported {}
+
 impl Sps {
     pub(super) fn coded_size(&self) -> (u32, u32) {
-        (self.width_mbs * 16, self.height_mbs * 16)
+        (
+            self.width_mbs.saturating_mul(16),
+            self.height_mbs.saturating_mul(16),
+        )
     }
 
+    /// Crop units are two samples in both directions: [`Self::check_supported`]
+    /// only admits progressive 4:2:0.
     pub(super) fn visible_rect(&self) -> (u32, u32, u32, u32) {
         let (left, right, top, bottom) = self.crop;
         let (width, height) = self.coded_size();
+        let units = |a: u32, b: u32| a.saturating_add(b).saturating_mul(2);
         (
-            2 * left,
-            2 * top,
-            width.saturating_sub(2 * (left + right)),
-            height.saturating_sub(2 * (top + bottom)),
+            left.saturating_mul(2),
+            top.saturating_mul(2),
+            width.saturating_sub(units(left, right)),
+            height.saturating_sub(units(top, bottom)),
         )
     }
 
@@ -80,12 +113,10 @@ impl Sps {
         }
     }
 
-    pub(super) fn check_supported(&self, pps: &Pps) -> Result<()> {
-        let unsupported = |what: &str| {
-            Err(FerricastError::Decode(format!(
-                "VA-API H.264: {what} is not supported"
-            )))
-        };
+    /// Features the VA-API path does not implement. Failing here does not
+    /// make the stream broken: a software decoder can take over.
+    pub(super) fn check_supported(&self, pps: &Pps) -> std::result::Result<(), Unsupported> {
+        let unsupported = |what: &'static str| Err(Unsupported(what));
         if !self.frame_mbs_only {
             return unsupported("interlaced coding");
         }
@@ -100,6 +131,61 @@ impl Sps {
         }
         if self.scaling_matrix_present || pps.scaling_matrix_present {
             return unsupported("scaling matrices");
+        }
+        if self.width_mbs > MAX_DIMENSION_MBS || self.height_mbs > MAX_DIMENSION_MBS {
+            return unsupported("pictures larger than 8192 pixels");
+        }
+        Ok(())
+    }
+
+    /// Range checks on stream-controlled values that later feed DPB and
+    /// buffer arithmetic. Failing here means the SPS is corrupt.
+    pub(super) fn check_valid(&self) -> Result<()> {
+        let invalid = |what: String| Err(FerricastError::Decode(format!("H.264 SPS: {what}")));
+        if self.width_mbs == 0 || self.height_mbs == 0 {
+            return invalid("zero-sized picture".into());
+        }
+        if self.max_num_ref_frames > MAX_DPB_FRAMES {
+            return invalid(format!(
+                "max_num_ref_frames {} exceeds {MAX_DPB_FRAMES}",
+                self.max_num_ref_frames
+            ));
+        }
+        if !(4..=MAX_LOG2).contains(&self.log2_max_frame_num) {
+            return invalid(format!(
+                "log2_max_frame_num {} outside 4..=16",
+                self.log2_max_frame_num
+            ));
+        }
+        match &self.poc {
+            PocKind::Lsb { log2_max_lsb } if !(4..=MAX_LOG2).contains(log2_max_lsb) => {
+                return invalid(format!(
+                    "log2_max_pic_order_cnt_lsb {log2_max_lsb} outside 4..=16"
+                ));
+            }
+            PocKind::Cycle {
+                offsets_for_ref_frame,
+                ..
+            } if offsets_for_ref_frame.len() > MAX_POC_CYCLE => {
+                return invalid(format!(
+                    "{} reference frames in the POC cycle exceed {MAX_POC_CYCLE}",
+                    offsets_for_ref_frame.len()
+                ));
+            }
+            PocKind::Lsb { .. } | PocKind::Cycle { .. } | PocKind::FrameNum => {}
+        }
+        let (width, height) = self.coded_size();
+        let (left, right, top, bottom) = self.crop;
+        let inside = |a: u32, b: u32, size: u32| {
+            a.checked_add(b)
+                .and_then(|sum| sum.checked_mul(2))
+                .is_some_and(|cropped| cropped < size)
+        };
+        if !inside(left, right, width) || !inside(top, bottom, height) {
+            return invalid(format!(
+                "crop {:?} leaves nothing of the {width}x{height} picture",
+                self.crop
+            ));
         }
         Ok(())
     }
@@ -360,7 +446,7 @@ pub(super) fn parse(rbsp: &[u8], nal_header: u8, sps: &Sps, pps: &Pps) -> Result
         header.direct_spatial_mv_pred = r.read_flag()?;
     }
     if slice_type.is_inter() {
-        header.num_ref_idx_active = pps.num_ref_idx_default.map(|n| n + 1);
+        header.num_ref_idx_active = pps.num_ref_idx_default.map(|n| n.saturating_add(1));
         if r.read_flag()? {
             header.num_ref_idx_active[0] = r.read_ue()? + 1;
             if slice_type == SliceType::B {
@@ -583,6 +669,7 @@ pub(super) mod tests {
             log2_max_frame_num: 4,
             poc: PocKind::Lsb { log2_max_lsb: 6 },
             max_num_ref_frames: 3,
+            gaps_allowed: false,
             frame_mbs_only: true,
             width_mbs: 120,
             height_mbs: 68,
@@ -591,6 +678,8 @@ pub(super) mod tests {
             num_reorder_frames: Some(2),
             max_dec_frame_buffering: Some(4),
             scaling_matrix_present: false,
+            matrix_coefficients: None,
+            full_range: false,
         }
     }
 
@@ -754,6 +843,47 @@ pub(super) mod tests {
         let mut fmo = pps();
         fmo.slice_groups = true;
         assert!(sps().check_supported(&fmo).is_err());
+    }
+
+    #[test]
+    fn stream_controlled_sps_values_are_range_checked() {
+        assert!(sps().check_valid().is_ok());
+        let mut refs = sps();
+        refs.max_num_ref_frames = 17;
+        assert!(refs.check_valid().is_err());
+        let mut crop = sps();
+        crop.crop = (0, 0, 0, 544);
+        assert!(crop.check_valid().is_err());
+        crop.crop = (u32::MAX, u32::MAX, 0, 0);
+        assert!(crop.check_valid().is_err());
+        let mut frame_num = sps();
+        frame_num.log2_max_frame_num = 17;
+        assert!(frame_num.check_valid().is_err());
+        let lsb = Sps {
+            poc: PocKind::Lsb { log2_max_lsb: 40 },
+            ..sps()
+        };
+        assert!(lsb.check_valid().is_err());
+        let cycle = Sps {
+            poc: PocKind::Cycle {
+                delta_always_zero: false,
+                offset_for_non_ref_pic: 0,
+                offset_for_top_to_bottom: 0,
+                offsets_for_ref_frame: vec![1; 256],
+            },
+            ..sps()
+        };
+        assert!(cycle.check_valid().is_err());
+    }
+
+    #[test]
+    fn huge_pictures_are_unsupported_and_their_sizes_saturate() {
+        let mut huge = sps();
+        huge.width_mbs = u32::MAX;
+        assert!(huge.check_supported(&pps()).is_err());
+        assert_eq!(huge.coded_size().0, u32::MAX);
+        huge.crop = (u32::MAX, u32::MAX, u32::MAX, u32::MAX);
+        assert_eq!(huge.visible_rect().2, 0);
     }
 
     #[test]
