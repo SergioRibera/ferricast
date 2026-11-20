@@ -30,7 +30,7 @@ mod slice;
 #[cfg(feature = "vaapi-decode")]
 mod vaapi_impl;
 
-#[cfg(feature = "vaapi-decode")]
+#[cfg(any(feature = "nvdec-decode", feature = "vaapi-decode"))]
 use std::collections::VecDeque;
 
 #[cfg(feature = "vaapi-decode")]
@@ -44,6 +44,8 @@ use tracing::warn;
 
 #[cfg(feature = "nvdec-decode")]
 pub use crate::nvdec::NvdecH264Decoder;
+#[cfg(feature = "nvdec-decode")]
+use crate::nvdec::probation::Probation;
 #[cfg(feature = "openh264-decode")]
 pub use openh264_impl::OpenH264Decoder;
 #[cfg(feature = "vaapi-decode")]
@@ -54,9 +56,10 @@ const H264_BACKEND_VAR: &str = "FERRICAST_H264_DECODE_BACKEND";
 #[derive(Default)]
 pub struct H264Decoder {
     backend: Backend,
-    /// Pictures the VA-API backend finished before handing the stream
-    /// over to openh264; served ahead of anything openh264 produces.
-    #[cfg(feature = "vaapi-decode")]
+    /// Pictures a hardware backend finished (or openh264 produced while
+    /// replaying a stream NVDEC rejected) before the stream moved to
+    /// openh264; served ahead of anything openh264 produces next.
+    #[cfg(any(feature = "nvdec-decode", feature = "vaapi-decode"))]
     handed_over: VecDeque<CapturedFrame>,
 }
 
@@ -65,7 +68,7 @@ enum Backend {
     #[default]
     Pending,
     #[cfg(feature = "nvdec-decode")]
-    Nvdec(NvdecH264Decoder),
+    Nvdec(Box<NvdecBackend>),
     #[cfg(feature = "vaapi-decode")]
     Vaapi(Box<VaapiBackend>),
     #[cfg(feature = "openh264-decode")]
@@ -97,7 +100,11 @@ impl H264Decoder {
                                     height = config.height,
                                     "H.264 decoder backend: NVDEC"
                                 );
-                                return Ok(Backend::Nvdec(d));
+                                return Ok(Backend::Nvdec(Box::new(NvdecBackend {
+                                    decoder: d,
+                                    config: config.clone(),
+                                    probation: Probation::default(),
+                                })));
                             }
                             Err(e) => warn!(
                                 error = %e,
@@ -177,6 +184,85 @@ impl H264Decoder {
     }
 }
 
+/// NVDEC plus what it takes to hand a stream it rejects to openh264.
+#[cfg(feature = "nvdec-decode")]
+struct NvdecBackend {
+    decoder: NvdecH264Decoder,
+    config: DecoderConfig,
+    probation: Probation,
+}
+
+#[cfg(feature = "nvdec-decode")]
+impl H264Decoder {
+    fn decode_nvdec(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+        let Backend::Nvdec(nvdec) = &mut self.backend else {
+            return Err(FerricastError::Decode(
+                "H.264 facade lost its NVDEC backend".into(),
+            ));
+        };
+        nvdec.probation.record(&frame);
+        match nvdec.decoder.decode(frame) {
+            Ok(picture) => {
+                if picture.is_some() {
+                    nvdec.probation.settle();
+                }
+                Ok(picture)
+            }
+            Err(error) => {
+                let Some(replay) = nvdec.probation.take_replay() else {
+                    return Err(error);
+                };
+                let config = nvdec.config.clone();
+                warn!(%error, "NVDEC rejected the stream; switching to openh264");
+                let software = self.replay_into_software(&config, replay)?;
+                self.backend = Backend::OpenH264(software);
+                Ok(self.handed_over.pop_front())
+            }
+        }
+    }
+
+    fn flush_nvdec(&mut self) -> Result<Vec<CapturedFrame>> {
+        let Backend::Nvdec(nvdec) = &mut self.backend else {
+            return Err(FerricastError::Decode(
+                "H.264 facade lost its NVDEC backend".into(),
+            ));
+        };
+        match nvdec.decoder.flush() {
+            Ok(frames) => Ok(frames),
+            Err(error) => {
+                let Some(replay) = nvdec.probation.take_replay() else {
+                    return Err(error);
+                };
+                let config = nvdec.config.clone();
+                warn!(%error, "NVDEC rejected the stream at flush; switching to openh264");
+                let mut software = self.replay_into_software(&config, replay)?;
+                self.handed_over.extend(software.flush()?);
+                self.backend = Backend::OpenH264(software);
+                Ok(self.handed_over.drain(..).collect())
+            }
+        }
+    }
+
+    /// Decodes the packets NVDEC was fed into a fresh openh264 decoder
+    /// and queues its pictures. A packet openh264 rejects (e.g. a P
+    /// slice before the first IDR) is skipped, as it would have been
+    /// had openh264 decoded the stream from the start.
+    fn replay_into_software(
+        &mut self,
+        config: &DecoderConfig,
+        replay: Vec<EncodedFrame>,
+    ) -> Result<OpenH264Decoder> {
+        let mut software = software(config)?;
+        for packet in replay {
+            match software.decode(packet) {
+                Ok(picture) => self.handed_over.extend(picture),
+                Err(error) => warn!(%error, "openh264 skipped a replayed packet"),
+            }
+        }
+        Ok(software)
+    }
+}
+
 #[cfg(feature = "openh264-decode")]
 fn software(config: &DecoderConfig) -> Result<OpenH264Decoder> {
     let mut decoder = OpenH264Decoder::default();
@@ -194,7 +280,10 @@ impl VideoDecoder for H264Decoder {
                 Ok(())
             }
             #[cfg(feature = "nvdec-decode")]
-            Backend::Nvdec(d) => d.configure(config),
+            Backend::Nvdec(d) => {
+                d.config = config.clone();
+                d.decoder.configure(config)
+            }
             #[cfg(feature = "vaapi-decode")]
             Backend::Vaapi(d) => {
                 d.config = config.clone();
@@ -213,13 +302,13 @@ impl VideoDecoder for H264Decoder {
                 ));
             }
             #[cfg(feature = "nvdec-decode")]
-            Backend::Nvdec(d) => d.decode(frame),
+            Backend::Nvdec(_) => return self.decode_nvdec(frame),
             #[cfg(feature = "vaapi-decode")]
             Backend::Vaapi(_) => return self.decode_vaapi(frame),
             #[cfg(feature = "openh264-decode")]
             Backend::OpenH264(d) => d.decode(frame),
         }?;
-        #[cfg(feature = "vaapi-decode")]
+        #[cfg(any(feature = "nvdec-decode", feature = "vaapi-decode"))]
         if !self.handed_over.is_empty() {
             self.handed_over.extend(decoded);
             return Ok(self.handed_over.pop_front());
@@ -231,13 +320,13 @@ impl VideoDecoder for H264Decoder {
         let flushed = match &mut self.backend {
             Backend::Pending => Vec::new(),
             #[cfg(feature = "nvdec-decode")]
-            Backend::Nvdec(d) => d.flush()?,
+            Backend::Nvdec(_) => return self.flush_nvdec(),
             #[cfg(feature = "vaapi-decode")]
             Backend::Vaapi(d) => d.decoder.flush()?,
             #[cfg(feature = "openh264-decode")]
             Backend::OpenH264(d) => d.flush()?,
         };
-        #[cfg(feature = "vaapi-decode")]
+        #[cfg(any(feature = "nvdec-decode", feature = "vaapi-decode"))]
         if !self.handed_over.is_empty() {
             self.handed_over.extend(flushed);
             return Ok(self.handed_over.drain(..).collect());
