@@ -110,7 +110,7 @@ impl CastSession for AirPlaySession {
             .expect("Ferricast airplay discovery bug");
 
         let pair_challange =
-            PairingChallenge::new_airplay(device_config.flags, &device_config.features);
+            PairingChallenge::new_airplay(&device_config);
 
         println!("{:?}", pair_challange);
 
@@ -127,12 +127,6 @@ impl CastSession for AirPlaySession {
         let (read_half, mut write_half) = socket.split();
         let mut buf_reader = BufReader::new(read_half);
 
-        if device_config.features.support_moddern_pairing()
-            && device_config.features.supports_transient_pairing()
-        {
-            println!("transient pairing")
-        } else {
-        }
 
         let client_id = Uuid::new_v4();
 

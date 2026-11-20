@@ -30,24 +30,11 @@ pub struct RtspReqBuilder {
     headers: Vec<(String, String)>,
 }
 
-fn req_headers(features: &Features) -> Vec<(String, String)> {
-    if features.prefers_legacy_pairing() {
-        return vec![(
-            "X-Apple-HKP".to_string(),
-            features.pair_effective().to_string(),
-        )];
-    }
-
-    return vec![
-        (
-            "X-Apple-HKP".to_string(),
-            features.pair_effective().to_string(),
-        ),
-        (
-            "X-Apple-Client-Name".to_string(),
-            "Ferricast Client".to_string(),
-        ),
-    ];
+fn req_headers(_features: &Features) -> Vec<(String, String)> {
+    vec![(
+        "X-Apple-Client-Name".to_string(),
+        "Ferricast Client".to_string(),
+    )]
 }
 
 impl RtspReqBuilder {

@@ -85,136 +85,170 @@ pub struct DeviceCapabilities {
     /// 1st/2nd-gen (`md=Chromecast`) — older firmware may refuse OFFER
     /// from non-Chrome senders; fall back to HLS for those.
     pub supports_cast_streaming: bool,
-    /// This only will have a value if the protocol is cast, other protocols just use None
+    /// AirPlay-specific discovery data. `None` for every other protocol.
     pub airplay_config: Option<AirplayConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AirplayConfig {
-    /// bitfield of supported features. This was originally a 32 bit value but it has since been expanded to a 64 bit value. To support both these types the mDNS value is encoded as two 32 bit values separated by comma with the comma and second 32 bit value being optional.
-    /// For more information visit <https://openairplay.github.io/airplay-spec/features.html>
+    /// Bitfield of supported features. Advertised over mDNS as one or two
+    /// 32-bit hex words separated by a comma; the second word is optional.
+    /// See <https://openairplay.github.io/airplay-spec/features.html>.
     pub features: Features,
-    /// bitfield of status flags
-    /// For more information visit <https://openairplay.github.io/airplay-spec/status_flags.html>
+    /// Bitfield of status flags.
+    /// See <https://openairplay.github.io/airplay-spec/status_flags.html>.
     pub flags: Flags,
-    /// Public Key, extracted from MDNS TxT
-    /// For more information visit <https://openairplay.github.io/airplay-spec/service_discovery.html>
+    /// Receiver Ed25519 public key (hex), from the `pk` TXT record.
     pub pk: Option<String>,
+    /// Receiver device id (`deviceid` TXT record, usually a MAC address).
+    /// Stable across restarts, so it keys stored pairing credentials.
+    pub device_id: Option<String>,
+}
+
+impl AirplayConfig {
+    /// Pairing procedure to run against this receiver, decided from what it
+    /// advertises (the same split pyatv makes in `get_protocol_version`).
+    ///
+    /// Receivers that advertise CoreUtils pairing (bit 38) or unified
+    /// pair-setup (bit 51) speak HomeKit pairing; everything else (UxPlay,
+    /// RPiPlay, shairplay derivatives, AirPlay 1 hardware) speaks the legacy
+    /// `/pair-setup` + `/pair-verify` exchange.
+    #[must_use]
+    pub fn pairing_mode(&self) -> AirPlayPairing {
+        let hap = self.features.intersects(
+            Features::CORE_UTILS_PAIRING_AND_ENCRYPTION | Features::UNIFIED_PAIR_SETUP_MFI,
+        );
+        let pin = self
+            .flags
+            .intersects(Flags::PIN_REQUIRED | Flags::PASSWORD_REQUIRED);
+        if hap {
+            let transient = self
+                .features
+                .intersects(Features::TRANSIENT_PAIRING | Features::SYSTEM_PAIRING);
+            if transient && !pin {
+                AirPlayPairing::HapTransient
+            } else {
+                AirPlayPairing::Hap
+            }
+        } else if pin {
+            AirPlayPairing::LegacyPin
+        } else {
+            AirPlayPairing::Legacy
+        }
+    }
+}
+
+/// Pairing procedure an AirPlay sender runs before streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AirPlayPairing {
+    /// `/pair-setup` with a raw Ed25519 key followed by `/pair-verify`.
+    /// No user interaction and no `X-Apple-HKP` header.
+    Legacy,
+    /// `/pair-pin-start` + SRP over `/pair-setup-pin` (binary plists), then
+    /// `/pair-verify`. The receiver shows a 4-digit PIN.
+    LegacyPin,
+    /// HomeKit pair-setup (SRP-6a, PIN shown on the receiver) followed by
+    /// HomeKit pair-verify. `X-Apple-HKP: 3`.
+    Hap,
+    /// HomeKit transient pair-setup with the fixed PIN `3939`; no stored
+    /// credentials. `X-Apple-HKP: 4`.
+    HapTransient,
+}
+
+impl AirPlayPairing {
+    /// Value of the `X-Apple-HKP` request header for this mode, if any.
+    #[must_use]
+    pub fn hkp_header(self) -> Option<&'static str> {
+        match self {
+            Self::Legacy | Self::LegacyPin => None,
+            Self::Hap => Some("3"),
+            Self::HapTransient => Some("4"),
+        }
+    }
 }
 
 bitflags::bitflags! {
+     /// AirPlay feature bits (`features` TXT record).
      #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
      pub struct Features: u64 {
-        const VIDEO_SUPPORTED = 0x1;
-        const PHOTO_SUPPORTED = 0x2;
-        const VIDEO_FAIRPLAY = 0x4;
-        const VOLUME_CONTROL = 0x8;
-        const VIDEO_HTTP_LIVE_STREAM = 0x10;
-        const SLIDESHOW_SUPPORTED = 0x20;
-        const MIRRORING_SUPPORTED = 0x80;
-        const SCREEN_ROTATE = 0x100;
-        const AUDIO_SUPPORTED = 0x200;
-        const AUDIO_REDUNDANCY_SUPPORTED = 0x800;
-        const FAIRPLAY_SECURE_AUTH_SUPPORTED = 0x1000;
-        const PHOTO_CACHING = 0x2000;
-        const AUTH4 = 0x4000;
-
-        const SUPPORT_LEGACY_PAIRING = (1 << 27);
-
-        const HAS_UNIFIED_ADVERTISER_INFO = (1 << 26);
-
-        const RAOP = (1 << 30);
-        const SUPPORTS_VOLUME = (1 << 32);
-        const AIRPLAY_VIDEO_PLAY_QUEUE = (1 << 33);
-        const AIRPLAY_FROM_CLOUD = (1 << 34);
-
-        const CORE_UTILS_PAIRING_AND_ENCRYPTION = (1 << 38);
-        const BUFFERED_AUDIO = (1 << 40);
-        const PTP = (1 << 41);
-        const SCREEN_MULTI_CODEC = (1 << 42);
-        const SYSTEM_PAIRING  = (1 << 43);
-
-        const HK_PAIRING_AND_ACCESS_CONTROL = (1 << 46);
-
-        const TRANSIENT_PAIRING = (1 << 48);
-
-        const UNIFIED_PAIR_SETUP_MFI = (1 << 51);
-
-        // There is other flags but.... who cares?
+        const VIDEO_SUPPORTED = 1 << 0;
+        const PHOTO_SUPPORTED = 1 << 1;
+        const VIDEO_FAIRPLAY = 1 << 2;
+        const VOLUME_CONTROL = 1 << 3;
+        const VIDEO_HTTP_LIVE_STREAM = 1 << 4;
+        const SLIDESHOW_SUPPORTED = 1 << 5;
+        /// Screen mirroring ("Screen").
+        const MIRRORING_SUPPORTED = 1 << 7;
+        const SCREEN_ROTATE = 1 << 8;
+        const AUDIO_SUPPORTED = 1 << 9;
+        const AUDIO_REDUNDANCY_SUPPORTED = 1 << 11;
+        const FAIRPLAY_SECURE_AUTH_SUPPORTED = 1 << 12;
+        const PHOTO_CACHING = 1 << 13;
+        const AUTH4 = 1 << 14;
+        /// MFi authentication ("Authentication_8").
+        const AUTHENTICATION_8 = 1 << 26;
+        const SUPPORT_LEGACY_PAIRING = 1 << 27;
+        const HAS_UNIFIED_ADVERTISER_INFO = 1 << 30;
+        const SUPPORTS_VOLUME = 1 << 32;
+        const AIRPLAY_VIDEO_PLAY_QUEUE = 1 << 33;
+        const AIRPLAY_FROM_CLOUD = 1 << 34;
+        const CORE_UTILS_PAIRING_AND_ENCRYPTION = 1 << 38;
+        const BUFFERED_AUDIO = 1 << 40;
+        const PTP = 1 << 41;
+        const SCREEN_MULTI_CODEC = 1 << 42;
+        const SYSTEM_PAIRING = 1 << 43;
+        const HK_PAIRING_AND_ACCESS_CONTROL = 1 << 46;
+        const TRANSIENT_PAIRING = 1 << 48;
+        const UNIFIED_PAIR_SETUP_MFI = 1 << 51;
      }
 }
 
-pub const AIRPLAY_PAIR_LEGACY: u8 = 3;
-pub const AIRPLAY_PAIR_MODERN: u8 = 5;
-pub const AIRPLAY_PAIR_TRANSIENT: u8 = 4;
-pub const AIRPLAY_PAIR_ERR: u8 = 0;
-
 impl Features {
-    pub fn support_moddern_pairing(&self) -> bool {
-        let core_utils = self.contains(Features::CORE_UTILS_PAIRING_AND_ENCRYPTION)
-            || self.contains(Features::SYSTEM_PAIRING)
-            || self.contains(Features::HK_PAIRING_AND_ACCESS_CONTROL)
-            || self.contains(Features::TRANSIENT_PAIRING);
-
-        let third_party = self.contains(Features::HAS_UNIFIED_ADVERTISER_INFO)
-            || self.contains(Features::UNIFIED_PAIR_SETUP_MFI);
-
-        core_utils && !third_party
-    }
-    pub fn supports_transient_pairing(&self) -> bool {
-        self.contains(Features::SYSTEM_PAIRING) || self.contains(Features::TRANSIENT_PAIRING)
-    }
-    pub fn supports_legacy_pairing(&self) -> bool {
-        self.contains(Features::SUPPORT_LEGACY_PAIRING)
-    }
-    /// True when the receiver does not speak modern (HomeKit) pairing.
-    /// Note this does not imply legacy pairing is available; see
-    /// [`Self::pair_effective`] for the mode actually negotiated.
-    pub fn prefers_legacy_pairing(&self) -> bool {
-        !self.support_moddern_pairing()
-    }
-
-    /// The `X-Apple-HKP` pairing mode to use with this receiver:
-    /// modern HomeKit pairing when supported, otherwise transient
-    /// pairing, otherwise legacy pairing if the receiver advertises
-    /// `SUPPORT_LEGACY_PAIRING`, and [`AIRPLAY_PAIR_ERR`] when none
-    /// of them is available.
-    pub fn pair_effective(&self) -> u8 {
-        if self.support_moddern_pairing() {
-            AIRPLAY_PAIR_MODERN
-        } else if self.supports_transient_pairing() {
-            AIRPLAY_PAIR_TRANSIENT
-        } else if self.supports_legacy_pairing() {
-            AIRPLAY_PAIR_LEGACY
-        } else {
-            AIRPLAY_PAIR_ERR
+    /// Parse the `features` TXT value: `0xLOW` or `0xLOW,0xHIGH`.
+    ///
+    /// Returns `None` when a word is not valid hex. Unknown bits are kept.
+    #[must_use]
+    pub fn parse_txt(value: &str) -> Option<Self> {
+        fn word(v: &str) -> Option<u64> {
+            let v = v.trim();
+            let v = v
+                .strip_prefix("0x")
+                .or_else(|| v.strip_prefix("0X"))
+                .unwrap_or(v);
+            u32::from_str_radix(v, 16).ok().map(u64::from)
         }
+        let mut parts = value.split(',');
+        let low = word(parts.next()?)?;
+        let high = match parts.next() {
+            Some(v) => word(v)?,
+            None => 0,
+        };
+        Some(Self::from_bits_retain((high << 32) | low))
     }
 }
 
 impl Display for Features {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
 bitflags::bitflags! {
+     /// AirPlay status flags (`flags` TXT record).
      #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
      pub struct Flags: u32 {
-        const PROBLEM_HAS_BEEN_DETECTED = (1 << 0);
-        const DEVICE_IS_NOT_CONFIGURED = (1 << 1);
-        const AUDIO_CABLE = (1 << 2);
-
-
-        const SUPPORTS_AIRPLAY_FROM_CLOUD= (1 << 6);
-        const PASSWORD_REQUIRED = (1 << 7);
-
-        const PIN_ONE_TIME_PAIRING = (1 << 9);
-        const DEVICE_WAS_SETUP_FOR_HK_ACCESS_CONTROL = (1 << 10);
-        const DEVICE_SUPPORT_RELAY = (1 << 11);
-        const SILENT_PRIMARY = (1 << 12);
-
-        const RECEIVER_SESSION_IS_ACTIVE = (1 << 17);
+        const PROBLEM_HAS_BEEN_DETECTED = 1 << 0;
+        const DEVICE_IS_NOT_CONFIGURED = 1 << 1;
+        const AUDIO_CABLE = 1 << 2;
+        /// The receiver requires a PIN before a sender may stream.
+        const PIN_REQUIRED = 1 << 3;
+        const SUPPORTS_AIRPLAY_FROM_CLOUD = 1 << 6;
+        const PASSWORD_REQUIRED = 1 << 7;
+        const PIN_ONE_TIME_PAIRING = 1 << 9;
+        const DEVICE_WAS_SETUP_FOR_HK_ACCESS_CONTROL = 1 << 10;
+        const DEVICE_SUPPORT_RELAY = 1 << 11;
+        const SILENT_PRIMARY = 1 << 12;
+        const RECEIVER_SESSION_IS_ACTIVE = 1 << 17;
     }
 }
 
@@ -271,28 +305,79 @@ pub enum DiscoveryEvent {
 mod tests {
     use super::*;
 
+    fn config(features: Features, flags: Flags) -> AirplayConfig {
+        AirplayConfig {
+            features,
+            flags,
+            pk: None,
+            device_id: None,
+        }
+    }
+
     #[test]
     fn pairing_mode_decision_table() {
-        let modern = Features::HK_PAIRING_AND_ACCESS_CONTROL;
-        let transient = Features::TRANSIENT_PAIRING;
-        let legacy = Features::SUPPORT_LEGACY_PAIRING;
-        let third_party = Features::HAS_UNIFIED_ADVERTISER_INFO;
+        let hap = Features::CORE_UTILS_PAIRING_AND_ENCRYPTION;
         let cases = [
-            (modern, AIRPLAY_PAIR_MODERN),
-            (modern | legacy, AIRPLAY_PAIR_MODERN),
-            (transient, AIRPLAY_PAIR_MODERN),
-            (transient | third_party, AIRPLAY_PAIR_TRANSIENT),
             (
-                Features::SYSTEM_PAIRING | third_party | legacy,
-                AIRPLAY_PAIR_TRANSIENT,
+                Features::SUPPORT_LEGACY_PAIRING,
+                Flags::empty(),
+                AirPlayPairing::Legacy,
             ),
-            (modern | third_party | legacy, AIRPLAY_PAIR_LEGACY),
-            (legacy, AIRPLAY_PAIR_LEGACY),
-            (modern | third_party, AIRPLAY_PAIR_ERR),
-            (Features::empty(), AIRPLAY_PAIR_ERR),
+            (Features::empty(), Flags::empty(), AirPlayPairing::Legacy),
+            (
+                Features::empty(),
+                Flags::PASSWORD_REQUIRED,
+                AirPlayPairing::LegacyPin,
+            ),
+            (
+                Features::empty(),
+                Flags::PIN_REQUIRED,
+                AirPlayPairing::LegacyPin,
+            ),
+            (hap, Flags::empty(), AirPlayPairing::Hap),
+            (
+                hap | Features::TRANSIENT_PAIRING,
+                Flags::empty(),
+                AirPlayPairing::HapTransient,
+            ),
+            (
+                hap | Features::TRANSIENT_PAIRING,
+                Flags::PIN_REQUIRED,
+                AirPlayPairing::Hap,
+            ),
+            (
+                Features::UNIFIED_PAIR_SETUP_MFI,
+                Flags::empty(),
+                AirPlayPairing::Hap,
+            ),
         ];
-        for (features, expected) in cases {
-            assert_eq!(features.pair_effective(), expected, "{features:?}");
+        for (features, flags, expected) in cases {
+            assert_eq!(
+                config(features, flags).pairing_mode(),
+                expected,
+                "{features:?} {flags:?}"
+            );
         }
+    }
+
+    #[test]
+    fn features_txt_second_word_is_optional() {
+        // UxPlay advertises only the low word as meaningful.
+        let f = Features::parse_txt("0x5A7FFEE6,0x0").unwrap();
+        assert!(f.contains(Features::MIRRORING_SUPPORTED | Features::SUPPORT_LEGACY_PAIRING));
+        assert!(f.contains(Features::HAS_UNIFIED_ADVERTISER_INFO));
+        assert_eq!(Features::parse_txt("0x5A7FFEE6"), Some(f));
+        let apple_tv = Features::parse_txt("0x4A7FDFD5,0xBC157FDE").unwrap();
+        assert!(apple_tv.contains(Features::CORE_UTILS_PAIRING_AND_ENCRYPTION));
+        assert!(Features::parse_txt("zz").is_none());
+        assert!(Features::parse_txt("0x1,zz").is_none());
+    }
+
+    #[test]
+    fn hkp_header_values() {
+        assert_eq!(AirPlayPairing::Hap.hkp_header(), Some("3"));
+        assert_eq!(AirPlayPairing::HapTransient.hkp_header(), Some("4"));
+        assert_eq!(AirPlayPairing::Legacy.hkp_header(), None);
+        assert_eq!(AirPlayPairing::LegacyPin.hkp_header(), None);
     }
 }

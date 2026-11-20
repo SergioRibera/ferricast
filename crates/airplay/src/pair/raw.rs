@@ -44,7 +44,7 @@ pub async fn raw_pair(
 
     let server_pub = req.content()?;
 
-    let mix_fairplay_key = !features.supports_legacy_pairing();
+    let mix_fairplay_key = !features.contains(Features::SUPPORT_LEGACY_PAIRING);
 
     let verify_headers = {
         if mix_fairplay_key {

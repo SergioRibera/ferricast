@@ -256,6 +256,7 @@ impl Discovery for AirPlayDiscovery {
                                     features,
                                     flags,
                                     pk: txt.get("pk").cloned(),
+                                    device_id: txt.get("deviceid").cloned(),
                                 }),
                                 ..Default::default()
                             },
