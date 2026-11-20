@@ -31,6 +31,7 @@ use ferricast_core::{
     Result, VideoEncoder,
 };
 
+use crate::config_ext::EncoderConfigExt;
 use crate::frame_view::FrameView;
 use shiguredo_nvcodec::{
     BufferFormat, CodecConfig, EncodeOptions, Encoder as NvEncoder, EncoderCodec,
@@ -165,6 +166,9 @@ pub struct NvencEncoder<C: NvencCodec> {
     /// implicitly via the soft-fallback path.
     #[cfg(feature = "nvenc-zero-copy")]
     dmabuf_cache: HashMap<DmabufKey, RegisteredResource>,
+    /// The configuration this session was opened for (bitrate kept in
+    /// sync with live retargets).
+    requested: EncoderConfig,
     _codec: PhantomData<C>,
 }
 
@@ -294,6 +298,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
             repack: Vec::new(),
             #[cfg(feature = "nvenc-zero-copy")]
             dmabuf_cache: HashMap::new(),
+            requested: cfg,
             _codec: PhantomData,
         })
     }
@@ -436,20 +441,19 @@ impl<C: NvencCodec> NvencEncoder<C> {
 impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
     const CODEC: Codec = C::FERRICAST_CODEC;
 
-    fn configure(&mut self, _config: &EncoderConfig) -> Result<()> {
-        // The `shiguredo_nvcodec::Encoder` is built fully configured
-        // by `probe_with`. A reconfigure-after-the-fact would mean
-        // tearing down the CUDA context and rebuilding the session;
-        // we don't support that today (the factory hands us a freshly-
-        // probed instance whenever the resolution changes).
-        //
-        // Drop the dmabuf cache anyway — `register_external_dmabuf`
-        // bakes the dimensions into NVENC's internal surface, so a
-        // cached `RegisteredResource` from a previous size is junk
-        // even if the fd happens to match. The cache will refill
-        // organically on the first encode at the new size.
-        #[cfg(feature = "nvenc-zero-copy")]
-        self.dmabuf_cache.clear();
+    fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
+        if self.requested.same_session_shape(config) {
+            // Same session; only the bitrate may differ, and NVENC
+            // retargets that live.
+            if config.bitrate_kbps != self.requested.bitrate_kbps {
+                self.set_bitrate_kbps(config.bitrate_kbps)?;
+            }
+            return Ok(());
+        }
+        // Geometry, frame rate, GOP, input format or profile changed:
+        // those are baked into the NVENC session (and any registered
+        // DMA-BUFs), so open a fresh one.
+        *self = Self::probe_with(config.clone())?;
         Ok(())
     }
 
@@ -494,6 +498,7 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
                     C::NAME
                 ))
             })?;
+        self.requested.bitrate_kbps = kbps;
         info!(codec = C::NAME, kbps, "NVENC bitrate live-reconfigured");
         Ok(())
     }

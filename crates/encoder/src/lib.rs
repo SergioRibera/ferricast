@@ -1,4 +1,6 @@
 pub mod aac;
+#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+mod config_ext;
 mod frame_view;
 #[cfg(feature = "vaapi")]
 mod gop;

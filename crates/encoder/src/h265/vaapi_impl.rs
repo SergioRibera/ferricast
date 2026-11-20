@@ -34,6 +34,7 @@ use ferricast_core::{
 use tracing::{debug, info, trace, warn};
 
 use super::headers::{self, ConformanceWindow, StreamParams};
+use crate::config_ext::EncoderConfigExt;
 use crate::frame_view::FrameView;
 use crate::gop::GopState;
 
@@ -91,6 +92,9 @@ pub struct VaapiH265Encoder {
     pps_nal: Vec<u8>,
 
     state: RefCell<FrameState>,
+
+    /// The configuration this session was opened for.
+    requested: EncoderConfig,
 }
 
 #[derive(Clone, Copy)]
@@ -218,6 +222,7 @@ impl VaapiH265Encoder {
         };
         info!(?profile, %vendor, "VA-API HEVC encoder selected");
 
+        let requested = cfg.clone();
         let cfg = build_encoder_cfg(profile_idc, bit_depth, &cfg)?;
 
         let mut config_attribs = vec![
@@ -305,6 +310,7 @@ impl VaapiH265Encoder {
             sps_nal,
             pps_nal,
             state: RefCell::new(FrameState::new(cfg.keyframe_interval)),
+            requested,
         })
     }
 }
@@ -453,10 +459,15 @@ fn pick_level(width: u32, height: u32, fps: u32, bitrate_bps: u32) -> u8 {
 impl VideoEncoder for VaapiH265Encoder {
     const CODEC: Codec = Codec::H265;
 
-    fn configure(&mut self, _config: &EncoderConfig) -> Result<()> {
-        // Stream-invariant configuration is committed in `probe_with`.
-        // Live resize would need to tear down surfaces / context /
-        // config; we don't support that today.
+    fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
+        if self.requested.same_session_shape(config)
+            && self.requested.bitrate_kbps == config.bitrate_kbps
+        {
+            return Ok(());
+        }
+        // Surfaces, context, rate control and packed headers are all
+        // derived from the config: open a new session.
+        *self = Self::probe_with(config.clone())?;
         Ok(())
     }
 

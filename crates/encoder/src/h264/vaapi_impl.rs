@@ -35,13 +35,14 @@ use std::rc::Rc;
 use bytes::Bytes;
 use cros_libva::*;
 use ferricast_core::{
-    CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, GpuFrame, PixelFormat,
-    Result, VideoEncoder,
+    CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, GpuFrame, H264Profile,
+    PixelFormat, Result, VideoEncoder,
 };
 use tracing::{debug, info, trace, warn};
 
 use super::headers::{self, FrameCrop, PpsParams, SpsParams, VuiParams, profile};
 use super::yuv;
+use crate::config_ext::EncoderConfigExt;
 use crate::frame_view::FrameView;
 use crate::gop::GopState;
 
@@ -130,6 +131,9 @@ pub struct VaapiH264Encoder {
     /// can take `&mut self` without bleeding the cell into every
     /// helper signature.
     state: RefCell<FrameState>,
+
+    /// The configuration this session was opened for.
+    requested: EncoderConfig,
 }
 
 #[derive(Clone)]
@@ -229,16 +233,21 @@ impl VaapiH264Encoder {
                 0b0100_0000_u8, // constraint_set1_flag = 1 (Constrained Baseline)
                 false,
             )
-        } else if supported.contains(&VAProfile::VAProfileH264Main)
+        } else if cfg.max_h264_profile != Some(H264Profile::Baseline)
+            && supported.contains(&VAProfile::VAProfileH264Main)
             && profile_has_enc_slice(&display, VAProfile::VAProfileH264Main)
         {
+            // Main exceeds a Baseline-only receiver, so only when allowed.
             (VAProfile::VAProfileH264Main, profile::MAIN, 0_u8, true)
         } else {
-            tracing::warn!("VA-API: no supported H264 encode profile, fallback to Main");
-            (VAProfile::VAProfileH264Main, profile::MAIN, 0_u8, true)
+            return Err(FerricastError::Encoder(format!(
+                "VA-API: no H.264 encode profile within {:?}",
+                cfg.max_h264_profile
+            )));
         };
         info!(?profile, %vendor, "VA-API H.264 encoder selected");
 
+        let requested = cfg.clone();
         let cfg = build_encoder_cfg(profile_idc, constraint_flags, cabac, &cfg)?;
 
         // VAConfig with rate control + RT format.
@@ -345,6 +354,7 @@ impl VaapiH264Encoder {
             sps_nal,
             pps_nal,
             state,
+            requested,
         })
     }
 }
@@ -550,11 +560,15 @@ fn pick_level(width_mbs: u32, height_mbs: u32, fps: u32, bitrate_bps: u32) -> u8
 impl VideoEncoder for VaapiH264Encoder {
     const CODEC: Codec = Codec::H264;
 
-    fn configure(&mut self, _config: &EncoderConfig) -> Result<()> {
-        // `probe_with` already configured everything stream-invariant
-        // when the factory built us. A reconfigure-after-the-fact
-        // would need to tear down surfaces / context / config; we
-        // don't support that today.
+    fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
+        if self.requested.same_session_shape(config)
+            && self.requested.bitrate_kbps == config.bitrate_kbps
+        {
+            return Ok(());
+        }
+        // Surfaces, context, rate control and packed headers are all
+        // derived from the config: open a new session.
+        *self = Self::probe_with(config.clone())?;
         Ok(())
     }
 
