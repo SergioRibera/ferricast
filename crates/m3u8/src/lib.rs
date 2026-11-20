@@ -80,9 +80,9 @@ pub struct Part {
     /// IDR). Required by the spec — clients use it to know which
     /// parts they can start playback from.
     pub independent: bool,
-    /// Marks the part that *ends* its parent segment. Clients can
-    /// use this together with `EXTINF` to validate boundary
-    /// continuity, but it's optional and most players don't care.
+    /// Marks the part that *ends* its parent segment. Informational
+    /// only: RFC 8216bis has no attribute for it (the parent's
+    /// `EXTINF` already closes the segment), so it is not serialised.
     pub last_of_segment: bool,
 }
 
@@ -379,9 +379,8 @@ fn write_part_line(w: &mut String, part: &Part) -> Result<(), FerricastError> {
     if part.independent {
         line.push_str(",INDEPENDENT=YES");
     }
-    if part.last_of_segment {
-        line.push_str(",GAP=NO");
-    }
+    // `GAP` is only defined with the value YES (RFC 8216bis §4.4.4.9),
+    // so nothing is written for `last_of_segment`.
     line.push('\n');
     w.push_str(&line);
     Ok(())
@@ -472,9 +471,11 @@ mod tests {
         w.add_segment(Segment::new(2.0, "a.ts")).unwrap();
         let mut p0 = Part::new(0.5, "a.0.ts");
         p0.independent = true;
-        let p1 = Part::new(0.5, "a.1.ts");
+        let mut p1 = Part::new(0.5, "a.1.ts");
+        p1.last_of_segment = true;
         w.attach_parts(vec![p0, p1]).unwrap();
         let s = w.to_string().unwrap();
+        assert!(!s.contains("GAP="), "GAP is only valid as YES");
         let p_idx = s.find("#EXT-X-PART:DURATION=0.500,URI=\"a.0.ts\"").unwrap();
         let extinf = s.find("#EXTINF:2.000").unwrap();
         assert!(p_idx < extinf, "parts must precede their parent EXTINF");
