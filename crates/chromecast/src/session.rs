@@ -79,7 +79,6 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Path of the media playlist on the HLS sink. The LOAD URL and the
 /// loopback probe both derive from this one value.
-const PLAYLIST_PATH: &str = "/index.m3u8";
 
 /// HLS segment length handed to the segmenter. 2 s segments + 4 s
 /// playlist target keep glass-to-glass around 6 s at the cost of ~2×
@@ -178,6 +177,9 @@ struct ConnectedState {
     /// Local IP from the receiver's perspective (the LAN side of the
     /// TCP socket). Used to build the HLS URL we hand back.
     local_ip: IpAddr,
+    /// The receiver itself: the only remote peer allowed to fetch the
+    /// stream.
+    device_ip: IpAddr,
     /// Mirror of `device.capabilities.requires_audio` so the HLS
     /// bootstrap path knows whether to ask the MPEG-TS muxer to
     /// inject a silent AAC track. Old generic Chromecasts need
@@ -386,6 +388,7 @@ impl CastSession for ChromecastSession {
             transport_id,
             session_id,
             local_ip,
+            device_ip: device.addr,
             requires_audio: device.capabilities.requires_audio,
             supports_low_latency_hls: device.capabilities.supports_low_latency_hls,
             request_id,
@@ -627,13 +630,15 @@ impl ChromecastSession {
                     .await?
             }
         };
-        // Bound on every interface; advertise the LAN-side IP observed
-        // on the control socket (`0.0.0.0` is unroutable).
+        // Bound on every interface, so only the receiver (and loopback)
+        // may fetch; advertise the LAN-side IP observed on the control
+        // socket (`0.0.0.0` is unroutable).
+        sink.allow_peer(state.device_ip);
         let location = PlaylistLocation::new(
             sink.scheme(),
             state.local_ip,
             sink.local_addr().port(),
-            PLAYLIST_PATH,
+            &sink.playlist_path(),
         );
         info!(
             url = %location.url(),
