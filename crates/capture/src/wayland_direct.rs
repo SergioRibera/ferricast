@@ -187,6 +187,7 @@ impl DmabufAllocator {
         width: u32,
         height: u32,
         fourcc: drm_fourcc::DrmFourcc,
+        format: PixelFormat,
     ) -> Result<AllocatedBuffer> {
         // Allocation strategy now goes through the compositor's
         // advertised modifier set first (via linux-dmabuf-v1
@@ -354,7 +355,7 @@ impl DmabufAllocator {
             height,
             stride,
             modifier,
-            fourcc,
+            format,
         })
     }
 }
@@ -373,17 +374,34 @@ struct AllocatedBuffer {
     height: u32,
     stride: u32,
     modifier: u64,
-    fourcc: drm_fourcc::DrmFourcc,
+    /// Byte order of the allocation, resolved from the fourcc by
+    /// [`dmabuf_pixel_format`] (which also rejects unsupported ones).
+    format: PixelFormat,
 }
 
-impl AllocatedBuffer {
-    fn pixel_format(&self) -> PixelFormat {
-        // We always allocate one of these two — see `pick_fourcc`.
-        match self.fourcc {
-            drm_fourcc::DrmFourcc::Argb8888 => PixelFormat::Bgra,
-            drm_fourcc::DrmFourcc::Abgr8888 => PixelFormat::Rgba,
-            _ => PixelFormat::Bgra,
-        }
+/// Memory byte order of the DRM fourccs we can hand downstream.
+/// Only 4×8-bit RGB packings: 10-bit (`XRGB2101010`, …) and other
+/// layouts would be misread as BGRA/RGBA by every encoder.
+/// X-variants carry an undefined alpha byte, which consumers ignore.
+fn dmabuf_pixel_format(fourcc: drm_fourcc::DrmFourcc) -> Option<PixelFormat> {
+    use drm_fourcc::DrmFourcc;
+    match fourcc {
+        DrmFourcc::Argb8888 | DrmFourcc::Xrgb8888 => Some(PixelFormat::Bgra),
+        DrmFourcc::Abgr8888 | DrmFourcc::Xbgr8888 => Some(PixelFormat::Rgba),
+        _ => None,
+    }
+}
+
+/// `wl_shm` formats we can read back, with their memory byte order.
+/// Note `wl_shm` codes 0/1 are ARGB/XRGB8888; every other code is the
+/// DRM fourcc.
+fn shm_pixel_format(raw: u32) -> Option<(wl_shm::Format, PixelFormat)> {
+    match raw {
+        0 => Some((wl_shm::Format::Argb8888, PixelFormat::Bgra)),
+        1 => Some((wl_shm::Format::Xrgb8888, PixelFormat::Bgra)),
+        0x3432_4241 => Some((wl_shm::Format::Abgr8888, PixelFormat::Rgba)),
+        0x3432_5258 => Some((wl_shm::Format::Xbgr8888, PixelFormat::Rgba)),
+        _ => None,
     }
 }
 
@@ -720,14 +738,44 @@ fn run_worker(
             let _ = tx.send((info.width, info.height));
         }
 
-        // Pick the transport: dmabuf if (a) the compositor offered
-        // it on this frame, (b) we have an allocator, and (c) the
-        // sticky-disable hasn't kicked in yet. Otherwise wl_shm
-        // fallback.
+        // Only offers in a format we can hand downstream count
+        // (8-bit RGB packings — a 10-bit offer would be misread).
+        let dmabuf_supported = info.dmabuf.as_ref().is_some_and(|o| {
+            drm_fourcc::DrmFourcc::try_from(o.format)
+                .ok()
+                .and_then(dmabuf_pixel_format)
+                .is_some()
+        });
+        let shm_supported = info
+            .shm
+            .as_ref()
+            .is_some_and(|o| shm_pixel_format(o.format).is_some());
+        if !dmabuf_supported && !shm_supported {
+            frame.destroy();
+            return Err(FerricastError::Capture(format!(
+                "compositor offered no supported buffer format (dmabuf fourcc={:?}, \
+                 wl_shm format={:?}); only 8-bit ARGB/XRGB/ABGR/XBGR are supported",
+                info.dmabuf.as_ref().map(|o| format!("0x{:08x}", o.format)),
+                info.shm.as_ref().map(|o| format!("0x{:08x}", o.format)),
+            )));
+        }
+
+        // Pick the transport: dmabuf if (a) the compositor offered a
+        // supported format on this frame, (b) we have an allocator,
+        // and (c) the sticky-disable hasn't kicked in yet. Otherwise
+        // wl_shm fallback.
         let dmabuf_offer = info
             .dmabuf
             .as_ref()
-            .filter(|_| allocator.is_some() && !dmabuf_disabled);
+            .filter(|_| dmabuf_supported && allocator.is_some() && !dmabuf_disabled);
+        if dmabuf_offer.is_none() && !shm_supported {
+            frame.destroy();
+            return Err(FerricastError::Capture(
+                "dmabuf transport unavailable (no allocator or disabled after repeated \
+                 failures) and the wl_shm offer uses an unsupported format"
+                    .into(),
+            ));
+        }
         let (buffer, transport) = if let (Some(offer), Some(alloc), Some(dmabuf_proxy)) =
             (dmabuf_offer, allocator.as_ref(), dmabuf.as_ref())
         {
@@ -755,6 +803,11 @@ fn run_worker(
                         );
                     } else {
                         warn!(%e, "dmabuf allocation failed, falling back to shm for this frame");
+                    }
+                    if !shm_supported {
+                        warn!("no usable wl_shm offer to fall back to — dropping frame");
+                        frame.destroy();
+                        continue;
                     }
                     let (buf, tx) = make_shm_buffer(&shm, &qh, &info)?;
                     (buf, Transport::Shm(tx))
@@ -839,7 +892,7 @@ fn run_worker(
                         width: alloc.width,
                         height: alloc.height,
                         stride: alloc.stride,
-                        format: alloc.pixel_format(),
+                        format: alloc.format,
                         timestamp_us: now_us(),
                         plane: DmaBufPlane {
                             fd: alloc.fd.as_raw_fd(),
@@ -906,7 +959,9 @@ fn make_dmabuf_buffer(
     let fourcc = drm_fourcc::DrmFourcc::try_from(offer.format).map_err(|_| {
         FerricastError::Capture(format!("unknown DRM fourcc 0x{:08x}", offer.format))
     })?;
-    let buf = alloc.alloc(offer.width, offer.height, fourcc)?;
+    let format = dmabuf_pixel_format(fourcc)
+        .ok_or_else(|| FerricastError::Capture(format!("unsupported dmabuf fourcc {fourcc:?}")))?;
+    let buf = alloc.alloc(offer.width, offer.height, fourcc, format)?;
     // The compositor only finds out about a bad params combo at
     // `copy()` time (it emits `failed` on the frame), so logging
     // what we negotiated here is the only way to diagnose
@@ -958,20 +1013,19 @@ fn make_shm_buffer(
     qh: &QueueHandle<WorkerState>,
     info: &FrameInfo,
 ) -> Result<(WlBuffer, ShmBuffer)> {
-    let size = info
-        .shm
-        .as_ref()
-        .map(|s| s.stride * info.height)
-        .unwrap_or(0);
-    let stride = info
-        .shm
-        .as_ref()
-        .map(|s| s.stride)
-        .unwrap_or(info.width * 4);
-    let shm_fmt = info.shm.as_ref().map(|s| s.format).unwrap_or(0);
-    if size == 0 {
+    let Some(offer) = info.shm.as_ref() else {
         return Err(FerricastError::Capture(
             "compositor didn't offer wl_shm format for this frame".into(),
+        ));
+    };
+    let (wl_format, pixel_format) = shm_pixel_format(offer.format).ok_or_else(|| {
+        FerricastError::Capture(format!("unsupported wl_shm format 0x{:08x}", offer.format))
+    })?;
+    let stride = offer.stride;
+    let size = stride.saturating_mul(info.height);
+    if size == 0 {
+        return Err(FerricastError::Capture(
+            "compositor offered an empty wl_shm buffer".into(),
         ));
     }
     let (fd, mmap) = alloc_memfd(size as usize)?;
@@ -981,12 +1035,11 @@ fn make_shm_buffer(
         info.width as i32,
         info.height as i32,
         stride as i32,
-        wl_shm_format(shm_fmt)?,
+        wl_format,
         qh,
         (),
     );
     pool.destroy();
-    let pixel_format = wl_shm_format_to_pixel(shm_fmt);
     Ok((
         wl_buf,
         ShmBuffer {
@@ -998,25 +1051,6 @@ fn make_shm_buffer(
             pixel_format,
         },
     ))
-}
-
-fn wl_shm_format(raw: u32) -> Result<wl_shm::Format> {
-    match raw {
-        0 => Ok(wl_shm::Format::Argb8888),
-        1 => Ok(wl_shm::Format::Xrgb8888),
-        0x34324241 => Ok(wl_shm::Format::Abgr8888),
-        0x34325258 => Ok(wl_shm::Format::Xbgr8888),
-        other => Err(FerricastError::Capture(format!(
-            "unsupported wl_shm format 0x{other:08x}"
-        ))),
-    }
-}
-
-fn wl_shm_format_to_pixel(raw: u32) -> PixelFormat {
-    match raw {
-        0x34324241 | 0x34325258 => PixelFormat::Rgba,
-        _ => PixelFormat::Bgra,
-    }
 }
 
 fn now_us() -> u64 {
@@ -1059,7 +1093,7 @@ fn mmap_bo_to_raw(alloc: &AllocatedBuffer) -> std::result::Result<RawFrame, Ferr
     let h = alloc.height as usize;
     let dst_stride = w * 4;
     let size = map_stride * h;
-    let format = alloc.pixel_format();
+    let format = alloc.format;
 
     dma_buf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ)
         .map_err(|e| FerricastError::Capture(format!("dma_buf_sync(START|READ): {e}")))?;

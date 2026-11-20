@@ -763,7 +763,8 @@ impl<S> EventQueueExt<S> for EventQueue<S> {
             };
             // Round up so a sub-millisecond remainder still sleeps
             // instead of busy-looping on a zero timeout.
-            let timeout_ms = i32::try_from(remaining.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+            let timeout_ms =
+                i32::try_from(remaining.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
             // SAFETY: `pfd` is a valid, exclusively borrowed pollfd for
             // the duration of the call and `nfds` is 1. The fd stays
             // open while `guard` (which borrows the connection) lives.
