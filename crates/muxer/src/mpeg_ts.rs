@@ -1192,7 +1192,10 @@ mod parameter_set_tests {
         // A later IDR without in-band headers gets the new SPS.
         muxer.add_frame(&idr(&[]), 3000, 3000).unwrap();
         let out = muxer.drain();
-        assert!(!contains(&out, &SPS_A[4..]), "stale SPS must not be emitted");
+        assert!(
+            !contains(&out, &SPS_A[4..]),
+            "stale SPS must not be emitted"
+        );
         assert!(contains(&out, &SPS_B[4..]));
     }
 }
