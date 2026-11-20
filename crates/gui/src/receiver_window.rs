@@ -603,6 +603,7 @@ fn codec_label_video(c: Codec) -> &'static str {
 fn codec_label_audio(c: AudioCodec) -> &'static str {
     match c {
         AudioCodec::Aac => "AAC",
+        AudioCodec::AacEld => "AAC-ELD",
         AudioCodec::Opus => "Opus",
         AudioCodec::Pcm => "PCM",
         AudioCodec::Alac => "ALAC",

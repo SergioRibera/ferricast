@@ -6,6 +6,10 @@
 //! * `<receiver device id>.json` — the receiver's long-term public key and
 //!   identifier learned during pair-setup, so later connections only run
 //!   pair-verify.
+//! * `<receiver device id>_password.json` — marks a receiver that wants an
+//!   access password and, once it accepted one, the password itself so it
+//!   is not asked for again. Stored in clear text, protected by the file
+//!   mode only.
 //!
 //! Files live in `$XDG_DATA_HOME/ferricast/airplay/` (default
 //! `~/.local/share/ferricast/airplay/`) and are created with mode 0600.
@@ -66,6 +70,11 @@ impl ReceiverKey {
     pub fn public_key_bytes(&self) -> Option<[u8; 32]> {
         hex::decode(&self.public_key).ok()?.try_into().ok()
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PasswordFile {
+    password: Option<String>,
 }
 
 /// Credential storage. Without a usable data directory it keeps everything
@@ -151,6 +160,34 @@ impl CredentialStore {
         }
     }
 
+    /// What is known about receiver `device_id`'s access password: `None`
+    /// when it is not known to want one, `Some(None)` when it wants one that
+    /// is not stored.
+    pub fn password(&self, device_id: &str) -> Option<Option<String>> {
+        let text = fs::read_to_string(self.password_path(device_id)?).ok()?;
+        serde_json::from_str::<PasswordFile>(&text)
+            .ok()
+            .map(|f| f.password)
+    }
+
+    /// Record that receiver `device_id` wants an access password, and the
+    /// password when it is known to be right.
+    pub fn save_password(&self, device_id: &str, password: Option<&str>) -> Result<()> {
+        match self.password_path(device_id) {
+            Some(path) => Self::write_json(
+                &path,
+                &PasswordFile {
+                    password: password.map(str::to_owned),
+                },
+            ),
+            None => Ok(()),
+        }
+    }
+
+    fn password_path(&self, device_id: &str) -> Option<PathBuf> {
+        self.path(&format!("{device_id}.password"))
+    }
+
     fn path(&self, name: &str) -> Option<PathBuf> {
         // Device ids are MAC addresses; keep only filename-safe characters.
         let safe: String = name
@@ -221,6 +258,17 @@ mod tests {
         }
         store.forget_receiver("AA:BB:CC:DD:EE:FF");
         assert_eq!(store.receiver("AA:BB:CC:DD:EE:FF"), None);
+
+        assert_eq!(store.password("AA:BB:CC:DD:EE:FF"), None);
+        store.save_password("AA:BB:CC:DD:EE:FF", None).unwrap();
+        assert_eq!(store.password("AA:BB:CC:DD:EE:FF"), Some(None));
+        store
+            .save_password("AA:BB:CC:DD:EE:FF", Some("secret"))
+            .unwrap();
+        assert_eq!(
+            store.password("AA:BB:CC:DD:EE:FF"),
+            Some(Some("secret".to_owned()))
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }

@@ -32,9 +32,15 @@ fn now_micros() -> u64 {
         .unwrap_or_default()
 }
 
-/// Current time as an NTP timestamp (seconds since 1900, 32.32).
+/// NTP timestamp (seconds since 1900, 32.32) of `micros` since the UNIX
+/// epoch: the clock the timing responder reports.
+pub(crate) fn ntp_from_micros(micros: u64) -> u64 {
+    fixed_point_from_micros(micros) + (NTP_EPOCH_OFFSET << 32)
+}
+
+/// Current time as an NTP timestamp.
 fn ntp_now() -> u64 {
-    fixed_point_from_micros(now_micros()) + (NTP_EPOCH_OFFSET << 32)
+    ntp_from_micros(now_micros())
 }
 
 /// Reply to one timing request (`0x80 0xd2 …`), or `None` if it is not one.

@@ -30,10 +30,10 @@ pub struct ReceiverWindowReq {
 
 /// Work for the App's window listener (it owns `Platform`).
 pub enum UiCommand {
-    /// Ask the user for a PIN.
-    PinPrompt {
+    /// Ask the user for a PIN or password.
+    PairingPrompt {
         device_name: String,
-        digits: u8,
+        secret: pairing::Secret,
         respond: PairingResponder,
     },
     /// A remote sender connected on a receiver.
@@ -198,8 +198,8 @@ impl AppState {
         }
     }
 
-    /// Route a pairing challenge: a PIN goes to the dialog, the rest
-    /// is answered here.
+    /// Route a pairing challenge: a PIN or password goes to the dialog,
+    /// the rest is answered here.
     pub fn pairing_prompt(
         &mut self,
         device_id: Uuid,
@@ -207,24 +207,20 @@ impl AppState {
         respond: &PairingResponder,
     ) -> Option<UiCommand> {
         match challenge {
-            PairingChallenge::Pin { digits } => Some(UiCommand::PinPrompt {
+            PairingChallenge::Pin { digits } => Some(UiCommand::PairingPrompt {
                 device_name: self.device_name(device_id),
-                digits: *digits,
+                secret: pairing::Secret::Pin { digits: *digits },
                 respond: respond.clone(),
             }),
             PairingChallenge::None => {
                 pairing::answer(respond, PairingResponse::Confirmed);
                 None
             }
-            PairingChallenge::Credential => {
-                pairing::answer(respond, PairingResponse::Cancelled);
-                let name = self.device_name(device_id);
-                self.notify(
-                    NoticeLevel::Error,
-                    format!("{name} asks for a password, which is not supported yet"),
-                );
-                None
-            }
+            PairingChallenge::Credential => Some(UiCommand::PairingPrompt {
+                device_name: self.device_name(device_id),
+                secret: pairing::Secret::Password,
+                respond: respond.clone(),
+            }),
         }
     }
 }
@@ -440,8 +436,8 @@ async fn run_window_listener(
             }
             cmd = cmd_rx.recv() => match cmd {
                 None => break,
-                Some(UiCommand::PinPrompt { device_name, digits, respond }) => {
-                    pairing::open_pin_dialog(platform.clone(), device_name, digits, respond);
+                Some(UiCommand::PairingPrompt { device_name, secret, respond }) => {
+                    pairing::open_pairing_dialog(platform.clone(), device_name, secret, respond);
                 }
                 Some(UiCommand::ReceiverSession { receiver_id, remote_id }) => {
                     sessions.insert(receiver_id, remote_id);
@@ -704,21 +700,31 @@ mod tests {
     }
 
     #[test]
-    fn pin_challenge_goes_to_the_dialog_others_are_answered() {
+    fn pin_and_password_challenges_go_to_the_dialog() {
         let mut s = AppState::default();
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         let respond: PairingResponder = Arc::new(tokio::sync::Mutex::new(Some(tx)));
         let id = Uuid::new_v4();
         assert!(matches!(
             s.pairing_prompt(id, &PairingChallenge::Pin { digits: 4 }, &respond),
-            Some(UiCommand::PinPrompt { digits: 4, .. })
+            Some(UiCommand::PairingPrompt {
+                secret: pairing::Secret::Pin { digits: 4 },
+                ..
+            })
+        ));
+        assert!(matches!(
+            s.pairing_prompt(id, &PairingChallenge::Credential, &respond),
+            Some(UiCommand::PairingPrompt {
+                secret: pairing::Secret::Password,
+                ..
+            })
         ));
         assert!(rx.try_recv().is_err());
         assert!(
-            s.pairing_prompt(id, &PairingChallenge::Credential, &respond)
+            s.pairing_prompt(id, &PairingChallenge::None, &respond)
                 .is_none()
         );
-        assert!(matches!(rx.try_recv(), Ok(PairingResponse::Cancelled)));
-        assert_eq!(s.notices.len(), 1);
+        assert!(matches!(rx.try_recv(), Ok(PairingResponse::Confirmed)));
+        assert!(s.notices.is_empty());
     }
 }

@@ -24,6 +24,8 @@ use ferricast_core::{
     FerricastError, PairingResponse, Result, ScreenCapture, StreamConfig, VideoEncoder,
 };
 use ferricast_encoder::aac::AacEncoder;
+#[cfg(feature = "fdk-aac")]
+use ferricast_encoder::aac::{ELD_SAMPLE_RATE, FdkEldEncoder};
 #[cfg(feature = "opus-rs")]
 use ferricast_encoder::opus::OpusEncoder;
 use ferricast_encoder::scale::FrameSize;
@@ -649,6 +651,7 @@ fn audio_encoder_available(codec: AudioCodec) -> bool {
     match codec {
         AudioCodec::Aac => true,
         AudioCodec::Opus => cfg!(feature = "opus-rs"),
+        AudioCodec::AacEld => cfg!(feature = "fdk-aac"),
         AudioCodec::Pcm | AudioCodec::Alac => false,
     }
 }
@@ -1005,6 +1008,16 @@ async fn run_audio_pipeline(config: AudioStreamConfig, tx: mpsc::Sender<AudioFra
         #[cfg(feature = "opus-rs")]
         AudioCodec::Opus => run_audio_pipeline_with(OpusEncoder::new(), config, tx).await,
         AudioCodec::Aac => run_audio_pipeline_with(AacEncoder::new(), config, tx).await,
+        // AirPlay decodes AAC-ELD at 44.1 kHz only; asking PipeWire for that
+        // rate lets its resampler do the conversion.
+        #[cfg(feature = "fdk-aac")]
+        AudioCodec::AacEld => {
+            let config = AudioStreamConfig {
+                sample_rate: ELD_SAMPLE_RATE,
+                ..config
+            };
+            run_audio_pipeline_with(FdkEldEncoder::new(), config, tx).await
+        }
         other => Err(FerricastError::Encoder(format!(
             "no {other:?} audio encoder in this build"
         ))),
