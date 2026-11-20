@@ -4,8 +4,8 @@ use std::path::Path;
 
 use ferricast_core::{Codec, EncodedFrame, FerricastError, Result};
 use matroska_demuxer::{
-    ContentCompAlgo, ContentEncAlgo, ContentEncodingValue, Frame, MatrixCoefficients,
-    MatroskaFile, Range, TrackEntry, TrackType,
+    ContentCompAlgo, ContentEncAlgo, ContentEncodingValue, Frame, MatrixCoefficients, MatroskaFile,
+    Range, TrackEntry, TrackType,
 };
 
 use crate::nal::{Framing, LengthPrefixed};
@@ -163,7 +163,12 @@ impl MatroskaDemuxer {
                     .data
                     .splice(0..0, self.stripped_header.iter().copied());
             }
-            let sync = self.frame.is_keyframe.unwrap_or(false);
+            // BlockGroups carry no keyframe flag (and the library does not
+            // expose their ReferenceBlocks), so fall back to the payload.
+            let sync = self
+                .frame
+                .is_keyframe
+                .unwrap_or_else(|| payload_is_keyframe(self.stream.codec, &self.frame.data));
             let (data, idr) = self
                 .framing
                 .annex_b(&self.frame.data, sync || self.at_start)?;
@@ -193,6 +198,39 @@ impl MatroskaDemuxer {
 
 pub(crate) fn is_matroska(head: &[u8]) -> bool {
     head.starts_with(&EBML_MAGIC)
+}
+
+/// Reads the keyframe flag from the codec's own frame header.
+///
+/// H.264/HEVC keyframes are found from their NAL types during Annex B
+/// conversion. AV1 would need OBU parsing (a sequence header followed by a
+/// KEY_FRAME frame header) and is reported as non-key here.
+fn payload_is_keyframe(codec: Codec, data: &[u8]) -> bool {
+    match codec {
+        // RFC 6386 §9.1: frame tag bit 0 clear, then the 9d 01 2a start code.
+        Codec::Vp8 => {
+            data.first().is_some_and(|tag| tag & 1 == 0)
+                && data.get(3..6) == Some(&[0x9d, 0x01, 0x2a])
+        }
+        Codec::Vp9 => vp9_is_keyframe(data),
+        Codec::H264 | Codec::H265 | Codec::Av1 => false,
+    }
+}
+
+/// VP9 uncompressed header (bitstream spec §6.2): frame_marker (2 bits, = 2),
+/// profile_low_bit, profile_high_bit, a reserved zero bit for profile 3, then
+/// show_existing_frame and frame_type (0 = KEY_FRAME).
+fn vp9_is_keyframe(data: &[u8]) -> bool {
+    let Some(&byte) = data.first() else {
+        return false;
+    };
+    let bit = |at: u32| (byte >> (7 - at)) & 1;
+    if byte >> 6 != 0b10 {
+        return false;
+    }
+    let profile = bit(3) << 1 | bit(2);
+    let show_existing_at = if profile == 3 { 5 } else { 4 };
+    bit(show_existing_at) == 0 && bit(show_existing_at + 1) == 0
 }
 
 /// Converts `ticks` of `scale_ns` nanoseconds to microseconds; both come from
@@ -283,13 +321,37 @@ mod tests {
     #[test]
     fn compressed_or_encrypted_tracks_are_rejected() {
         for what in ["zlib compression", "encryption"] {
-            let error = stripped_header([(0, SCOPE_FRAMES, Encoding::Unsupported(what))])
-                .unwrap_err();
+            let error =
+                stripped_header([(0, SCOPE_FRAMES, Encoding::Unsupported(what))]).unwrap_err();
             assert!(error.to_string().contains(what), "{error}");
         }
         assert!(
             stripped_header([(0, SCOPE_CODEC_PRIVATE, Encoding::HeaderStripping(&[0]))]).is_err()
         );
+    }
+
+    #[test]
+    fn vp8_keyframes_are_read_from_the_frame_tag() {
+        let key = [0x50, 0x2d, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x00];
+        let inter = [0x51, 0x2d, 0x00, 0x00, 0x00, 0x00];
+        assert!(payload_is_keyframe(Codec::Vp8, &key));
+        assert!(!payload_is_keyframe(Codec::Vp8, &inter));
+        assert!(!payload_is_keyframe(Codec::Vp8, &[]));
+    }
+
+    #[test]
+    fn vp9_keyframes_are_read_from_the_uncompressed_header() {
+        // marker 10, profile 0, show_existing 0, frame_type 0
+        assert!(payload_is_keyframe(Codec::Vp9, &[0b1000_0010]));
+        // frame_type 1: inter frame
+        assert!(!payload_is_keyframe(Codec::Vp9, &[0b1000_0110]));
+        // show_existing_frame 1
+        assert!(!payload_is_keyframe(Codec::Vp9, &[0b1000_1000]));
+        // profile 3 has a reserved bit before show_existing_frame
+        assert!(payload_is_keyframe(Codec::Vp9, &[0b1011_0001]));
+        assert!(!payload_is_keyframe(Codec::Vp9, &[0b1011_0010]));
+        // wrong frame marker
+        assert!(!payload_is_keyframe(Codec::Vp9, &[0b0000_0000]));
     }
 
     #[test]
