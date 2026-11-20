@@ -8,7 +8,7 @@ pub struct MiracastDiscovery;
 impl Discovery for MiracastDiscovery {
     const PROTOCOL: &'static str = "miracast";
 
-    async fn start(&mut self, tx: mpsc::Sender<DiscoveryEvent>) -> Result<()> {
+    async fn start(&mut self, _tx: mpsc::Sender<DiscoveryEvent>) -> Result<()> {
         Ok(())
     }
 

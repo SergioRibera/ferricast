@@ -9,11 +9,11 @@ impl CastSession for MiracastSession {
         Ok(ConnectOutcome::Ready)
     }
 
-    async fn setup_stream(&mut self, config: &StreamConfig) -> Result<()> {
+    async fn setup_stream(&mut self, _config: &StreamConfig) -> Result<()> {
         Ok(())
     }
 
-    async fn send_frame(&mut self, frame: &EncodedFrame) -> Result<()> {
+    async fn send_frame(&mut self, _frame: &EncodedFrame) -> Result<()> {
         Ok(())
     }
 

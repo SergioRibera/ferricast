@@ -18,10 +18,10 @@ impl ProtocolHandler for MiracastHandler {
     type Session = MiracastSession;
 
     fn create_discovery(&self) -> MiracastDiscovery {
-        MiracastDiscovery::default()
+        MiracastDiscovery
     }
 
     fn create_session(&self) -> Result<MiracastSession> {
-        Ok(MiracastSession::default())
+        Ok(MiracastSession)
     }
 }
