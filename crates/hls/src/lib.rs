@@ -153,6 +153,14 @@ pub struct HlsConfig {
     /// Recommended values: 0.2–0.5 s. Smaller means more overhead
     /// and a longer playlist; larger reduces the latency benefit.
     pub part_target_secs: Option<f32>,
+
+    /// Segments that must exist before the stream counts as playable
+    /// ([`HlsFrameSink::first_segment_ready`], [`HlsServer::start`]).
+    /// RFC 8216 §6.3.3: a client starts a live stream at least three
+    /// target durations from the end of the playlist, so pointing a
+    /// player at it earlier makes it stall or start at the very edge.
+    /// Clamped to `1..=keep_segments`.
+    pub startup_segments: usize,
 }
 
 impl Default for HlsConfig {
@@ -174,7 +182,25 @@ impl Default for HlsConfig {
             adaptive: None,
             tls: None,
             part_target_secs: None,
+            startup_segments: 3,
         }
+    }
+}
+
+/// Base allowance for the first segments to appear: covers encoder
+/// warm-up and the wait for the first keyframe.
+const STARTUP_TIMEOUT_BASE: Duration = Duration::from_secs(30);
+
+/// Readiness criterion derived from [`HlsConfig`].
+#[derive(Debug, Clone, Copy)]
+struct Startup {
+    segments: u64,
+    timeout: Duration,
+}
+
+impl Startup {
+    async fn wait(self, ring: &Arc<RwLock<SegmentRing>>) -> bool {
+        ring::wait_for_segments(ring, self.segments, self.timeout).await
     }
 }
 
@@ -194,6 +220,24 @@ impl HlsConfig {
             )));
         }
         Ok(())
+    }
+
+    /// What "playable" means for this config: how many segments, and
+    /// how long to wait for them before declaring the pipeline dead
+    /// (30 s plus the time the segments take to produce).
+    fn startup(&self) -> Startup {
+        let segments = self.startup_segments.clamp(1, self.keep_segments.max(1));
+        let per_segment = if self.segment_target_secs.is_finite() && self.segment_target_secs > 0.0
+        {
+            Duration::from_secs_f32(self.segment_target_secs)
+        } else {
+            Duration::ZERO
+        };
+        let count = u32::try_from(segments).unwrap_or(u32::MAX);
+        Startup {
+            segments: u64::from(count),
+            timeout: STARTUP_TIMEOUT_BASE.saturating_add(per_segment.saturating_mul(count)),
+        }
     }
 
     /// The fixed `#EXT-X-TARGETDURATION` the playlist advertises:
@@ -262,10 +306,11 @@ impl HlsServer {
             }
         });
 
-        if !ring::wait_for_first_segment(&ring).await {
+        if !config.startup().wait(&ring).await {
             segmenter.abort();
             return Err(FerricastError::Hls(
-                "HLS segmenter did not produce any output within 30s; encoder likely failed".into(),
+                "HLS segmenter did not produce the startup segments in time; encoder likely failed"
+                    .into(),
             ));
         }
 
@@ -499,6 +544,7 @@ pub struct HlsFrameSink {
     /// builder) doesn't have to track the same option twice.
     scheme: &'static str,
     ring: Arc<RwLock<SegmentRing>>,
+    startup: Startup,
     connections: Arc<Connections>,
     segmenter: JoinHandle<()>,
     accept: JoinHandle<()>,
@@ -593,6 +639,7 @@ impl HlsFrameSink {
             addr: local,
             scheme,
             ring,
+            startup: config.startup(),
             connections,
             segmenter,
             accept,
@@ -630,17 +677,21 @@ impl HlsFrameSink {
         self.connections.state.allow_peer(ip);
     }
 
-    /// Wait until at least one segment has been pushed to the ring.
-    /// Cheap polling — segments emit within `segment_target_secs +
-    /// keyframe_lag` so this resolves in under a second on typical
-    /// streams. Returns `false` if the 30-second deadline passes
-    /// without any segment (encoder/capture pipeline failed).
+    /// Wait until the stream is playable: [`HlsConfig::startup_segments`]
+    /// segments (default 3, RFC 8216 §6.3.3) have been produced.
+    /// Returns `false` if they don't appear within 30 s plus their
+    /// production time (encoder/capture pipeline failed).
     pub async fn wait_first_segment(&self) -> bool {
-        ring::wait_for_first_segment(&self.ring).await
+        self.startup.wait(&self.ring).await
     }
 
-    /// Owned future that resolves when the first segment lands (or
-    /// after the 30-second deadline if the encoder never produces one).
+    /// Owned future with the same semantics as
+    /// [`Self::wait_first_segment`]: resolves `true` once
+    /// [`HlsConfig::startup_segments`] segments exist, `false` on
+    /// timeout. Despite the name it waits for the startup window, not
+    /// just the first segment, so a player pointed at the playlist
+    /// right after it resolves has the three target durations of
+    /// media it needs to start.
     ///
     /// Doesn't borrow `self`, so it can be awaited from a `tokio::spawn`
     /// task. Used by receiver protocols (Chromecast `LOAD`, …) that
@@ -648,7 +699,8 @@ impl HlsFrameSink {
     /// playable without blocking the frame-feeding code path.
     pub fn first_segment_ready(&self) -> impl Future<Output = bool> + Send + 'static {
         let ring = self.ring.clone();
-        async move { ring::wait_for_first_segment(&ring).await }
+        let startup = self.startup;
+        async move { startup.wait(&ring).await }
     }
 }
 
@@ -773,5 +825,50 @@ mod tests {
         let seg = get(addr, &format!("/{token}/segment-0.ts")).await;
         // No segment yet, but the route is reachable under the token.
         assert!(seg.starts_with("HTTP/1.1 404"), "{seg}");
+    }
+
+    fn frame(i: u64) -> EncodedFrame {
+        let key = i % 60 == 0;
+        EncodedFrame {
+            codec: ferricast_core::Codec::H264,
+            data: bytes::Bytes::from(vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }, 0xAA]),
+            timestamp_us: 1_000_000 + i * 33_333,
+            is_keyframe: key,
+            duration_us: None,
+            pts_dts: (0, 0),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_is_ready_only_after_the_startup_segments() {
+        let (tx, rx) = mpsc::channel(256);
+        let sink = HlsFrameSink::start(
+            "127.0.0.1:0",
+            rx,
+            None,
+            vec![0, 0, 0, 1, 0x67],
+            HlsConfig {
+                segment_target_secs: 2.0,
+                playlist_target_duration: 4,
+                target_fps: 30,
+                ..HlsConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut ready = Box::pin(sink.first_segment_ready());
+        // Two complete segments (the keyframe at 120 closes the second).
+        for i in 0..=120 {
+            tx.send(frame(i)).await.unwrap();
+        }
+        let early = tokio::time::timeout(Duration::from_millis(300), &mut ready).await;
+        assert!(early.is_err(), "two segments must not count as ready");
+        for i in 121..=180 {
+            tx.send(frame(i)).await.unwrap();
+        }
+        let ready = tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .expect("third segment makes the stream ready");
+        assert!(ready);
     }
 }
