@@ -203,8 +203,7 @@ pub(crate) fn is_matroska(head: &[u8]) -> bool {
 /// Reads the keyframe flag from the codec's own frame header.
 ///
 /// H.264/HEVC keyframes are found from their NAL types during Annex B
-/// conversion. AV1 would need OBU parsing (a sequence header followed by a
-/// KEY_FRAME frame header) and is reported as non-key here.
+/// conversion.
 fn payload_is_keyframe(codec: Codec, data: &[u8]) -> bool {
     match codec {
         // RFC 6386 §9.1: frame tag bit 0 clear, then the 9d 01 2a start code.
@@ -213,8 +212,101 @@ fn payload_is_keyframe(codec: Codec, data: &[u8]) -> bool {
                 && data.get(3..6) == Some(&[0x9d, 0x01, 0x2a])
         }
         Codec::Vp9 => vp9_is_keyframe(data),
-        Codec::H264 | Codec::H265 | Codec::Av1 => false,
+        Codec::Av1 => av1_is_keyframe(data),
+        Codec::H264 | Codec::H265 => false,
     }
+}
+
+/// AV1 OBU types (bitstream spec §6.2.2) that decide a keyframe.
+const OBU_SEQUENCE_HEADER: u8 = 1;
+const OBU_FRAME_HEADER: u8 = 3;
+const OBU_FRAME: u8 = 6;
+
+/// An AV1 temporal unit is a keyframe (AV1-in-Matroska §4.4) when it
+/// carries a sequence header and its first frame header is a KEY_FRAME
+/// that is decoded rather than shown from a reference: show_existing_frame
+/// (1 bit) and frame_type (2 bits, 0 = KEY_FRAME) open the uncompressed
+/// header (§5.9.2), unless reduced_still_picture_header (bit 4 of the
+/// sequence header, after seq_profile and still_picture) makes every
+/// frame a key frame with neither field coded.
+fn av1_is_keyframe(data: &[u8]) -> bool {
+    let mut reduced_still_picture = None;
+    for obu in Obus(data) {
+        match obu.kind {
+            OBU_SEQUENCE_HEADER => {
+                reduced_still_picture = Some(obu.payload.first().is_some_and(|b| b & 0x08 != 0));
+            }
+            OBU_FRAME_HEADER | OBU_FRAME => {
+                return reduced_still_picture.is_some_and(|reduced| {
+                    reduced || obu.payload.first().is_some_and(|b| b & 0xe0 == 0)
+                });
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// One OBU of an AV1 temporal unit.
+struct Obu<'a> {
+    kind: u8,
+    payload: &'a [u8],
+}
+
+/// Walks the OBUs of a low-overhead AV1 bitstream (§5.3), ending at the
+/// first malformed one. Every OBU consumes at least its header byte, so
+/// the walk is bounded by the input length.
+struct Obus<'a>(&'a [u8]);
+
+impl<'a> Obus<'a> {
+    /// Splits the leading OBU off `data`: obu_header (forbidden bit,
+    /// obu_type, extension flag, has_size_field, reserved bit), the
+    /// optional extension byte, then a leb128 obu_size or, without a size
+    /// field, everything that is left.
+    fn split(data: &'a [u8]) -> Option<(Obu<'a>, &'a [u8])> {
+        let (&header, rest) = data.split_first()?;
+        if header & 0x80 != 0 {
+            return None;
+        }
+        let rest = if header & 0x04 != 0 {
+            rest.get(1..)?
+        } else {
+            rest
+        };
+        let (payload, tail) = if header & 0x02 != 0 {
+            let (size, rest) = leb128(rest)?;
+            rest.split_at_checked(usize::try_from(size).ok()?)?
+        } else {
+            (rest, &[][..])
+        };
+        let kind = (header >> 3) & 0x0f;
+        Some((Obu { kind, payload }, tail))
+    }
+}
+
+impl<'a> Iterator for Obus<'a> {
+    type Item = Obu<'a>;
+
+    fn next(&mut self) -> Option<Obu<'a>> {
+        let Some((obu, tail)) = Self::split(self.0) else {
+            self.0 = &[];
+            return None;
+        };
+        self.0 = tail;
+        Some(obu)
+    }
+}
+
+/// Unsigned LEB128 (§4.10.5): at most 8 bytes, little-endian 7-bit groups.
+fn leb128(data: &[u8]) -> Option<(u64, &[u8])> {
+    let mut value = 0;
+    for (i, &byte) in data.iter().take(8).enumerate() {
+        value |= u64::from(byte & 0x7f) << (7 * i);
+        if byte & 0x80 == 0 {
+            return Some((value, data.get(i + 1..)?));
+        }
+    }
+    None
 }
 
 /// VP9 uncompressed header (bitstream spec §6.2): frame_marker (2 bits, = 2),
@@ -352,6 +444,98 @@ mod tests {
         assert!(!payload_is_keyframe(Codec::Vp9, &[0b1011_0010]));
         // wrong frame marker
         assert!(!payload_is_keyframe(Codec::Vp9, &[0b0000_0000]));
+    }
+
+    /// Temporal delimiter, sequence header with `seq` as its first
+    /// payload byte, then a frame OBU whose header starts with `frame`.
+    fn av1_unit(seq: u8, frame: u8) -> [u8; 8] {
+        [0x12, 0x00, 0x0a, 0x01, seq, 0x32, 0x01, frame]
+    }
+
+    #[test]
+    fn av1_keyframes_are_read_from_the_frame_header() {
+        // show_existing_frame 0, frame_type KEY_FRAME, show_frame 1
+        assert!(payload_is_keyframe(Codec::Av1, &av1_unit(0, 0b0001_0000)));
+        // frame_type INTER_FRAME
+        assert!(!payload_is_keyframe(Codec::Av1, &av1_unit(0, 0b0011_0000)));
+        // show_existing_frame 1
+        assert!(!payload_is_keyframe(Codec::Av1, &av1_unit(0, 0b1000_0000)));
+        // reduced_still_picture_header: no frame_type, always a key frame
+        assert!(payload_is_keyframe(Codec::Av1, &av1_unit(0x18, 0xff)));
+        // a KEY_FRAME without a sequence header is not a sync point
+        assert!(!payload_is_keyframe(Codec::Av1, &[0x32, 0x01, 0x10]));
+        // a frame header OBU works like a frame OBU
+        assert!(payload_is_keyframe(
+            Codec::Av1,
+            &[0x0a, 0x01, 0x00, 0x1a, 0x01, 0x10]
+        ));
+    }
+
+    #[test]
+    fn av1_obu_headers_are_walked_correctly() {
+        // sequence header with an extension byte, then a last frame OBU
+        // without a size field that runs to the end of the block
+        let unit = [0x0e, 0x00, 0x01, 0x00, 0x30, 0x10, 0xaa];
+        assert!(payload_is_keyframe(Codec::Av1, &unit));
+        // a two-byte leb128 size (128) skips a padding OBU
+        let mut padded = vec![0x0a, 0x01, 0x00, 0x7a, 0x80, 0x01];
+        padded.extend([0; 128]);
+        padded.extend([0x32, 0x01, 0x10]);
+        assert!(payload_is_keyframe(Codec::Av1, &padded));
+        assert_eq!(leb128(&[0x80, 0x01, 0xff]), Some((128, &[0xff][..])));
+    }
+
+    #[test]
+    fn malformed_av1_units_are_not_keyframes() {
+        let cases: [&[u8]; 7] = [
+            &[],
+            // forbidden bit set on the sequence header
+            &[0x8a, 0x01, 0x00, 0x32, 0x01, 0x10],
+            // leb128 cut off mid-number
+            &[0x0a, 0x80],
+            // leb128 longer than eight bytes
+            &[0x0a, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00],
+            // obu_size past the end of the block
+            &[0x0a, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x00],
+            // extension flag without the extension byte
+            &[0x0e],
+            // frame OBU cut off before its header
+            &[0x0a, 0x01, 0x00, 0x32, 0x01],
+        ];
+        for case in cases {
+            assert!(!payload_is_keyframe(Codec::Av1, case), "{case:02x?}");
+        }
+    }
+
+    /// Garbage never panics or loops; xorshift keeps the run reproducible.
+    #[test]
+    fn random_bytes_never_panic_the_av1_parser() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = usize::try_from(next() % 64).unwrap();
+            let data: Vec<u8> = (0..len).map(|_| next().to_le_bytes()[0]).collect();
+            let _ = payload_is_keyframe(Codec::Av1, &data);
+        }
+    }
+
+    /// The fixture's first block is a keyframe by its own bitstream, not
+    /// only by the container flag; so is the second keyframe it carries.
+    #[test]
+    fn av1_fixture_keyframes_are_found_in_the_bitstream() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/av1.webm");
+        let mut demuxer = MatroskaDemuxer::open(&path).unwrap();
+        let mut keyframes = Vec::new();
+        while let Some(frame) = demuxer.next_frame().unwrap() {
+            keyframes.push(payload_is_keyframe(Codec::Av1, &frame.data));
+        }
+        assert_eq!(keyframes.first(), Some(&true));
+        assert_eq!(keyframes.iter().filter(|&&key| key).count(), 2);
     }
 
     #[test]
