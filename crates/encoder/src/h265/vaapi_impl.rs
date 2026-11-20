@@ -120,6 +120,17 @@ impl EncoderCfg {
         u32::from(self.height_ctus) * 32
     }
 
+    /// Top-left `width × height` rectangle: where VPP writes the picture
+    /// inside the padded surface.
+    fn visible_region(&self) -> VARectangle {
+        VARectangle {
+            x: 0,
+            y: 0,
+            width: u16::try_from(self.width).unwrap_or(u16::MAX),
+            height: u16::try_from(self.height).unwrap_or(u16::MAX),
+        }
+    }
+
     /// Size of the surfaces the encoder reads from — and the picture
     /// size signalled in the SPS.
     fn coded_size(&self) -> (u32, u32) {
@@ -1009,7 +1020,9 @@ impl VaapiH265Encoder {
             imported.id(),
             None,
             0_u8,
-            None,
+            // Visible area only; the default (whole surface) would
+            // stretch the frame into the CTU padding.
+            Some(self.cfg.visible_region()),
             0,
             0_u8,
             0,

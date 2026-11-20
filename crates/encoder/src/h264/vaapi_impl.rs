@@ -403,6 +403,17 @@ impl EncoderCfg {
         (self.height_mbs as u32) * 16
     }
 
+    /// Top-left `width × height` rectangle: where VPP writes the picture
+    /// inside the padded surface.
+    fn visible_region(&self) -> VARectangle {
+        VARectangle {
+            x: 0,
+            y: 0,
+            width: u16::try_from(self.width).unwrap_or(u16::MAX),
+            height: u16::try_from(self.height).unwrap_or(u16::MAX),
+        }
+    }
+
     /// Size of the surfaces the encoder reads from.
     fn coded_size(&self) -> (u32, u32) {
         (self.padded_width(), self.padded_height())
@@ -1174,13 +1185,13 @@ impl VaapiH264Encoder {
         // `run_encode` will pass to `vaBeginPicture`.
         let pipe = ProcPipelineParameterBuffer::new(
             imported.id(),
-            None, // surface_region = full
-            0_u8, // VAProcColorStandardNone — driver picks BT.601/709.
-            None, // output_region = full
-            0,    // output_background_color
-            0_u8, // VAProcColorStandardNone — driver picks BT.601/709.
-            0,    // pipeline_flags
-            0,    // filter_flags
+            None,                            // surface_region = full
+            0_u8,                            // VAProcColorStandardNone — driver picks BT.601/709.
+            Some(self.cfg.visible_region()), // never stretch into the MB padding
+            0,                               // output_background_color
+            0_u8,                            // VAProcColorStandardNone — driver picks BT.601/709.
+            0,                               // pipeline_flags
+            0,                               // filter_flags
             None,
             None,
             None,
