@@ -344,12 +344,12 @@ impl DmabufAllocator {
         })?;
 
         let modifier = u64::from(bo.modifier());
-        let stride = bo.stride() as u32;
+        let stride = bo.stride();
         let fd: OwnedFd = bo
             .fd()
             .map_err(|e| FerricastError::Capture(format!("gbm fd: {e}")))?;
         Ok(AllocatedBuffer {
-            bo,
+            _bo: bo,
             fd,
             width,
             height,
@@ -364,11 +364,10 @@ impl DmabufAllocator {
 /// (drop releases the memory) and exposes the fd for wl_buffer
 /// wrapping + downstream consumption.
 struct AllocatedBuffer {
-    /// Held to keep the buffer alive while the wl_buffer + the
-    /// downstream `CapturedFrame` reference it. Also used as the
-    /// handle for `gbm_bo_map` when we have to read the bytes
-    /// back for a CPU encoder.
-    bo: gbm::BufferObject<()>,
+    /// Never read: held so the memory stays alive while the
+    /// wl_buffer and the exported `fd` reference it (readback goes
+    /// through the fd, see `mmap_bo_to_raw`).
+    _bo: gbm::BufferObject<()>,
     fd: OwnedFd,
     width: u32,
     height: u32,
@@ -407,6 +406,7 @@ fn shm_pixel_format(raw: u32) -> Option<(wl_shm::Format, PixelFormat)> {
 
 // ── ScreenCapture wrapper ─────────────────────────────────────────
 
+#[derive(Default)]
 pub struct WaylandDirectCapture {
     worker: Option<WorkerHandle>,
     fps: u32,
@@ -414,12 +414,9 @@ pub struct WaylandDirectCapture {
 }
 
 impl WaylandDirectCapture {
+    #[must_use]
     pub fn new() -> Self {
-        Self {
-            worker: None,
-            fps: 0,
-            size: (0, 0),
-        }
+        Self::default()
     }
 }
 
@@ -1711,7 +1708,7 @@ fn query_feedback(
     let mut accepted: HashMap<u32, Vec<u64>> = HashMap::new();
     if let (Some(fd), Some(main_dev)) = (state.format_table_fd.as_ref(), state.main_device) {
         let table_size = state.format_table_size as usize;
-        if table_size > 0 && table_size % 16 == 0 {
+        if table_size > 0 && table_size.is_multiple_of(16) {
             let ptr = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),

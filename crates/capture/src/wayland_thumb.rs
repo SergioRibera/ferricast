@@ -88,8 +88,9 @@ impl BufferInfo {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum FrameStatus {
+    #[default]
     Pending,
     Ready,
     Failed,
@@ -262,12 +263,6 @@ struct OutputEntry {
 /// even though wayland-client's `WEnum<Transform>` is `!Copy`. Keeps
 /// the per-orientation match arms in one place too.
 type WlTransform = wl_output::Transform;
-
-impl Default for FrameStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 impl Dispatch<WlRegistry, GlobalListContents> for MonitorState {
     fn event(

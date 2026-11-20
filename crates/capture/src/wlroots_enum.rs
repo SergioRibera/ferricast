@@ -177,7 +177,7 @@ impl State {
             return;
         }
         let mut snap = Snapshot::default();
-        for (_, (_, o)) in &self.outputs {
+        for (_, o) in self.outputs.values() {
             if !o.ready {
                 continue;
             }
@@ -531,16 +531,14 @@ impl Dispatch<WlOutput, ()> for State {
                     entry.1.model = Some(model);
                 }
             }
-            wl_output::Event::Mode { refresh, flags, .. } => {
-                // Only the *current* mode counts. wlroots flags the
-                // current one with `current` in the mode flags.
+            // Only the *current* mode counts. wlroots flags the
+            // current one with `current` in the mode flags.
+            wl_output::Event::Mode { refresh, flags, .. }
                 if flags
                     .into_result()
-                    .map(|f| f.contains(wl_output::Mode::Current))
-                    .unwrap_or(false)
-                {
-                    entry.1.refresh_mhz = refresh;
-                }
+                    .is_ok_and(|f| f.contains(wl_output::Mode::Current)) =>
+            {
+                entry.1.refresh_mhz = refresh;
             }
             wl_output::Event::Scale { factor } => {
                 entry.1.scale = factor;
@@ -558,11 +556,11 @@ impl Dispatch<WlOutput, ()> for State {
             _ => {}
         }
         // Bind xdg-output lazily once the manager is around.
-        if !state.xdg_outputs.contains_key(&id) {
-            if let Some(mgr) = state.xdg_output_manager.as_ref() {
-                let xo = mgr.get_xdg_output(proxy, qh, id);
-                state.xdg_outputs.insert(id, xo);
-            }
+        if !state.xdg_outputs.contains_key(&id)
+            && let Some(mgr) = state.xdg_output_manager.as_ref()
+        {
+            let xo = mgr.get_xdg_output(proxy, qh, id);
+            state.xdg_outputs.insert(id, xo);
         }
     }
 }
@@ -600,15 +598,11 @@ impl Dispatch<ZxdgOutputV1, u32> for State {
                 entry.1.logical_w = width;
                 entry.1.logical_h = height;
             }
-            zxdg_output_v1::Event::Name { name } => {
-                if entry.1.name.is_none() {
-                    entry.1.name = Some(name);
-                }
+            zxdg_output_v1::Event::Name { name } if entry.1.name.is_none() => {
+                entry.1.name = Some(name);
             }
-            zxdg_output_v1::Event::Description { description } => {
-                if entry.1.description.is_none() {
-                    entry.1.description = Some(description);
-                }
+            zxdg_output_v1::Event::Description { description } if entry.1.description.is_none() => {
+                entry.1.description = Some(description);
             }
             zxdg_output_v1::Event::Done => {
                 state.monitors_dirty = true;

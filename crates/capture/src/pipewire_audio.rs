@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use ferricast_core::{
     AudioCapture, AudioCaptureConfig, AudioCodec, AudioFrame, AudioMuteHandle, AudioSource,
     FerricastError, Result,
@@ -65,10 +65,10 @@ struct NegotiatedAudio {
 impl AudioWorkerHandle {
     fn shutdown(&mut self) {
         let _ = self.terminator.send(Terminate);
-        if let Some(h) = self.join.take() {
-            if let Err(panic) = h.join() {
-                error!(?panic, "PipeWire audio worker panicked during shutdown");
-            }
+        if let Some(h) = self.join.take()
+            && let Err(panic) = h.join()
+        {
+            error!(?panic, "PipeWire audio worker panicked during shutdown");
         }
     }
 }
@@ -598,7 +598,7 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
 
     let frame = AudioFrame {
         codec: AudioCodec::Pcm,
-        data: Bytes::from(bytes),
+        data: bytes,
         timestamp_us,
         sample_rate: frame_rate,
         channels: frame_channels,
