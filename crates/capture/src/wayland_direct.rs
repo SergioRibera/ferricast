@@ -69,7 +69,7 @@ use wayland_client::{
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
     zwp_linux_dmabuf_feedback_v1::{self, ZwpLinuxDmabufFeedbackV1},
-    zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+    zwp_linux_dmabuf_v1::{self, ZwpLinuxDmabufV1},
 };
 use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_manager_v1::ZxdgOutputManagerV1,
@@ -575,6 +575,7 @@ fn run_worker(
         frame_info: None,
         buffer_done: false,
         status: FrameStatus::Pending,
+        dmabuf_v3_modifiers: HashMap::new(),
     };
     let mut size_tx = Some(size_tx);
 
@@ -611,7 +612,22 @@ fn run_worker(
     // gbm picked isn't in the compositor's accept-list. Feedback
     // is best-effort: a v3 compositor doesn't have it and we fall
     // back to "open first available node, allocate LINEAR, hope".
-    let feedback_info = dmabuf.as_ref().and_then(|d| query_feedback(&conn, d).ok());
+    let feedback_info = dmabuf.as_ref().and_then(|d| {
+        if d.version() >= 4 {
+            query_feedback(&conn, d).ok()
+        } else {
+            // v3: no feedback object (`get_default_feedback` is a v4
+            // request — sending it on v3 is a protocol error). The
+            // global announced its (format, modifier) pairs via
+            // `modifier` events during the output roundtrip above;
+            // there is no main_device, so allocation falls back to the
+            // first usable render node.
+            Some(FeedbackInfo {
+                main_device: None,
+                accepted: std::mem::take(&mut state.dmabuf_v3_modifiers),
+            })
+        }
+    });
     if let Some(info) = feedback_info.as_ref() {
         info!(
             main_device = format!("0x{:016x}", info.main_device.unwrap_or(0)),
@@ -1190,6 +1206,10 @@ struct WorkerState {
     /// (`buffer` / `linux_dmabuf`) has been announced.
     buffer_done: bool,
     status: FrameStatus,
+    /// `(fourcc → modifiers)` from the v3 `zwp_linux_dmabuf_v1.modifier`
+    /// events. Only populated when the global is bound below v4 (v4
+    /// compositors use the feedback object instead).
+    dmabuf_v3_modifiers: HashMap<u32, Vec<u64>>,
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for WorkerState {
@@ -1290,13 +1310,27 @@ impl Dispatch<WlBuffer, ()> for WorkerState {
 }
 impl Dispatch<ZwpLinuxDmabufV1, ()> for WorkerState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &ZwpLinuxDmabufV1,
-        _: <ZwpLinuxDmabufV1 as Proxy>::Event,
+        event: <ZwpLinuxDmabufV1 as Proxy>::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        // v3 advertises its accept-list here; v4 compositors no longer
+        // send these and use the feedback object instead.
+        if let zwp_linux_dmabuf_v1::Event::Modifier {
+            format,
+            modifier_hi,
+            modifier_lo,
+        } = event
+        {
+            let modifier = (u64::from(modifier_hi) << 32) | u64::from(modifier_lo);
+            let list = state.dmabuf_v3_modifiers.entry(format).or_default();
+            if !list.contains(&modifier) {
+                list.push(modifier);
+            }
+        }
     }
 }
 impl Dispatch<ZwpLinuxBufferParamsV1, ()> for WorkerState {
@@ -1518,10 +1552,9 @@ fn query_feedback(
     let fb_qh = feedback_queue.handle();
 
     // `get_default_feedback` only exists since version 4 of the
-    // dmabuf global. If we bound a lower version the request just
-    // wouldn't be in the proxy's API surface — we wouldn't reach
-    // this function at all (the caller filters on `dmabuf.version()`
-    // implicitly via the bind range).
+    // dmabuf global; the caller only gets here when
+    // `dmabuf.version() >= 4` (sending it on v3 is a protocol error
+    // that kills the connection).
     let _feedback = dmabuf.get_default_feedback(&fb_qh, ());
 
     let mut state = FeedbackState::default();
