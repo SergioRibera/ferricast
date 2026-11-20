@@ -149,6 +149,22 @@ impl ServerState {
             .unwrap_or_else(PoisonError::into_inner);
         allowed.is_empty() || allowed.contains(&ip)
     }
+
+    /// Whether segment deliveries to `ip` feed the adaptive bitrate
+    /// controller: the allowed (cast) peers when an allowlist is set,
+    /// otherwise the first peer that fetched a segment.
+    fn drives_adaptive(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        let allowed = self
+            .allowed_peers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if allowed.is_empty() {
+            self.stats.is_first_peer(ip)
+        } else {
+            allowed.contains(&ip)
+        }
+    }
 }
 
 /// Per-connection entry point. Loops as long as the client wants to
@@ -403,7 +419,12 @@ where
                                 ((total_len as f64 * 8.0) / 1000.0 / seg_dur.max(0.001) as f64)
                                     as u32;
 
-                            let tele = stats.record_segment_get(seq, mbps, Instant::now());
+                            let tele = stats.record_segment_get(peer_ip, seq, mbps, Instant::now());
+                            // Only the cast receiver's deliveries steer
+                            // the encoder bitrate; other viewers are
+                            // just logged.
+                            let adaptive_for_peer =
+                                adaptive.filter(|_| state.drives_adaptive(peer_ip));
                             let gap_ms = tele.inter_request_gap.map(|d| d.as_millis() as u64);
                             let seq_jump = tele
                                 .prev_seq
@@ -426,7 +447,7 @@ where
                             );
 
                             if let (Some(avg_mbps), Some(state)) =
-                                (tele.probe_avg_mbps, adaptive.as_deref())
+                                (tele.probe_avg_mbps, adaptive_for_peer.as_deref())
                             {
                                 let avg_kbps = (avg_mbps * 1000.0) as u32;
                                 match state.observe_link_capacity_kbps(avg_kbps) {
@@ -446,7 +467,7 @@ where
                                 }
                             }
 
-                            if let Some(state) = adaptive.as_deref() {
+                            if let Some(state) = adaptive_for_peer.as_deref() {
                                 if let Some(new_kbps) = state.record_pressure(pct) {
                                     tracing::info!(
                                         new_target_kbps = new_kbps,
@@ -1425,5 +1446,27 @@ mod stall_tests {
         w.shutdown().await.unwrap();
         drop(w);
         assert_eq!(drain.await.unwrap(), 64 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod adaptive_peer_tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_follows_the_allowed_peer_or_else_the_first_one() {
+        let ring = Arc::new(RwLock::new(SegmentRing::new(6, 4)));
+        let state = ServerState::new(ring, None).unwrap();
+        let viewer: IpAddr = "192.168.1.50".parse().unwrap();
+        let cast: IpAddr = "192.168.1.30".parse().unwrap();
+        let now = Instant::now();
+        state.stats.record_segment_get(viewer, 0, 1.0, now);
+        state.stats.record_segment_get(cast, 0, 1.0, now);
+        assert!(state.drives_adaptive(viewer));
+        assert!(!state.drives_adaptive(cast));
+        state.allow_peer(cast);
+        assert!(state.drives_adaptive(cast));
+        assert!(!state.drives_adaptive(viewer));
+        assert!(!state.drives_adaptive("127.0.0.1".parse().unwrap()));
     }
 }
