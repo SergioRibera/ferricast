@@ -428,7 +428,13 @@ fn build_encoder_cfg(
     let height_mbs = height.div_ceil(16) as u16;
     let padded_h = (height_mbs as u32) * 16;
     let height_crop = (padded_h - height) / 2;
-    let level_idc = pick_level(width, height, cfg.fps);
+    let bitrate_bps = cfg.bitrate_kbps.max(1).saturating_mul(1000);
+    let level_idc = pick_level(
+        u32::from(width_mbs),
+        u32::from(height_mbs),
+        cfg.fps.max(1),
+        bitrate_bps,
+    );
 
     Ok(EncoderCfg {
         profile_idc,
@@ -440,31 +446,56 @@ fn build_encoder_cfg(
         height_mbs,
         height_crop,
         fps: cfg.fps.max(1),
-        bitrate_bps: cfg.bitrate_kbps.max(1).saturating_mul(1000),
+        bitrate_bps,
         keyframe_interval: cfg.keyframe_interval_frames(),
         initial_qp: 26,
         level_idc,
     })
 }
 
-/// Pick the smallest H.264 level that contains the requested
-/// resolution+framerate (Annex A, Table A-1). 41 covers 1080p60;
-/// 50 covers 4K30. Anything larger we just clamp to 51.
-fn pick_level(width: u32, height: u32, fps: u32) -> u8 {
-    let mb_per_sec = width.div_ceil(16) * height.div_ceil(16) * fps.max(1);
-    if mb_per_sec <= 245_760 {
-        31
-    } else if mb_per_sec <= 522_240 {
-        40
-    } else if mb_per_sec <= 589_824 {
-        41
-    } else if mb_per_sec <= 983_040 {
-        42
-    } else if mb_per_sec <= 2_073_600 {
-        50
-    } else {
-        51
-    }
+/// H.264 Table A-1: `(level_idc, MaxMBPS, MaxFS, MaxBR)`; MaxBR in
+/// 1000 bit/s (cpbBrVclFactor of Baseline / Main, the only profiles
+/// this encoder emits). Level 1b is skipped.
+const H264_LEVELS: &[(u8, u64, u64, u64)] = &[
+    (10, 1_485, 99, 64),
+    (11, 3_000, 396, 192),
+    (12, 6_000, 396, 384),
+    (13, 11_880, 396, 768),
+    (20, 11_880, 396, 2_000),
+    (21, 19_800, 792, 4_000),
+    (22, 20_250, 1_620, 4_000),
+    (30, 40_500, 1_620, 10_000),
+    (31, 108_000, 3_600, 14_000),
+    (32, 216_000, 5_120, 20_000),
+    (40, 245_760, 8_192, 20_000),
+    (41, 245_760, 8_192, 50_000),
+    (42, 522_240, 8_704, 50_000),
+    (50, 589_824, 22_080, 135_000),
+    (51, 983_040, 36_864, 240_000),
+    (52, 2_073_600, 36_864, 240_000),
+    (60, 4_177_920, 139_264, 240_000),
+    (61, 8_355_840, 139_264, 480_000),
+    (62, 16_711_680, 139_264, 800_000),
+];
+
+/// Smallest H.264 level (Annex A.3.1) whose MaxMBPS, MaxFS, frame
+/// dimensions (each ≤ √(8·MaxFS) macroblocks) and MaxBR admit the
+/// stream. Anything beyond the table clamps to 6.2.
+fn pick_level(width_mbs: u32, height_mbs: u32, fps: u32, bitrate_bps: u32) -> u8 {
+    let (w, h) = (u64::from(width_mbs), u64::from(height_mbs));
+    let frame_size = w * h;
+    let mbps = frame_size * u64::from(fps);
+    H264_LEVELS
+        .iter()
+        .find(|&&(_, max_mbps, max_fs, max_br)| {
+            let max_dim = (8 * max_fs).isqrt();
+            mbps <= max_mbps
+                && frame_size <= max_fs
+                && w <= max_dim
+                && h <= max_dim
+                && u64::from(bitrate_bps) <= max_br * 1000
+        })
+        .map_or(62, |&(level, ..)| level)
 }
 
 impl VideoEncoder for VaapiH264Encoder {
@@ -1197,4 +1228,39 @@ impl VaapiH264Encoder {
 #[cfg(test)]
 fn _build_seq_for_test(cfg: &EncoderCfg) -> EncSequenceParameterBufferH264 {
     build_seq_param(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn level(w: u32, h: u32, fps: u32, kbps: u32) -> u8 {
+        pick_level(w.div_ceil(16), h.div_ceil(16), fps, kbps * 1000)
+    }
+
+    #[test]
+    fn levels_follow_table_a1() {
+        assert_eq!(level(640, 480, 30, 2_000), 30);
+        assert_eq!(level(1280, 720, 30, 5_000), 31);
+        assert_eq!(level(1280, 720, 60, 8_000), 32);
+        // 1080p30 is 8160 MBs/frame: over 3.2's MaxFS (5120).
+        assert_eq!(level(1920, 1080, 30, 8_000), 40);
+        assert_eq!(level(1920, 1080, 60, 8_000), 42);
+        assert_eq!(level(3840, 2160, 30, 20_000), 51);
+        assert_eq!(level(3840, 2160, 60, 20_000), 52);
+    }
+
+    #[test]
+    fn bitrate_raises_level() {
+        // 1080p30 at 25 Mbps exceeds 4.0's 20 Mbps MaxBR.
+        assert_eq!(level(1920, 1080, 30, 25_000), 41);
+    }
+
+    #[test]
+    fn extreme_aspect_ratio_respects_dimension_limit() {
+        // 4096x64 is only 1024 MBs, but 256 MBs wide needs
+        // √(8·MaxFS) ≥ 256, i.e. level 4.0; 257 MBs wide needs 4.2.
+        assert_eq!(level(4096, 64, 30, 1_000), 40);
+        assert_eq!(level(4112, 64, 30, 1_000), 42);
+    }
 }

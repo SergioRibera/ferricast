@@ -333,7 +333,8 @@ fn build_encoder_cfg(profile_idc: u8, bit_depth: u8, cfg: &EncoderConfig) -> Res
     let height_ctus = height.div_ceil(32) as u16;
     let padded_h = (height_ctus as u32) * 32;
     let height_crop = padded_h - height;
-    let level_idc = pick_level(width, height, cfg.fps);
+    let bitrate_bps = cfg.bitrate_kbps.max(1).saturating_mul(1000);
+    let level_idc = pick_level(width, height, cfg.fps.max(1), bitrate_bps);
 
     Ok(EncoderCfg {
         profile_idc,
@@ -343,7 +344,7 @@ fn build_encoder_cfg(profile_idc: u8, bit_depth: u8, cfg: &EncoderConfig) -> Res
         height_ctus,
         height_crop,
         fps: cfg.fps.max(1),
-        bitrate_bps: cfg.bitrate_kbps.max(1).saturating_mul(1000),
+        bitrate_bps,
         keyframe_interval: cfg.keyframe_interval_frames(),
         initial_qp: 26,
         level_idc,
@@ -352,26 +353,43 @@ fn build_encoder_cfg(profile_idc: u8, bit_depth: u8, cfg: &EncoderConfig) -> Res
     })
 }
 
-/// HEVC level table (Annex A, Table A.6). Levels times 30. We pick
-/// the smallest level that contains the requested resolution+framerate.
-fn pick_level(width: u32, height: u32, fps: u32) -> u8 {
-    let luma_samples = width * height;
-    let samples_per_sec = luma_samples * fps.max(1);
-    if samples_per_sec <= 33_177_600 {
-        90 // 3.0
-    } else if samples_per_sec <= 66_846_720 {
-        93 // 3.1
-    } else if samples_per_sec <= 133_693_440 {
-        120 // 4.0
-    } else if samples_per_sec <= 267_386_880 {
-        123 // 4.1
-    } else if samples_per_sec <= 534_773_760 {
-        150 // 5.0
-    } else if samples_per_sec <= 1_069_547_520 {
-        153 // 5.1
-    } else {
-        156 // 5.2
-    }
+/// HEVC Tables A.8 / A.9, Main tier: `(general_level_idc, MaxLumaPs,
+/// MaxLumaSr, MaxBR)`; level_idc is the level × 30, MaxBR in 1000 bit/s
+/// (CpbBrVclFactor of Main / Main10).
+const HEVC_LEVELS: &[(u8, u64, u64, u64)] = &[
+    (30, 36_864, 552_960, 128),
+    (60, 122_880, 3_686_400, 1_500),
+    (63, 245_760, 7_372_800, 3_000),
+    (90, 552_960, 16_588_800, 6_000),
+    (93, 983_040, 33_177_600, 10_000),
+    (120, 2_228_224, 66_846_720, 12_000),
+    (123, 2_228_224, 133_693_440, 20_000),
+    (150, 8_912_896, 267_386_880, 25_000),
+    (153, 8_912_896, 534_773_760, 40_000),
+    (156, 8_912_896, 1_069_547_520, 60_000),
+    (180, 35_651_584, 1_069_547_520, 60_000),
+    (183, 35_651_584, 2_139_095_040, 120_000),
+    (186, 35_651_584, 4_278_190_080, 240_000),
+];
+
+/// Smallest HEVC level (A.4.1) whose MaxLumaPs, MaxLumaSr, picture
+/// dimensions (each ≤ √(8·MaxLumaPs)) and MaxBR admit the coded
+/// picture size `width × height`. Anything beyond clamps to 6.2.
+fn pick_level(width: u32, height: u32, fps: u32, bitrate_bps: u32) -> u8 {
+    let (w, h) = (u64::from(width), u64::from(height));
+    let pic_size = w * h;
+    let sample_rate = pic_size * u64::from(fps);
+    HEVC_LEVELS
+        .iter()
+        .find(|&&(_, max_ps, max_sr, max_br)| {
+            let max_dim = (8 * max_ps).isqrt();
+            pic_size <= max_ps
+                && sample_rate <= max_sr
+                && w <= max_dim
+                && h <= max_dim
+                && u64::from(bitrate_bps) <= max_br * 1000
+        })
+        .map_or(186, |&(level, ..)| level)
 }
 
 impl VideoEncoder for VaapiH265Encoder {
@@ -1018,5 +1036,27 @@ impl VaapiH265Encoder {
         })?;
         drop(imported);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn levels_follow_tables_a8_a9() {
+        // 1080p is 2 073 600 samples: over 3.1's MaxLumaPs (983 040).
+        assert_eq!(pick_level(1920, 1088, 30, 8_000_000), 120);
+        // 1080p60 needs 124 M samples/s: over 4.0's 66.8 M.
+        assert_eq!(pick_level(1920, 1088, 60, 8_000_000), 123);
+        assert_eq!(pick_level(1280, 736, 30, 5_000_000), 93);
+        assert_eq!(pick_level(3840, 2176, 30, 20_000_000), 150);
+        assert_eq!(pick_level(3840, 2176, 60, 20_000_000), 153);
+    }
+
+    #[test]
+    fn bitrate_raises_level() {
+        // 1080p30 at 15 Mbps exceeds 4.0's 12 Mbps Main-tier MaxBR.
+        assert_eq!(pick_level(1920, 1088, 30, 15_000_000), 123);
     }
 }
