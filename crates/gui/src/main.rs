@@ -221,13 +221,36 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     run_window(
-        manager,
+        manager.clone(),
         ui_rx,
         picker_rx,
         receiver_window_rx,
         args.background,
     );
+    shutdown_manager(&manager).await;
     Ok(())
+}
+
+/// Stop streams (receivers get a STOP, nothing keeps showing our
+/// splash), receivers and discovery (mDNS goodbye) before exiting.
+async fn shutdown_manager(manager: &SharedManager) {
+    const WRITE_LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+    tracing::info!("shutting down streams, receivers and discovery");
+    // Cancels in-flight starts too, which releases their read locks.
+    manager.read().await.stop_all_streams().await;
+    match tokio::time::timeout(WRITE_LOCK_GRACE, manager.write()).await {
+        Ok(mut m) => {
+            if let Err(e) = m.shutdown().await {
+                tracing::warn!(%e, "manager shutdown");
+            }
+        }
+        Err(_) => {
+            tracing::warn!("manager still busy; stopping discovery only");
+            if let Err(e) = manager.read().await.stop_discovery().await {
+                tracing::warn!(%e, "stop discovery");
+            }
+        }
+    }
 }
 
 fn run_window(
