@@ -16,6 +16,7 @@
 //! parse the few headers we care about (`Connection`, `Range`)
 //! manually.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -38,6 +39,26 @@ const KEEPALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// (rfc8216bis §6.2.5.2).
 const BLOCKING_RELOAD_TARGET_DURATIONS: u32 = 3;
 
+/// State one HLS server shares with all of its connection handlers.
+pub(crate) struct ServerState {
+    pub(crate) ring: Arc<RwLock<SegmentRing>>,
+    pub(crate) adaptive: Option<Arc<AdaptiveBitrateState>>,
+    pub(crate) stats: SessionStats,
+}
+
+impl ServerState {
+    pub(crate) fn new(
+        ring: Arc<RwLock<SegmentRing>>,
+        adaptive: Option<Arc<AdaptiveBitrateState>>,
+    ) -> Self {
+        Self {
+            ring,
+            adaptive,
+            stats: SessionStats::new(),
+        }
+    }
+}
+
 /// Per-connection entry point. Loops as long as the client wants to
 /// keep the TCP connection alive (HTTP/1.1 default; opt-out via
 /// `Connection: close`).
@@ -47,16 +68,14 @@ const BLOCKING_RELOAD_TARGET_DURATIONS: u32 = 3;
 /// and `peer_addr` work happens in the caller (the accept loop in
 /// [`crate::HlsFrameSink`] / [`crate::HlsServer`]) so this layer
 /// stays IO-agnostic.
-pub async fn handle<I>(
-    peer: String,
-    io: I,
-    ring: Arc<RwLock<SegmentRing>>,
-    adaptive: Option<Arc<AdaptiveBitrateState>>,
-    stats: Arc<SessionStats>,
-) -> Result<()>
+pub(crate) async fn handle<I>(peer: SocketAddr, io: I, state: Arc<ServerState>) -> Result<()>
 where
     I: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let ring = &state.ring;
+    let adaptive = state.adaptive.as_ref();
+    let stats = &state.stats;
+    let peer = peer.to_string();
     let (read_half, mut write_half) = tokio::io::split(io);
     let mut reader = BufReader::new(read_half);
 

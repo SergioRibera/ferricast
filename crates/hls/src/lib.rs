@@ -38,13 +38,14 @@ pub use puller::HlsPuller;
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio::sync::{RwLock, mpsc};
-use tokio::task::JoinHandle;
+use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 
 use ferricast_core::{
     AudioFrame, EncodedFrame, FerricastError, Result, ScreenCapture, VideoEncoder,
@@ -178,6 +179,23 @@ impl Default for HlsConfig {
 }
 
 impl HlsConfig {
+    /// Reject configurations no server can honour.
+    fn validate(&self) -> Result<()> {
+        if self.keep_segments < 3 {
+            return Err(FerricastError::Hls(format!(
+                "keep_segments={} too small (minimum 3)",
+                self.keep_segments
+            )));
+        }
+        if f32::from(self.playlist_target_duration) < self.segment_target_secs {
+            return Err(FerricastError::Hls(format!(
+                "playlist_target_duration={}s < segment_target_secs={}s",
+                self.playlist_target_duration, self.segment_target_secs
+            )));
+        }
+        Ok(())
+    }
+
     /// The fixed `#EXT-X-TARGETDURATION` the playlist advertises:
     /// [`Self::playlist_target_duration`], raised to at least
     /// `ceil(segment_target_secs)`. Computed once per server and never
@@ -200,12 +218,8 @@ impl HlsConfig {
 /// [`Self::run`] then accepts connections forever.
 pub struct HlsServer {
     listener: TcpListener,
-    ring: Arc<RwLock<SegmentRing>>,
-    adaptive: Option<Arc<ferricast_core::AdaptiveBitrateState>>,
-    stats: Arc<stats::SessionStats>,
-    tls: Option<TlsAcceptor>,
-    /// Cancels the capture loop when the server is dropped.
-    _segmenter: JoinHandle<()>,
+    connections: Arc<Connections>,
+    segmenter: JoinHandle<()>,
 }
 
 impl HlsServer {
@@ -213,24 +227,18 @@ impl HlsServer {
     /// and return. The server is ready to serve as soon as this
     /// resolves — players that connect immediately will see a
     /// non-empty playlist on their first request.
+    ///
+    /// # Errors
+    ///
+    /// Invalid configuration, bind failure, or no segment produced
+    /// before the startup deadline.
     pub async fn start<S, E, A>(addr: A, capture: S, encoder: E, config: HlsConfig) -> Result<Self>
     where
         S: ScreenCapture + Send + 'static,
         E: VideoEncoder + Send + 'static,
         A: ToSocketAddrs,
     {
-        if config.keep_segments < 3 {
-            return Err(FerricastError::Hls(format!(
-                "keep_segments={} too small (minimum 3)",
-                config.keep_segments
-            )));
-        }
-        if (config.playlist_target_duration as f32) < config.segment_target_secs {
-            return Err(FerricastError::Hls(format!(
-                "playlist_target_duration={}s < segment_target_secs={}s",
-                config.playlist_target_duration, config.segment_target_secs
-            )));
-        }
+        config.validate()?;
 
         let listener = TcpListener::bind(addr).await?;
         let local = listener
@@ -265,19 +273,20 @@ impl HlsServer {
             "HLS server ready"
         );
 
-        let tls = config.tls.clone().map(TlsAcceptor::from);
+        let state = Arc::new(http::ServerState::new(ring, config.adaptive.clone()));
         Ok(Self {
             listener,
-            ring,
-            adaptive: config.adaptive.clone(),
-            stats: Arc::new(stats::SessionStats::new()),
-            tls,
-            _segmenter: segmenter,
+            connections: Arc::new(Connections::new(state, config.tls.clone())),
+            segmenter,
         })
     }
 
     /// Bound socket address. Useful when [`Self::start`] is given
     /// `0.0.0.0:0` and the caller needs to discover the assigned port.
+    ///
+    /// # Errors
+    ///
+    /// The socket's address cannot be queried.
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.listener.local_addr().map_err(FerricastError::from)
     }
@@ -285,40 +294,120 @@ impl HlsServer {
     /// Accept a single connection and dispatch it to a per-connection
     /// task. Useful when the caller wants to drive accept manually
     /// (e.g. integrate with a select! loop).
+    ///
+    /// # Errors
+    ///
+    /// The `accept` call failed; the caller decides whether to retry.
     pub async fn accept_one(&self) -> Result<()> {
         let (socket, peer) = self.listener.accept().await?;
-        let ring = self.ring.clone();
-        let adaptive = self.adaptive.clone();
-        let stats = self.stats.clone();
-        let tls = self.tls.clone();
-        tokio::spawn(async move {
-            spawn_handler(socket, peer.to_string(), tls, ring, adaptive, stats).await;
-        });
+        self.connections.dispatch(socket, peer);
         Ok(())
     }
 
-    /// Accept loop. Runs until the listener errors out (interface
-    /// going away, fd exhaustion, …). Per-connection failures are
-    /// logged but never bring down the loop.
+    /// Accept loop. Runs until the returned future is dropped.
+    /// Transient accept failures (fd exhaustion, aborted handshakes)
+    /// are logged and retried after a short pause; they never stop the
+    /// server.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error today; the `Result` is kept for API
+    /// stability.
     pub async fn run(self) -> Result<()> {
-        loop {
-            match self.listener.accept().await {
-                Ok((socket, peer)) => {
-                    let ring = self.ring.clone();
-                    let adaptive = self.adaptive.clone();
-                    let stats = self.stats.clone();
-                    let tls = self.tls.clone();
+        self.connections.accept_loop(&self.listener).await;
+        Ok(())
+    }
+}
 
-                    tokio::spawn(async move {
-                        spawn_handler(socket, peer.to_string(), tls, ring, adaptive, stats).await;
-                    });
-                }
+impl Drop for HlsServer {
+    fn drop(&mut self) {
+        // The segmenter owns the capture + encoder; it must not
+        // outlive the server. Handler tasks would otherwise keep
+        // serving a ring nobody updates.
+        self.segmenter.abort();
+        self.connections.shutdown();
+    }
+}
+
+/// Upper bound on simultaneously served connections per server. A
+/// Chromecast uses one or two; the cap only matters when something
+/// floods the port.
+const MAX_CONNECTIONS: usize = 64;
+
+/// Pause after a failed `accept()` before trying again. Errors like
+/// `EMFILE` repeat immediately while the condition lasts, so retrying
+/// in a tight loop would spin a core.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// The connections one server accepts: TLS wrapping, the concurrency
+/// cap, and the handler tasks (aborted together on shutdown).
+struct Connections {
+    state: Arc<http::ServerState>,
+    tls: Option<TlsAcceptor>,
+    permits: Arc<Semaphore>,
+    handlers: StdMutex<JoinSet<()>>,
+}
+
+impl Connections {
+    fn new(state: Arc<http::ServerState>, tls: Option<Arc<rustls::ServerConfig>>) -> Self {
+        Self {
+            state,
+            tls: tls.map(TlsAcceptor::from),
+            permits: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            handlers: StdMutex::new(JoinSet::new()),
+        }
+    }
+
+    fn handlers(&self) -> std::sync::MutexGuard<'_, JoinSet<()>> {
+        // A panic while holding the lock leaves the JoinSet intact.
+        self.handlers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Accept forever, retrying after transient errors.
+    async fn accept_loop(&self, listener: &TcpListener) {
+        loop {
+            match listener.accept().await {
+                Ok((socket, peer)) => self.dispatch(socket, peer),
                 Err(e) => {
-                    error!(error = %e, "HLS listener accept failed");
-                    return Err(FerricastError::from(e));
+                    warn!(error = %e, "HLS accept failed; retrying");
+                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
                 }
             }
         }
+    }
+
+    /// Hand an accepted socket to a tracked handler task, or turn it
+    /// away with 503 when the connection cap is reached.
+    fn dispatch(&self, socket: TcpStream, peer: SocketAddr) {
+        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+            warn!(%peer, limit = MAX_CONNECTIONS, "HLS connection limit reached; rejecting");
+            // Best effort, never blocks: one non-blocking write on the
+            // fresh socket, whose send buffer has room for this short
+            // response. (Tokio's `try_write` would refuse before the
+            // reactor has seen the socket become writable.)
+            if let Ok(mut std_socket) = socket.into_std() {
+                let _ = std::io::Write::write(
+                    &mut std_socket,
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+                      Retry-After: 1\r\nConnection: close\r\n\r\n",
+                );
+            }
+            return;
+        };
+        let state = self.state.clone();
+        let tls = self.tls.clone();
+        let mut handlers = self.handlers();
+        // Reap finished handlers so the set doesn't grow unbounded.
+        while handlers.try_join_next().is_some() {}
+        handlers.spawn(async move {
+            serve_connection(socket, peer, tls, state).await;
+            drop(permit);
+        });
+    }
+
+    /// Abort every connection handler.
+    fn shutdown(&self) {
+        self.handlers().abort_all();
     }
 }
 
@@ -327,32 +416,25 @@ impl HlsServer {
 /// or wrap it in a `TlsAcceptor::accept` first (HTTPS). All HLS
 /// servers in this crate funnel through here so the TLS branch
 /// stays in one place.
-async fn spawn_handler(
+async fn serve_connection(
     socket: TcpStream,
-    peer: String,
+    peer: SocketAddr,
     tls: Option<TlsAcceptor>,
-    ring: Arc<RwLock<SegmentRing>>,
-    adaptive: Option<Arc<ferricast_core::AdaptiveBitrateState>>,
-    stats: Arc<stats::SessionStats>,
+    state: Arc<http::ServerState>,
 ) {
     let _ = socket.set_nodelay(true);
-    match tls {
+    let result = match tls {
         Some(acceptor) => match acceptor.accept(socket).await {
-            Ok(tls_stream) => {
-                if let Err(e) = http::handle(peer.clone(), tls_stream, ring, adaptive, stats).await
-                {
-                    trace!(%peer, error = %e, "HLS connection ended");
-                }
-            }
+            Ok(tls_stream) => http::handle(peer, tls_stream, state).await,
             Err(e) => {
                 trace!(%peer, error = %e, "TLS handshake failed");
+                return;
             }
         },
-        None => {
-            if let Err(e) = http::handle(peer.clone(), socket, ring, adaptive, stats).await {
-                trace!(%peer, error = %e, "HLS connection ended");
-            }
-        }
+        None => http::handle(peer, socket, state).await,
+    };
+    if let Err(e) = result {
+        trace!(%peer, error = %e, "HLS connection ended");
     }
 }
 
@@ -360,8 +442,8 @@ async fn spawn_handler(
 ///
 /// Unlike [`HlsServer`], this handle spawns its own accept loop on
 /// construction so the caller doesn't have to drive it; dropping the
-/// handle aborts the accept loop and dropping the [`mpsc::Sender`]
-/// the caller still holds shuts the segmenter down.
+/// handle stops the accept loop, every connection handler and the
+/// segmenter.
 ///
 /// Used by receiver protocols (Chromecast, …) whose capture+encode
 /// loop is already driven by the global stream manager — they don't
@@ -374,7 +456,8 @@ pub struct HlsFrameSink {
     /// builder) doesn't have to track the same option twice.
     scheme: &'static str,
     ring: Arc<RwLock<SegmentRing>>,
-    _segmenter: JoinHandle<()>,
+    connections: Arc<Connections>,
+    segmenter: JoinHandle<()>,
     accept: JoinHandle<()>,
 }
 
@@ -383,6 +466,10 @@ impl HlsFrameSink {
     /// HTTP accept loop, and return immediately. The HLS playlist
     /// won't have any segments yet — call [`Self::wait_first_segment`]
     /// before pointing a player at the URL.
+    ///
+    /// # Errors
+    ///
+    /// Invalid configuration or bind failure.
     pub async fn start<A: ToSocketAddrs>(
         addr: A,
         frames: mpsc::Receiver<EncodedFrame>,
@@ -398,6 +485,11 @@ impl HlsFrameSink {
     /// Use this when the caller pre-bound the port (e.g. via
     /// [`ferricast_core::bind_in_range`]) to keep the bind inside a
     /// known firewall-friendly range.
+    ///
+    /// # Errors
+    ///
+    /// Invalid configuration, or the listener's address cannot be
+    /// queried.
     pub async fn start_on_listener(
         listener: TcpListener,
         frames: mpsc::Receiver<EncodedFrame>,
@@ -405,18 +497,7 @@ impl HlsFrameSink {
         parameter_sets: Vec<u8>,
         config: HlsConfig,
     ) -> Result<Self> {
-        if config.keep_segments < 3 {
-            return Err(FerricastError::Hls(format!(
-                "keep_segments={} too small (minimum 3)",
-                config.keep_segments
-            )));
-        }
-        if (config.playlist_target_duration as f32) < config.segment_target_secs {
-            return Err(FerricastError::Hls(format!(
-                "playlist_target_duration={}s < segment_target_secs={}s",
-                config.playlist_target_duration, config.segment_target_secs
-            )));
-        }
+        config.validate()?;
 
         let local = listener.local_addr().map_err(FerricastError::from)?;
 
@@ -425,7 +506,6 @@ impl HlsFrameSink {
             config.target_duration(),
         )));
         let segmenter_ring = ring.clone();
-        let adaptive_for_segmenter = config.adaptive.clone();
         let cfg_for_segmenter = config.clone();
         let segmenter = tokio::spawn(async move {
             if let Err(e) = segmenter::run_from_frames(
@@ -439,35 +519,21 @@ impl HlsFrameSink {
             {
                 error!(error = %e, "HLS frame-source segmenter exited");
             }
-            // Drop reference once the segmenter exits so the
-            // adaptive state can be freed.
-            drop(adaptive_for_segmenter);
         });
 
-        let accept_ring = ring.clone();
-        let accept_adaptive = config.adaptive.clone();
-        let stats = Arc::new(stats::SessionStats::new());
-        let accept_stats = stats.clone();
-        let acceptor = config.tls.clone().map(TlsAcceptor::from);
-        let scheme: &'static str = if acceptor.is_some() { "https" } else { "http" };
+        let state = Arc::new(http::ServerState::new(
+            ring.clone(),
+            config.adaptive.clone(),
+        ));
+        let connections = Arc::new(Connections::new(state, config.tls.clone()));
+        let scheme: &'static str = if config.tls.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        let accept_connections = connections.clone();
         let accept = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((socket, peer)) => {
-                        let r = accept_ring.clone();
-                        let a = accept_adaptive.clone();
-                        let s = accept_stats.clone();
-                        let t = acceptor.clone();
-                        tokio::spawn(async move {
-                            spawn_handler(socket, peer.to_string(), t, r, a, s).await;
-                        });
-                    }
-                    Err(e) => {
-                        error!(error = %e, "HLS frame-sink accept failed");
-                        return;
-                    }
-                }
-            }
+            accept_connections.accept_loop(&listener).await;
         });
 
         info!(
@@ -483,13 +549,15 @@ impl HlsFrameSink {
             addr: local,
             scheme,
             ring,
-            _segmenter: segmenter,
+            connections,
+            segmenter,
             accept,
         })
     }
 
     /// Bound socket address (always reflects the actual port even if
     /// the caller asked for `:0`).
+    #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
@@ -497,6 +565,7 @@ impl HlsFrameSink {
     /// `"http"` when [`HlsConfig::tls`] was `None`, `"https"` when it
     /// was set. The chromecast LOAD URL builder uses this to keep
     /// scheme + TLS toggle in one place.
+    #[must_use]
     pub fn scheme(&self) -> &'static str {
         self.scheme
     }
@@ -525,12 +594,13 @@ impl HlsFrameSink {
 
 impl Drop for HlsFrameSink {
     fn drop(&mut self) {
-        // Abort the accept loop so the listener fd is reclaimed.
-        // The segmenter exits on its own as soon as the caller drops
-        // their `mpsc::Sender`, so we don't have to abort it here —
-        // but we abort defensively in case the sender outlives us.
+        // Stop accepting (reclaims the listener fd), cut every open
+        // connection so keep-alive clients can't keep reading a dead
+        // ring, and stop the segmenter even if the caller still holds
+        // the frame sender.
         self.accept.abort();
-        self._segmenter.abort();
+        self.connections.shutdown();
+        self.segmenter.abort();
     }
 }
 
@@ -552,5 +622,70 @@ mod tests {
             ..HlsConfig::default()
         };
         assert_eq!(cfg.target_duration(), 5);
+    }
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn sink() -> (HlsFrameSink, mpsc::Sender<EncodedFrame>) {
+        let (tx, rx) = mpsc::channel(8);
+        let sink = HlsFrameSink::start(
+            "127.0.0.1:0",
+            rx,
+            None,
+            vec![0, 0, 0, 1, 0x67],
+            HlsConfig {
+                segment_target_secs: 2.0,
+                playlist_target_duration: 4,
+                ..HlsConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        (sink, tx)
+    }
+
+    async fn get(addr: SocketAddr, path: &str) -> String {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(format!("GET {path} HTTP/1.0\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn connections_over_the_cap_get_503() {
+        let (sink, _tx) = sink().await;
+        let addr = sink.local_addr();
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+        // Let the accept loop take all of them.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Read without sending a request: the server answers 503 and
+        // closes right away.
+        let mut over = TcpStream::connect(addr).await.unwrap();
+        let mut reply = String::new();
+        over.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
+        drop(idle);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let reply = get(addr, "/index.m3u8").await;
+        assert!(!reply.starts_with("HTTP/1.1 503"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_sink_closes_open_connections() {
+        let (sink, _tx) = sink().await;
+        let mut conn = TcpStream::connect(sink.local_addr()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(sink);
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .expect("handler must be aborted, not left waiting for a request");
+        assert!(matches!(read, Ok(0) | Err(_)));
     }
 }
