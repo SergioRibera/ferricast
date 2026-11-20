@@ -34,6 +34,7 @@ use ferricast_core::{
 use tracing::{debug, info, trace, warn};
 
 use super::headers::{self, ConformanceWindow, StreamParams};
+use crate::frame_view::FrameView;
 
 const RENDER_NODES: &[&str] = &[
     "/dev/dri/renderD128",
@@ -113,6 +114,11 @@ impl EncoderCfg {
     /// smaller and is communicated via the SPS conformance window.
     fn padded_height(&self) -> u32 {
         (self.height_ctus as u32) * 32
+    }
+
+    /// Size of the surfaces the encoder reads from.
+    fn coded_size(&self) -> (u32, u32) {
+        (self.width, self.padded_height())
     }
 }
 
@@ -385,13 +391,8 @@ impl VideoEncoder for VaapiH265Encoder {
             }
             other => {
                 let raw = other.into_cpu()?;
-                if !matches!(raw.format, PixelFormat::Bgra | PixelFormat::Rgba) {
-                    return Err(FerricastError::Encoder(format!(
-                        "VA-API HEVC: unexpected runtime pixel format {:?}",
-                        raw.format
-                    )));
-                }
-                upload_bgra_to_nv12(target_surface, &self.cfg, &raw.data, raw.stride as usize)?;
+                let view = FrameView::new(&raw, self.cfg.width, self.cfg.height)?;
+                crate::h264::yuv::upload_to_surface(target_surface, self.cfg.coded_size(), &view)?;
             }
         }
 
@@ -426,84 +427,6 @@ impl VideoEncoder for VaapiH265Encoder {
         out.extend_from_slice(&self.pps_nal);
         Ok(out)
     }
-}
-
-fn upload_bgra_to_nv12(
-    surface: &Surface<()>,
-    cfg: &EncoderCfg,
-    bgra: &[u8],
-    bgra_stride: usize,
-) -> Result<()> {
-    let w = cfg.width;
-    let h = cfg.height;
-    let padded_h = cfg.padded_height();
-
-    let mut image = match Image::derive_from(surface, (w, padded_h)) {
-        Ok(img) => img,
-        Err(_e) => {
-            let format = VAImageFormat {
-                fourcc: VA_FOURCC_NV12,
-                byte_order: VA_LSB_FIRST,
-                bits_per_pixel: 12,
-                ..Default::default()
-            };
-            Image::create_from(surface, format, (w, padded_h), (w, padded_h))
-                .map_err(|e| FerricastError::Encoder(format!("vaCreateImage(NV12): {e}")))?
-        }
-    };
-
-    let im = image.image();
-    let y_off = im.offsets[0] as usize;
-    let uv_off = im.offsets[1] as usize;
-    let y_stride = im.pitches[0] as usize;
-    let uv_stride = im.pitches[1] as usize;
-
-    let buf = image.as_mut();
-    let len = buf.len();
-    if y_off + y_stride * (padded_h as usize) > len
-        || uv_off + uv_stride * ((padded_h / 2) as usize) > len
-    {
-        return Err(FerricastError::Encoder(
-            "VA-API HEVC NV12 image buffer smaller than expected planes".into(),
-        ));
-    }
-    let (y_plane, uv_plane) = if y_off < uv_off {
-        let (lo, hi) = buf.split_at_mut(uv_off);
-        (&mut lo[y_off..], hi)
-    } else {
-        let (lo, hi) = buf.split_at_mut(y_off);
-        (hi, &mut lo[uv_off..])
-    };
-
-    crate::h264::yuv::bgra_to_nv12(
-        bgra,
-        bgra_stride.max((w * 4) as usize),
-        w,
-        h,
-        crate::h264::yuv::Nv12Planes {
-            y: &mut *y_plane,
-            y_stride,
-            uv: &mut *uv_plane,
-            uv_stride,
-        },
-    );
-
-    if padded_h > h {
-        for row in h..padded_h {
-            let off = (row as usize) * y_stride;
-            for b in &mut y_plane[off..off + w as usize] {
-                *b = 16;
-            }
-        }
-        for row in (h / 2)..(padded_h / 2) {
-            let off = (row as usize) * uv_stride;
-            for b in &mut uv_plane[off..off + w as usize] {
-                *b = 128;
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>, bool, u32, i32)> {

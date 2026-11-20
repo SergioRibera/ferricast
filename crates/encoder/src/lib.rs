@@ -1,4 +1,5 @@
 pub mod aac;
+mod frame_view;
 pub mod h264;
 #[cfg(any(feature = "nvenc-hevc", feature = "vaapi-hevc"))]
 pub mod h265;

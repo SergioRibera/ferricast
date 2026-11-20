@@ -27,9 +27,11 @@ use std::marker::PhantomData;
 
 use bytes::Bytes;
 use ferricast_core::{
-    CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, PixelFormat, Result,
-    VideoEncoder,
+    CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, PixelFormat, RawFrame,
+    Result, VideoEncoder,
 };
+
+use crate::frame_view::FrameView;
 use shiguredo_nvcodec::{
     BufferFormat, CodecConfig, EncodeOptions, Encoder as NvEncoder, EncoderCodec,
     EncoderConfig as NvCfg, H264EncoderConfig, H264Profile as NvH264Profile, PictureType, Preset,
@@ -148,6 +150,9 @@ pub struct NvencEncoder<C: NvencCodec> {
     /// the segmenter can anchor segment boundaries to wall clock
     /// when the capture stalls.
     pending_keyframe: bool,
+    /// Scratch for repacking row-padded CPU frames into the tight
+    /// layout NVENC's host upload expects. Reused across frames.
+    repack: Vec<u8>,
     /// `NvEncRegisterResource` is expensive (driver round-trip plus
     /// `cuExternalMemoryImport`), so we cache the registration
     /// keyed by `(fd, modifier, dims)`. PipeWire and our wayland-direct
@@ -167,6 +172,7 @@ pub struct NvencEncoder<C: NvencCodec> {
 struct NvencCfg {
     width: u32,
     height: u32,
+    pixel_format: PixelFormat,
     fps: u32,
     keyframe_interval: u32,
 }
@@ -279,30 +285,36 @@ impl<C: NvencCodec> NvencEncoder<C> {
             cfg: NvencCfg {
                 width: cfg.width.max(16),
                 height: cfg.height.max(16),
+                pixel_format: cfg.pixel_format,
                 fps: cfg.fps.max(1),
                 keyframe_interval: cfg.keyframe_interval_frames(),
             },
             frame_count: 0,
             pending_keyframe: false,
+            repack: Vec::new(),
             #[cfg(feature = "nvenc-zero-copy")]
             dmabuf_cache: HashMap::new(),
             _codec: PhantomData,
         })
     }
 
-    fn encode_cpu(&mut self, host: &[u8], options: &EncodeOptions) -> Result<()> {
-        let expected = (self.cfg.width as usize)
-            .saturating_mul(self.cfg.height as usize)
-            .saturating_mul(4);
-        if host.len() < expected {
+    fn encode_cpu(&mut self, raw: &RawFrame, options: &EncodeOptions) -> Result<()> {
+        if raw.format != self.cfg.pixel_format {
+            // The session was opened for one byte order; feeding the
+            // other would silently swap red and blue.
             return Err(FerricastError::Encoder(format!(
-                "NVENC ({}): short frame {} bytes, want {expected}",
+                "NVENC ({}): frame format {:?} differs from configured {:?}",
                 C::NAME,
-                host.len()
+                raw.format,
+                self.cfg.pixel_format
             )));
         }
+        let view = FrameView::new(raw, self.cfg.width, self.cfg.height)?;
+        // NVENC's CPU path takes tightly packed rows (`inputPitch` is
+        // derived from the width), so padded frames are repacked.
+        let host = view.tight_rows(&mut self.repack);
         self.encoder
-            .encode(&host[..expected], options)
+            .encode(host, options)
             .map_err(|e| FerricastError::Encoder(format!("NVENC ({}) encode (cpu): {e}", C::NAME)))
     }
 
@@ -410,18 +422,18 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
                         // sticky.
                         warn!(codec = C::NAME, %e, "NVENC dmabuf path failed; falling back to CPU readback for this frame");
                         let raw = CapturedFrame::Gpu(g).into_cpu()?;
-                        self.encode_cpu(&raw.data, &options)?;
+                        self.encode_cpu(&raw, &options)?;
                     }
                 }
                 CapturedFrame::Cpu(raw) => {
-                    self.encode_cpu(&raw.data, &options)?;
+                    self.encode_cpu(&raw, &options)?;
                 }
             }
         }
         #[cfg(not(feature = "nvenc-zero-copy"))]
         {
             let raw = frame.into_cpu()?;
-            self.encode_cpu(&raw.data, &options)?;
+            self.encode_cpu(&raw, &options)?;
         }
 
         let nv_frame = self.encoder.next_frame().ok_or_else(|| {

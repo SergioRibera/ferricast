@@ -42,6 +42,7 @@ use tracing::{debug, info, trace, warn};
 
 use super::headers::{self, FrameCrop, PpsParams, SpsParams, VuiParams, profile};
 use super::yuv;
+use crate::frame_view::FrameView;
 
 const RENDER_NODES: &[&str] = &[
     "/dev/dri/renderD128",
@@ -393,6 +394,11 @@ impl EncoderCfg {
     fn padded_height(&self) -> u32 {
         (self.height_mbs as u32) * 16
     }
+
+    /// Size of the surfaces the encoder reads from.
+    fn coded_size(&self) -> (u32, u32) {
+        (self.width, self.padded_height())
+    }
 }
 
 fn build_encoder_cfg(
@@ -473,13 +479,8 @@ impl VideoEncoder for VaapiH264Encoder {
             }
             other => {
                 let raw = other.into_cpu()?;
-                if !matches!(raw.format, PixelFormat::Bgra | PixelFormat::Rgba) {
-                    return Err(FerricastError::Encoder(format!(
-                        "VA-API: unexpected runtime pixel format {:?}",
-                        raw.format
-                    )));
-                }
-                upload_bgra_to_nv12(target_surface, &self.cfg, &raw.data, raw.stride as usize)?;
+                let view = FrameView::new(&raw, self.cfg.width, self.cfg.height)?;
+                yuv::upload_to_surface(target_surface, self.cfg.coded_size(), &view)?;
             }
         }
 
@@ -519,99 +520,6 @@ impl VideoEncoder for VaapiH264Encoder {
         out.extend_from_slice(&self.pps_nal);
         Ok(out)
     }
-}
-
-/// Upload a BGRA frame into the encoder's NV12 input surface. Uses
-/// `vaDeriveImage` for a zero-copy view when the driver supports
-/// it; falls back to `vaCreateImage` + `vaPutImage` otherwise.
-fn upload_bgra_to_nv12(
-    surface: &Surface<()>,
-    cfg: &EncoderCfg,
-    bgra: &[u8],
-    bgra_stride: usize,
-) -> Result<()> {
-    let w = cfg.width;
-    let h = cfg.height;
-    // Pad height up to MB boundary; the extra rows will be black.
-    let padded_h = cfg.padded_height();
-
-    // Try derive first.
-    let mut image = match Image::derive_from(surface, (w, padded_h)) {
-        Ok(img) => img,
-        Err(_e) => {
-            // Driver doesn't allow derive on this format. Allocate
-            // an NV12 image and pay the put-image cost on drop.
-            let format = VAImageFormat {
-                fourcc: VA_FOURCC_NV12,
-                byte_order: VA_LSB_FIRST,
-                bits_per_pixel: 12,
-                ..Default::default()
-            };
-            Image::create_from(surface, format, (w, padded_h), (w, padded_h))
-                .map_err(|e| FerricastError::Encoder(format!("vaCreateImage(NV12): {e}")))?
-        }
-    };
-
-    // Lay out the NV12 planes inside the mapped buffer using the
-    // image's plane offsets and strides.
-    let im = image.image();
-    let y_off = im.offsets[0] as usize;
-    let uv_off = im.offsets[1] as usize;
-    let y_stride = im.pitches[0] as usize;
-    let uv_stride = im.pitches[1] as usize;
-
-    let buf = image.as_mut(); // marks dirty so vaPutImage runs on drop
-    let len = buf.len();
-    if y_off + y_stride * (padded_h as usize) > len
-        || uv_off + uv_stride * ((padded_h / 2) as usize) > len
-    {
-        return Err(FerricastError::Encoder(
-            "VA-API NV12 image buffer smaller than expected planes".into(),
-        ));
-    }
-    // Split-borrow to write Y and UV planes.
-    let (y_plane, uv_plane) = if y_off < uv_off {
-        let (lo, hi) = buf.split_at_mut(uv_off);
-        (&mut lo[y_off..], hi)
-    } else {
-        let (lo, hi) = buf.split_at_mut(y_off);
-        (hi, &mut lo[uv_off..])
-    };
-
-    yuv::bgra_to_nv12(
-        bgra,
-        bgra_stride.max((w * 4) as usize),
-        w,
-        h,
-        yuv::Nv12Planes {
-            y: &mut *y_plane,
-            y_stride,
-            uv: &mut *uv_plane,
-            uv_stride,
-        },
-    );
-
-    // Zero out any padding rows so they don't leak previous frame's
-    // data into reference frames at the bottom edge.
-    if padded_h > h {
-        for row in h..padded_h {
-            let off = (row as usize) * y_stride;
-            for b in &mut y_plane[off..off + w as usize] {
-                *b = 16;
-            }
-        }
-        for row in (h / 2)..(padded_h / 2) {
-            let off = (row as usize) * uv_stride;
-            for b in &mut uv_plane[off..off + w as usize] {
-                *b = 128;
-            }
-        }
-    }
-
-    Ok(())
-    // Image drops here: if !derived && dirty, vaPutImage writes
-    // back to the surface; vaUnmapBuffer + vaDestroyImage either
-    // way.
 }
 
 /// The actual encode call. Bumps frame state, builds parameter

@@ -1,8 +1,11 @@
 use bytes::Bytes;
-use ferricast_core::{Codec, EncodedFrame, FerricastError, H264Profile, PixelFormat, VideoEncoder};
+use ferricast_core::{
+    Codec, EncodedFrame, FerricastError, H264Profile, PixelFormat, Result, VideoEncoder,
+};
 use x264::{Colorspace, Encoder, Image, Plane, Preset, Setup, Tune};
 use yuv::{YuvChromaSubsampling, YuvPlanarImageMut, bgra_to_yuv420, rgba_to_yuv420};
 
+use crate::frame_view::FrameView;
 use crate::h264::utils::extract_sps_pps;
 
 const X264_PRESET_VAR: &str = "FERRICAST_X264_PRESET";
@@ -14,10 +17,7 @@ pub struct X264Encoder {
     pub frame_count: i64,
     pub fps: u32,
     pub sps_pps: Vec<u8>,
-    /// Reused BGRA→YUV scratch. Allocated on first encode (and on
-    /// dimension change), then borrowed mutably each frame so the
-    /// hot path doesn't pay ~1.5×W×H bytes of alloc/free per frame.
-    planar: Option<YuvPlanarImageMut<'static, u8>>,
+    planar: Option<I420Scratch>,
 }
 
 // SAFETY: x264::Encoder wraps a `*mut x264_t` from libx264. The
@@ -122,118 +122,36 @@ impl VideoEncoder for X264Encoder {
     ) -> ferricast_core::Result<ferricast_core::EncodedFrame> {
         let timestamp_us = frame.timestamp_us();
         let frame = frame.into_cpu()?;
-        let encoder = self
-            .encoder
-            .as_mut()
-            .expect("Ferricast(X264) bug: use of an encoder that has not been configured");
+        let encoder = self.encoder.as_mut().ok_or_else(|| {
+            FerricastError::Encoder("x264: encode called before configure()".into())
+        })?;
+        // x264 asserts (panics) on a size mismatch, so validate first.
+        let view = FrameView::new(&frame, encoder.width() as u32, encoder.height() as u32)?;
+        let planar = self
+            .planar
+            .get_or_insert_with(|| I420Scratch::new(view.width(), view.height()));
+        planar.fill_from(&view)?;
+        let planar = &planar.0;
 
-        let needs_alloc = match &self.planar {
-            Some(p) => p.width != frame.width || p.height != frame.height,
-            None => true,
-        };
-        if needs_alloc {
-            self.planar = Some(YuvPlanarImageMut::<u8>::alloc(
-                frame.width,
-                frame.height,
-                YuvChromaSubsampling::Yuv420,
-            ));
-        }
-        let planar = self.planar.as_mut().expect("just allocated above");
-
-        match frame.format {
-            PixelFormat::Bgra => {
-                bgra_to_yuv420(
-                    planar,
-                    &frame.data,
-                    frame.width * 4,
-                    yuv::YuvRange::Limited,
-                    yuv::YuvStandardMatrix::Bt601,
-                    yuv::YuvConversionMode::Balanced,
-                )
-                .map_err(|_| {
-                    FerricastError::Encoding("Cannot convert BGRA to YUV 4:2:0".to_string())
-                })?;
-            }
-            PixelFormat::Rgba => {
-                rgba_to_yuv420(
-                    planar,
-                    &frame.data,
-                    frame.width * 4,
-                    yuv::YuvRange::Limited,
-                    yuv::YuvStandardMatrix::Bt601,
-                    yuv::YuvConversionMode::Balanced,
-                )
-                .map_err(|_| {
-                    FerricastError::Encoding("Cannot convert RGBA to YUV 4:2:0".to_string())
-                })?;
-            }
-            PixelFormat::Nv12 => {
-                // NV12: Y plane (W×H) then interleaved UV (U0V0 U1V1…, W×H/2 bytes).
-                // Deinterleave into the I420 scratch: Y as-is, UV split into U and V planes.
-                let y_size = (frame.width * frame.height) as usize;
-                planar
-                    .y_plane
-                    .borrow_mut()
-                    .copy_from_slice(&frame.data[..y_size]);
-                let uv = &frame.data[y_size..];
-                let u_dst = planar.u_plane.borrow_mut();
-                let v_dst = planar.v_plane.borrow_mut();
-                for (i, chunk) in uv.chunks_exact(2).enumerate() {
-                    u_dst[i] = chunk[0];
-                    v_dst[i] = chunk[1];
-                }
-            }
-            PixelFormat::I420 => {}
-        };
-
-        let image = match frame.format {
-            PixelFormat::I420 => {
-                let y_size = (frame.width * frame.height) as usize;
-                let uv_size = ((frame.width / 2) * (frame.height / 2)) as usize;
-
-                let (y, tmp) = frame.data.split_at(y_size);
-                let (u, v) = tmp.split_at(uv_size);
-
-                Image::new(
-                    Colorspace::I420,
-                    frame.width as i32,
-                    frame.height as i32,
-                    &[
-                        Plane {
-                            stride: frame.width as i32,
-                            data: y,
-                        },
-                        Plane {
-                            stride: (frame.width / 2) as i32,
-                            data: u,
-                        },
-                        Plane {
-                            stride: (frame.width / 2) as i32,
-                            data: v,
-                        },
-                    ],
-                )
-            }
-            _ => Image::new(
-                Colorspace::I420,
-                frame.width as i32,
-                frame.height as i32,
-                &[
-                    Plane {
-                        stride: planar.y_stride as i32,
-                        data: planar.y_plane.borrow(),
-                    },
-                    Plane {
-                        stride: planar.u_stride as i32,
-                        data: planar.u_plane.borrow(),
-                    },
-                    Plane {
-                        stride: planar.v_stride as i32,
-                        data: planar.v_plane.borrow(),
-                    },
-                ],
-            ),
-        };
+        let image = Image::new(
+            Colorspace::I420,
+            view.width() as i32,
+            view.height() as i32,
+            &[
+                Plane {
+                    stride: planar.y_stride as i32,
+                    data: planar.y_plane.borrow(),
+                },
+                Plane {
+                    stride: planar.u_stride as i32,
+                    data: planar.u_plane.borrow(),
+                },
+                Plane {
+                    stride: planar.v_stride as i32,
+                    data: planar.v_plane.borrow(),
+                },
+            ],
+        );
 
         // x264 only requires monotonic PTS for ordering; the rate
         // model is driven by the `fps` we configured in `Setup::fps`.
@@ -291,6 +209,104 @@ impl VideoEncoder for X264Encoder {
     }
 }
 
+/// Reused I420 staging buffer. Allocated on the first encode after a
+/// `configure()` (which sizes it), then borrowed mutably each frame so
+/// the hot path doesn't pay ~1.5×W×H bytes of alloc/free per frame.
+struct I420Scratch(YuvPlanarImageMut<'static, u8>);
+
+impl I420Scratch {
+    fn new(width: u32, height: u32) -> Self {
+        Self(YuvPlanarImageMut::alloc(
+            width,
+            height,
+            YuvChromaSubsampling::Yuv420,
+        ))
+    }
+
+    /// Convert / copy `src` into the scratch planes, walking `src` with
+    /// its own stride (see [`FrameView`] for the planar layouts).
+    fn fill_from(&mut self, src: &FrameView<'_>) -> Result<()> {
+        let dst = &mut self.0;
+        let stride = u32::try_from(src.stride())
+            .map_err(|_| FerricastError::Encoder("x264: stride exceeds u32".into()))?;
+        match src.format() {
+            PixelFormat::Bgra => bgra_to_yuv420(
+                dst,
+                src.data(),
+                stride,
+                yuv::YuvRange::Limited,
+                yuv::YuvStandardMatrix::Bt601,
+                yuv::YuvConversionMode::Balanced,
+            )
+            .map_err(|e| FerricastError::Encoding(format!("x264: BGRA → I420: {e}"))),
+            PixelFormat::Rgba => rgba_to_yuv420(
+                dst,
+                src.data(),
+                stride,
+                yuv::YuvRange::Limited,
+                yuv::YuvStandardMatrix::Bt601,
+                yuv::YuvConversionMode::Balanced,
+            )
+            .map_err(|e| FerricastError::Encoding(format!("x264: RGBA → I420: {e}"))),
+            PixelFormat::Nv12 => {
+                let (w, cw) = (src.width() as usize, src.width().div_ceil(2) as usize);
+                copy_rows(
+                    dst.y_plane.borrow_mut(),
+                    dst.y_stride as usize,
+                    src.data(),
+                    src.stride(),
+                    w,
+                );
+                let (u_stride, v_stride) = (dst.u_stride as usize, dst.v_stride as usize);
+                let uv = &src.data()[src.chroma_offset()..];
+                let u_rows = dst.u_plane.borrow_mut().chunks_mut(u_stride);
+                let v_rows = dst.v_plane.borrow_mut().chunks_mut(v_stride);
+                for ((u, v), line) in u_rows.zip(v_rows).zip(uv.chunks(src.chroma_stride())) {
+                    for (i, pair) in line[..cw * 2].chunks_exact(2).enumerate() {
+                        u[i] = pair[0];
+                        v[i] = pair[1];
+                    }
+                }
+                Ok(())
+            }
+            PixelFormat::I420 => {
+                let (w, cw) = (src.width() as usize, src.width().div_ceil(2) as usize);
+                let data = src.data();
+                copy_rows(
+                    dst.y_plane.borrow_mut(),
+                    dst.y_stride as usize,
+                    data,
+                    src.stride(),
+                    w,
+                );
+                copy_rows(
+                    dst.u_plane.borrow_mut(),
+                    dst.u_stride as usize,
+                    &data[src.chroma_offset()..],
+                    src.chroma_stride(),
+                    cw,
+                );
+                copy_rows(
+                    dst.v_plane.borrow_mut(),
+                    dst.v_stride as usize,
+                    &data[src.v_offset()..],
+                    src.chroma_stride(),
+                    cw,
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Copy `width` bytes of every row from `src` (rows `src_stride`
+/// apart) into `dst` (rows `dst_stride` apart), for as many rows as
+/// both buffers hold.
+fn copy_rows(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, width: usize) {
+    for (d, s) in dst.chunks_mut(dst_stride).zip(src.chunks(src_stride)) {
+        d[..width].copy_from_slice(&s[..width]);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
