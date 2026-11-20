@@ -357,8 +357,8 @@ pub async fn run_from_frames(
             "empty H.264 parameter sets; refusing to start segmenter".into(),
         ));
     }
-    let target = Duration::from_secs_f32(config.segment_target_secs);
-    let frame_period_us = (1_000_000_f64 / (config.target_fps.max(1) as f64)) as u64;
+    let frame_period_us = (1_000_000_f64 / f64::from(config.target_fps.max(1))) as u64;
+    let cut = SegmentCut::new(config.segment_target_secs, frame_period_us);
     // LL-HLS: when `part_target_secs` is set, we publish partial
     // segments ("parts") into the ring as they're ready, instead of
     // waiting for the segment to close. This keeps clients fed at
@@ -452,7 +452,6 @@ pub async fn run_from_frames(
             },
         };
 
-        let started = Instant::now();
         let mut frames_in_segment: u64 = 0;
         let first_wall_ts = first.timestamp_us;
         // Latch the global wall-time origin on the very first video
@@ -468,9 +467,14 @@ pub async fn run_from_frames(
             );
         }
         let origin = video_wall_anchor.unwrap_or(first_wall_ts);
-        let video_pts_us = first_wall_ts.saturating_sub(origin);
-        push_frame(&mut muxer, &first, video_pts_us)?;
+        let segment_start_pts_us = first_wall_ts.saturating_sub(origin);
+        let mut last_video_pts_us = segment_start_pts_us;
+        push_frame(&mut muxer, &first, segment_start_pts_us)?;
         frames_in_segment += 1;
+        // Media duration of the segment, measured on the PTS timeline.
+        // Set when the next segment's keyframe closes this one;
+        // otherwise (sender hung up) derived from the last frame.
+        let mut closing_span_us: Option<u64> = None;
 
         // LL-HLS state for this segment.
         // `local_parts` collects each part's bytes locally so we can
@@ -509,12 +513,14 @@ pub async fn run_from_frames(
                     break;
                 }
                 SegEvent::Video(Some(encoded)) => {
-                    if encoded.is_keyframe && started.elapsed() >= target {
+                    let video_pts_us = encoded.timestamp_us.saturating_sub(origin);
+                    let span_us = video_pts_us.saturating_sub(segment_start_pts_us);
+                    if encoded.is_keyframe && cut.accepts(span_us) {
+                        closing_span_us = Some(span_us);
                         pending = Some(encoded);
                         break;
                     }
-                    let wall_ts = encoded.timestamp_us;
-                    let video_pts_us = wall_ts.saturating_sub(origin);
+                    last_video_pts_us = video_pts_us;
                     push_frame(&mut muxer, &encoded, video_pts_us)?;
                     frames_in_segment += 1;
                     video_pushed_window = video_pushed_window.saturating_add(1);
@@ -604,19 +610,21 @@ pub async fn run_from_frames(
             }
         }
 
-        let elapsed = started.elapsed();
+        // EXTINF is the PTS span the segment covers: from its first
+        // frame to the keyframe opening the next segment (or one frame
+        // past the last frame when the stream ends). Dequeue-time wall
+        // clock would add channel/encoder jitter on top.
+        let span_us = closing_span_us.unwrap_or_else(|| {
+            last_video_pts_us
+                .saturating_sub(segment_start_pts_us)
+                .saturating_add(frame_period_us)
+        });
+        let elapsed = Duration::from_micros(span_us);
 
-        // Diagnostic: report the per-segment measured wall cadence
-        // against the configured frame period. Big delta → encoder
-        // / capture is slower than `target_fps`. Doesn't drive PTS
-        // anymore (video PTS is wall-anchored), so the warn is
-        // informational only — the receiver stays in A/V sync
-        // regardless.
-        let measured_period_us = if frames_in_segment > 0 {
-            (elapsed.as_micros() as u64).saturating_div(frames_in_segment)
-        } else {
-            0
-        };
+        // Diagnostic: report the per-segment measured cadence against
+        // the configured frame period. Big delta → encoder / capture
+        // is slower than `target_fps`. Informational only.
+        let measured_period_us = span_us.checked_div(frames_in_segment).unwrap_or(0);
         if frames_in_segment >= 30 && measured_period_us > frame_period_us.saturating_mul(3) {
             warn!(
                 measured_us = measured_period_us,
@@ -799,3 +807,130 @@ fn push_audio_frame(
 /// silent-injection lag threshold, so a real frame that survives
 /// this filter is still in the window the muxer will accept.
 const MAX_AUDIO_STALENESS_US: u64 = 300_000;
+
+/// Decides when a keyframe may close the current segment, using the
+/// frames' PTS span rather than wall time spent dequeuing them.
+///
+/// Forced IDRs land on a fixed wall-clock grid but are attached to
+/// whichever frame arrives first after each grid point, so the span
+/// between consecutive IDRs jitters by up to one frame period around
+/// the target. Requiring `span >= target` would reject roughly half
+/// of them and produce alternating 2 s / 4 s segments; accepting
+/// anything within one frame period of the target keeps every
+/// segment at ≈ target.
+#[derive(Debug, Clone, Copy)]
+struct SegmentCut {
+    min_span_us: u64,
+}
+
+impl SegmentCut {
+    fn new(segment_target_secs: f32, frame_period_us: u64) -> Self {
+        let target_us = if segment_target_secs.is_finite() && segment_target_secs > 0.0 {
+            // Saturating float→int cast; the target is a few seconds.
+            (f64::from(segment_target_secs) * 1_000_000.0) as u64
+        } else {
+            0
+        };
+        Self {
+            min_span_us: target_us.saturating_sub(frame_period_us),
+        }
+    }
+
+    /// Whether a keyframe whose PTS sits `span_us` after the
+    /// segment's first frame should start a new segment.
+    fn accepts(self, span_us: u64) -> bool {
+        span_us >= self.min_span_us
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyframe_just_under_target_closes_segment() {
+        // 30 fps, 2 s target: forced IDRs jitter by up to one frame.
+        let cut = SegmentCut::new(2.0, 33_333);
+        assert!(cut.accepts(2_000_000));
+        assert!(cut.accepts(1_990_000));
+        assert!(cut.accepts(1_966_667));
+        assert!(!cut.accepts(1_900_000));
+        assert!(!cut.accepts(1_000_000));
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use ferricast_core::Codec;
+
+    const PARAMS: [u8; 16] = [
+        0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1F, 0, 0, 0, 1, 0x68, 0xCE, 0x06, 0xE2,
+    ];
+
+    pub(super) fn frame(ts_us: u64, keyframe: bool) -> EncodedFrame {
+        let mut data = vec![0, 0, 0, 1, if keyframe { 0x65 } else { 0x41 }];
+        data.extend_from_slice(&[0xAA; 64]);
+        EncodedFrame {
+            codec: Codec::H264,
+            data: Bytes::from(data),
+            timestamp_us: ts_us,
+            is_keyframe: keyframe,
+            duration_us: None,
+            pts_dts: (0, 0),
+        }
+    }
+
+    /// Feed `frames` through `run_from_frames` and return the ring.
+    pub(super) async fn segment(frames: Vec<EncodedFrame>, config: HlsConfig) -> SegmentRing {
+        let ring = Arc::new(RwLock::new(SegmentRing::new(64, config.target_duration())));
+        let (tx, rx) = mpsc::channel(frames.len().max(1));
+        for f in frames {
+            tx.send(f).await.unwrap();
+        }
+        drop(tx);
+        run_from_frames(rx, None, PARAMS.to_vec(), ring.clone(), config)
+            .await
+            .unwrap();
+        Arc::try_unwrap(ring).ok().unwrap().into_inner()
+    }
+
+    #[tokio::test]
+    async fn forced_keyframes_with_jitter_give_uniform_segments() {
+        // 30 fps capture; the encoder forces an IDR on the first frame
+        // at or after each 2 s wall-clock grid point, with a phase that
+        // drifts so consecutive IDR spans fall both below and above 2 s.
+        let period = 33_333u64;
+        let base = 1_700_000_000_000_000u64;
+        let mut frames = Vec::new();
+        let mut next_grid = 0u64;
+        for i in 0..(30 * 21) {
+            // Small per-frame jitter (±3 ms) on top of the cadence.
+            let jitter = (i % 7) * 1_000;
+            let t = i * period + jitter;
+            let key = t >= next_grid;
+            if key {
+                next_grid += 2_000_000;
+            }
+            frames.push(frame(base + t, key));
+        }
+        let config = HlsConfig {
+            segment_target_secs: 2.0,
+            playlist_target_duration: 4,
+            target_fps: 30,
+            ..HlsConfig::default()
+        };
+        let ring = segment(frames, config).await;
+        let playlist = ring.build_playlist().unwrap();
+        let durations: Vec<f32> = playlist
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .map(|l| l.trim_end_matches(',').parse().unwrap())
+            .collect();
+        assert!(durations.len() >= 9, "{playlist}");
+        // Every closed segment (all but the trailing one) is ~2 s.
+        for d in &durations[..durations.len() - 1] {
+            assert!((d - 2.0).abs() < 0.05, "segment {d} s in:\n{playlist}");
+        }
+    }
+}
