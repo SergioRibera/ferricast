@@ -1,12 +1,21 @@
 use ferricast_core::{
     CapturedFrame, Codec, DecoderConfig, EncodedFrame, PixelFormat, Result, VideoDecoder,
 };
+use ferricast_decoder::h264::OpenH264Decoder;
 #[cfg(feature = "vaapi")]
 use ferricast_decoder::h264::VaapiH264Decoder;
-use ferricast_decoder::{Av1Decoder, H264Decoder, H265Decoder, Vp8Decoder, Vp9Decoder};
+use ferricast_decoder::{Av1Decoder, H265Decoder, Vp8Decoder, Vp9Decoder};
+
+/// Same switch the decoder crate's H.264 facade reads; VA-API decode is
+/// not yet verified across drivers, so it only runs when asked for.
+#[cfg(feature = "vaapi")]
+const H264_BACKEND_VAR: &str = "FERRICAST_H264_DECODE_BACKEND";
 
 pub(crate) enum Decoder {
-    H264(H264Decoder),
+    /// openh264 directly rather than the H.264 facade: the facade would
+    /// pick VA-API again when the environment asks for it, and this is
+    /// the variant the player falls back to after VA-API failed.
+    H264(OpenH264Decoder),
     H265(H265Decoder),
     Vp8(Box<Vp8Decoder>),
     Vp9(Box<Vp9Decoder>),
@@ -24,7 +33,7 @@ impl Decoder {
             pixel_format: PixelFormat::Nv12,
             low_latency: false,
         };
-        if !software_only && !software_requested(codec) {
+        if !software_only {
             match hardware(codec, &config) {
                 Some(Ok(decoder)) => {
                     tracing::info!(%codec, width, height, "decoding on the GPU through VA-API");
@@ -83,33 +92,22 @@ impl Decoder {
     }
 }
 
+#[cfg(feature = "vaapi")]
 fn hardware(codec: Codec, config: &DecoderConfig) -> Option<Result<Decoder>> {
-    match codec {
-        #[cfg(feature = "vaapi")]
-        Codec::H264 => Some(
-            VaapiH264Decoder::probe_with(config).and_then(|mut decoder| {
-                decoder.configure(config)?;
-                Ok(Decoder::VaapiH264(Box::new(decoder)))
-            }),
-        ),
-        _ => {
-            let _ = config;
-            None
-        }
+    if codec != Codec::H264 || std::env::var(H264_BACKEND_VAR).as_deref() != Ok("vaapi") {
+        return None;
     }
+    Some(
+        VaapiH264Decoder::probe_with(config).and_then(|mut decoder| {
+            decoder.configure(config)?;
+            Ok(Decoder::VaapiH264(Box::new(decoder)))
+        }),
+    )
 }
 
-fn software_requested(codec: Codec) -> bool {
-    let variable = match codec {
-        Codec::H264 => "FERRICAST_H264_DECODE_BACKEND",
-        Codec::H265 => "FERRICAST_H265_DECODE_BACKEND",
-        Codec::Vp9 => "FERRICAST_VP9_DECODE_BACKEND",
-        Codec::Vp8 | Codec::Av1 => return true,
-    };
-    matches!(
-        std::env::var(variable).as_deref(),
-        Ok("software" | "openh264")
-    )
+#[cfg(not(feature = "vaapi"))]
+fn hardware(_codec: Codec, _config: &DecoderConfig) -> Option<Result<Decoder>> {
+    None
 }
 
 fn configured<D: VideoDecoder + Default>(config: &DecoderConfig) -> Result<D> {
