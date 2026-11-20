@@ -8,7 +8,6 @@ use ferricast::prelude::*;
 use freya::{prelude::*, radio::*};
 use tokio::sync::mpsc;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
-use uuid::Uuid;
 
 use crate::app::ReceiverWindowReq;
 use crate::daemon::{PickerRequest, SharedManager};
@@ -17,6 +16,7 @@ mod app;
 mod cli;
 mod client;
 mod daemon;
+mod pairing;
 mod picker;
 mod receiver_window;
 
@@ -262,6 +262,8 @@ fn run_window(
 ) {
     let radio_station = RadioStation::create_global(AppState::default());
     let mut radio_events = radio_station.clone();
+    // Pump → window listener: pairing prompts and receiver lifecycle.
+    let (ui_cmd_tx, ui_cmd_rx) = mpsc::channel::<UiCommand>(16);
 
     let mut window_config = WindowConfig::new_app(FerricastApp {
         stream_manager,
@@ -272,6 +274,7 @@ fn run_window(
         // listener; subsequent renders see `None` and skip.
         picker_req_rx: Rc::new(RefCell::new(Some(picker_rx))),
         receiver_req_rx: Rc::new(RefCell::new(Some(receiver_window_rx))),
+        ui_cmd_rx: Rc::new(RefCell::new(Some(ui_cmd_rx))),
     })
     .with_title("Ferricast")
     .with_size(800., 600.);
@@ -304,75 +307,60 @@ fn run_window(
                         .await;
                 };
                 let pump = async {
-                    loop {
-                        match ui_rx.recv().await {
-                            Some(ManagerEvent::DeviceFound(device)) => {
-                                radio_events
-                                    .write_channel(AppChannel::Devices)
-                                    .devices
-                                    .entry(device.id)
-                                    .insert_entry(device);
-                            }
-                            Some(ManagerEvent::DeviceLost(id)) => {
-                                radio_events
-                                    .write_channel(AppChannel::Devices)
-                                    .devices
-                                    .remove(&id);
-                                radio_events
-                                    .write_channel(AppChannel::Streaming)
-                                    .streaming
-                                    .retain(|&s| s != id);
-                            }
-                            Some(ManagerEvent::StreamStarted { device_id, .. }) => {
-                                let mut state = radio_events.write_channel(AppChannel::Streaming);
-                                if !state.streaming.contains(&device_id) {
-                                    state.streaming.push(device_id);
-                                }
-                            }
-                            Some(ManagerEvent::StreamStopped { device_id, .. }) => {
-                                radio_events
-                                    .write_channel(AppChannel::Streaming)
-                                    .streaming
-                                    .retain(|&s| s != device_id);
-                            }
-                            Some(ManagerEvent::ReceiverIncoming {
-                                protocol, remote, ..
-                            }) => {
+                    while let Some(event) = ui_rx.recv().await {
+                        let command = match &event {
+                            ManagerEvent::PairingRequired {
+                                device_id,
+                                challenge,
+                                respond,
+                            } => radio_events
+                                .write_channel(AppChannel::Notices)
+                                .pairing_prompt(*device_id, challenge, respond),
+                            ManagerEvent::ReceiverIncoming {
+                                receiver_id,
+                                protocol,
+                                remote,
+                            } => {
                                 tracing::info!(
                                     protocol,
                                     sender = %remote.addr,
                                     "receiver: sender connected — waiting for LOAD"
                                 );
+                                Some(UiCommand::ReceiverSession {
+                                    receiver_id: *receiver_id,
+                                    remote_id: remote.id,
+                                })
                             }
-                            Some(ManagerEvent::ReceiverStarted { remote, info, .. }) => {
-                                // Window has already been requested
-                                // from `sink_factory`; this event is
-                                // diagnostic only.
+                            ManagerEvent::ReceiverStarted { remote, info, .. } => {
+                                // The window was already requested by
+                                // the sink factory.
                                 tracing::info!(
                                     sender = %remote.addr,
                                     audio = info.audio.is_some(),
                                     video = info.video.is_some(),
                                     "receiver: LOAD acknowledged, pipeline running"
                                 );
+                                None
                             }
-                            Some(ManagerEvent::ReceiverStateChanged { receiver_id, state }) => {
+                            ManagerEvent::ReceiverStateChanged { receiver_id, state } => {
                                 tracing::debug!(?receiver_id, ?state, "receiver state");
+                                None
                             }
-                            Some(ManagerEvent::ReceiverStopped { receiver_id })
-                            | Some(ManagerEvent::ReceiverError { receiver_id, .. }) => {
-                                // TODO follow-up: close the
-                                // associated receiver window here.
-                                // Tracking the WindowId requires the
-                                // app listener to bubble it back
-                                // (`launch_window` returns the id
-                                // on the freya local thread only) —
-                                // small wire-up out of scope this
-                                // turn. User closes the window
-                                // manually in the meantime.
-                                let _ = receiver_id;
+                            ManagerEvent::ReceiverStopped { receiver_id }
+                            | ManagerEvent::ReceiverError { receiver_id, .. } => {
+                                Some(UiCommand::ReceiverEnded {
+                                    receiver_id: *receiver_id,
+                                })
                             }
-                            None => break,
-                            _ => {}
+                            _ => None,
+                        };
+                        radio_events
+                            .write_channel(AppChannel::Devices)
+                            .apply(&event);
+                        if let Some(command) = command
+                            && ui_cmd_tx.send(command).await.is_err()
+                        {
+                            tracing::warn!("window listener gone; dropping UI command");
                         }
                     }
                 };

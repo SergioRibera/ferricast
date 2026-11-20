@@ -109,7 +109,12 @@ pub fn open_picker_for_dto(platform: Platform, reply_tx: oneshot::Sender<Option<
 /// confirms. Convenience wrapper used by the main app's share
 /// buttons. The daemon path uses [`open_picker_for_dto`] directly
 /// because it does the start_stream work itself.
-pub fn open_picker(platform: Platform, stream_manager: SharedManager, device_id: Uuid) {
+pub fn open_picker(
+    platform: Platform,
+    stream_manager: SharedManager,
+    device_id: Uuid,
+    on_error: impl FnOnce(String) + 'static,
+) {
     let (tx, rx) = oneshot::channel::<Option<SourceDto>>();
     open_picker_for_dto(platform, tx);
     spawn(async move {
@@ -117,6 +122,14 @@ pub fn open_picker(platform: Platform, stream_manager: SharedManager, device_id:
             && let Err(e) = start_stream_with_dto(stream_manager, device_id, dto).await
         {
             tracing::error!(%e, ?device_id, "start_stream");
+            // Failures after the start was accepted arrive as
+            // StreamError events; only rejections need a notice here.
+            if matches!(
+                e,
+                FerricastError::SessionAlreadyActive(_) | FerricastError::DeviceNotFound(_)
+            ) {
+                on_error(format!("Could not start: {e}"));
+            }
         }
     });
 }
