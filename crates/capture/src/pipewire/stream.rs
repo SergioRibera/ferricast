@@ -20,8 +20,10 @@
 //! manually. Tiled / compressed modifiers need GPU-import and are
 //! dropped with a warning until that path is wired up.
 
+use std::cell::RefCell;
 use std::os::fd::{BorrowedFd, RawFd};
 use std::ptr;
+use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -79,6 +81,10 @@ struct UserData {
     /// dropped). Used together with `frame_period` to decide
     /// whether to skip the next arriving buffer.
     last_processed_at: Option<Instant>,
+    /// `true` while buffers sit unprocessed in the stream queue
+    /// because they arrived inside the throttle window; the throttle
+    /// timer processes the newest once the window closes.
+    deferred: bool,
     /// `Some` when Vulkan came up successfully and we can import
     /// the dmabuf modifiers we advertised. The PW worker thread
     /// invokes `importer.readback(...)` directly inside
@@ -87,6 +93,18 @@ struct UserData {
     /// previous frame. `None` collapses the dmabuf path to a warning
     /// + drop and we rely on the SHM fallback.
     importer: Option<Arc<VulkanImporter>>,
+}
+
+impl UserData {
+    /// Whether a buffer arriving at `now` falls inside the throttle
+    /// window opened by the last processed frame.
+    fn is_throttled(&self, now: Instant) -> bool {
+        is_within_period(self.last_processed_at, now, self.frame_period)
+    }
+}
+
+fn is_within_period(last: Option<Instant>, now: Instant, period: Duration) -> bool {
+    last.is_some_and(|prev| now.saturating_duration_since(prev) < period)
 }
 
 pub(super) struct WorkerHandle {
@@ -168,16 +186,19 @@ fn run(
         .connect(None)
         .map_err(|e| FerricastError::Capture(format!("Context::connect: {e}")))?;
 
-    let stream = Stream::new(
-        &core,
-        "ferricast-capture",
-        properties! {
-            *pw::keys::MEDIA_TYPE => "Video",
-            *pw::keys::MEDIA_CATEGORY => "Capture",
-            *pw::keys::MEDIA_ROLE => "Screen",
-        },
-    )
-    .map_err(|e| FerricastError::Capture(format!("Stream::new: {e}")))?;
+    // `Rc`: the throttle timer below needs the stream too.
+    let stream = Rc::new(
+        Stream::new(
+            &core,
+            "ferricast-capture",
+            properties! {
+                *pw::keys::MEDIA_TYPE => "Video",
+                *pw::keys::MEDIA_CATEGORY => "Capture",
+                *pw::keys::MEDIA_ROLE => "Screen",
+            },
+        )
+        .map_err(|e| FerricastError::Capture(format!("Stream::new: {e}")))?,
+    );
 
     let enum_params = EnumFormatParams {
         default_width: portal.size_hint.map(|(w, _)| w).unwrap_or(1920),
@@ -219,7 +240,9 @@ fn run(
         None => Vec::new(),
     };
 
-    let user_data = UserData {
+    // Shared between the stream listener and the throttle timer; both
+    // run on this thread's PipeWire loop, never re-entrantly.
+    let user_data = Rc::new(RefCell::new(UserData {
         video_info: VideoInfoRaw::default(),
         negotiated: None,
         shared: Arc::clone(&shared),
@@ -232,11 +255,13 @@ fn run(
         // being dropped by a hair.
         frame_period: Duration::from_secs_f64(0.95 / (config.fps.max(1) as f64)),
         last_processed_at: None,
+        deferred: false,
         importer,
-    };
+    }));
+    let frame_period = user_data.borrow().frame_period;
 
     let _listener = stream
-        .add_local_listener_with_user_data(user_data)
+        .add_local_listener_with_user_data(Rc::clone(&user_data))
         .state_changed({
             let mainloop = mainloop.clone();
             let error_tx = error_tx.clone();
@@ -250,16 +275,38 @@ fn run(
             }
         })
         .param_changed(|stream, ud, id, param| {
-            handle_param_changed(stream, ud, id, param);
+            handle_param_changed(stream, &mut ud.borrow_mut(), id, param);
         })
         .process({
             let frame_tx = frame_tx.clone();
             move |stream, ud| {
-                handle_process(stream, ud, &frame_tx);
+                handle_process(stream, &mut ud.borrow_mut(), &frame_tx);
             }
         })
         .register()
         .map_err(|e| FerricastError::Capture(format!("listener register: {e}")))?;
+
+    // Flushes buffers that `handle_process` left queued while
+    // throttled, once the frame period has expired. Without it the
+    // last buffer of a burst would wait for the *next* damage event —
+    // on damage-driven compositors that can be never, leaving the
+    // receiver on a stale frame.
+    let throttle_timer = mainloop.loop_().add_timer({
+        let stream = Rc::clone(&stream);
+        let user_data = Rc::clone(&user_data);
+        let frame_tx = frame_tx.clone();
+        move |_| {
+            let mut ud = user_data.borrow_mut();
+            if ud.deferred && !ud.is_throttled(Instant::now()) {
+                handle_process(&stream, &mut ud, &frame_tx);
+            }
+        }
+    });
+    let tick = (frame_period / 4).max(Duration::from_millis(2));
+    throttle_timer
+        .update_timer(Some(tick), Some(tick))
+        .into_result()
+        .map_err(|e| FerricastError::Capture(format!("arm throttle timer: {e}")))?;
 
     let pod_storage = format::initial_enum_format_list(&enum_params, &gpu_formats);
     info!(
@@ -410,26 +457,25 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
 
     // Throttle to `ud.frame_period`. The Wayland compositor emits
     // a buffer per refresh (60 Hz typical) regardless of what
-    // framerate the consumer wants. Doing the full Vulkan import
-    // + blit + ~8 MB readback on every one of those buffers when
-    // the encoder only consumes at 30 fps is pure CPU/PCIe waste
-    // (≈ 240 MB/s of memcpy + GPU work we throw away). When the
-    // arrival is too soon after the last processed frame, drain
-    // and discard everything — quick path, no GPU work, no
-    // memcpy. PW reuses the buffer slot on the next round.
+    // framerate the consumer wants; copying / importing every one
+    // when the encoder only consumes at 30 fps is pure waste. When
+    // the arrival is too soon after the last processed frame, leave
+    // the buffers queued in the stream and let the throttle timer
+    // (see `run`) process the newest one once the period expires —
+    // dropping them here would lose the final frame of a burst on
+    // damage-driven compositors. Holding them for at most one
+    // period also back-pressures the compositor, which skips
+    // renders while it has no free buffer instead of rendering
+    // frames we'd discard.
     let now = Instant::now();
-    if let Some(prev) = ud.last_processed_at {
-        if now.duration_since(prev) < ud.frame_period {
-            let mut dropped = 0;
-            while stream.dequeue_buffer().is_some() {
-                dropped += 1;
-            }
-            if dropped > 0 {
-                trace!(dropped, "throttle: discarded buffer(s) before Vulkan path");
-            }
-            return;
+    if ud.is_throttled(now) {
+        if !ud.deferred {
+            trace!("throttle: deferring buffer(s) to the period timer");
         }
+        ud.deferred = true;
+        return;
     }
+    ud.deferred = false;
 
     // Drain stale buffers and keep only the newest.
     let mut drained = 0;
@@ -786,7 +832,23 @@ fn now_us() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlaneLayout, StreamState, fatal_state_transition};
+    use super::{PlaneLayout, StreamState, fatal_state_transition, is_within_period};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn throttle_window() {
+        let period = Duration::from_millis(30);
+        let t0 = Instant::now();
+        assert!(!is_within_period(None, t0, period));
+        assert!(is_within_period(
+            Some(t0),
+            t0 + Duration::from_millis(29),
+            period
+        ));
+        assert!(!is_within_period(Some(t0), t0 + period, period));
+        // A clock that appears to go backwards must not panic.
+        assert!(is_within_period(Some(t0 + period), t0, period));
+    }
 
     #[test]
     fn unconnected_after_connect_and_errors_are_fatal() {
