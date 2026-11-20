@@ -35,6 +35,7 @@ use tracing::{debug, info, trace, warn};
 
 use super::headers::{self, ConformanceWindow, StreamParams};
 use crate::frame_view::FrameView;
+use crate::gop::GopState;
 
 const RENDER_NODES: &[&str] = &[
     "/dev/dri/renderD128",
@@ -122,21 +123,24 @@ impl EncoderCfg {
     }
 }
 
-#[derive(Default)]
 struct FrameState {
+    gop: GopState,
+    /// Pictures encoded so far; reported as DTS.
     frame_idx: u32,
-    /// HEVC POC counts in frames (not 2× like H.264 with
-    /// pic_order_cnt_type 0 / interlaced semantics).
-    poc: i32,
+    /// Round-robin index into `recon` for the next picture.
     next_recon: usize,
-    prev_recon: Option<usize>,
-    prev_poc: i32,
-    pending_keyframe: bool,
+    /// `(recon index, POC)` of the reference for the next P picture.
+    prev_ref: Option<(usize, i32)>,
 }
 
 impl FrameState {
-    fn frame_idx_at_last_idr(&self, gop: u32) -> u32 {
-        (self.frame_idx / gop) * gop
+    fn new(keyframe_interval: u32) -> Self {
+        Self {
+            gop: GopState::new(keyframe_interval),
+            frame_idx: 0,
+            next_recon: 0,
+            prev_ref: None,
+        }
     }
 }
 
@@ -276,7 +280,7 @@ impl VaapiH265Encoder {
             vps_nal,
             sps_nal,
             pps_nal,
-            state: RefCell::new(FrameState::default()),
+            state: RefCell::new(FrameState::new(cfg.keyframe_interval)),
         })
     }
 }
@@ -381,6 +385,35 @@ impl VideoEncoder for VaapiH265Encoder {
     }
 
     fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
+        let result = self.encode_frame(frame);
+        if result.is_err() {
+            // Never predict from a picture the driver may not have
+            // finished; restart the GOP.
+            self.state.borrow_mut().gop.request_idr();
+        }
+        result
+    }
+
+    fn flush(self) -> Result<Vec<EncodedFrame>> {
+        Ok(Vec::new())
+    }
+
+    fn request_keyframe(&mut self) {
+        self.state.borrow_mut().gop.request_idr();
+    }
+
+    fn get_headers(&mut self) -> Result<Vec<u8>> {
+        let mut out =
+            Vec::with_capacity(self.vps_nal.len() + self.sps_nal.len() + self.pps_nal.len());
+        out.extend_from_slice(&self.vps_nal);
+        out.extend_from_slice(&self.sps_nal);
+        out.extend_from_slice(&self.pps_nal);
+        Ok(out)
+    }
+}
+
+impl VaapiH265Encoder {
+    fn encode_frame(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
         let target_recon_idx = self.state.borrow().next_recon;
         let target_surface = &self.recon[target_recon_idx];
 
@@ -407,52 +440,29 @@ impl VideoEncoder for VaapiH265Encoder {
             timestamp_us,
             duration_us: Some(1_000_000 / self.cfg.fps as u64),
             is_keyframe,
-            pts_dts: (poc as u64, frame_idx as u64),
+            pts_dts: (poc.unsigned_abs().into(), frame_idx.into()),
         })
-    }
-
-    fn flush(self) -> Result<Vec<EncodedFrame>> {
-        Ok(Vec::new())
-    }
-
-    fn request_keyframe(&mut self) {
-        self.state.borrow_mut().pending_keyframe = true;
-    }
-
-    fn get_headers(&mut self) -> Result<Vec<u8>> {
-        let mut out =
-            Vec::with_capacity(self.vps_nal.len() + self.sps_nal.len() + self.pps_nal.len());
-        out.extend_from_slice(&self.vps_nal);
-        out.extend_from_slice(&self.sps_nal);
-        out.extend_from_slice(&self.pps_nal);
-        Ok(out)
     }
 }
 
 fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>, bool, u32, i32)> {
     let cfg = &enc.cfg;
-    let is_idr = state.frame_idx.is_multiple_of(cfg.keyframe_interval)
-        || std::mem::take(&mut state.pending_keyframe);
-    let poc = if is_idr {
-        0
-    } else {
-        // POC counts frames since last IDR.
-        (state.frame_idx - state.frame_idx_at_last_idr(cfg.keyframe_interval)) as i32
-    };
-
+    // State only advances after the driver returned the picture (see
+    // `GopState`); POC counts pictures since the last emitted IDR.
+    let plan = state.gop.plan();
+    let is_idr = plan.is_idr;
+    let poc = i32::try_from(plan.position).unwrap_or(i32::MAX);
     let cur_recon_idx = state.next_recon;
-    let prev_recon_idx = state.prev_recon;
-    state.next_recon = (cur_recon_idx + 1) % enc.recon.len();
 
     let curr_pic = PictureHEVC::new(enc.recon[cur_recon_idx].id(), poc, 0);
-    let prev_ref: Option<PictureHEVC> = if !is_idr {
-        prev_recon_idx.map(|prev_idx| {
+    let prev_ref: Option<PictureHEVC> = if is_idr {
+        None
+    } else {
+        state.prev_ref.map(|(prev_idx, prev_poc)| {
             // VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE (0x10) marks the
             // single short-term-before reference our IPPP slot uses.
-            PictureHEVC::new(enc.recon[prev_idx].id(), state.prev_poc, 0x10)
+            PictureHEVC::new(enc.recon[prev_idx].id(), prev_poc, 0x10)
         })
-    } else {
-        None
     };
 
     let reference_frames: [PictureHEVC; 15] = std::array::from_fn(|i| {
@@ -576,9 +586,9 @@ fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>
 
     let frame_idx_now = state.frame_idx;
     state.frame_idx += 1;
-    state.prev_recon = Some(cur_recon_idx);
-    state.prev_poc = poc;
-    state.poc = poc;
+    state.gop.commit(plan);
+    state.next_recon = (cur_recon_idx + 1) % enc.recon.len();
+    state.prev_ref = Some((cur_recon_idx, poc));
 
     Ok((bitstream, is_idr, frame_idx_now, poc))
 }

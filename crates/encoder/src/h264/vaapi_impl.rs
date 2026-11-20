@@ -43,6 +43,7 @@ use tracing::{debug, info, trace, warn};
 use super::headers::{self, FrameCrop, PpsParams, SpsParams, VuiParams, profile};
 use super::yuv;
 use crate::frame_view::FrameView;
+use crate::gop::GopState;
 
 const RENDER_NODES: &[&str] = &[
     "/dev/dri/renderD128",
@@ -80,6 +81,11 @@ const RECON_POOL: usize = 2;
 /// 1.5 × width × height bytes; we round up to a comfortable 8 MB
 /// because the driver pads its allocation anyway.
 const CODED_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+
+/// `MaxFrameNum = 2^8` and `MaxPicOrderCntLsb = 2^8`, written into
+/// both the packed SPS and the VA sequence parameters.
+const LOG2_MAX_FRAME_NUM: u32 = 8;
+const LOG2_MAX_POC_LSB: u32 = 8;
 
 pub struct VaapiH264Encoder {
     display: Rc<Display>,
@@ -149,28 +155,36 @@ struct EncoderCfg {
     level_idc: u8,
 }
 
-#[derive(Default)]
 struct FrameState {
+    gop: GopState,
+    /// Pictures encoded so far; reported as DTS.
     frame_idx: u32,
-    /// Picture-order-count (×2 per frame, mod `MaxPicOrderCntLsb`).
-    poc: u32,
     /// Toggles 0..1 every IDR. Sent in the slice header.
     idr_pic_id: u16,
-    /// Round-robin index into `recon`.
+    /// Round-robin index into `recon` for the next picture.
     next_recon: usize,
-    /// Previous reconstruction surface index, or `None` on the very
-    /// first frame.
-    prev_recon: Option<usize>,
-    /// Frame number of the previous reference (for P frame ref
-    /// list).
-    prev_frame_num: u32,
-    /// POC of the previous reference.
-    prev_poc: u32,
-    /// Set by [`VaapiH264Encoder::request_keyframe`]; OR-ed into the
-    /// natural interval-based IDR decision on the next encode so
-    /// the HLS segmenter can anchor segment boundaries to wall
-    /// clock without reconfiguring the encoder.
-    pending_keyframe: bool,
+    /// Reference for the next P picture; `None` before the first IDR.
+    prev_ref: Option<RefPic>,
+}
+
+/// The last successfully encoded (reference) picture.
+#[derive(Clone, Copy)]
+struct RefPic {
+    recon: usize,
+    frame_num: u32,
+    poc: u32,
+}
+
+impl FrameState {
+    fn new(keyframe_interval: u32) -> Self {
+        Self {
+            gop: GopState::new(keyframe_interval),
+            frame_idx: 0,
+            idr_pic_id: 0,
+            next_recon: 0,
+            prev_ref: None,
+        }
+    }
 }
 
 unsafe impl Send for VaapiH264Encoder {}
@@ -282,8 +296,8 @@ impl VaapiH264Encoder {
             seq_parameter_set_id: 0,
             pic_width_in_mbs_minus1: (cfg.width_mbs as u32) - 1,
             pic_height_in_map_units_minus1: (cfg.height_mbs as u32) - 1,
-            log2_max_frame_num_minus4: 4,
-            log2_max_pic_order_cnt_lsb_minus4: 4,
+            log2_max_frame_num_minus4: LOG2_MAX_FRAME_NUM - 4,
+            log2_max_pic_order_cnt_lsb_minus4: LOG2_MAX_POC_LSB - 4,
             max_num_ref_frames: 1,
             frame_cropping: if cfg.height_crop > 0 {
                 Some(FrameCrop {
@@ -325,6 +339,7 @@ impl VaapiH264Encoder {
             }
         };
 
+        let state = RefCell::new(FrameState::new(cfg.keyframe_interval));
         Ok(Self {
             display,
             config: cfg_handle,
@@ -335,7 +350,7 @@ impl VaapiH264Encoder {
             cfg,
             sps_nal,
             pps_nal,
-            state: RefCell::new(FrameState::default()),
+            state,
         })
     }
 }
@@ -464,6 +479,41 @@ impl VideoEncoder for VaapiH264Encoder {
     }
 
     fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
+        let result = self.encode_frame(frame);
+        if result.is_err() {
+            // The driver may have half-written the target surface or
+            // dropped a picture the receiver will never see; restart
+            // prediction from a fresh IDR rather than reference it.
+            self.state.borrow_mut().gop.request_idr();
+        }
+        result
+    }
+
+    fn flush(self) -> Result<Vec<EncodedFrame>> {
+        // No B-frame queue, no buffered frames — every `encode()`
+        // already produced its output.
+        Ok(Vec::new())
+    }
+
+    fn request_keyframe(&mut self) {
+        self.state.borrow_mut().gop.request_idr();
+    }
+
+    fn get_headers(&mut self) -> Result<Vec<u8>> {
+        // SPS + PPS, AnnexB-prefixed, ready to live at the start of
+        // every HLS segment. The bitstream we hand out from
+        // `encode()` does NOT include these (we emit them via
+        // packed headers and the driver writes them into the coded
+        // buffer for IDR frames; non-IDR frames don't carry them).
+        let mut out = Vec::with_capacity(self.sps_nal.len() + self.pps_nal.len());
+        out.extend_from_slice(&self.sps_nal);
+        out.extend_from_slice(&self.pps_nal);
+        Ok(out)
+    }
+}
+
+impl VaapiH264Encoder {
+    fn encode_frame(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
         // The VA-API encoder reads from the surface passed to
         // `vaBeginPicture`, which must be one of the context's render
         // targets (the recon pool). Upload the frame data directly
@@ -495,30 +545,8 @@ impl VideoEncoder for VaapiH264Encoder {
             timestamp_us,
             duration_us: Some(1_000_000 / self.cfg.fps as u64),
             is_keyframe,
-            pts_dts: (poc as u64, frame_idx as u64),
+            pts_dts: (u64::from(poc), u64::from(frame_idx)),
         })
-    }
-
-    fn flush(self) -> Result<Vec<EncodedFrame>> {
-        // No B-frame queue, no buffered frames — every `encode()`
-        // already produced its output.
-        Ok(Vec::new())
-    }
-
-    fn request_keyframe(&mut self) {
-        self.state.borrow_mut().pending_keyframe = true;
-    }
-
-    fn get_headers(&mut self) -> Result<Vec<u8>> {
-        // SPS + PPS, AnnexB-prefixed, ready to live at the start of
-        // every HLS segment. The bitstream we hand out from
-        // `encode()` does NOT include these (we emit them via
-        // packed headers and the driver writes them into the coded
-        // buffer for IDR frames; non-IDR frames don't carry them).
-        let mut out = Vec::with_capacity(self.sps_nal.len() + self.pps_nal.len());
-        out.extend_from_slice(&self.sps_nal);
-        out.extend_from_slice(&self.pps_nal);
-        Ok(out)
     }
 }
 
@@ -526,43 +554,36 @@ impl VideoEncoder for VaapiH264Encoder {
 /// buffers, submits, syncs, extracts the coded bitstream.
 fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>, bool, u32, u32)> {
     let cfg = &enc.cfg;
-    let is_idr = state.frame_idx.is_multiple_of(cfg.keyframe_interval)
-        || std::mem::take(&mut state.pending_keyframe);
-    let frame_num = if is_idr {
-        0
-    } else {
-        // frame_num counts reference frames since last IDR (mod
-        // 2^(log2_max_frame_num_minus4+4) = 2^8 = 256).
-        ((state.frame_idx - state.frame_idx_at_last_idr(cfg.keyframe_interval)) & 0xff) as u16
-    };
-    let poc = if is_idr { 0 } else { state.poc };
+    // Nothing in `state` changes until the driver returned the coded
+    // picture (see `GopState`), so a failure leaves the reference
+    // surface, frame_num and any pending IDR request untouched.
+    let plan = state.gop.plan();
+    let frame_num = plan.frame_num(LOG2_MAX_FRAME_NUM);
+    // pic_order_cnt_type 0: two POC units per frame; the slice header
+    // carries the LSBs modulo MaxPicOrderCntLsb.
+    let poc = plan.position * 2;
+    let poc_lsb = (poc & ((1 << LOG2_MAX_POC_LSB) - 1)) as u16;
+    let is_idr = plan.is_idr;
 
-    // Pick this frame's recon surface and remember the previous
-    // one as the P-frame reference.
+    // This picture's recon surface is the one the frame was uploaded
+    // into; the previous one serves as the P-frame reference.
     let cur_recon_idx = state.next_recon;
-    let prev_recon_idx = state.prev_recon;
-    state.next_recon = (cur_recon_idx + 1) % enc.recon.len();
 
-    let curr_pic = picture_h264(
-        enc.recon[cur_recon_idx].id(),
-        frame_num as u32,
-        0,
-        poc as i32,
-    );
+    let curr_pic = picture_h264(enc.recon[cur_recon_idx].id(), frame_num, 0, poc as i32);
     // The "previous reference" slot used by P frames. `None` for
     // IDR — built once and cloned into both the picture-param
     // ReferenceFrames[16] and the slice-param ref_pic_list_0[32].
-    let prev_ref: Option<PictureH264> = if !is_idr {
-        prev_recon_idx.map(|prev_idx| {
+    let prev_ref: Option<PictureH264> = if is_idr {
+        None
+    } else {
+        state.prev_ref.map(|r| {
             picture_h264(
-                enc.recon[prev_idx].id(),
-                state.prev_frame_num,
+                enc.recon[r.recon].id(),
+                r.frame_num,
                 VA_PICTURE_H264_SHORT_TERM_REFERENCE,
-                state.prev_poc as i32,
+                r.poc as i32,
             )
         })
-    } else {
-        None
     };
     let reference_frames: [PictureH264; 16] = std::array::from_fn(|i| {
         if i == 0 {
@@ -622,7 +643,8 @@ fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         reference_frames,
         coded.id(),
         is_idr,
-        frame_num,
+        // Masked to MaxFrameNum = 256, so it always fits.
+        frame_num as u16,
     );
     // Rebuild the per-slice ref list from `prev_ref` rather than
     // cloning the picture-param array (those `PictureH264` values
@@ -651,7 +673,7 @@ fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         packed_buffer_ids.push(pd);
     }
 
-    let slice = build_slice_param(cfg, is_idr, state.idr_pic_id, poc as u16, prev_ref.as_ref());
+    let slice = build_slice_param(cfg, is_idr, state.idr_pic_id, poc_lsb, prev_ref.as_ref());
     buffers.push(
         enc.context
             .create_buffer(cros_libva::BufferType::EncSliceParameter(
@@ -713,13 +735,16 @@ fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>
     // Destroy the packed-header buffers we allocated by hand.
     destroy_packed(&enc.display, &packed_buffer_ids);
 
-    // Update state for the next frame.
+    // The picture is in the bitstream: commit the state for the next one.
     let frame_idx_now = state.frame_idx;
     state.frame_idx += 1;
-    state.poc = if is_idr { 2 } else { state.poc + 2 };
-    state.prev_recon = Some(cur_recon_idx);
-    state.prev_frame_num = frame_num as u32;
-    state.prev_poc = poc;
+    state.gop.commit(plan);
+    state.next_recon = (cur_recon_idx + 1) % enc.recon.len();
+    state.prev_ref = Some(RefPic {
+        recon: cur_recon_idx,
+        frame_num,
+        poc,
+    });
     if is_idr {
         state.idr_pic_id ^= 1;
     }
@@ -727,20 +752,16 @@ fn run_encode(enc: &VaapiH264Encoder, state: &mut FrameState) -> Result<(Vec<u8>
     Ok((bitstream, is_idr, frame_idx_now, poc))
 }
 
-/// Helper kept inline so `state` updates and `frame_num` math live
-/// next to each other.
-impl FrameState {
-    fn frame_idx_at_last_idr(&self, gop: u32) -> u32 {
-        (self.frame_idx / gop) * gop
-    }
-}
-
 fn build_seq_param(cfg: &EncoderCfg) -> EncSequenceParameterBufferH264 {
     let seq_fields = H264EncSeqFields::new(
-        /* chroma_format_idc */ 1, /* frame_mbs_only_flag */ 1,
-        /* mb_adaptive_frame_field_flag */ 0, /* seq_scaling_matrix_present_flag */ 0,
-        /* direct_8x8_inference_flag */ 1, /* log2_max_frame_num_minus4 */ 4,
-        /* pic_order_cnt_type */ 0, /* log2_max_pic_order_cnt_lsb_minus4 */ 4,
+        /* chroma_format_idc */ 1,
+        /* frame_mbs_only_flag */ 1,
+        /* mb_adaptive_frame_field_flag */ 0,
+        /* seq_scaling_matrix_present_flag */ 0,
+        /* direct_8x8_inference_flag */ 1,
+        /* log2_max_frame_num_minus4 */ LOG2_MAX_FRAME_NUM - 4,
+        /* pic_order_cnt_type */ 0,
+        /* log2_max_pic_order_cnt_lsb_minus4 */ LOG2_MAX_POC_LSB - 4,
         /* delta_pic_order_always_zero_flag */ 0,
     );
 
