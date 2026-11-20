@@ -114,6 +114,18 @@ const AUDIO_PTS_TOLERANCE_90K: u64 = 4;
 
 /// Distance (in 90 kHz ticks) by which PCR is biased *behind* PTS so
 /// that `PCR <= first_PTS_in_packet` holds even with rounding. ~2 ms.
+///
+/// Known deviation, kept on purpose: the T-STD model (ISO/IEC 13818-1
+/// §2.4.2) wants PCR far enough ahead of each access unit's DTS to
+/// cover its transfer through the decoder buffer — typically hundreds
+/// of milliseconds, not 2 ms. Strict analysers therefore flag these
+/// segments as buffer-underflowing. Every receiver we target (all
+/// Chromecast generations, VLC, hls.js, ffmpeg) plays them fine
+/// because HLS clients re-time from PTS anyway, and this value sits on
+/// the Chromecast A/V sync path that took a long time to get right:
+/// moving PCR changes the receiver's STC lock and therefore start-up
+/// latency and audio alignment. Do not change it without re-validating
+/// playback on real Chromecast hardware.
 const PCR_PTS_OFFSET: u64 = 200;
 
 /// Bit field giving the H.264 codec parameter sets (SPS + PPS,
