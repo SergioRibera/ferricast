@@ -169,8 +169,15 @@ where
     let stats = &state.stats;
     let peer_ip = peer.ip();
     let peer = peer.to_string();
-    let (read_half, mut write_half) = tokio::io::split(io);
+    let (read_half, write_half) = tokio::io::split(io);
     let mut reader = BufReader::new(read_half);
+    // A peer that stops reading (powered-off receiver) must not pin
+    // this task until the kernel gives up on the socket.
+    let write_timeout = {
+        let target = u64::from(ring.read().await.target_duration());
+        Duration::from_secs(target.saturating_mul(2)).max(MIN_WRITE_STALL_TIMEOUT)
+    };
+    let mut write_half = StallTimeout::new(write_half, write_timeout);
 
     loop {
         let request = match timeout(KEEPALIVE_IDLE_TIMEOUT, read_request(&mut reader)).await {
@@ -1303,5 +1310,120 @@ mod allowlist_tests {
                 .await
                 .starts_with("HTTP/1.1 200")
         );
+    }
+}
+
+/// Lower bound for the write stall timeout (normally two target
+/// durations).
+const MIN_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// `AsyncWrite` adapter that fails with `TimedOut` when the inner
+/// writer makes no progress for `limit`. The timer runs only while a
+/// write/flush/shutdown is pending and restarts on every bit of
+/// progress, so slow-but-moving transfers are unaffected; only a peer
+/// that stopped reading entirely trips it.
+struct StallTimeout<W> {
+    inner: W,
+    limit: Duration,
+    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+    armed: bool,
+}
+
+impl<W> StallTimeout<W> {
+    fn new(inner: W, limit: Duration) -> Self {
+        Self {
+            inner,
+            limit,
+            deadline: Box::pin(tokio::time::sleep(limit)),
+            armed: false,
+        }
+    }
+
+    /// Map a poll of the inner writer through the stall timer.
+    fn guard<T>(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        poll: std::task::Poll<std::io::Result<T>>,
+    ) -> std::task::Poll<std::io::Result<T>> {
+        use std::future::Future as _;
+        use std::task::Poll;
+        match poll {
+            Poll::Ready(result) => {
+                self.armed = false;
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                if !self.armed {
+                    self.armed = true;
+                    let at = tokio::time::Instant::now() + self.limit;
+                    self.deadline.as_mut().reset(at);
+                }
+                match self.deadline.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "HLS client stopped reading",
+                    ))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for StallTimeout<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.guard(cx, poll)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_flush(cx);
+        self.guard(cx, poll)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.guard(cx, poll)
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_that_never_drains_times_out() {
+        // A 1 KiB pipe nobody reads from: the second write stalls.
+        let (_reader, writer) = tokio::io::duplex(1024);
+        let mut w = StallTimeout::new(writer, Duration::from_secs(8));
+        let started = tokio::time::Instant::now();
+        let err = w.write_all(&[0u8; 4096]).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), Duration::from_secs(8));
+    }
+
+    #[tokio::test]
+    async fn draining_writer_completes() {
+        let (mut reader, writer) = tokio::io::duplex(1024);
+        let drain = tokio::spawn(async move {
+            let mut sink = Vec::new();
+            reader.read_to_end(&mut sink).await.unwrap();
+            sink.len()
+        });
+        let mut w = StallTimeout::new(writer, Duration::from_secs(1));
+        w.write_all(&[0u8; 64 * 1024]).await.unwrap();
+        w.shutdown().await.unwrap();
+        drop(w);
+        assert_eq!(drain.await.unwrap(), 64 * 1024);
     }
 }

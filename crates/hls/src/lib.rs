@@ -356,6 +356,17 @@ const MAX_CONNECTIONS: usize = 64;
 /// in a tight loop would spin a core.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+/// A client that opens a TCP connection but never completes the TLS
+/// handshake is dropped after this long.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// TCP keepalive: first probe after this much idle time…
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+/// …then one probe every interval…
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// …and the connection is dropped after this many unanswered probes.
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
 /// The connections one server accepts: TLS wrapping, the concurrency
 /// cap, and the handler tasks (aborted together on shutdown).
 struct Connections {
@@ -440,14 +451,29 @@ async fn serve_connection(
     state: Arc<http::ServerState>,
 ) {
     let _ = socket.set_nodelay(true);
+    // Detect a peer that vanished without closing (receiver powered
+    // off) within ~25 s instead of the kernel's 2 h default.
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+    if let Err(e) = socket2::SockRef::from(&socket).set_tcp_keepalive(&keepalive) {
+        trace!(%peer, error = %e, "could not enable TCP keepalive");
+    }
     let result = match tls {
-        Some(acceptor) => match acceptor.accept(socket).await {
-            Ok(tls_stream) => http::handle(peer, tls_stream, state).await,
-            Err(e) => {
-                trace!(%peer, error = %e, "TLS handshake failed");
-                return;
+        Some(acceptor) => {
+            match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await {
+                Ok(Ok(tls_stream)) => http::handle(peer, tls_stream, state).await,
+                Ok(Err(e)) => {
+                    trace!(%peer, error = %e, "TLS handshake failed");
+                    return;
+                }
+                Err(_) => {
+                    trace!(%peer, "TLS handshake timed out");
+                    return;
+                }
             }
-        },
+        }
         None => http::handle(peer, socket, state).await,
     };
     if let Err(e) = result {
