@@ -43,13 +43,13 @@ use shiguredo_nvcodec::{HevcEncoderConfig, HevcProfile as NvHevcProfile};
 use tracing::{debug, info};
 
 #[cfg(feature = "nvenc-zero-copy")]
+use ferricast_core::DmaBufId;
+#[cfg(feature = "nvenc-zero-copy")]
 use ferricast_core::GpuFrame;
 #[cfg(feature = "nvenc-zero-copy")]
 use shiguredo_nvcodec::RegisteredResource;
 #[cfg(feature = "nvenc-zero-copy")]
 use std::collections::HashMap;
-#[cfg(feature = "nvenc-zero-copy")]
-use ferricast_core::DmaBufId;
 #[cfg(feature = "nvenc-zero-copy")]
 use tracing::warn;
 
