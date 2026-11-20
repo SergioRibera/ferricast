@@ -81,13 +81,17 @@ impl MatroskaDemuxer {
                 .framing
                 .annex_b(&self.frame.data, sync || self.at_start)?;
             self.at_start = false;
-            let pts = self.frame.timestamp * self.scale_ns / 1000;
+            let pts = scaled_micros(self.frame.timestamp, self.scale_ns)?;
             return Ok(Some(EncodedFrame {
                 codec: self.stream.codec,
                 data,
                 timestamp_us: pts,
                 is_keyframe: sync || idr,
-                duration_us: self.frame.duration.map(|d| d * self.scale_ns / 1000),
+                duration_us: self
+                    .frame
+                    .duration
+                    .map(|d| scaled_micros(d, self.scale_ns))
+                    .transpose()?,
                 pts_dts: (pts, pts),
             }));
         }
@@ -102,6 +106,17 @@ impl MatroskaDemuxer {
 
 pub(crate) fn is_matroska(head: &[u8]) -> bool {
     head.starts_with(&EBML_MAGIC)
+}
+
+/// Converts `ticks` of `scale_ns` nanoseconds to microseconds; both come from
+/// the file, so the product is computed wide and an unrepresentable result
+/// is a demux error rather than a silent wrap.
+fn scaled_micros(ticks: u64, scale_ns: u64) -> Result<u64> {
+    u64::try_from(u128::from(ticks) * u128::from(scale_ns) / 1000).map_err(|_| {
+        FerricastError::Demux(format!(
+            "timestamp {ticks} at {scale_ns} ns per tick does not fit in microseconds"
+        ))
+    })
 }
 
 fn demux(error: matroska_demuxer::DemuxError) -> FerricastError {
@@ -160,5 +175,16 @@ mod tests {
             0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86, 0x81
         ]));
         assert!(!is_matroska(&[0, 0, 0, 0x20, b'f', b't', b'y', b'p']));
+    }
+
+    #[test]
+    fn timestamps_scale_without_overflowing() {
+        assert_eq!(scaled_micros(40, 1_000_000).unwrap(), 40_000);
+        assert_eq!(
+            scaled_micros(u64::MAX, 1_000).unwrap(),
+            u64::MAX,
+            "a product past u64 is still exact"
+        );
+        assert!(scaled_micros(u64::MAX, u64::MAX).is_err());
     }
 }
