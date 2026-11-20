@@ -2037,7 +2037,10 @@ dependencies = [
  "bytes",
  "ferricast-core",
  "matroska-demuxer",
+ "reqwest",
  "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

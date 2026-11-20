@@ -12,6 +12,8 @@ mod nal;
 
 #[cfg(feature = "matroska")]
 mod matroska;
+#[cfg(feature = "http")]
+mod puller;
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -21,6 +23,8 @@ use ferricast_core::{AudioFrame, Codec, EncodedFrame, FerricastError, Result};
 
 pub use audio::AudioStream;
 pub use mp4::Mp4Demuxer;
+#[cfg(feature = "http")]
+pub use puller::ProgressivePuller;
 
 #[cfg(feature = "matroska")]
 pub use matroska::MatroskaDemuxer;
