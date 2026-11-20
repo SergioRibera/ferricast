@@ -649,3 +649,71 @@ async fn second_sender_is_served_and_its_load_interrupts_the_first() {
     assert_eq!(counts, (2, 1));
     rx.manager.stop_receivers().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_stream_plays_paced_from_near_the_live_edge() {
+    let Some((_dir, server)) = support::live_server(None).await else {
+        return;
+    };
+    let mut rx = Receiver::start().await;
+    let mut sender = Sender::connect(rx.port, "sender-live").await;
+    sender.launch().await;
+    let reply = sender
+        .load(&server.url("/live.m3u8"), "application/x-mpegurl")
+        .await;
+    assert_eq!(reply["status"][0]["playerState"], "PLAYING", "{reply}");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let log = std::mem::take(&mut *rx.log.lock().unwrap());
+    let frames = &log.video;
+    assert!(frames.len() > 60, "only {} frames", frames.len());
+    assert!(
+        frames.windows(2).all(|w| w[0].1 < w[1].1),
+        "PTS not increasing"
+    );
+    let pts_span = Duration::from_micros(frames[frames.len() - 1].1 - frames[0].1);
+    let wall_span = frames[frames.len() - 1].0 - frames[0].0;
+    let drift = wall_span.as_secs_f64() - pts_span.as_secs_f64();
+    eprintln!(
+        "E2E live: {} frames in {:.3}s wall for {:.3}s of PTS (drift {drift:+.3}s), {} audio chunks",
+        frames.len(),
+        wall_span.as_secs_f64(),
+        pts_span.as_secs_f64(),
+        log.audio.len()
+    );
+    assert!(drift.abs() < 0.25, "live paced {drift:+.3}s off real time");
+    assert!(!log.audio.is_empty());
+    rx.manager.stop_receivers().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn taken_port_is_reported_once_without_spinning() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let squatter = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = squatter.local_addr().unwrap().port();
+    let (mut manager, mut events) = StreamManager::builder()
+        .with_receiver(TestReceiver(ChromecastReceiver::with_port("e2e", port)))
+        .set_sink_factory(|_remote, _info| async {
+            Err::<Box<dyn FrameSink>, _>(ferricast::FerricastError::Other("unused".into()))
+        })
+        .build_with_events();
+    manager.start_receivers().await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("no event for the taken port")
+        .unwrap();
+    match first {
+        ManagerEvent::ReceiverError { message, .. } => {
+            eprintln!("E2E taken port: {message}");
+            assert!(message.contains("bind"), "{message}");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    // Nothing else follows: no retry loop flooding errors.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), events.recv())
+            .await
+            .is_err()
+    );
+    manager.stop_receivers().await.unwrap();
+}

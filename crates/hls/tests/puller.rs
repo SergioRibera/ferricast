@@ -5,12 +5,12 @@
 mod support;
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferricast_core::{AudioCodec, Codec, MediaPacket, MediaPuller, PullSpec};
 use ferricast_hls::HlsPuller;
-use support::{Reply, TestServer};
+use support::{Reply, TestServer, live_server};
 
 fn spec(url: String) -> PullSpec {
     PullSpec {
@@ -236,58 +236,6 @@ async fn seek_discards_queued_packets_and_restarts_the_timeline() {
         min.abs_diff(first_pts + 4_000_000) < 50_000,
         "{min} vs {first_pts}"
     );
-}
-
-/// A live source simulated from VOD segments: a sliding window of
-/// `WINDOW` segments that advances by one segment per `SEGMENT`
-/// wall-clock seconds. `restart_after` restarts the media sequence.
-struct LiveSim {
-    segments: Vec<(f32, String)>,
-    started: Instant,
-    restart_at: Option<Duration>,
-}
-
-const WINDOW: usize = 6;
-
-impl LiveSim {
-    fn playlist(&self) -> String {
-        let elapsed = self.started.elapsed();
-        let elapsed = match self.restart_at {
-            Some(at) if elapsed >= at => elapsed - at,
-            _ => elapsed,
-        };
-        let head = (elapsed.as_secs() as usize).min(self.segments.len() - WINDOW);
-        let mut text = format!(
-            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:{}\n",
-            head
-        );
-        for (d, name) in &self.segments[head..head + WINDOW] {
-            text.push_str(&format!("#EXTINF:{d:.3},\n{name}\n"));
-        }
-        text
-    }
-}
-
-async fn live_server(restart_at: Option<Duration>) -> Option<(tempfile::TempDir, TestServer)> {
-    let dir = tempfile::tempdir().unwrap();
-    if !support::generate_hls(dir.path(), 24, 1, &[]) {
-        return None;
-    }
-    let sim = Arc::new(Mutex::new(LiveSim {
-        segments: support::segments(dir.path()),
-        started: Instant::now(),
-        restart_at,
-    }));
-    let files = support::dir_handler(dir.path());
-    let server = TestServer::start(Arc::new(move |path: &str| {
-        if path == "/live.m3u8" {
-            Reply::Ok(sim.lock().unwrap().playlist().into_bytes())
-        } else {
-            files(path)
-        }
-    }))
-    .await;
-    Some((dir, server))
 }
 
 #[tokio::test]

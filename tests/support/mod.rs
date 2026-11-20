@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -215,4 +216,56 @@ pub fn segments(dir: &Path) -> Vec<(f32, String)> {
         }
     }
     out
+}
+
+/// A live source simulated from VOD segments: a sliding window of
+/// `WINDOW` segments that advances by one segment per wall-clock
+/// second. `restart_at` restarts the media sequence.
+pub struct LiveSim {
+    segments: Vec<(f32, String)>,
+    started: Instant,
+    restart_at: Option<Duration>,
+}
+
+pub const WINDOW: usize = 6;
+
+impl LiveSim {
+    pub fn playlist(&self) -> String {
+        let elapsed = self.started.elapsed();
+        let elapsed = match self.restart_at {
+            Some(at) if elapsed >= at => elapsed - at,
+            _ => elapsed,
+        };
+        let head = (elapsed.as_secs() as usize).min(self.segments.len() - WINDOW);
+        let mut text = format!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:{}\n",
+            head
+        );
+        for (d, name) in &self.segments[head..head + WINDOW] {
+            text.push_str(&format!("#EXTINF:{d:.3},\n{name}\n"));
+        }
+        text
+    }
+}
+
+pub async fn live_server(restart_at: Option<Duration>) -> Option<(tempfile::TempDir, TestServer)> {
+    let dir = tempfile::tempdir().unwrap();
+    if !generate_hls(dir.path(), 24, 1, &[]) {
+        return None;
+    }
+    let sim = Arc::new(Mutex::new(LiveSim {
+        segments: segments(dir.path()),
+        started: Instant::now(),
+        restart_at,
+    }));
+    let files = dir_handler(dir.path());
+    let server = TestServer::start(Arc::new(move |path: &str| {
+        if path == "/live.m3u8" {
+            Reply::Ok(sim.lock().unwrap().playlist().into_bytes())
+        } else {
+            files(path)
+        }
+    }))
+    .await;
+    Some((dir, server))
 }
