@@ -43,32 +43,27 @@ const STREAM_TYPE_AAC_ADTS: u8 = 0x0F;
 const PES_STREAM_ID_VIDEO: u8 = 0xE0;
 const PES_STREAM_ID_AUDIO: u8 = 0xC0;
 
-/// One AAC LC ADTS frame at 48 kHz / stereo / silence.
-///
-/// Older Chromecast Default Media Receiver firmwares (1st/2nd gen,
-/// `md=Chromecast` in mDNS) reject HLS streams that don't carry an
-/// audio track — the LOAD lands, the receiver builds a media
-/// session, then immediately responds with
-/// `LOAD_FAILED, idleReason=ERROR` because the demuxer expects two
-/// elementary streams. Other players (VLC, hls.js, ffmpeg) don't
-/// care and will play video-only HLS happily, which is why our
-/// stream tests fine elsewhere but fails on the cast device.
-///
-/// Inject one silent AAC frame per ~21 ms (1024 samples / 48 kHz)
-/// to satisfy the receiver. Total per-stream overhead: ~600 B/s.
-///
-/// Bytes are a hand-crafted silent AAC LC frame for stereo 48 kHz:
-/// * 7-byte ADTS header (no CRC, profile=LC, sfi=3 → 48k,
-///   channel_config=2, frame_length=13)
-/// * 6-byte raw_data_block carrying a CPE with zero scale factors
-///   and zero spectrum (= digital silence).
-const SILENT_AAC_FRAME: [u8; 13] = [
-    0xFF, 0xF1, 0x4C, 0x80, 0x01, 0xBF, 0xFC, 0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C,
-];
+// Silent AAC frames on the audio PID.
+//
+// Older Chromecast Default Media Receiver firmwares (1st/2nd gen,
+// `md=Chromecast` in mDNS) reject HLS streams that don't carry an
+// audio track — the LOAD lands, the receiver builds a media
+// session, then immediately responds with
+// `LOAD_FAILED, idleReason=ERROR` because the demuxer expects two
+// elementary streams. Other players (VLC, hls.js, ffmpeg) don't
+// care and will play video-only HLS happily, which is why our
+// stream tests fine elsewhere but fails on the cast device.
+//
+// Inject one silent AAC frame per AAC frame period (~21 ms at
+// 48 kHz) to satisfy the receiver. Total per-stream overhead:
+// ~600 B/s. The silent frame and its period come from
+// [`adts::AdtsFormat`]: AAC LC 48 kHz stereo until the first real
+// ADTS frame arrives, then that frame's profile, rate and channel
+// layout, so silence and real audio on the shared PID never
+// disagree about the stream format.
+mod adts;
 
-/// 1024 samples at 48 kHz = 1024/48000 s = 21.333 ms.
-/// In MPEG-TS 90 kHz ticks: 1024 × (90000 / 48000) = 1920.
-const AAC_FRAME_TICKS_90K: u64 = 1920;
+use adts::AdtsFormat;
 
 /// How far behind the current video PTS the audio elementary stream
 /// is allowed to drift before the muxer starts plugging the gap
@@ -178,6 +173,11 @@ pub struct MpegTs {
     /// occupies that slot). `None` until the first video frame
     /// initialises it.
     audio_pts_90k: Option<u64>,
+    /// Format of the real AAC stream, taken from the first ADTS header
+    /// pushed through [`Self::add_audio_frame`]. `None` until then;
+    /// silent frames and the watermark step use
+    /// [`AdtsFormat::default`] (48 kHz stereo LC) meanwhile.
+    audio_format: Option<AdtsFormat>,
     out: Vec<u8>,
 }
 
@@ -238,6 +238,12 @@ impl MpegTs {
         if payload.is_empty() {
             return Ok(());
         }
+        // Learn the real stream's format from its first ADTS header so
+        // later silent fills match it (and the watermark steps by the
+        // right frame period). Unparseable headers keep the default.
+        if self.audio_format.is_none() {
+            self.audio_format = AdtsFormat::parse(payload);
+        }
         // Drop real audio that's behind where the silent-fallback
         // has already filled, but tolerate `AUDIO_PTS_TOLERANCE_90K`
         // ticks of slack — the encoder's per-frame PTS jitters
@@ -286,10 +292,15 @@ impl MpegTs {
         // existing watermark guards against rollback when a real
         // frame was admitted via `AUDIO_PTS_TOLERANCE_90K` after
         // the silent-fill loop had already advanced past it.
-        let advanced = pts_90k.saturating_add(AAC_FRAME_TICKS_90K);
+        let advanced = pts_90k.saturating_add(self.aac_format().frame_ticks_90k());
         let prev = self.audio_pts_90k.unwrap_or(0);
         self.audio_pts_90k = Some(advanced.max(prev));
         Ok(())
+    }
+
+    /// Format used for silent fills and the audio watermark step.
+    fn aac_format(&self) -> AdtsFormat {
+        self.audio_format.unwrap_or_default()
     }
 
     /// True when the muxer is currently advertising an audio PID.
@@ -379,15 +390,16 @@ impl Muxer for MpegTs {
         // PTSes. `audio_pts_90k` is the shared watermark — both
         // `add_audio_frame` and this loop advance it, so the
         // two paths never collide.
-        let _ = pcr; // pcr binding kept alive for video write above
         if self.inject_silent_audio || self.has_external_audio {
             let lag_threshold = pts_90k.saturating_sub(SILENT_INJECT_LAG_90K);
             let start_apts = self.audio_pts_90k.unwrap_or(lag_threshold);
             if start_apts < lag_threshold {
+                let format = self.aac_format();
+                let silent_frame = format.silent_frame();
                 let mut apts = start_apts;
                 let mut frames_emitted = 0u32;
                 while apts < lag_threshold && frames_emitted < SILENT_INJECT_MAX_PER_FRAME {
-                    let aac_pes = build_audio_pes(&SILENT_AAC_FRAME, apts)?;
+                    let aac_pes = build_audio_pes(&silent_frame, apts)?;
                     write_pes_to_ts(
                         &mut self.out,
                         PID_AUDIO,
@@ -396,7 +408,7 @@ impl Muxer for MpegTs {
                         /* random_access_indicator */ false,
                         None,
                     );
-                    apts = apts.saturating_add(AAC_FRAME_TICKS_90K);
+                    apts = apts.saturating_add(format.frame_ticks_90k());
                     frames_emitted += 1;
                 }
                 if frames_emitted > 0 {
@@ -989,6 +1001,42 @@ mod tests {
         assert!(muxer.drain().is_empty());
         muxer.add_frame(&frame(Codec::H264), 0, 0).unwrap();
         assert!(!muxer.drain().is_empty());
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn silent_fill_follows_the_real_audio_format() {
+        let mono_44k = AdtsFormat::parse(&[0xFF, 0xF1, 0x50, 0x40, 0x01, 0x7F, 0xFC]).unwrap();
+        let mut muxer = MpegTs::default().with_external_audio(true);
+        muxer.config(vec![0, 0, 0, 1, 0x67]).unwrap();
+        muxer.add_audio_frame(&mono_44k.silent_frame(), 0).unwrap();
+        assert_eq!(muxer.audio_pts_90k, Some(2089));
+        muxer.drain();
+        // Video far enough ahead that the audio PID needs bridging.
+        muxer
+            .add_frame(&frame(Codec::H264), 90_000, 90_000)
+            .unwrap();
+        let out = muxer.drain();
+        assert!(contains(&out, &mono_44k.silent_frame()));
+        assert!(!contains(&out, &AdtsFormat::default().silent_frame()));
+        assert_eq!(muxer.audio_pts_90k, Some(2089 * 9));
+    }
+
+    #[test]
+    fn silent_only_mode_keeps_the_48k_stereo_frame() {
+        let mut muxer = MpegTs::default().with_silent_audio(true);
+        muxer.config(vec![0, 0, 0, 1, 0x67]).unwrap();
+        muxer.add_frame(&frame(Codec::H264), 0, 0).unwrap();
+        muxer
+            .add_frame(&frame(Codec::H264), 90_000, 90_000)
+            .unwrap();
+        assert!(contains(
+            &muxer.drain(),
+            &AdtsFormat::default().silent_frame()
+        ));
     }
 
     #[test]
