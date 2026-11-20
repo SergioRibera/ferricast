@@ -1,18 +1,20 @@
-//! Vulkan-backed DmaBuf importer.
+//! Vulkan-backed DmaBuf importer, shared by the capture backends.
 //!
 //! Why this module exists: PipeWire's screencast on Mutter / KWin
 //! prefers DmaBuf for performance, but the buffers come back with
 //! GPU-vendor-specific DRM format modifiers (tiled, compressed). We
 //! can't `mmap` those for CPU read — every byte we'd see would be
 //! garbage. The fix is to import the dmabuf into a `VkImage`, blit it
-//! to a linearly-laid-out staging buffer, and `mmap` *that*.
+//! to a linearly-laid-out staging buffer, and `mmap` *that*. The
+//! wayland-direct backend attaches the same importer to its
+//! `GpuFrame`s so CPU encoders can read them back.
 //!
 //! Public surface:
 //!
 //! * [`VulkanImporter::new`] — try to bring up Vulkan. Returns `Err`
 //!   on systems without a loader / driver / required extensions, in
-//!   which case [`super::stream`] falls back to SHM-only EnumFormat
-//!   advertising.
+//!   which case the capture backend falls back to CPU frames (the
+//!   PipeWire worker to SHM-only EnumFormat advertising).
 //! * [`VulkanImporter::supported_modifiers`] — the actual DRM
 //!   modifiers the GPU can produce/consume for a given pixel format.
 //!   Used to populate the EnumFormat pod's `VideoModifier` choice.

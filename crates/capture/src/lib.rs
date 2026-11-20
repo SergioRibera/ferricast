@@ -17,6 +17,8 @@ mod native;
 mod pipewire;
 #[cfg(feature = "pipewire")]
 mod pipewire_audio;
+#[cfg(feature = "vulkan")]
+mod vulkan;
 #[cfg(feature = "wayland-direct")]
 mod wayland_direct;
 #[cfg(feature = "wlroots")]

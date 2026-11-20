@@ -50,7 +50,7 @@ use pw::stream::{Stream, StreamFlags, StreamRef, StreamState};
 use super::format::{self, EnumFormatParams, GpuFormat, NegotiatedFormat};
 use super::lease::{BufferLeases, DequeuedBuffer, Release};
 use super::portal::PortalStream;
-use super::vulkan::VulkanImporter;
+use crate::vulkan::VulkanImporter;
 
 pub(super) type SharedFormat = Arc<RwLock<Option<NegotiatedFormat>>>;
 

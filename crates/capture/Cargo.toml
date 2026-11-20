@@ -10,7 +10,11 @@ description = "PipeWire and X11 screen capture for ferricast"
 # a Wayland-only desktop appliance) can opt out via
 # `default-features = false` + the backend they want.
 default = ["pipewire", "wlroots", "wayland-direct"]
-pipewire = ["dep:ashpd", "dep:pipewire", "dep:libspa", "dep:ash", "dep:futures-util"]
+pipewire = ["vulkan", "dep:ashpd", "dep:pipewire", "dep:libspa", "dep:futures-util"]
+# Vulkan DMA-BUF importer shared by the capture backends: reads
+# tiled / compressed DMA-BUFs back to CPU memory. Pulled in by the
+# backends that emit `GpuFrame`s; does nothing on its own.
+vulkan = ["dep:ash"]
 
 # wayland (window/monitor enumeration). "wlroots" is the historical
 # name and stays for backward compat, but the backend now also
@@ -69,7 +73,7 @@ pipewire = { version = "0.8", features = ["v0_3_77"], optional = true }
 # feature, which the `pipewire` crate doesn't pass through directly.
 libspa = { version = "0.8", features = ["v0_3_75"], optional = true }
 
-# Vulkan loader — used to import dmabuf frames from PipeWire and read
+# Vulkan loader — used to import dmabuf frames from the capture backends and read
 # them back to CPU memory. Optional at runtime: if `ash::Entry::load()`
 # fails (no Vulkan loader / driver) the capture path falls back to
 # SHM-only EnumFormat advertising.
