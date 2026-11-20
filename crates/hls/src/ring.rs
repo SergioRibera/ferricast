@@ -227,18 +227,26 @@ impl SegmentRing {
         seq
     }
 
-    /// Close the in-progress segment by consuming its accumulated
-    /// `pending_parts` as the new segment's `parts`. Convenience for
-    /// the segmenter — equivalent to a manual `push_with_parts` with
-    /// `std::mem::take(&mut pending_parts)`.
-    pub fn complete_pending_segment(
-        &mut self,
-        duration_secs: f32,
-        discontinuity: bool,
-        data: Bytes,
-    ) -> u64 {
-        let parts = std::mem::take(&mut self.pending_parts);
-        self.push_with_parts(duration_secs, discontinuity, data, parts)
+    /// Close the in-progress segment from its accumulated
+    /// `pending_parts`: the segment body is their concatenation, and
+    /// each part is re-pointed at a slice of that body so the bytes
+    /// are held once (the separate part buffers are released as soon
+    /// as in-flight HTTP responses drop their clones).
+    pub fn complete_pending_segment(&mut self, duration_secs: f32, discontinuity: bool) -> u64 {
+        let mut parts = std::mem::take(&mut self.pending_parts);
+        let total: usize = parts.iter().map(|p| p.data.len()).sum();
+        let mut body = bytes::BytesMut::with_capacity(total);
+        for part in &parts {
+            body.extend_from_slice(&part.data);
+        }
+        let body = body.freeze();
+        let mut offset = 0;
+        for part in &mut parts {
+            let end = offset + part.data.len();
+            part.data = body.slice(offset..end);
+            offset = end;
+        }
+        self.push_with_parts(duration_secs, discontinuity, body, parts)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -387,5 +395,28 @@ pub async fn wait_for_first_segment(ring: &Arc<RwLock<SegmentRing>>) -> bool {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(50).min(remaining)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_segment_parts_share_the_segment_body() {
+        let mut ring = SegmentRing::new(4, 4);
+        ring.enable_low_latency(0.5);
+        ring.push_pending_part(0.5, true, Bytes::from_static(&[1; 188]));
+        ring.push_pending_part(0.5, false, Bytes::from_static(&[2; 376]));
+        let seq = ring.complete_pending_segment(1.0, false);
+        let seg = ring.get(seq).unwrap();
+        assert_eq!(seg.data.len(), 564);
+        assert_eq!(&seg.data[..188], &[1; 188][..]);
+        let body = seg.data.as_ptr_range();
+        for part in &seg.parts {
+            let p = part.data.as_ptr_range();
+            assert!(body.start <= p.start && p.end <= body.end, "part not a body slice");
+        }
+        assert_eq!(&seg.parts[1].data[..], &[2; 376][..]);
     }
 }

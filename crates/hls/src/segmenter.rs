@@ -480,17 +480,10 @@ pub async fn run_from_frames(
         // otherwise (sender hung up) derived from the last frame.
         let mut closing_span_us: Option<u64> = None;
 
-        // LL-HLS state for this segment.
-        // `local_parts` collects each part's bytes locally so we can
-        // splice them into the full segment body at close time —
-        // because clients that didn't fetch parts (or arrived after
-        // the segment closed) still need the regular `/segment-N.ts`
-        // to serve a complete contiguous TS body. The ring also
-        // already has these parts published via `push_pending_part`,
-        // but those are slices the muxer drained piecemeal; we keep
-        // a parallel copy here so reconstructing the segment doesn't
-        // require holding the ring write lock for a long time.
-        let mut local_parts: Vec<Bytes> = Vec::new();
+        // LL-HLS state for this segment. Parts are published into the
+        // ring as they close; at segment close the ring stitches them
+        // into the `/segment-N.ts` body.
+        let mut parts_count: usize = 0;
         let mut part_start_pts_us = segment_start_pts_us;
         let mut first_part_of_segment = true;
 
@@ -538,7 +531,7 @@ pub async fn run_from_frames(
                         {
                             let part_bytes = Bytes::from(muxer.drain());
                             if !part_bytes.is_empty() {
-                                local_parts.push(part_bytes.clone());
+                                parts_count += 1;
                                 ring.write().await.push_pending_part(
                                     micros_to_secs(part_span_us),
                                     first_part_of_segment,
@@ -654,24 +647,14 @@ pub async fn run_from_frames(
                         .saturating_add(span_us)
                         .saturating_sub(part_start_pts_us),
                 );
-                local_parts.push(final_drain.clone());
+                parts_count += 1;
                 ring.write()
                     .await
                     .push_pending_part(part_dur, first_part_of_segment, final_drain);
             }
-            // Concatenate all parts to form the segment body the
-            // `/segment-N.ts` endpoint will serve.
-            let total: usize = local_parts.iter().map(|b| b.len()).sum();
-            let mut full = bytes::BytesMut::with_capacity(total);
-            for p in &local_parts {
-                full.extend_from_slice(p);
-            }
-            let body = Bytes::from(full);
-            let size = body.len();
-            let seq =
-                ring.write()
-                    .await
-                    .complete_pending_segment(elapsed.as_secs_f32(), false, body);
+            let mut ring = ring.write().await;
+            let seq = ring.complete_pending_segment(elapsed.as_secs_f32(), false);
+            let size = ring.get(seq).map_or(0, |s| s.data.len());
             (size, seq)
         } else {
             // Classic HLS — single drain → one push.
@@ -686,7 +669,6 @@ pub async fn run_from_frames(
         let size_bytes = full_segment_bytes;
         let encoded_kbps =
             ((size_bytes as f64 * 8.0) / 1000.0 / elapsed.as_secs_f64().max(0.001)) as u32;
-        let parts_count = local_parts.len();
         if seq < 3 {
             info!(
                 seq,
