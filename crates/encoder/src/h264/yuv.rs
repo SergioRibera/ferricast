@@ -16,7 +16,7 @@ use cros_libva::{Image, Surface, VA_LSB_FIRST, VAImageFormat};
 use ferricast_core::{FerricastError, PixelFormat, Result};
 use yuv::{
     BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvRange, YuvStandardMatrix,
-    bgra_to_yuv_nv12,
+    bgra_to_yuv_nv12, rgba_to_yuv_nv12,
 };
 
 use crate::frame_view::FrameView;
@@ -68,9 +68,17 @@ impl Nv12Planes<'_> {
                 YuvStandardMatrix::Bt601,
                 YuvConversionMode::Balanced,
             ),
-            other @ (PixelFormat::Rgba | PixelFormat::Nv12 | PixelFormat::I420) => {
+            PixelFormat::Rgba => rgba_to_yuv_nv12(
+                &mut bi,
+                src.data(),
+                src_stride,
+                YuvRange::Limited,
+                YuvStandardMatrix::Bt601,
+                YuvConversionMode::Balanced,
+            ),
+            other @ (PixelFormat::Nv12 | PixelFormat::I420) => {
                 return Err(FerricastError::Encoder(format!(
-                    "VA-API: cannot upload {other:?} frames (need Bgra)"
+                    "VA-API: cannot upload {other:?} frames (need Bgra/Rgba)"
                 )));
             }
         };
@@ -248,6 +256,24 @@ mod tests {
             y.iter().all(|&v| (233..=237).contains(&v)),
             "Y plane should be ~235 (white): {:?}",
             &y[..4]
+        );
+    }
+
+    /// The same bytes mean red in RGBA and blue in BGRA; the luma of
+    /// red is roughly twice that of blue, so a swapped dispatch shows.
+    #[test]
+    fn rgba_and_bgra_dispatch_differ() {
+        let px = [0xFFu8, 0, 0, 0xFF];
+        let mut raw = frame(PixelFormat::Rgba, 4, 4, 16, 0);
+        raw.data = Bytes::from(px.repeat(16));
+        let (red_y, _) = convert(&raw).unwrap();
+        raw.format = PixelFormat::Bgra;
+        let (blue_y, _) = convert(&raw).unwrap();
+        assert!(
+            red_y[0] > blue_y[0] + 20,
+            "red {} vs blue {}",
+            red_y[0],
+            blue_y[0]
         );
     }
 
