@@ -6,8 +6,8 @@
 //! `#EXT-X-DISCONTINUITY-SEQUENCE`, `#EXT-X-DISCONTINUITY`,
 //! `#EXT-X-PROGRAM-DATE-TIME`, `#EXTINF`, plus the Low-Latency HLS
 //! additions (RFC 8216bis / Apple HLS 2nd edition):
-//! `#EXT-X-PART-INF`, `#EXT-X-SERVER-CONTROL`, `#EXT-X-PART`,
-//! `#EXT-X-PRELOAD-HINT`.
+//! `#EXT-X-PART-INF`, `#EXT-X-SERVER-CONTROL`, `#EXT-X-PART`.
+//! `#EXT-X-PRELOAD-HINT` and rendition reports are not implemented.
 //!
 //! Two playlist flavours:
 //! * **Live** — no `#EXT-X-ENDLIST`, the player keeps polling.
@@ -255,6 +255,7 @@ impl M3u8Writer {
                 segment.duration, rounded, self.target_duration
             )));
         }
+        check_uri(&segment.uri)?;
         self.segments.push(segment);
         Ok(())
     }
@@ -402,6 +403,7 @@ impl M3u8Writer {
 }
 
 fn write_part_line(w: &mut String, part: &Part) -> Result<(), FerricastError> {
+    check_uri(&part.uri)?;
     let mut line = String::from("#EXT-X-PART:");
     let _ = write!(&mut line, "DURATION={:.3}", part.duration);
     let _ = write!(&mut line, ",URI=\"{}\"", part.uri);
@@ -412,6 +414,18 @@ fn write_part_line(w: &mut String, part: &Part) -> Result<(), FerricastError> {
     // so nothing is written for `last_of_segment`.
     line.push('\n');
     w.push_str(&line);
+    Ok(())
+}
+
+/// Rejects URIs that would break the playlist syntax: a line break
+/// ends the URI line (or tag) early, and `"` closes the quoted-string
+/// `URI` attribute of `EXT-X-PART`.
+fn check_uri(uri: &str) -> Result<(), FerricastError> {
+    if uri.contains(['"', '\r', '\n']) {
+        return Err(FerricastError::M3u8(format!(
+            "URI {uri:?} contains a quote or line break"
+        )));
+    }
     Ok(())
 }
 
@@ -522,6 +536,19 @@ mod tests {
         assert!(s.contains("PART-TARGET=0.534"), "{s}");
         assert!(s.contains("PART-HOLD-BACK=1.602"), "{s}");
         w.set_pending_parts(vec![Part::new(f32::NAN, "b.0.ts")]);
+        assert!(w.to_string().is_err());
+    }
+
+    #[test]
+    fn uris_that_break_the_playlist_syntax_are_rejected() {
+        let mut w = M3u8Writer::live(M3u8Version::V6)
+            .with_target_duration(4)
+            .with_part_target(0.5);
+        for uri in ["a\n#EXT-X-ENDLIST", "a\r.ts"] {
+            assert!(w.add_segment(Segment::new(2.0, uri)).is_err(), "{uri:?}");
+        }
+        w.add_segment(Segment::new(2.0, "a.ts")).unwrap();
+        w.set_pending_parts(vec![Part::new(0.5, "b\".ts")]);
         assert!(w.to_string().is_err());
     }
 
