@@ -82,6 +82,9 @@ const RECON_POOL: usize = 2;
 /// because the driver pads its allocation anyway.
 const CODED_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 
+/// Packed SPS (sequence) and PPS (picture) headers are submitted on IDRs.
+const PACKED_HEADERS: u32 = VA_ENC_PACKED_HEADER_SEQUENCE | VA_ENC_PACKED_HEADER_PICTURE;
+
 /// `MaxFrameNum = 2^8` and `MaxPicOrderCntLsb = 2^8`, written into
 /// both the packed SPS and the VA sequence parameters.
 const LOG2_MAX_FRAME_NUM: u32 = 8;
@@ -239,21 +242,19 @@ impl VaapiH264Encoder {
         let cfg = build_encoder_cfg(profile_idc, constraint_flags, cabac, &cfg)?;
 
         // VAConfig with rate control + RT format.
+        let mut config_attribs = vec![
+            VAConfigAttrib {
+                type_: VAConfigAttribType::VAConfigAttribRTFormat,
+                value: VA_RT_FORMAT_YUV420,
+            },
+            VAConfigAttrib {
+                type_: VAConfigAttribType::VAConfigAttribRateControl,
+                value: VA_RC_CBR,
+            },
+        ];
+        config_attribs.extend(packed_headers_attrib(&display, profile, PACKED_HEADERS));
         let cfg_handle = display
-            .create_config(
-                vec![
-                    VAConfigAttrib {
-                        type_: VAConfigAttribType::VAConfigAttribRTFormat,
-                        value: VA_RT_FORMAT_YUV420,
-                    },
-                    VAConfigAttrib {
-                        type_: VAConfigAttribType::VAConfigAttribRateControl,
-                        value: VA_RC_CBR,
-                    },
-                ],
-                profile,
-                VAEntrypoint::VAEntrypointEncSlice,
-            )
+            .create_config(config_attribs, profile, VAEntrypoint::VAEntrypointEncSlice)
             .map_err(|e| FerricastError::Encoder(format!("vaCreateConfig: {e}")))?;
 
         // Allocate the reconstruction pool (NV12). Frames are uploaded
@@ -394,6 +395,38 @@ fn profile_has_enc_slice(display: &Display, profile: VAProfile::Type) -> bool {
         Ok(eps) => eps.contains(&VAEntrypoint::VAEntrypointEncSlice),
         Err(_) => false,
     }
+}
+
+/// The `VAConfigAttribEncPackedHeaders` attribute announcing which of
+/// `wanted` we submit as packed headers, restricted to what the driver
+/// supports. Without it drivers may ignore our packed SPS/PPS and emit
+/// their own, which then no longer match `get_headers()`.
+fn packed_headers_attrib(
+    display: &Display,
+    profile: VAProfile::Type,
+    wanted: u32,
+) -> Option<VAConfigAttrib> {
+    let mut query = [VAConfigAttrib {
+        type_: VAConfigAttribType::VAConfigAttribEncPackedHeaders,
+        value: 0,
+    }];
+    let supported = display
+        .get_config_attributes(profile, VAEntrypoint::VAEntrypointEncSlice, &mut query)
+        .ok()
+        .map(|()| query[0].value)
+        .filter(|&v| v != VA_ATTRIB_NOT_SUPPORTED)
+        .unwrap_or(0);
+    let value = supported & wanted;
+    if value != wanted {
+        warn!(
+            supported,
+            wanted, "VA-API: driver does not accept all packed headers we submit"
+        );
+    }
+    (value != 0).then_some(VAConfigAttrib {
+        type_: VAConfigAttribType::VAConfigAttribEncPackedHeaders,
+        value,
+    })
 }
 
 impl EncoderCfg {

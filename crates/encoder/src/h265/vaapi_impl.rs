@@ -54,6 +54,9 @@ const VA_RT_FORMAT_RGB32: u32 = 0x04;
 const RECON_POOL: usize = 2;
 const CODED_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 
+/// VPS, SPS and PPS all go in as `Sequence`-type packed headers.
+const PACKED_HEADERS: u32 = VA_ENC_PACKED_HEADER_SEQUENCE;
+
 const HEVC_PROFILE_MAIN_IDC: u8 = 1;
 const HEVC_PROFILE_MAIN10_IDC: u8 = 2;
 const HEVC_NAL_TRAIL_R: u8 = 1;
@@ -217,21 +220,19 @@ impl VaapiH265Encoder {
 
         let cfg = build_encoder_cfg(profile_idc, bit_depth, &cfg)?;
 
+        let mut config_attribs = vec![
+            VAConfigAttrib {
+                type_: VAConfigAttribType::VAConfigAttribRTFormat,
+                value: VA_RT_FORMAT_YUV420,
+            },
+            VAConfigAttrib {
+                type_: VAConfigAttribType::VAConfigAttribRateControl,
+                value: VA_RC_CBR,
+            },
+        ];
+        config_attribs.extend(packed_headers_attrib(&display, profile, PACKED_HEADERS));
         let cfg_handle = display
-            .create_config(
-                vec![
-                    VAConfigAttrib {
-                        type_: VAConfigAttribType::VAConfigAttribRTFormat,
-                        value: VA_RT_FORMAT_YUV420,
-                    },
-                    VAConfigAttrib {
-                        type_: VAConfigAttribType::VAConfigAttribRateControl,
-                        value: VA_RC_CBR,
-                    },
-                ],
-                profile,
-                VAEntrypoint::VAEntrypointEncSlice,
-            )
+            .create_config(config_attribs, profile, VAEntrypoint::VAEntrypointEncSlice)
             .map_err(|e| FerricastError::Encoder(format!("vaCreateConfig(HEVC): {e}")))?;
 
         let recon_descs: Vec<()> = (0..RECON_POOL).map(|_| ()).collect();
@@ -344,6 +345,38 @@ fn profile_has_enc_slice(display: &Display, profile: VAProfile::Type) -> bool {
         Ok(eps) => eps.contains(&VAEntrypoint::VAEntrypointEncSlice),
         Err(_) => false,
     }
+}
+
+/// The `VAConfigAttribEncPackedHeaders` attribute announcing which of
+/// `wanted` we submit as packed headers, restricted to what the driver
+/// supports. Without it drivers may ignore our packed SPS/PPS and emit
+/// their own, which then no longer match `get_headers()`.
+fn packed_headers_attrib(
+    display: &Display,
+    profile: VAProfile::Type,
+    wanted: u32,
+) -> Option<VAConfigAttrib> {
+    let mut query = [VAConfigAttrib {
+        type_: VAConfigAttribType::VAConfigAttribEncPackedHeaders,
+        value: 0,
+    }];
+    let supported = display
+        .get_config_attributes(profile, VAEntrypoint::VAEntrypointEncSlice, &mut query)
+        .ok()
+        .map(|()| query[0].value)
+        .filter(|&v| v != VA_ATTRIB_NOT_SUPPORTED)
+        .unwrap_or(0);
+    let value = supported & wanted;
+    if value != wanted {
+        warn!(
+            supported,
+            wanted, "VA-API: driver does not accept all packed headers we submit"
+        );
+    }
+    (value != 0).then_some(VAConfigAttrib {
+        type_: VAConfigAttribType::VAConfigAttribEncPackedHeaders,
+        value,
+    })
 }
 
 fn build_encoder_cfg(profile_idc: u8, bit_depth: u8, cfg: &EncoderConfig) -> Result<EncoderCfg> {
