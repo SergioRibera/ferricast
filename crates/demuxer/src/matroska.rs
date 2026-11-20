@@ -3,7 +3,10 @@ use std::io::BufReader;
 use std::path::Path;
 
 use ferricast_core::{Codec, EncodedFrame, FerricastError, Result};
-use matroska_demuxer::{Frame, MatrixCoefficients, MatroskaFile, Range, TrackEntry, TrackType};
+use matroska_demuxer::{
+    ContentCompAlgo, ContentEncAlgo, ContentEncodingValue, Frame, MatrixCoefficients,
+    MatroskaFile, Range, TrackEntry, TrackType,
+};
 
 use crate::nal::{Framing, LengthPrefixed};
 use crate::{Color, VideoStream};
@@ -20,6 +23,77 @@ pub struct MatroskaDemuxer {
     /// The next frame is the first one after open/rewind and must carry the
     /// parameter sets whatever its NAL types.
     at_start: bool,
+    /// Bytes removed from the front of every frame by header-stripping
+    /// content compression; restored before the frame is handed out.
+    stripped_header: Vec<u8>,
+}
+
+/// One `ContentEncoding` of a track, reduced to what this demuxer can undo.
+#[derive(Debug, PartialEq, Eq)]
+enum Encoding<'a> {
+    HeaderStripping(&'a [u8]),
+    /// Signed but not encrypted: the frames are untouched.
+    SignedOnly,
+    Unsupported(&'static str),
+}
+
+impl<'a> From<&'a ContentEncodingValue> for Encoding<'a> {
+    fn from(value: &'a ContentEncodingValue) -> Self {
+        match value {
+            ContentEncodingValue::Compression(compression) => match compression.algo() {
+                ContentCompAlgo::Stripping => {
+                    Encoding::HeaderStripping(compression.settings().unwrap_or_default())
+                }
+                ContentCompAlgo::Zlib => Encoding::Unsupported("zlib compression"),
+                ContentCompAlgo::Bzlib => Encoding::Unsupported("bzlib compression"),
+                ContentCompAlgo::Lzo1x => Encoding::Unsupported("lzo1x compression"),
+                ContentCompAlgo::Unknown => Encoding::Unsupported("an unknown compression"),
+            },
+            ContentEncodingValue::Encryption(encryption) => match encryption.algo() {
+                ContentEncAlgo::NotEncrypted => Encoding::SignedOnly,
+                _ => Encoding::Unsupported("encryption"),
+            },
+            ContentEncodingValue::Unknown => Encoding::Unsupported("an unknown content encoding"),
+        }
+    }
+}
+
+/// `ContentEncodingScope` bit: the transform applies to frame contents.
+const SCOPE_FRAMES: u64 = 1;
+/// `ContentEncodingScope` bit: the transform applies to `CodecPrivate`.
+const SCOPE_CODEC_PRIVATE: u64 = 2;
+
+/// Returns the bytes to prepend to every frame, or an error when the track
+/// uses an encoding this demuxer cannot undo. Encodings are given as
+/// `(order, scope, encoding)`; stripping applied in ascending order is undone
+/// by prepending the stripped headers in that same order.
+fn stripped_header<'a>(
+    encodings: impl IntoIterator<Item = (u64, u64, Encoding<'a>)>,
+) -> Result<Vec<u8>> {
+    let mut encodings: Vec<_> = encodings.into_iter().collect();
+    encodings.sort_by_key(|&(order, _, _)| order);
+    let mut header = Vec::new();
+    for (_, scope, encoding) in encodings {
+        match encoding {
+            Encoding::SignedOnly => {}
+            Encoding::HeaderStripping(_) if scope & SCOPE_CODEC_PRIVATE != 0 => {
+                return Err(FerricastError::Demux(
+                    "header-stripped CodecPrivate is not supported".into(),
+                ));
+            }
+            Encoding::HeaderStripping(bytes) => {
+                if scope & SCOPE_FRAMES != 0 {
+                    header.extend_from_slice(bytes);
+                }
+            }
+            Encoding::Unsupported(what) => {
+                return Err(FerricastError::Demux(format!(
+                    "video track uses {what}, which is not supported"
+                )));
+            }
+        }
+    }
+    Ok(header)
 }
 
 impl MatroskaDemuxer {
@@ -53,6 +127,13 @@ impl MatroskaDemuxer {
             presentation_start_us: 0,
         };
         let track = entry.track_number().get();
+        let stripped_header = stripped_header(
+            entry
+                .content_encodings()
+                .unwrap_or_default()
+                .iter()
+                .map(|e| (e.order(), e.scope(), Encoding::from(e.encoding()))),
+        )?;
         Ok(Self {
             file,
             stream,
@@ -61,6 +142,7 @@ impl MatroskaDemuxer {
             scale_ns,
             frame: Frame::default(),
             at_start: true,
+            stripped_header,
         })
     }
 
@@ -75,6 +157,11 @@ impl MatroskaDemuxer {
             }
             if self.frame.track != self.track {
                 continue;
+            }
+            if !self.stripped_header.is_empty() {
+                self.frame
+                    .data
+                    .splice(0..0, self.stripped_header.iter().copied());
             }
             let sync = self.frame.is_keyframe.unwrap_or(false);
             let (data, idr) = self
@@ -175,6 +262,34 @@ mod tests {
             0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86, 0x81
         ]));
         assert!(!is_matroska(&[0, 0, 0, 0x20, b'f', b't', b'y', b'p']));
+    }
+
+    #[test]
+    fn stripped_headers_are_restored_in_encoding_order() {
+        let header = stripped_header([
+            (1, SCOPE_FRAMES, Encoding::HeaderStripping(&[3, 4])),
+            (0, SCOPE_FRAMES, Encoding::HeaderStripping(&[1, 2])),
+            (2, SCOPE_FRAMES, Encoding::SignedOnly),
+        ])
+        .unwrap();
+        assert_eq!(header, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_track_without_encodings_needs_no_header() {
+        assert!(stripped_header([]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn compressed_or_encrypted_tracks_are_rejected() {
+        for what in ["zlib compression", "encryption"] {
+            let error = stripped_header([(0, SCOPE_FRAMES, Encoding::Unsupported(what))])
+                .unwrap_err();
+            assert!(error.to_string().contains(what), "{error}");
+        }
+        assert!(
+            stripped_header([(0, SCOPE_CODEC_PRIVATE, Encoding::HeaderStripping(&[0]))]).is_err()
+        );
     }
 
     #[test]
