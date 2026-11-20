@@ -196,10 +196,16 @@ impl VulkanImporter {
     ///   + `VK_EXT_external_memory_dma_buf`
     /// * Logical device creation failed
     ///
+    /// `compositor_device` is the `dev_t` of the GPU the compositor
+    /// allocates its DMA-BUFs on (`linux-dmabuf` feedback
+    /// `main_device`), when the caller knows it: the matching Vulkan
+    /// device is preferred, unless `FERRICAST_DRM_RENDER_NODE`
+    /// overrides it.
+    ///
     /// The capture worker treats this as a soft failure and falls
-    /// back to SHM-only EnumFormat advertising.
-    pub(crate) fn new() -> Result<Self> {
-        let inner = init::build()?;
+    /// back to CPU frames.
+    pub(crate) fn new(compositor_device: Option<u64>) -> Result<Self> {
+        let inner = init::build(compositor_device)?;
         let state = State::create(&inner)?;
         Ok(Self {
             inner,

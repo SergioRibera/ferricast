@@ -213,7 +213,7 @@ fn run(
     // Try to bring Vulkan up — gives us GPU-supported DRM modifiers
     // for the EnumFormat advertise and a real DmaBuf import path in
     // `process`. Soft-failure: we log and keep going with SHM only.
-    let importer = match VulkanImporter::new() {
+    let importer = match VulkanImporter::new(None) {
         Ok(imp) => Some(Arc::new(imp)),
         Err(e) => {
             warn!(error = %e, "Vulkan unavailable, falling back to SHM-only capture");

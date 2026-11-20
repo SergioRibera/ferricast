@@ -8,7 +8,8 @@
 //! 3. Walk physical devices that support all the extensions we need
 //!    and expose a transfer-capable queue, and pick the best-ranked
 //!    one (see [`DeviceRank`]): the device whose DRM node matches
-//!    `FERRICAST_DRM_RENDER_NODE` first, then integrated GPUs (on
+//!    `FERRICAST_DRM_RENDER_NODE` (or, without it, the caller's
+//!    compositor main device) first, then integrated GPUs (on
 //!    hybrid laptops the compositor almost always renders on the
 //!    iGPU, and its dmabufs/modifiers belong to that device), then
 //!    the rest.
@@ -81,14 +82,15 @@ fn validation_layer_available(entry: &ash::Entry) -> bool {
     }
 }
 
-pub(super) fn build() -> Result<Inner> {
+pub(super) fn build(compositor_device: Option<u64>) -> Result<Inner> {
     let entry = unsafe {
         ash::Entry::load()
             .map_err(|e| FerricastError::Capture(format!("Vulkan loader missing: {e}")))?
     };
 
     let instance = create_instance(&entry)?;
-    let (physical_device, queue_family_index) = pick_physical_device(&instance)?;
+    let preferred = PreferredNode::resolve(env_drm_node(), compositor_device);
+    let (physical_device, queue_family_index) = pick_physical_device(&instance, preferred)?;
     let sync_fd_import = supports_sync_fd_import(&instance, physical_device);
     let device = create_device(
         &instance,
@@ -236,7 +238,7 @@ impl From<u64> for DrmNode {
 /// order is the comparison order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct DeviceRank {
-    /// The device owns the DRM node named by [`DRM_NODE_ENV`].
+    /// The device owns the preferred DRM node (see [`PreferredNode`]).
     matches_drm_node: bool,
     /// Preference by device type, see [`DeviceRank::type_score`].
     type_score: u8,
@@ -266,7 +268,7 @@ impl DeviceRank {
     }
 }
 
-fn preferred_drm_node() -> Option<DrmNode> {
+fn env_drm_node() -> Option<DrmNode> {
     use std::os::unix::fs::MetadataExt;
 
     let path = std::env::var_os(DRM_NODE_ENV)?;
@@ -275,6 +277,31 @@ fn preferred_drm_node() -> Option<DrmNode> {
         Err(e) => {
             warn!(path = ?path, error = %e, "{DRM_NODE_ENV}: can't stat DRM node, ignoring");
             None
+        }
+    }
+}
+
+/// The DRM node device selection favours, by where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreferredNode {
+    /// [`DRM_NODE_ENV`]: an explicit user override, always wins.
+    Env(DrmNode),
+    /// The compositor's main device (`linux-dmabuf` feedback): the
+    /// GPU its DMA-BUFs live on.
+    Compositor(DrmNode),
+}
+
+impl PreferredNode {
+    /// `compositor` is a raw `dev_t` (any node of the device: primary
+    /// or render).
+    fn resolve(env: Option<DrmNode>, compositor: Option<u64>) -> Option<Self> {
+        env.map(Self::Env)
+            .or_else(|| compositor.map(|dev| Self::Compositor(DrmNode::from(dev))))
+    }
+
+    fn node(self) -> DrmNode {
+        match self {
+            Self::Env(node) | Self::Compositor(node) => node,
         }
     }
 }
@@ -318,7 +345,10 @@ fn device_drm_nodes(
 /// supports the dmabuf-import extensions and has a queue family with
 /// `TRANSFER` (or `GRAPHICS`, which implies transfer). Ties keep
 /// enumeration order. Returns `(device, queue_family_index)`.
-fn pick_physical_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32)> {
+fn pick_physical_device(
+    instance: &ash::Instance,
+    preferred: Option<PreferredNode>,
+) -> Result<(vk::PhysicalDevice, u32)> {
     let devices = unsafe { instance.enumerate_physical_devices() }
         .map_err(|e| FerricastError::Capture(format!("enumerate_physical_devices: {e}")))?;
 
@@ -328,7 +358,6 @@ fn pick_physical_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice,
         ));
     }
 
-    let preferred = preferred_drm_node();
     let mut best: Option<(DeviceRank, vk::PhysicalDevice, u32, String)> = None;
 
     for &dev in &devices {
@@ -358,8 +387,9 @@ fn pick_physical_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice,
             continue;
         };
 
-        let matches_drm_node = preferred
-            .is_some_and(|want| device_drm_nodes(instance, dev, &props, &exts).contains(&want));
+        let matches_drm_node = preferred.is_some_and(|want| {
+            device_drm_nodes(instance, dev, &props, &exts).contains(&want.node())
+        });
         let rank = DeviceRank::new(props.device_type, matches_drm_node);
         debug!(device = %dev_name, device_type = ?props.device_type, ?rank, "usable Vulkan device");
         if best.as_ref().is_none_or(|(b, ..)| rank > *b) {
@@ -372,8 +402,17 @@ fn pick_physical_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice,
             "Vulkan: no physical device supports dmabuf import".into(),
         ));
     };
-    if preferred.is_some() && !rank.matches_drm_node {
-        warn!("{DRM_NODE_ENV} matched no usable Vulkan device; using the type heuristic");
+    match preferred {
+        Some(PreferredNode::Env(_)) if !rank.matches_drm_node => {
+            warn!("{DRM_NODE_ENV} matched no usable Vulkan device; using the type heuristic");
+        }
+        Some(PreferredNode::Compositor(node)) if !rank.matches_drm_node => {
+            warn!(
+                ?node,
+                "compositor main device matched no usable Vulkan device; using the type heuristic"
+            );
+        }
+        Some(PreferredNode::Env(_) | PreferredNode::Compositor(_)) | None => {}
     }
     info!(device = %dev_name, queue_family = qf, ?rank, "Vulkan ready");
     Ok((dev, qf))
@@ -430,8 +469,29 @@ fn create_device(
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceRank, DrmNode, env_flag_enabled};
+    use super::{DeviceRank, DrmNode, PreferredNode, env_flag_enabled};
     use ash::vk::PhysicalDeviceType as T;
+
+    #[test]
+    fn env_override_beats_compositor_main_device() {
+        let env = DrmNode {
+            major: 226,
+            minor: 129,
+        };
+        let card0 = 0xe200;
+        assert_eq!(
+            PreferredNode::resolve(Some(env), Some(card0)),
+            Some(PreferredNode::Env(env))
+        );
+        assert_eq!(
+            PreferredNode::resolve(None, Some(card0)),
+            Some(PreferredNode::Compositor(DrmNode {
+                major: 226,
+                minor: 0
+            }))
+        );
+        assert_eq!(PreferredNode::resolve(None, None), None);
+    }
 
     #[test]
     fn drm_node_decodes_linux_dev_t() {
