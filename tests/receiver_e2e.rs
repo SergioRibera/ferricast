@@ -128,10 +128,15 @@ impl Receiver {
         };
         let log = Arc::new(Mutex::new(SinkLog::default()));
         let log_factory = log.clone();
-        let (mut manager, events) = StreamManager::builder()
+        let builder = StreamManager::builder()
             .with_receiver(TestReceiver(ChromecastReceiver::with_port("e2e", port)))
             .with_h264_decoder()
-            .with_aac_decoder()
+            .with_aac_decoder();
+        #[cfg(feature = "vp9-decode")]
+        let builder = builder.register_video_decoder::<ferricast::decoder::Vp9Decoder>();
+        #[cfg(feature = "opus-decode")]
+        let builder = builder.register_audio_decoder::<ferricast::decoder::OpusDecoder>();
+        let (mut manager, events) = builder
             .set_sink_factory(move |_remote, _info| {
                 log_factory.lock().unwrap().sinks_created += 1;
                 let sink = HeadlessSink(log_factory.clone());
@@ -716,4 +721,240 @@ async fn taken_port_is_reported_once_without_spinning() {
             .is_err()
     );
     manager.stop_receivers().await.unwrap();
+}
+
+// ── Progressive files ───────────────────────────────────────────
+
+/// What a finished playback looked like in the sink.
+struct Playback {
+    frames: usize,
+    pts_span: f64,
+    drift: f64,
+    audio_secs: f64,
+    audio_chunks: usize,
+}
+
+impl Playback {
+    fn of(log: &SinkLog) -> Self {
+        let frames = &log.video;
+        let (first, last) = (frames[0], frames[frames.len() - 1]);
+        let pts_span = Duration::from_micros(last.1 - first.1).as_secs_f64();
+        let wall_span = (last.0 - first.0).as_secs_f64();
+        // The first chunk is the priming silence.
+        let audio: Duration = log.audio.iter().skip(1).map(|a| a.2).sum();
+        Self {
+            frames: frames.len(),
+            pts_span,
+            drift: wall_span - pts_span,
+            audio_secs: audio.as_secs_f64(),
+            audio_chunks: log.audio.len(),
+        }
+    }
+}
+
+/// Loads `url` and plays it to IDLE/FINISHED; returns the LOAD reply.
+async fn play_to_end(rx: &Receiver, sender: &mut Sender, url: &str, content_type: &str) -> Value {
+    std::mem::take(&mut *rx.log.lock().unwrap());
+    let reply = sender.load(url, content_type).await;
+    assert_eq!(reply["type"], "MEDIA_STATUS", "{reply}");
+    assert_eq!(reply["status"][0]["playerState"], "PLAYING", "{reply}");
+    let finished = sender
+        .expect(namespace::MEDIA, "IDLE FINISHED", |v| {
+            v["status"][0]["playerState"] == "IDLE"
+        })
+        .await;
+    assert_eq!(
+        finished["status"][0]["idleReason"], "FINISHED",
+        "{finished}"
+    );
+    reply
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn progressive_files_play_paced_with_audio_and_report_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cases = vec![
+        ("moov_at_end.mp4", support::H264_AAC, &[][..], "video/mp4"),
+        (
+            "faststart.mp4",
+            support::H264_AAC,
+            &["-movflags", "+faststart"][..],
+            "video/mp4",
+        ),
+        (
+            "h264_aac.mkv",
+            support::H264_AAC,
+            &[][..],
+            "video/x-matroska",
+        ),
+    ];
+    if cfg!(all(feature = "vp9-decode", feature = "opus-decode")) {
+        cases.push(("vp9_opus.webm", support::VP9_OPUS, &[][..], "video/webm"));
+    }
+    for (name, codecs, extra, _) in &cases {
+        if !support::generate_progressive(dir.path(), name, 4, codecs, extra) {
+            return;
+        }
+    }
+    let server = TestServer::start(support::dir_handler(dir.path())).await;
+    let mut rx = Receiver::start().await;
+    let mut sender = Sender::connect(rx.port, "sender-progressive").await;
+    sender.launch().await;
+    for (name, _, _, content_type) in &cases {
+        let reply = play_to_end(
+            &rx,
+            &mut sender,
+            &server.url(&format!("/{name}")),
+            content_type,
+        )
+        .await;
+        let media = &reply["status"][0]["media"];
+        let p = Playback::of(&rx.log.lock().unwrap());
+        eprintln!(
+            "E2E progressive {name}: duration {} streamType {}, {} frames, PTS span {:.3}s, \
+             drift {:+.3}s, {} audio chunks = {:.3}s of audio",
+            media["duration"],
+            media["streamType"],
+            p.frames,
+            p.pts_span,
+            p.drift,
+            p.audio_chunks,
+            p.audio_secs
+        );
+        assert_eq!(media["streamType"], "BUFFERED", "{name}");
+        let duration = media["duration"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{name}: no duration"));
+        assert!((duration - 4.0).abs() < 0.1, "{name}: duration {duration}");
+        assert!(
+            p.drift.abs() < 0.25,
+            "{name}: paced {:+.3}s off real time",
+            p.drift
+        );
+        assert!(
+            (p.audio_secs - 4.0).abs() < 0.2,
+            "{name}: {:.3}s of audio",
+            p.audio_secs
+        );
+        assert!(p.pts_span > 3.8, "{name}: PTS span {:.3}s", p.pts_span);
+        assert!(p.frames >= 100, "{name}: only {} frames shown", p.frames);
+    }
+    let requests = server.log.lock().unwrap().len();
+    eprintln!("E2E progressive: {requests} HTTP requests in total");
+    rx.manager.stop_receivers().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seek_in_a_progressive_file_lands_near_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    if !support::generate_progressive(dir.path(), "long.mp4", 12, support::H264_AAC, &[]) {
+        return;
+    }
+    let server = TestServer::start(support::dir_handler(dir.path())).await;
+    let mut rx = Receiver::start().await;
+    let mut sender = Sender::connect(rx.port, "sender-seek").await;
+    sender.launch().await;
+    let reply = sender.load(&server.url("/long.mp4"), "video/mp4").await;
+    assert_eq!(reply["status"][0]["playerState"], "PLAYING", "{reply}");
+    let session_id = reply["status"][0]["mediaSessionId"].clone();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let shown_before = rx.log.lock().unwrap().video.len();
+    let seek_sent = Instant::now();
+    let id = sender
+        .request(
+            namespace::MEDIA,
+            json!({"type": "SEEK", "mediaSessionId": session_id, "currentTime": 7.5}),
+        )
+        .await;
+    sender
+        .expect(namespace::MEDIA, "MEDIA_STATUS for SEEK", |v| {
+            v["requestId"] == id
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (first_after, last_after, at_first) = {
+        let log = rx.log.lock().unwrap();
+        let after = &log.video[shown_before..];
+        let first = after
+            .iter()
+            .find(|(_, pts)| *pts >= 5_000_000)
+            .copied()
+            .expect("frames after the seek");
+        (first.1, after.last().unwrap().1, first.0)
+    };
+    let id = sender
+        .request(
+            namespace::MEDIA,
+            json!({"type": "PAUSE", "mediaSessionId": session_id}),
+        )
+        .await;
+    sender
+        .expect(namespace::MEDIA, "MEDIA_STATUS for PAUSE", |v| {
+            v["requestId"] == id
+        })
+        .await;
+    let paused = sender
+        .expect(namespace::MEDIA, "PAUSED status from the pipeline", |v| {
+            v["requestId"] == 0 && v["status"][0]["playerState"] == "PAUSED"
+        })
+        .await;
+    let reported = paused["status"][0]["currentTime"].as_f64().unwrap();
+    eprintln!(
+        "E2E seek: target 7.500s, first frame after seek at {:.3}s ({:.0} ms after SEEK), \
+         last shown {:.3}s, PAUSED currentTime {reported:.3}s",
+        first_after as f64 / 1e6,
+        (at_first - seek_sent).as_secs_f64() * 1000.0,
+        last_after as f64 / 1e6,
+    );
+    // Keyframes every second: playback resumes from the one at 7.0 s.
+    assert!(
+        (6_900_000..=7_500_000).contains(&first_after),
+        "resumed at {first_after}"
+    );
+    assert!(
+        (reported - last_after as f64 / 1e6).abs() < 0.3,
+        "status says {reported}, last frame {last_after}"
+    );
+    rx.manager.stop_receivers().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn progressive_file_plays_from_a_server_without_range_support() {
+    let dir = tempfile::tempdir().unwrap();
+    if !support::generate_progressive(dir.path(), "moov_at_end.mp4", 4, support::H264_AAC, &[]) {
+        return;
+    }
+    let body = std::fs::read(dir.path().join("moov_at_end.mp4")).unwrap();
+    let server = TestServer::start(Arc::new(move |path: &str| match path {
+        "/moov_at_end.mp4" => support::Reply::OkIgnoringRange(body.clone()),
+        _ => support::Reply::Status(404),
+    }))
+    .await;
+    let mut rx = Receiver::start().await;
+    let mut sender = Sender::connect(rx.port, "sender-norange").await;
+    sender.launch().await;
+    let reply = play_to_end(
+        &rx,
+        &mut sender,
+        &server.url("/moov_at_end.mp4"),
+        "video/mp4",
+    )
+    .await;
+    let p = Playback::of(&rx.log.lock().unwrap());
+    let requests = server.log.lock().unwrap().len();
+    eprintln!(
+        "E2E no-range: duration {}, {} frames, drift {:+.3}s, {:.3}s of audio, {requests} HTTP requests",
+        reply["status"][0]["media"]["duration"], p.frames, p.drift, p.audio_secs
+    );
+    assert_eq!(requests, 1, "the file is downloaded once");
+    assert!(p.frames >= 100 && p.drift.abs() < 0.25);
+    assert!((p.audio_secs - 4.0).abs() < 0.2);
+
+    // Something that is not a media file fails the LOAD cleanly.
+    let reply = sender
+        .load(&server.url("/missing.webm"), "video/webm")
+        .await;
+    assert_eq!(reply["type"], "LOAD_FAILED", "{reply}");
+    rx.manager.stop_receivers().await.unwrap();
 }

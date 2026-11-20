@@ -20,6 +20,9 @@ use tokio::net::TcpListener;
 /// What the handler answers for one request path.
 pub enum Reply {
     Ok(Vec<u8>),
+    /// The whole body with 200, whatever `Range` asked for (a server
+    /// without range support).
+    OkIgnoringRange(Vec<u8>),
     Status(u16),
     Redirect(String),
 }
@@ -100,6 +103,16 @@ impl TestServer {
                                 r
                             }
                         },
+                        Reply::OkIgnoringRange(body) => {
+                            let mut r = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                                 Connection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .into_bytes();
+                            r.extend_from_slice(&body);
+                            r
+                        }
                         Reply::Status(code) => format!(
                             "HTTP/1.1 {code} Status\r\nContent-Length: 0\r\n\
                              Connection: close\r\n\r\n"
@@ -269,3 +282,72 @@ pub async fn live_server(restart_at: Option<Duration>) -> Option<(tempfile::Temp
     .await;
     Some((dir, server))
 }
+
+/// Encodes a `seconds`-long test clip (320x240 at 30 fps, a keyframe
+/// every second, 48 kHz stereo audio) into `dir/name`; the container
+/// follows the extension. `codecs` are the ffmpeg codec arguments and
+/// `extra` goes before the output path. Returns `false` when ffmpeg is
+/// unavailable.
+pub fn generate_progressive(
+    dir: &Path,
+    name: &str,
+    seconds: u32,
+    codecs: &[&str],
+    extra: &[&str],
+) -> bool {
+    let Some(ffmpeg) = ffmpeg() else {
+        eprintln!("ffmpeg not found (set FERRICAST_FFMPEG) — skipping");
+        return false;
+    };
+    let status = Command::new(ffmpeg)
+        .env_remove("LD_LIBRARY_PATH")
+        .current_dir(dir)
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"])
+        .args(["-t", &seconds.to_string()])
+        .args([
+            "-g",
+            "30",
+            "-keyint_min",
+            "30",
+            "-pix_fmt",
+            "yuv420p",
+            "-ac",
+            "2",
+        ])
+        .args(codecs)
+        .args(extra)
+        .arg(name)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed: {status}");
+    true
+}
+
+pub const H264_AAC: &[&str] = &[
+    "-c:v",
+    "libx264",
+    "-profile:v",
+    "high",
+    "-bf",
+    "2",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "96k",
+];
+pub const VP9_OPUS: &[&str] = &[
+    "-c:v",
+    "libvpx-vp9",
+    "-deadline",
+    "realtime",
+    "-cpu-used",
+    "8",
+    "-b:v",
+    "300k",
+    "-c:a",
+    "libopus",
+    "-b:a",
+    "64k",
+];
