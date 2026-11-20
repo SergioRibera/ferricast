@@ -89,7 +89,13 @@ pub(super) fn build() -> Result<Inner> {
 
     let instance = create_instance(&entry)?;
     let (physical_device, queue_family_index) = pick_physical_device(&instance)?;
-    let device = create_device(&instance, physical_device, queue_family_index)?;
+    let sync_fd_import = supports_sync_fd_import(&instance, physical_device);
+    let device = create_device(
+        &instance,
+        physical_device,
+        queue_family_index,
+        sync_fd_import,
+    )?;
 
     let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
@@ -117,6 +123,8 @@ pub(super) fn build() -> Result<Inner> {
 
     let drm_modifier = ash::ext::image_drm_format_modifier::Device::new(&instance, &device);
     let external_memory_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
+    let external_semaphore_fd =
+        sync_fd_import.then(|| ash::khr::external_semaphore_fd::Device::new(&instance, &device));
 
     let memory_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
@@ -130,8 +138,41 @@ pub(super) fn build() -> Result<Inner> {
         command_pool,
         drm_modifier,
         external_memory_fd,
+        external_semaphore_fd,
         memory_props,
     })
+}
+
+/// Whether the device can import a `sync_file` as a semaphore
+/// payload (`VK_KHR_external_semaphore_fd` + `SYNC_FD` import). Used
+/// to wait on the dmabuf's implicit-sync write fence before the blit;
+/// optional, the import path works without it (minus that wait).
+fn supports_sync_fd_import(instance: &ash::Instance, dev: vk::PhysicalDevice) -> bool {
+    // SAFETY: plain queries on a physical device from this instance.
+    let props = unsafe { instance.get_physical_device_properties(dev) };
+    if props.api_version < vk::API_VERSION_1_1 {
+        return false;
+    }
+    let exts = match unsafe { instance.enumerate_device_extension_properties(dev) } {
+        Ok(exts) => exts,
+        Err(_) => return false,
+    };
+    if !has_extension(&exts, ash::khr::external_semaphore_fd::NAME) {
+        debug!("no VK_KHR_external_semaphore_fd: dmabuf implicit-sync wait disabled");
+        return false;
+    }
+    let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+    let mut out = vk::ExternalSemaphoreProperties::default();
+    // SAFETY: core 1.1 query (checked above) with valid in/out structs.
+    unsafe { instance.get_physical_device_external_semaphore_properties(dev, &info, &mut out) };
+    let importable = out
+        .external_semaphore_features
+        .contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE);
+    if !importable {
+        debug!("SYNC_FD semaphore import unsupported: dmabuf implicit-sync wait disabled");
+    }
+    importable
 }
 
 fn create_instance(entry: &ash::Entry) -> Result<ash::Instance> {
@@ -366,6 +407,7 @@ fn create_device(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     queue_family_index: u32,
+    sync_fd_import: bool,
 ) -> Result<ash::Device> {
     let priorities = [1.0_f32];
     let queue_info = vk::DeviceQueueCreateInfo::default()
@@ -373,7 +415,10 @@ fn create_device(
         .queue_priorities(&priorities);
     let queue_infos = [queue_info];
 
-    let ext_ptrs: Vec<*const i8> = REQUIRED_DEVICE_EXTS.iter().map(|c| c.as_ptr()).collect();
+    let mut ext_ptrs: Vec<*const i8> = REQUIRED_DEVICE_EXTS.iter().map(|c| c.as_ptr()).collect();
+    if sync_fd_import {
+        ext_ptrs.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
+    }
 
     let create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_infos)

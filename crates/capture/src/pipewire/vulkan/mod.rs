@@ -90,6 +90,9 @@ pub(super) struct Inner {
     pub(super) drm_modifier: ash::ext::image_drm_format_modifier::Device,
     #[allow(dead_code)] // used for the future GPU-handoff encoder path
     pub(super) external_memory_fd: ash::khr::external_memory_fd::Device,
+    /// `Some` when the device can import a `sync_file` into a
+    /// semaphore; used to wait on the dmabuf's implicit write fence.
+    pub(super) external_semaphore_fd: Option<ash::khr::external_semaphore_fd::Device>,
 
     /// Memory type indices grouped by the property flags we care
     /// about. Set up once during init so each import / readback
@@ -160,6 +163,10 @@ pub(super) struct State {
 pub(super) struct Slot {
     pub(super) command_buffer: vk::CommandBuffer,
     pub(super) fence: vk::Fence,
+    /// Binary semaphore that temporarily receives the dmabuf's
+    /// implicit-sync `sync_file` before each submit on this slot.
+    /// Null when `Inner::external_semaphore_fd` is `None`.
+    pub(super) acquire_semaphore: vk::Semaphore,
     pub(super) staging: Option<Staging>,
     /// `Some` while the slot has a submitted-but-not-yet-drained
     /// blit. The metadata travels alongside the bytes when the slot
@@ -431,9 +438,21 @@ impl State {
                     .create_fence(&vk::FenceCreateInfo::default(), None)
             }
             .map_err(|e| FerricastError::Capture(format!("vk create_fence: {e}")))?;
+            let acquire_semaphore = if inner.external_semaphore_fd.is_some() {
+                // SAFETY: valid device, default create info.
+                unsafe {
+                    inner
+                        .device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                }
+                .map_err(|e| FerricastError::Capture(format!("vk create_semaphore: {e}")))?
+            } else {
+                vk::Semaphore::null()
+            };
             slots.push(Slot {
                 command_buffer: cmd,
                 fence,
+                acquire_semaphore,
                 staging: None,
                 pending_meta: None,
             });
@@ -493,6 +512,9 @@ impl Drop for VulkanImporter {
                 }
                 if slot.fence != vk::Fence::null() {
                     dev.destroy_fence(slot.fence, None);
+                }
+                if slot.acquire_semaphore != vk::Semaphore::null() {
+                    dev.destroy_semaphore(slot.acquire_semaphore, None);
                 }
                 if slot.command_buffer != vk::CommandBuffer::null() {
                     cmd_to_free.push(slot.command_buffer);

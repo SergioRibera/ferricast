@@ -21,7 +21,7 @@
 //! out — orders of magnitude cheaper than the per-frame
 //! create/destroy pattern this replaced.
 
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use ash::vk;
 use bytes::Bytes;
@@ -103,7 +103,7 @@ pub(super) fn run_sync(
     let slot = &state.slots[slot_idx];
     let staging = slot.staging.as_ref().expect("ensure_staging populated it");
 
-    record_and_submit(inner, slot, image, staging, width, height, staging_size)?;
+    record_and_submit(inner, slot, fd, image, staging, width, height, staging_size)?;
     wait_and_reset_fence(inner, slot.fence)?;
     let bytes = readback_from_staging(staging, staging_size);
 
@@ -188,7 +188,7 @@ pub(super) fn run_pipelined(
     // 4. Record + submit on this slot. DO NOT wait — that's the
     //    whole point of the ring. The next call (or `flush_pending`)
     //    will wait on this slot's fence.
-    record_and_submit(inner, slot, image, staging, width, height, byte_size)?;
+    record_and_submit(inner, slot, fd, image, staging, width, height, byte_size)?;
 
     // 5. Mark the slot pending so the next ring step knows what to
     //    rebuild when it drains.
@@ -658,6 +658,7 @@ fn ensure_staging(
 fn record_and_submit(
     inner: &Inner,
     slot: &Slot,
+    dmabuf_fd: RawFd,
     image: vk::Image,
     staging: &Staging,
     width: u32,
@@ -678,13 +679,17 @@ fn record_and_submit(
             .begin_command_buffer(cmd, &begin)
             .map_err(|e| FerricastError::Capture(format!("vk begin_command_buffer: {e}")))?;
 
-        // Acquire the image from FOREIGN (the dmabuf producer) and
-        // transition to TRANSFER_SRC_OPTIMAL.
+        // Acquire the image from FOREIGN (the dmabuf producer). Stay
+        // in GENERAL, the layout foreign producers hand dmabufs over
+        // in: UNDEFINED would allow the driver to discard the
+        // contents, and an in-place transition to
+        // TRANSFER_SRC_OPTIMAL could rewrite (e.g. decompress) the
+        // compositor's shared image.
         let acquire = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::GENERAL)
             .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
             .dst_queue_family_index(inner.queue_family_index)
             .image(image)
@@ -722,7 +727,7 @@ fn record_and_submit(
         device.cmd_copy_image_to_buffer(
             cmd,
             image,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::GENERAL,
             staging.buffer,
             &[region],
         );
@@ -750,13 +755,90 @@ fn record_and_submit(
             .map_err(|e| FerricastError::Capture(format!("vk end_command_buffer: {e}")))?;
 
         let cmd_buffers = [cmd];
-        let submit = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
+        // Wait for the producer's pending writes (implicit sync)
+        // before the copy reads the image, when the kernel and driver
+        // let us turn the dmabuf's fence into a semaphore.
+        let wait_semaphores = [slot.acquire_semaphore];
+        let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+        let mut submit = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
+        if arm_acquire_semaphore(inner, slot, dmabuf_fd) {
+            submit = submit
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages);
+        }
         device
             .queue_submit(inner.queue, &[submit], slot.fence)
             .map_err(|e| FerricastError::Capture(format!("vk queue_submit: {e}")))?;
     }
 
     Ok(())
+}
+
+/// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` =
+/// `_IOWR('b', 2, struct dma_buf_export_sync_file)` (Linux >= 6.0).
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u32 = 0xC008_6202;
+/// Export the fences a *reader* must wait for (pending writes).
+const DMA_BUF_SYNC_READ: u32 = 1;
+
+/// `struct dma_buf_export_sync_file` from `<linux/dma-buf.h>`.
+#[repr(C)]
+struct DmaBufExportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+/// The dmabuf's implicit-sync write fence as a `sync_file`, or `None`
+/// on kernels / exporters without `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`.
+fn export_read_fence(dmabuf_fd: RawFd) -> Option<OwnedFd> {
+    let mut arg = DmaBufExportSyncFile {
+        flags: DMA_BUF_SYNC_READ,
+        fd: -1,
+    };
+    // SAFETY: `dmabuf_fd` is a live descriptor owned by the caller's
+    // frame; `arg` matches the kernel's struct layout and outlives the
+    // call. The request number's type differs between libc flavours,
+    // hence the inferred cast.
+    let rc = unsafe { libc::ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE as _, &raw mut arg) };
+    if rc != 0 || arg.fd < 0 {
+        trace!(
+            error = %std::io::Error::last_os_error(),
+            "DMA_BUF_IOCTL_EXPORT_SYNC_FILE unavailable; copying without implicit-sync wait"
+        );
+        return None;
+    }
+    // SAFETY: on success the kernel returns a fresh fd we now own.
+    Some(unsafe { OwnedFd::from_raw_fd(arg.fd) })
+}
+
+/// Load the dmabuf's pending-write fence into `slot.acquire_semaphore`
+/// as a temporary payload. Returns `true` when the submit must wait
+/// on that semaphore. Any failure degrades to "no wait" (the
+/// pre-existing behaviour) rather than dropping the frame.
+fn arm_acquire_semaphore(inner: &Inner, slot: &Slot, dmabuf_fd: RawFd) -> bool {
+    let Some(ext) = inner.external_semaphore_fd.as_ref() else {
+        return false;
+    };
+    let Some(sync_file) = export_read_fence(dmabuf_fd) else {
+        return false;
+    };
+    let raw = sync_file.into_raw_fd();
+    let info = vk::ImportSemaphoreFdInfoKHR::default()
+        .semaphore(slot.acquire_semaphore)
+        .flags(vk::SemaphoreImportFlags::TEMPORARY)
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+        .fd(raw);
+    // SAFETY: the semaphore belongs to this device and no pending
+    // submission uses it (the slot's previous submit was drained
+    // before the slot was reused). On success Vulkan owns `raw`.
+    match unsafe { ext.import_semaphore_fd(&info) } {
+        Ok(()) => true,
+        Err(e) => {
+            // SAFETY: import failed, so ownership of `raw` stayed with us.
+            drop(unsafe { OwnedFd::from_raw_fd(raw) });
+            warn!(error = %e, "vk import_semaphore_fd(SYNC_FD) failed; copying without wait");
+            false
+        }
+    }
 }
 
 fn pick_memory_type(
@@ -812,7 +894,16 @@ impl Drop for OwnedFdGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::buffer_id;
+    use super::{buffer_id, export_read_fence};
+
+    /// A non-dmabuf fd must make the implicit-sync export degrade to
+    /// "no wait", not error or panic.
+    #[test]
+    fn export_read_fence_degrades_on_non_dmabuf() {
+        let fd = make_memfd("ferricast-sync-file");
+        assert!(export_read_fence(fd).is_none());
+        unsafe { libc::close(fd) };
+    }
     use std::ffi::CString;
     use std::os::fd::RawFd;
 
