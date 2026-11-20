@@ -33,6 +33,7 @@ use libva::{
 
 use super::dpb::{Dpb, Frame as DpbFrame, Released};
 use super::slice::{self, PocKind, Pps, SliceHeader, SliceType, Sps, Unsupported};
+use super::split_annex_b;
 use crate::nv12::{self, Nv12Planes};
 
 /// Why a VA-API decode call failed, split so the facade can tell a
@@ -978,49 +979,9 @@ fn first_mb_in_slice(nal: &[u8]) -> Result<u32> {
     slice::BitReader::new(&rbsp).read_ue()
 }
 
-pub(super) fn split_annex_b(buf: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let mut start = None;
-    let mut index = 0;
-    while index + 3 <= buf.len() {
-        if buf[index] == 0 && buf[index + 1] == 0 && buf[index + 2] == 1 {
-            if let Some(begin) = start {
-                let end = if index > begin && buf[index - 1] == 0 {
-                    index - 1
-                } else {
-                    index
-                };
-                out.push(&buf[begin..end]);
-            }
-            index += 3;
-            start = Some(index);
-            continue;
-        }
-        index += 1;
-    }
-    if let Some(begin) = start {
-        out.push(&buf[begin..]);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn annex_b_units_are_split_at_three_and_four_byte_start_codes() {
-        let stream = [
-            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 4,
-        ];
-        let units = split_annex_b(&stream);
-        assert_eq!(units, [&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 4][..]]);
-    }
-
-    #[test]
-    fn a_stream_without_start_codes_has_no_units() {
-        assert!(split_annex_b(&[1, 2, 3, 4]).is_empty());
-    }
 
     struct Simulation {
         output_order: Vec<u64>,
