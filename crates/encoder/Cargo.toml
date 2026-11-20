@@ -27,7 +27,7 @@ edition = "2024"
 # fix for cros-libva ABI mismatches:
 #   ferricast = { default-features = false, features = ["x264", "nvenc", "fdk-aac"] }
 default = ["x264", "vaapi", "nvenc", "fdk-aac", "opus-rs"]
-x264 = ["dep:x264"]
+x264 = ["dep:x264-sys"]
 vaapi = ["dep:cros-libva"]
 nvenc = ["dep:shiguredo_nvcodec"]
 # HEVC (H.265) encode through NVENC. Builds on top of `nvenc` — the
@@ -97,6 +97,8 @@ shiguredo_nvcodec = { version = "2026.1.0", optional = true }
 # reference AAC implementation; oxideav-aac is the fallback for
 # environments where pulling in the C library is impractical.
 fdk-aac = { version = "0.8", optional = true }
-x264 = { version = "0.5.0", optional = true }
+# Raw libx264 bindings. The safe `x264` wrapper hides zerolatency/VBV
+# params, per-picture IDR forcing and delayed-frame draining.
+x264-sys = { version = "0.2", optional = true }
 yuv = "0.8.16"
 opus-rs = { version = "0.1.23", optional = true }
