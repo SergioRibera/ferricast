@@ -7,11 +7,15 @@ use tracing::debug;
 
 use crate::audio_clock::{AudioClock, ClockEvent};
 
-// 20 ms at 48 kHz — valid for Hybrid mode (frame_rate = 50).
-// Chromecast Cast Streaming receivers expect RFC 7587 packets at
-// this granularity; smaller sizes (e.g. 480) are also valid but
-// 960 gives the best quality/latency trade-off for desktop mirroring.
-const FRAME_SAMPLES: usize = 960;
+// 20 ms frames (frame_rate = 50, valid for Hybrid mode): 960 samples
+// at 48 kHz. Chromecast Cast Streaming receivers expect RFC 7587
+// packets at this granularity; it is the best quality/latency
+// trade-off for desktop mirroring.
+const FRAMES_PER_SECOND: u32 = 50;
+
+// Input rates Opus encodes natively (RFC 6716 §2). Anything else
+// (44.1 kHz in particular) needs resampling, which this crate lacks.
+const SUPPORTED_RATES: [u32; 5] = [8_000, 12_000, 16_000, 24_000, 48_000];
 
 // Generous upper bound for one encoded Opus packet (RFC 7587 §2.1.3
 // permits up to ~1275 bytes for the highest bitrate; 4 KiB is safe).
@@ -22,8 +26,10 @@ pub struct OpusEncoder {
     enc: Option<RawEncoder>,
     sample_rate: u32,
     channels: u16,
+    // Samples per channel in one 20 ms frame at `sample_rate`.
+    frame_samples: usize,
     // Interleaved f32 PCM accumulated across PipeWire chunks until
-    // we have at least FRAME_SAMPLES × channels samples to give Opus.
+    // we have at least frame_samples × channels samples to give Opus.
     pcm_buf: Vec<f32>,
     // Output timestamps; created by `configure()` with the input rate.
     clock: Option<AudioClock>,
@@ -50,6 +56,14 @@ impl AudioEncoder for OpusEncoder {
                 config.channels
             )));
         }
+        if !SUPPORTED_RATES.contains(&config.sample_rate) {
+            return Err(FerricastError::Encoder(format!(
+                "opus-rs: {} Hz input is not an Opus rate (8/12/16/24/48 kHz); \
+                 capture at 48 kHz or use AAC",
+                config.sample_rate
+            )));
+        }
+        let frame_samples = (config.sample_rate / FRAMES_PER_SECOND) as usize;
         let mut enc = RawEncoder::new(
             config.sample_rate as i32,
             config.channels as usize,
@@ -66,7 +80,8 @@ impl AudioEncoder for OpusEncoder {
         self.enc = Some(enc);
         self.sample_rate = config.sample_rate;
         self.channels = config.channels;
-        self.pcm_buf = Vec::with_capacity(FRAME_SAMPLES * config.channels as usize * 4);
+        self.frame_samples = frame_samples;
+        self.pcm_buf = Vec::with_capacity(frame_samples * config.channels as usize * 4);
         self.clock = Some(AudioClock::new(config.sample_rate));
         Ok(())
     }
@@ -104,12 +119,12 @@ impl AudioEncoder for OpusEncoder {
             i += 2;
         }
 
-        let samples_per_frame = FRAME_SAMPLES * self.channels as usize;
+        let samples_per_frame = self.frame_samples * self.channels as usize;
         let mut out = vec![0u8; OUT_BUF];
         while self.pcm_buf.len() >= samples_per_frame {
             let input_view = &self.pcm_buf[..samples_per_frame];
             let n = enc
-                .encode(input_view, FRAME_SAMPLES, &mut out)
+                .encode(input_view, self.frame_samples, &mut out)
                 .map_err(|e| FerricastError::Encoder(format!("opus-rs: encode failed: {e}")))?;
             self.pcm_buf.drain(..samples_per_frame);
 
@@ -122,7 +137,7 @@ impl AudioEncoder for OpusEncoder {
                     sample_rate: self.sample_rate,
                     channels: self.channels,
                 });
-                clock.advance(FRAME_SAMPLES as u64);
+                clock.advance(self.frame_samples as u64);
             }
         }
         Ok(())
@@ -134,5 +149,41 @@ impl AudioEncoder for OpusEncoder {
 
     fn flush(mut self) -> Result<Vec<AudioFrame>> {
         Ok(std::mem::take(&mut self.pending))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(sample_rate: u32) -> AudioEncoderConfig {
+        AudioEncoderConfig {
+            codec: AudioCodec::Opus,
+            sample_rate,
+            channels: 2,
+            bitrate_kbps: 96,
+        }
+    }
+
+    #[test]
+    fn cd_rate_is_rejected_up_front() {
+        let err = OpusEncoder::new().configure(&config(44_100)).unwrap_err();
+        assert!(err.to_string().contains("44100"), "{err}");
+    }
+
+    /// 20 ms of input at a non-48 kHz rate yields exactly one packet.
+    #[test]
+    fn frame_size_follows_sample_rate() {
+        let mut enc = OpusEncoder::new();
+        enc.configure(&config(24_000)).expect("configure");
+        let pcm = AudioFrame {
+            codec: AudioCodec::Pcm,
+            data: Bytes::from(vec![0u8; 480 * 2 * 2]),
+            timestamp_us: 0,
+            sample_rate: 24_000,
+            channels: 2,
+        };
+        enc.encode(&pcm).expect("encode");
+        assert_eq!(enc.take_output().len(), 1);
     }
 }
