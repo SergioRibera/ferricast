@@ -1,0 +1,14 @@
+[package]
+name = "ferricast-demuxer"
+version = "0.1.0"
+edition = "2024"
+description = "MP4, MOV, WebM and MKV demuxers for ferricast"
+
+[features]
+default = ["matroska"]
+matroska = ["dep:matroska-demuxer"]
+
+[dependencies]
+ferricast-core = { path = "../core", default-features = false }
+bytes.workspace = true
+matroska-demuxer = { version = "0.8", optional = true }

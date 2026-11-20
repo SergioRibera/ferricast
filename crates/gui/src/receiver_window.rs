@@ -509,6 +509,7 @@ fn codec_label_video(c: Codec) -> &'static str {
         Codec::H265 => "H.265",
         Codec::Vp8 => "VP8",
         Codec::Vp9 => "VP9",
+        Codec::Av1 => "AV1",
     }
 }
 

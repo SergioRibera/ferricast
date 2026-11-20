@@ -1,0 +1,223 @@
+use std::collections::VecDeque;
+use std::mem::MaybeUninit;
+use std::ptr::NonNull;
+
+use ferricast_core::{
+    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, PixelFormat, RawFrame,
+    Result, VideoDecoder,
+};
+use rav1d::include::dav1d::data::Dav1dData;
+use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
+use rav1d::include::dav1d::picture::Dav1dPicture;
+use rav1d::src::lib::{
+    dav1d_close, dav1d_data_create, dav1d_data_unref, dav1d_default_settings, dav1d_get_picture,
+    dav1d_open, dav1d_picture_unref, dav1d_send_data,
+};
+
+use crate::nv12::{self, Planar};
+
+const I420: u32 = 1;
+
+#[derive(Default)]
+pub struct Av1Decoder {
+    context: Option<Dav1dContext>,
+    ready: VecDeque<CapturedFrame>,
+}
+
+// SAFETY: the context is an Arc-backed rav1d decoder that is only ever used through
+// `&mut self`, and rav1d synchronises its own worker threads internally.
+unsafe impl Send for Av1Decoder {}
+
+impl VideoDecoder for Av1Decoder {
+    const CODEC: Codec = Codec::Av1;
+
+    fn configure(&mut self, config: &DecoderConfig) -> Result<()> {
+        if config.codec != Codec::Av1 {
+            return Err(FerricastError::Decode(format!(
+                "Av1Decoder asked to decode {:?}; only AV1 supported",
+                config.codec
+            )));
+        }
+        self.close();
+        let mut settings = MaybeUninit::<Dav1dSettings>::uninit();
+        // SAFETY: `settings` is valid for writes and dav1d_default_settings initialises all of it.
+        let mut settings = unsafe {
+            dav1d_default_settings(NonNull::from(&mut settings).cast());
+            settings.assume_init()
+        };
+        settings.n_threads = 1;
+        settings.max_frame_delay = 1;
+        let mut context = None;
+        // SAFETY: both pointers come from live references and `context` is only read back once
+        // dav1d_open has reported success.
+        let opened = unsafe {
+            dav1d_open(
+                Some(NonNull::from(&mut context)),
+                Some(NonNull::from(&mut settings)),
+            )
+        };
+        match context {
+            Some(context) if opened.0 == 0 => {
+                self.context = Some(context);
+                Ok(())
+            }
+            _ => Err(FerricastError::Decode(format!(
+                "rav1d open failed with {}",
+                opened.0
+            ))),
+        }
+    }
+
+    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+        let context = self.context.ok_or_else(|| {
+            FerricastError::Decode("Av1Decoder::decode before configure()".into())
+        })?;
+        let mut data = Dav1dData::default();
+        // SAFETY: `data` is valid for writes; on success dav1d owns a buffer of the requested size.
+        let buffer = unsafe { dav1d_data_create(Some(NonNull::from(&mut data)), frame.data.len()) };
+        if buffer.is_null() {
+            return Err(FerricastError::Decode(
+                "rav1d could not allocate a packet".into(),
+            ));
+        }
+        // SAFETY: `buffer` has room for `frame.data.len()` bytes and cannot overlap `frame.data`.
+        unsafe { std::ptr::copy_nonoverlapping(frame.data.as_ptr(), buffer, frame.data.len()) };
+        data.m.timestamp = frame.timestamp_us as i64;
+        let result = self.feed(context, &mut data);
+        // SAFETY: `data` was filled by dav1d_data_create and is unreferenced exactly once, here.
+        unsafe { dav1d_data_unref(Some(NonNull::from(&mut data))) };
+        result?;
+        Ok(self.ready.pop_front())
+    }
+
+    fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
+        Ok(self.ready.drain(..).collect())
+    }
+}
+
+impl Av1Decoder {
+    fn feed(&mut self, context: Dav1dContext, data: &mut Dav1dData) -> Result<()> {
+        while data.sz > 0 {
+            // SAFETY: `context` comes from dav1d_open and has not been closed; `data` is valid.
+            let sent = unsafe { dav1d_send_data(Some(context), Some(NonNull::from(&mut *data))) };
+            if sent.0 != 0 && sent.0 != -libc::EAGAIN {
+                return Err(FerricastError::Decode(format!(
+                    "rav1d send failed with {}",
+                    sent.0
+                )));
+            }
+            let pulled = self.pull(context)?;
+            if sent.0 != 0 && !pulled {
+                return Err(FerricastError::Decode("rav1d stalled on a packet".into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn pull(&mut self, context: Dav1dContext) -> Result<bool> {
+        let mut pulled = false;
+        loop {
+            let mut picture = Dav1dPicture::default();
+            // SAFETY: `context` is open and `picture` is valid for writes.
+            let got =
+                unsafe { dav1d_get_picture(Some(context), Some(NonNull::from(&mut picture))) };
+            if got.0 == -libc::EAGAIN {
+                return Ok(pulled);
+            }
+            if got.0 != 0 {
+                return Err(FerricastError::Decode(format!(
+                    "rav1d get_picture failed with {}",
+                    got.0
+                )));
+            }
+            let frame = nv12_frame(&picture);
+            // SAFETY: `picture` was filled by dav1d_get_picture and is unreferenced exactly once.
+            unsafe { dav1d_picture_unref(Some(NonNull::from(&mut picture))) };
+            self.ready.push_back(frame?);
+            pulled = true;
+        }
+    }
+
+    fn close(&mut self) {
+        if self.context.is_some() {
+            // SAFETY: the context came from dav1d_open and dav1d_close clears it so it cannot be
+            // closed twice.
+            unsafe { dav1d_close(Some(NonNull::from(&mut self.context))) };
+            self.context = None;
+        }
+        self.ready.clear();
+    }
+}
+
+impl Drop for Av1Decoder {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn nv12_frame(picture: &Dav1dPicture) -> Result<CapturedFrame> {
+    let short = || FerricastError::Decode("rav1d returned short planes".into());
+    if picture.p.layout != I420 {
+        return Err(FerricastError::Decode(format!(
+            "rav1d pixel layout {} is not 4:2:0",
+            picture.p.layout
+        )));
+    }
+    let (width, height) = (
+        usize::try_from(picture.p.w).map_err(|_| short())?,
+        usize::try_from(picture.p.h).map_err(|_| short())?,
+    );
+    let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
+    let bytes = if picture.p.bpc > 8 { 2 } else { 1 };
+    let plane = |index: usize, rows: usize| {
+        let stride = usize::try_from(picture.stride[usize::from(index > 0)]).ok()?;
+        let base = picture.data[index]?;
+        // SAFETY: dav1d allocates every plane as `stride * rows` bytes at least, and the picture
+        // stays referenced until the caller unreferences it after this function returns.
+        let samples =
+            unsafe { std::slice::from_raw_parts(base.as_ptr().cast::<u8>(), stride * rows) };
+        Some((samples, stride))
+    };
+    let (y, y_stride) = plane(0, height).ok_or_else(short)?;
+    let (u, uv_stride) = plane(1, chroma_height).ok_or_else(short)?;
+    let (v, _) = plane(2, chroma_height).ok_or_else(short)?;
+    let (data, stride) = if bytes == 1 {
+        nv12::from_i420(&Planar {
+            width,
+            height,
+            y,
+            y_stride,
+            u,
+            v,
+            uv_stride,
+        })
+    } else {
+        let depth = u32::try_from(picture.p.bpc).map_err(|_| short())?;
+        let (y, u, v) = (
+            nv12::narrow_le_bytes(y, y_stride, width, height, depth),
+            nv12::narrow_le_bytes(u, uv_stride, chroma_width, chroma_height, depth),
+            nv12::narrow_le_bytes(v, uv_stride, chroma_width, chroma_height, depth),
+        );
+        match (y, u, v) {
+            (Some(y), Some(u), Some(v)) => nv12::from_i420(&Planar {
+                width,
+                height,
+                y: &y,
+                y_stride: width,
+                u: &u,
+                v: &v,
+                uv_stride: chroma_width,
+            }),
+            _ => None,
+        }
+    }
+    .ok_or_else(short)?;
+    Ok(CapturedFrame::Cpu(RawFrame {
+        width: width as u32,
+        height: height as u32,
+        stride: stride as u32,
+        format: PixelFormat::Nv12,
+        data,
+        timestamp_us: picture.m.timestamp as u64,
+    }))
+}

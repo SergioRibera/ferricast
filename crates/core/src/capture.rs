@@ -82,24 +82,19 @@ pub trait ScreenCapture: Send {
 /// screencast. `Node` is an explicit PipeWire object id used when
 /// the UI lets the user pick a specific source/sink-monitor (e.g.
 /// the captured app's own output via pavucontrol-style routing).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum AudioSource {
     /// Monitor the default sink (system-wide output capture). The
     /// backend resolves this to whatever sink PipeWire reports as
     /// default at start time; subsequent default-sink changes do
     /// not migrate the active stream — restart capture to pick up
     /// a new default.
+    #[default]
     DefaultMonitor,
     /// Bind directly to a PipeWire node id (use `pw-dump` /
     /// `pw-cli ls Node` to discover). Useful when the user wants
     /// "just this app's audio" via a manual route in pavucontrol.
     Node(u32),
-}
-
-impl Default for AudioSource {
-    fn default() -> Self {
-        AudioSource::DefaultMonitor
-    }
 }
 
 #[derive(Debug, Clone, Copy)]

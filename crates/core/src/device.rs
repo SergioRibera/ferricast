@@ -183,7 +183,7 @@ impl Features {
             return AIRPLAY_PAIR_TRANSIENT;
         }
 
-        return AIRPLAY_PAIR_ERR;
+        AIRPLAY_PAIR_ERR
     }
 }
 
@@ -252,6 +252,7 @@ pub enum H265Profile {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum DiscoveryEvent {
     DeviceFound(Device),
     DeviceLost(Uuid),

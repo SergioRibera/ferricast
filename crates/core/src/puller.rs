@@ -15,9 +15,9 @@
 
 use std::collections::HashMap;
 
+use crate::codec::Codec;
 use crate::error::Result;
 use crate::frame::{AudioCodec, AudioFrame, EncodedFrame};
-use crate::protocol::Codec;
 
 /// Where + how to fetch a stream. Headers cover the common
 /// authenticated-URL case (Cast LOAD with `Authorization`, signed

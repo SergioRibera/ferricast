@@ -44,6 +44,9 @@ pub enum FerricastError {
     #[error("Decode error: {0}")]
     Decode(String),
 
+    #[error("Demux error: {0}")]
+    Demux(String),
+
     #[error("Pull error: {0}")]
     Pull(String),
 

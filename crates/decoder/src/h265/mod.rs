@@ -14,7 +14,11 @@
 //! two GPU backends compiled in, the facade refuses to build via
 //! the `compile_error!` below.
 
-#[cfg(not(any(feature = "nvdec-hevc-decode", feature = "vaapi-hevc-decode")))]
+#[cfg(not(any(
+    feature = "nvdec-hevc-decode",
+    feature = "vaapi-hevc-decode",
+    feature = "hevc-decode"
+)))]
 compile_error!(
     "ferricast-decoder's H.265 facade requires at least one of \
      `nvdec-hevc-decode` / `vaapi-hevc-decode`. HEVC has no software \
@@ -22,6 +26,8 @@ compile_error!(
      path is wanted."
 );
 
+#[cfg(feature = "hevc-decode")]
+mod software_impl;
 #[cfg(feature = "vaapi-hevc-decode")]
 mod vaapi_impl;
 
@@ -33,28 +39,28 @@ use tracing::info;
 
 #[cfg(feature = "nvdec-hevc-decode")]
 pub use crate::nvdec::NvdecH265Decoder;
+#[cfg(feature = "hevc-decode")]
+pub use software_impl::SoftwareH265Decoder;
 #[cfg(feature = "vaapi-hevc-decode")]
 pub use vaapi_impl::VaapiH265Decoder;
 
 const H265_BACKEND_VAR: &str = "FERRICAST_H265_DECODE_BACKEND";
 
+#[derive(Default)]
 pub enum H265Decoder {
+    #[default]
     Pending,
     #[cfg(feature = "nvdec-hevc-decode")]
     Nvdec(NvdecH265Decoder),
     #[cfg(feature = "vaapi-hevc-decode")]
     Vaapi(VaapiH265Decoder),
+    #[cfg(feature = "hevc-decode")]
+    Software(Box<SoftwareH265Decoder>),
 }
 
 impl H265Decoder {
     pub fn new() -> Self {
         Self::default()
-    }
-}
-
-impl Default for H265Decoder {
-    fn default() -> Self {
-        H265Decoder::Pending
     }
 }
 
@@ -69,6 +75,8 @@ impl VideoDecoder for H265Decoder {
                 H265Decoder::Nvdec(d) => d.configure(config),
                 #[cfg(feature = "vaapi-hevc-decode")]
                 H265Decoder::Vaapi(d) => d.configure(config),
+                #[cfg(feature = "hevc-decode")]
+                H265Decoder::Software(d) => d.configure(config),
             };
         }
 
@@ -116,9 +124,19 @@ impl VideoDecoder for H265Decoder {
             }
         }
 
+        #[cfg(feature = "hevc-decode")]
+        {
+            if var.is_empty() || var == "software" {
+                info!("H.265 decoder backend: software");
+                let mut d = SoftwareH265Decoder::default();
+                d.configure(config)?;
+                *self = H265Decoder::Software(Box::new(d));
+                return Ok(());
+            }
+        }
+
         Err(FerricastError::Decode(format!(
-            "no H.265 decoder backend available for FERRICAST_H265_DECODE_BACKEND={var:?} \
-             — HEVC requires GPU hardware (NVDEC or VA-API)"
+            "no H.265 decoder backend available for FERRICAST_H265_DECODE_BACKEND={var:?}"
         )))
     }
 
@@ -131,6 +149,8 @@ impl VideoDecoder for H265Decoder {
             H265Decoder::Nvdec(d) => d.decode(frame),
             #[cfg(feature = "vaapi-hevc-decode")]
             H265Decoder::Vaapi(d) => d.decode(frame),
+            #[cfg(feature = "hevc-decode")]
+            H265Decoder::Software(d) => d.decode(frame),
         }
     }
 
@@ -141,6 +161,8 @@ impl VideoDecoder for H265Decoder {
             H265Decoder::Nvdec(d) => d.flush(),
             #[cfg(feature = "vaapi-hevc-decode")]
             H265Decoder::Vaapi(d) => d.flush(),
+            #[cfg(feature = "hevc-decode")]
+            H265Decoder::Software(d) => d.flush(),
         }
     }
 }

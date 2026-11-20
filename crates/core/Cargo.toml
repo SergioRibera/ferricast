@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2024"
 description = "Core traits and types for ferricast streaming protocols"
 
+[features]
+default = ["net"]
+net = ["dep:tokio"]
+
 [dependencies]
-tokio = { workspace = true, features = ["sync", "macros", "net"] }
+tokio = { workspace = true, features = ["sync", "macros", "net"], optional = true }
 tracing.workspace = true
 thiserror.workspace = true
 bytes.workspace = true

@@ -21,7 +21,7 @@ impl PairingChallenge {
             return Self::Pin { digits: 4 };
         }
 
-        return Self::None;
+        Self::None
     }
 }
 

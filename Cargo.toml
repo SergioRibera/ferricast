@@ -9,6 +9,8 @@ members = [
     "crates/miracast",
     "crates/encoder",
     "crates/decoder",
+    "crates/demuxer",
+    "crates/player",
     "crates/m3u8",
     "crates/muxer",
     "crates/hls",
@@ -23,6 +25,7 @@ ferricast-capture = { path = "crates/capture", default-features = false }
 ferricast-chromecast = { path = "crates/chromecast" }
 ferricast-encoder = { path = "crates/encoder", default-features = false }
 ferricast-decoder = { path = "crates/decoder", default-features = false }
+ferricast-demuxer = { path = "crates/demuxer" }
 ferricast-m3u8 = { path = "crates/m3u8" }
 ferricast-muxer = { path = "crates/muxer" }
 ferricast-hls = { path = "crates/hls" }
@@ -141,3 +144,7 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.fdk-aac]
 opt-level = 3
+[profile.dev.package.rav1d]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
