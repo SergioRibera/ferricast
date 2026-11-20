@@ -220,16 +220,16 @@ impl MpegTs {
         // frames get rejected here even on a perfectly healthy
         // stream, which on the receiver sounds like a robotic
         // ratcheting stutter.
-        if let Some(watermark) = self.audio_pts_90k {
-            if pts_90k.saturating_add(AUDIO_PTS_TOLERANCE_90K) < watermark {
-                tracing::debug!(
-                    pts_90k,
-                    watermark,
-                    behind_90k = watermark - pts_90k,
-                    "muxer: dropping real AAC frame behind silent watermark"
-                );
-                return Ok(());
-            }
+        if let Some(watermark) = self.audio_pts_90k
+            && pts_90k.saturating_add(AUDIO_PTS_TOLERANCE_90K) < watermark
+        {
+            tracing::debug!(
+                pts_90k,
+                watermark,
+                behind_90k = watermark - pts_90k,
+                "muxer: dropping real AAC frame behind silent watermark"
+            );
+            return Ok(());
         }
         // PSI must still appear first if no video has shown up yet
         // (rare for the live screencast pipeline: audio anchors at
