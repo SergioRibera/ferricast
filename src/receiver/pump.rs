@@ -125,7 +125,7 @@ impl Clock {
             Some(d) if d <= now + MAX_AHEAD => d,
             _ => {
                 tracing::debug!(pts_us, "pump: timestamp jump — re-anchoring");
-                self.anchor_at(pts_us);
+                self.anchor = Some((now + AUDIO_LEAD, pts_us));
                 now + AUDIO_LEAD
             }
         }
