@@ -1,47 +1,179 @@
+//! AirPlay receiver discovery over mDNS (`_airplay._tcp`).
+
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
-use ferricast_core::device::{Features, Flags};
-use mdns_sd::ServiceDaemon;
-use tokio::io::BufReader;
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-
+use ferricast_core::device::{AirplayConfig, Features, Flags};
 use ferricast_core::{
     Codec, Device, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError, MdnsDiscovery,
     Result,
 };
+use mdns_sd::{ServiceDaemon, ServiceEvent};
+use plist::Value;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::rtsp::{RtspManager, RtspResponse};
+use crate::crypto::sha512_16;
+use crate::rtsp::{ClientIdentity, RtspClient};
 
-/// The mDNS service type for AirPlay.
 const AIRPLAY_SERVICE_TYPE: &str = "_airplay._tcp.local.";
-
 const AIRPLAY_ICON: Bytes = Bytes::from_static(include_bytes!("../../../assets/airplay.svg"));
+const INFO_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// AirPlay device discovery implementation using mDNS-SD.
+/// `Device::metadata` key holding further receiver addresses (comma
+/// separated), tried in order when the primary address is unreachable.
+pub const META_ADDRESSES: &str = "airplay.addresses";
+
+/// AirPlay device discovery using mDNS-SD.
+#[derive(Default)]
 pub struct AirPlayDiscovery {
     running: Arc<AtomicBool>,
     daemon: Option<ServiceDaemon>,
-    handle: Option<tokio::task::JoinHandle<()>>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl MdnsDiscovery for AirPlayDiscovery {
     const SERVICE_TYPE: &'static str = AIRPLAY_SERVICE_TYPE;
 }
 
-impl Default for AirPlayDiscovery {
-    fn default() -> Self {
-        Self {
-            running: Arc::new(AtomicBool::new(false)),
-            daemon: None,
-            handle: None,
-        }
+/// Stable device id: the same receiver keeps its UUID across restarts.
+fn stable_id(device_id: &str) -> Uuid {
+    uuid::Builder::from_random_bytes(sha512_16(&[b"ferricast-airplay:", device_id.as_bytes()]))
+        .into_uuid()
+}
+
+/// Order addresses so the most likely reachable one comes first. IPv6
+/// link-local addresses are dropped: they need a scope id we don't have.
+fn rank_addresses(addrs: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
+    let rank = |ip: &IpAddr| match ip {
+        IpAddr::V4(v4) if v4.is_private() => 0,
+        IpAddr::V4(v4) if !v4.is_link_local() => 1,
+        IpAddr::V4(_) => 2,
+        IpAddr::V6(_) => 3,
+    };
+    let mut addrs: Vec<IpAddr> = addrs
+        .into_iter()
+        .filter(|ip| match ip {
+            IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
+            IpAddr::V4(_) => true,
+        })
+        .collect();
+    addrs.sort_by_key(|ip| (rank(ip), *ip));
+    addrs
+}
+
+/// Build a [`Device`] from a resolved service, or `None` if it cannot
+/// mirror the screen.
+fn device_from_service(
+    fullname: &str,
+    port: u16,
+    addrs: Vec<IpAddr>,
+    txt: &HashMap<String, String>,
+) -> Option<Device> {
+    let Some(features) = txt.get("features").and_then(|f| Features::parse_txt(f)) else {
+        warn!(
+            name = fullname,
+            "AirPlay service without valid features, skipping"
+        );
+        return None;
+    };
+    if !features.contains(Features::MIRRORING_SUPPORTED) {
+        debug!(name = fullname, %features, "AirPlay receiver without screen mirroring, skipping");
+        return None;
     }
+    let mut flags = txt
+        .get("flags")
+        .and_then(|v| {
+            u32::from_str_radix(v.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()
+        })
+        .map(Flags::from_bits_retain)
+        .unwrap_or_else(Flags::empty);
+    // UxPlay / RPiPlay signal "PIN or password required" only via `pw`.
+    if txt
+        .get("pw")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    {
+        flags |= Flags::PASSWORD_REQUIRED;
+    }
+    let addrs = rank_addresses(addrs);
+    let (&addr, rest) = addrs.split_first()?;
+    let device_id = txt.get("deviceid").cloned();
+    let id = stable_id(device_id.as_deref().unwrap_or(fullname));
+    let mut metadata = HashMap::new();
+    if !rest.is_empty() {
+        let rest: Vec<String> = rest.iter().map(ToString::to_string).collect();
+        metadata.insert(META_ADDRESSES.to_owned(), rest.join(","));
+    }
+    Some(Device {
+        id,
+        name: fullname
+            .strip_suffix(".")
+            .unwrap_or(fullname)
+            .strip_suffix("._airplay._tcp.local")
+            .unwrap_or(fullname)
+            .to_owned(),
+        protocol: "airplay",
+        protocol_icon: AIRPLAY_ICON,
+        addr,
+        port,
+        model: txt.get("model").cloned(),
+        metadata,
+        capabilities: DeviceCapabilities {
+            supports_audio: features.contains(Features::AUDIO_SUPPORTED),
+            supports_video: features.contains(Features::VIDEO_SUPPORTED),
+            supports_screen_mirror: true,
+            supported_codecs: vec![Codec::H264],
+            max_width: Some(1920),
+            max_height: Some(1080),
+            max_fps: Some(30),
+            airplay_config: Some(AirplayConfig {
+                features,
+                flags,
+                pk: txt.get("pk").cloned(),
+                device_id,
+            }),
+            ..Default::default()
+        },
+    })
+}
+
+/// Display limits from `GET /info`: `(width, height, fps)`.
+async fn probe_info(device: &Device) -> Result<(u32, u32, u32)> {
+    let addr = std::net::SocketAddr::new(device.addr, device.port);
+    let mut rtsp = RtspClient::connect(&[addr], ClientIdentity::default(), None).await?;
+    let reply = rtsp
+        .request("GET", "/info", None, &[])
+        .await?
+        .ensure_success("GET /info")?;
+    let info = plist::from_bytes::<Value>(&reply.body)
+        .ok()
+        .and_then(Value::into_dictionary)
+        .ok_or_else(|| FerricastError::Protocol("GET /info: not a plist dictionary".into()))?;
+    let display = info
+        .get("displays")
+        .and_then(Value::as_array)
+        .and_then(|d| d.first())
+        .and_then(Value::as_dictionary)
+        .ok_or_else(|| FerricastError::Protocol("GET /info: no displays".into()))?;
+    let get = |key: &str, default: u32| {
+        display
+            .get(key)
+            .and_then(Value::as_unsigned_integer)
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default)
+    };
+    Ok((
+        get("widthPixels", 1920),
+        get("heightPixels", 1080),
+        get("maxFPS", 30),
+    ))
 }
 
 impl Discovery for AirPlayDiscovery {
@@ -49,268 +181,90 @@ impl Discovery for AirPlayDiscovery {
 
     async fn start(&mut self, tx: mpsc::Sender<DiscoveryEvent>) -> Result<()> {
         if self.running.load(Ordering::SeqCst) {
-            info!("Airplay discovery already running");
             return Ok(());
         }
-
-        info!("Starting AirPlay discovery");
-
         let daemon = ServiceDaemon::new()
-            .map_err(|e| FerricastError::Discovery(format!("Failed to create mDNS daemon {e}")))?;
-
-        let receiver = daemon.browse(AIRPLAY_SERVICE_TYPE).map_err(|e| {
-            FerricastError::Discovery(format!("Fail to browse for airplay receivers {e}"))
+            .map_err(|e| FerricastError::Discovery(format!("cannot start mDNS daemon: {e}")))?;
+        let events = daemon.browse(AIRPLAY_SERVICE_TYPE).map_err(|e| {
+            FerricastError::Discovery(format!("cannot browse for AirPlay receivers: {e}"))
         })?;
-
         self.daemon = Some(daemon);
         self.running.store(true, Ordering::SeqCst);
+        info!("AirPlay discovery started");
 
         let running = self.running.clone();
-
-        let handle = tokio::spawn(async move {
+        self.handle = Some(tokio::spawn(async move {
             let mut known: HashMap<String, Uuid> = HashMap::new();
-
             while running.load(Ordering::SeqCst) {
-                let event = {
-                    let receiver_ref = receiver.clone();
-
-                    match tokio::task::spawn_blocking(move || {
-                        receiver_ref.recv_timeout(std::time::Duration::from_secs(5))
-                    })
-                    .await
-                    {
-                        Ok(Ok(ev)) => ev,
-                        Ok(Err(_timeout)) => continue,
-                        Err(join_err) => {
-                            tracing::error!(
-                                "mdns browse taContent-Length: 0sk panicked: {join_err}"
-                            );
-                            break;
-                        }
-                    }
+                let Ok(event) = events.recv_async().await else {
+                    break;
                 };
-
                 match event {
-                    mdns_sd::ServiceEvent::ServiceResolved(info) => {
-                        info!(name = info.get_fullname(), "airplay service resolved");
-
-                        let properties = info.get_properties();
-                        let txt: HashMap<String, String> = properties
+                    ServiceEvent::ServiceResolved(service) => {
+                        let txt: HashMap<String, String> = service
+                            .get_properties()
                             .iter()
-                            .map(|p| (p.key().to_string(), p.val_str().to_string()))
+                            .map(|p| (p.key().to_owned(), p.val_str().to_owned()))
                             .collect();
-
-                        let device_uuid = Uuid::new_v4();
-
-                        let addr: std::net::IpAddr = match info.get_addresses_v4().iter().next() {
-                            Some(addr) => (*(*addr)).into(),
-                            None => {
-                                warn!(
-                                    name = info.get_fullname(),
-                                    "resolved service has no addresses, skipping"
-                                );
-                                continue;
-                            }
-                        };
-
-                        let port = info.get_port();
-
-                        let features_txt = txt.get("features").cloned().unwrap_or_default();
-
-                        let mut features = features_txt.split(",");
-
-                        let part1 = match features.next() {
-                            Some(v) => {
-                                match u32::from_str_radix(v.strip_prefix("0x").unwrap_or(v), 16) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        warn!("Invalid features: {:?}", e);
-                                        continue;
-                                    }
-                                }
-                            }
-                            None => {
-                                warn!("Invalid features");
-                                continue;
-                            }
-                        };
-
-                        let part2 = match features.next() {
-                            Some(v) => {
-                                match u32::from_str_radix(v.strip_prefix("0x").unwrap_or(v), 16) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        warn!("Invalid features: {:?}", e);
-                                        continue;
-                                    }
-                                }
-                            }
-                            None => {
-                                warn!("Invalid features");
-                                continue;
-                            }
-                        };
-
-                        let flags = match txt.get("flags") {
-                            Some(v) => {
-                                match u32::from_str_radix(v.strip_prefix("0x").unwrap_or(v), 16) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        warn!("Invalid airplay flags: {:?}", e);
-                                        continue;
-                                    }
-                                }
-                            }
-                            None => {
-                                warn!("No flags present");
-                                continue;
-                            }
-                        };
-
-                        let num = ((part2 as u64) << 32) | (part1 as u64);
-
-                        let features = Features::from_bits_truncate(num);
-
-                        let fullname = info.get_fullname();
-
-                        if !features.contains(Features::VIDEO_HTTP_LIVE_STREAM) {
-                            warn!("Skipped airplay device {}", fullname);
+                        let fullname = service.get_fullname().to_owned();
+                        let addrs = service.get_addresses().iter().copied().collect();
+                        let Some(mut device) =
+                            device_from_service(&fullname, service.get_port(), addrs, &txt)
+                        else {
                             continue;
-                        }
-
-                        let flags = Flags::from_bits_truncate(flags);
-
-                        info!("Device {:?} Flags {:?}", info.get_fullname(), flags,);
-
-                        let mut socket = match TcpStream::connect((addr, port)).await {
-                            Ok(v) => v,
-                            Err(_) => {
-                                warn!("Invalid Airplay Device {:?}", info.get_fullname());
-                                continue;
-                            }
                         };
-
-                        let manager = RtspManager::new(features);
-
-                        let (read_half, mut write_half) = socket.split();
-                        let mut buf_reader = BufReader::new(read_half);
-
-                        match manager
-                            .builder()
-                            .get()
-                            .path("/info".to_string())
-                            .write(&mut write_half)
-                            .await
+                        known.insert(fullname, device.id);
+                        let tx = tx.clone();
+                        // Probe display limits off the event loop so one slow
+                        // receiver doesn't delay the others.
+                        tokio::spawn(async move {
+                            match tokio::time::timeout(INFO_TIMEOUT, probe_info(&device)).await {
+                                Ok(Ok((w, h, fps))) => {
+                                    device.capabilities.max_width = Some(w);
+                                    device.capabilities.max_height = Some(h);
+                                    device.capabilities.max_fps = Some(fps);
+                                }
+                                Ok(Err(e)) => {
+                                    debug!(name = %device.name, error = %e, "AirPlay /info probe failed")
+                                }
+                                Err(_) => {
+                                    debug!(name = %device.name, "AirPlay /info probe timed out")
+                                }
+                            }
+                            info!(name = %device.name, addr = %device.addr, port = device.port, "discovered AirPlay receiver");
+                            let _ = tx.send(DiscoveryEvent::DeviceFound(device)).await;
+                        });
+                    }
+                    ServiceEvent::ServiceRemoved(_, fullname) => {
+                        if let Some(id) = known.remove(&fullname)
+                            && tx.send(DiscoveryEvent::DeviceLost(id)).await.is_err()
                         {
-                            Ok(v) => v,
-                            Err(_) => {
-                                warn!("Invalid Airplay Device {:?}", info.get_fullname());
-                                continue;
-                            }
-                        };
-
-                        let res = match RtspResponse::read(&mut buf_reader).await {
-                            Ok(v) => v,
-                            Err(_) => {
-                                warn!("Invalid Airplay Device {:?}", info.get_fullname());
-                                continue;
-                            }
-                        };
-
-                        let plist_info = match parse_plist(&res) {
-                            Ok(v) => v,
-                            Err(_) => {
-                                warn!("Invalid Airplay Device Plist {:?}", info.get_fullname());
-                                continue;
-                            }
-                        };
-
-                        let device = Device {
-                            id: device_uuid,
-                            name: fullname
-                                .strip_suffix("._airplay._tcp.local.")
-                                .unwrap_or(fullname)
-                                .to_string(),
-                            protocol: Self::PROTOCOL,
-                            protocol_icon: AIRPLAY_ICON,
-                            model: txt.get("model").cloned(),
-                            port,
-                            addr,
-                            metadata: HashMap::new(),
-                            capabilities: DeviceCapabilities {
-                                supports_audio: features.contains(Features::AUDIO_SUPPORTED),
-                                supports_screen_mirror: features
-                                    .contains(Features::MIRRORING_SUPPORTED),
-                                supports_video: features.contains(Features::VIDEO_SUPPORTED),
-                                requires_audio: features.contains(Features::AUDIO_SUPPORTED),
-                                supports_low_latency_hls: features
-                                    .contains(Features::VIDEO_HTTP_LIVE_STREAM),
-                                supported_codecs: vec![Codec::H264],
-                                max_width: Some(plist_info.0 as u32),
-                                max_height: Some(plist_info.1 as u32),
-                                max_fps: Some(plist_info.2 as u32),
-                                max_h264_profile: Some(ferricast_core::H264Profile::Baseline), // Lets
-                                // use
-                                // Baseline in tests
-                                airplay_config: Some(ferricast_core::device::AirplayConfig {
-                                    features,
-                                    flags,
-                                    pk: txt.get("pk").cloned(),
-                                    device_id: txt.get("deviceid").cloned(),
-                                }),
-                                ..Default::default()
-                            },
-                        };
-
-                        known.insert(info.get_fullname().to_string(), device_uuid);
-
-                        info!(
-                            id = %device.id,
-                            name = %device.name,
-                            addr = %device.addr,
-                            port = device.port,
-                            feature = %features,
-                            "discovered airplay device"
-                        );
-
-                        if let Err(e) = tx.send(DiscoveryEvent::DeviceFound(device)).await {
-                            tracing::error!(error = %e, "Discovery event channel closed, stopping");
                             break;
                         }
                     }
-
-                    mdns_sd::ServiceEvent::ServiceRemoved(_, fullname) => {
-                        info!(name = %fullname, "Airplay device removed");
-
-                        if let Some(uuid) = known.remove(fullname.as_str()) {
-                            if let Err(e) = tx.send(DiscoveryEvent::DeviceLost(uuid)).await {
-                                tracing::error!(error = %e, "Discovery event channel closed, skipping");
-                                break;
-                            }
-                        }
-                    }
-
-                    mdns_sd::ServiceEvent::SearchStarted(_ty) => {
-                        debug!("Airplay mdns search started");
-                    }
-
-                    mdns_sd::ServiceEvent::ServiceFound(_, _) => {
-                        debug!("Service found waiting for resolve");
-                    }
-
-                    mdns_sd::ServiceEvent::SearchStopped(ty) => {
-                        debug!("Airplay mdns search stoped");
-                    }
+                    ServiceEvent::SearchStarted(_)
+                    | ServiceEvent::ServiceFound(_, _)
+                    | ServiceEvent::SearchStopped(_) => {}
                 }
             }
-        });
-
-        self.handle = Some(handle);
-
+            running.store(false, Ordering::SeqCst);
+        }));
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<()> {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+        if let Some(daemon) = self.daemon.take() {
+            if let Err(e) = daemon.stop_browse(AIRPLAY_SERVICE_TYPE) {
+                debug!(error = %e, "stop AirPlay browse");
+            }
+            if let Err(e) = daemon.shutdown() {
+                debug!(error = %e, "shut down mDNS daemon");
+            }
+        }
         Ok(())
     }
 
@@ -319,53 +273,102 @@ impl Discovery for AirPlayDiscovery {
     }
 }
 
-fn parse_plist(v: &RtspResponse) -> Result<(u64, u64, u64)> {
-    let c = v.content()?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let info: plist::Value = plist::from_bytes(c)
-        .map_err(|_| FerricastError::Protocol("Invalid plist from airplay device".to_string()))?;
+    /// TXT record UxPlay 1.73.6 registers for `_airplay._tcp`.
+    fn uxplay_txt(pw: bool) -> HashMap<String, String> {
+        [
+            ("deviceid", "60:cf:84:ad:6f:97"),
+            ("features", "0x527FFEE6,0x0"),
+            ("pw", if pw { "true" } else { "false" }),
+            ("flags", "0x4"),
+            ("model", "AppleTV3,2"),
+            (
+                "pk",
+                "19a1e2ab4f4c48d78716415be798d18ae5fbab408033af2d82df3f639a9dea54",
+            ),
+            ("srcvers", "220.68"),
+            ("vv", "2"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
+    }
 
-    let info = info.into_dictionary().ok_or(FerricastError::Protocol(
-        "Invalid plist from airplay device".to_string(),
-    ))?;
+    #[test]
+    fn uxplay_record_becomes_a_legacy_mirroring_device() {
+        let addrs = vec![
+            "fe80::1".parse().unwrap(),
+            "192.168.1.20".parse().unwrap(),
+            "10.0.0.5".parse().unwrap(),
+        ];
+        let d = device_from_service(
+            "ferricast-test._airplay._tcp.local.",
+            7000,
+            addrs,
+            &uxplay_txt(false),
+        )
+        .unwrap();
+        assert_eq!(d.name, "ferricast-test");
+        assert_eq!(d.addr, "10.0.0.5".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            d.metadata.get(META_ADDRESSES).map(String::as_str),
+            Some("192.168.1.20")
+        );
+        let cfg = d.capabilities.airplay_config.unwrap();
+        assert_eq!(cfg.pairing_mode(), ferricast_core::AirPlayPairing::Legacy);
+        assert_eq!(cfg.device_id.as_deref(), Some("60:cf:84:ad:6f:97"));
+        // Same deviceid → same UUID on every resolve.
+        let again = device_from_service(
+            "x._airplay._tcp.local.",
+            7000,
+            vec!["10.0.0.5".parse().unwrap()],
+            &uxplay_txt(false),
+        )
+        .unwrap();
+        assert_eq!(again.id, d.id);
+    }
 
-    let displays = info.get("displays").ok_or(FerricastError::Protocol(
-        "Invalid plist from airplay device no displays".to_string(),
-    ))?;
+    #[test]
+    fn pw_true_requires_pin_pairing() {
+        let d = device_from_service(
+            "u._airplay._tcp.local.",
+            7000,
+            vec!["10.0.0.5".parse().unwrap()],
+            &uxplay_txt(true),
+        )
+        .unwrap();
+        let cfg = d.capabilities.airplay_config.unwrap();
+        assert_eq!(
+            cfg.pairing_mode(),
+            ferricast_core::AirPlayPairing::LegacyPin
+        );
+    }
 
-    let displays = displays
-        .clone()
-        .into_array()
-        .ok_or(FerricastError::Protocol(
-            "Invalid plist from airplay device".to_string(),
-        ))?;
-
-    // TODO(juanperias): What happens if airplay device displays more than 1 display
-    let display = match displays.get(0) {
-        Some(v) => v.clone().into_dictionary().ok_or(FerricastError::Protocol(
-            "Invalid display in plist".to_string(),
-        ))?,
-        None => {
-            return Ok((1920, 1080, 60));
-        }
-    };
-
-    let width = display
-        .get("widthPixels")
-        .unwrap_or(&plist::Value::Integer(1920.into()))
-        .as_unsigned_integer()
-        .unwrap_or(1920);
-    let height = display
-        .get("heightPixels")
-        .unwrap_or(&plist::Value::Integer(1080.into()))
-        .as_unsigned_integer()
-        .unwrap_or(1080);
-
-    let max_fps = display
-        .get("maxFPS")
-        .unwrap_or(&plist::Value::Integer(60.into()))
-        .as_unsigned_integer()
-        .unwrap_or(60);
-
-    Ok((width, height, max_fps))
+    #[test]
+    fn receivers_without_screen_mirroring_are_skipped() {
+        let mut txt = uxplay_txt(false);
+        txt.insert("features".into(), "0x10".into());
+        assert!(
+            device_from_service(
+                "a._airplay._tcp.local.",
+                7000,
+                vec!["10.0.0.5".parse().unwrap()],
+                &txt
+            )
+            .is_none()
+        );
+        txt.insert("features".into(), "nope".into());
+        assert!(
+            device_from_service(
+                "a._airplay._tcp.local.",
+                7000,
+                vec!["10.0.0.5".parse().unwrap()],
+                &txt
+            )
+            .is_none()
+        );
+    }
 }

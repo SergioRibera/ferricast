@@ -1,546 +1,509 @@
-use std::io::Read;
+//! AirPlay screen-mirroring sender session.
+//!
+//! `connect` pairs with the receiver (asking for a PIN through
+//! [`ConnectOutcome::PairingRequired`] when needed), `setup_stream` runs
+//! FairPlay setup, both `SETUP` requests and `RECORD`, then opens the
+//! mirroring data connection; `send_frame` pushes encrypted H.264 access
+//! units and a background task posts `/feedback` every two seconds.
+
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use easy_srp::ClientStep3Params;
-use easy_srp::groups::{G_2048, SrpGroup};
-use ed25519_dalek::SigningKey;
-use ferricast_core::device::Features;
-use num_bigint::{BigInt, Sign};
-
-use rand::Rng;
-use rand::rngs::OsRng;
-use sha2::{Digest, Sha512};
-use tokio::io::BufReader;
-use tokio::net::TcpStream;
-use tracing::{info, warn};
-use uuid::Uuid;
-
+use ferricast_core::device::{AirPlayPairing, AirplayConfig};
 use ferricast_core::{
     CastSession, Codec, ConnectOutcome, Device, EncodedFrame, FerricastError, PairingChallenge,
     PairingResponse, Result, StreamConfig,
 };
+use plist::{Dictionary, Value};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
 
-use crate::rtsp::{RtspManager, RtspResponse};
-use crate::tlv;
+use crate::crypto::sha512_16;
+use crate::fairplay;
+use crate::mirror::{MirrorStream, stream_cipher};
+use crate::ntp::TimingServer;
+use crate::pair::{PairedSession, hap, legacy, legacy_pin};
+use crate::rtsp::{CONTENT_BPLIST, ClientIdentity, RtspClient, RtspResponse};
+use crate::store::{CredentialStore, Identity, ReceiverKey};
 
-const TLV_FLAGS_TRANSIENT: [u8; 4] = 0x00000010_u32.to_le_bytes();
+const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
+const DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// `SETUP` stream type for screen mirroring.
+const STREAM_TYPE_MIRROR: u64 = 110;
 
-/// Internal state of the AirPlay session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionState {
+enum State {
     Disconnected,
-    /// TCP open, `/pair-pin-start` sent, waiting for PIN from user.
+    /// Pair-setup needs the PIN the receiver is showing.
     AwaitingPin,
-    Connected,
+    /// Paired and verified; ready for `setup_stream`.
     Paired,
-    Ready,
     Streaming,
-    TearingDown,
 }
 
-impl std::fmt::Display for SessionState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Disconnected => write!(f, "Disconnected"),
-            Self::AwaitingPin => write!(f, "AwaitingPin"),
-            Self::Connected => write!(f, "Connected"),
-            Self::Paired => write!(f, "Paired"),
-            Self::Ready => write!(f, "Ready"),
-            Self::Streaming => write!(f, "Streaming"),
-            Self::TearingDown => write!(f, "TearingDown"),
-        }
+/// Aborts the wrapped task when dropped.
+struct TaskGuard(JoinHandle<()>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
-/// An AirPlay 2 screen mirroring session.
+/// Everything that only exists while streaming.
+struct Stream {
+    mirror: MirrorStream,
+    _timing: TimingServer,
+    _feedback: TaskGuard,
+}
+
+/// Connection to the receiver that survives from `connect` to `stop`.
+struct Link {
+    rtsp: Arc<Mutex<RtspClient>>,
+    /// Receiver device id (key for stored credentials).
+    device_id: String,
+    mode: AirPlayPairing,
+    /// `rtsp://<local ip>/<session id>` request URI.
+    session_uri: String,
+}
+
+/// An AirPlay screen-mirroring session.
 pub struct AirPlaySession {
-    state: SessionState,
-    session_id: String,
-    client_device_id: String,
+    store: CredentialStore,
+    identity: Option<Identity>,
+    state: State,
+    link: Option<Link>,
+    paired: PairedSession,
+    stream: Option<Stream>,
     alive: Arc<AtomicBool>,
-    frame_counter: u64,
-    features: Option<Features>,
-    /// Held open between `connect()` and `submit_pairing()`.
-    /// `connect()` sends `/pair-pin-start` and waits for the user to
-    /// type the PIN shown on the TV screen; `submit_pairing()` takes
-    /// this stream and continues the SRP-based pair-setup exchange.
-    pending_conn: Option<TcpStream>,
 }
 
 impl Default for AirPlaySession {
     fn default() -> Self {
-        let session_id = Uuid::new_v4().to_string();
-        let client_device_id = generate_device_id();
         Self {
-            state: SessionState::Disconnected,
-            session_id,
-            client_device_id,
-            alive: Default::default(),
-            frame_counter: Default::default(),
-            pending_conn: None,
-            features: None,
+            store: CredentialStore::default(),
+            identity: None,
+            state: State::Disconnected,
+            link: None,
+            paired: PairedSession::default(),
+            stream: None,
+            alive: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
-impl AirPlaySession {
-    pub fn session_id(&self) -> &str {
-        &self.session_id
+/// Addresses to try for `device`: the resolved address first, then any
+/// extra addresses discovery recorded.
+fn candidate_addrs(device: &Device) -> Vec<SocketAddr> {
+    let mut addrs = vec![SocketAddr::new(device.addr, device.port)];
+    if let Some(extra) = device.metadata.get(crate::discovery::META_ADDRESSES) {
+        addrs.extend(
+            extra
+                .split(',')
+                .filter_map(|a| a.trim().parse::<IpAddr>().ok())
+                .map(|ip| SocketAddr::new(ip, device.port))
+                .filter(|a| a.ip() != device.addr),
+        );
     }
+    addrs
+}
+
+fn bplist(dict: Dictionary) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    plist::to_writer_binary(&mut out, &Value::Dictionary(dict))
+        .map_err(|e| FerricastError::Protocol(format!("encode SETUP plist: {e}")))?;
+    Ok(out)
+}
+
+fn reply_dict(response: &RtspResponse, what: &str) -> Result<Dictionary> {
+    plist::from_bytes::<Value>(&response.body)
+        .ok()
+        .and_then(Value::into_dictionary)
+        .ok_or_else(|| FerricastError::Protocol(format!("{what}: reply is not a plist dictionary")))
+}
+
+impl AirPlaySession {
+    fn identity(&mut self) -> Identity {
+        self.identity
+            .get_or_insert_with(|| self.store.identity())
+            .clone()
+    }
+
+    fn link(&self) -> Result<&Link> {
+        self.link
+            .as_ref()
+            .ok_or_else(|| FerricastError::Protocol("AirPlay session is not connected".into()))
+    }
+
+    fn reset(&mut self) {
+        self.stream = None;
+        self.link = None;
+        self.paired = PairedSession::default();
+        self.state = State::Disconnected;
+        self.alive.store(false, Ordering::Relaxed);
+    }
+
+    /// Try pair-verify with stored credentials. `Ok(false)` means there are
+    /// none or the receiver no longer accepts them.
+    async fn verify_stored(
+        &mut self,
+        rtsp: &mut RtspClient,
+        device_id: &str,
+        mode: AirPlayPairing,
+    ) -> Result<bool> {
+        let Some(stored) = self.store.receiver(device_id) else {
+            return Ok(false);
+        };
+        let identity = self.identity();
+        let result = match mode {
+            AirPlayPairing::LegacyPin => match stored.public_key_bytes() {
+                Some(pk) => legacy::pair_verify(rtsp, &identity.key, &pk)
+                    .await
+                    .map(|ecdh| self.paired.ecdh_secret = Some(ecdh)),
+                None => Err(FerricastError::Protocol(
+                    "stored receiver key is corrupt".into(),
+                )),
+            },
+            AirPlayPairing::Hap => {
+                hap::pair_verify(rtsp, &identity, &stored)
+                    .await
+                    .and_then(|secret| {
+                        let (write, read) = hap::control_keys(&secret)?;
+                        rtsp.enable_encryption(&write, &read);
+                        self.paired.hap_secret = Some(secret);
+                        Ok(())
+                    })
+            }
+            AirPlayPairing::Legacy | AirPlayPairing::HapTransient => return Ok(false),
+        };
+        match result {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                warn!(error = %e, device_id, "stored AirPlay pairing rejected; pairing again");
+                self.store.forget_receiver(device_id);
+                Ok(false)
+            }
+        }
+    }
+
+    async fn pair(
+        &mut self,
+        rtsp: &mut RtspClient,
+        device_id: &str,
+        mode: AirPlayPairing,
+    ) -> Result<ConnectOutcome> {
+        let identity = self.identity();
+        match mode {
+            AirPlayPairing::Legacy => {
+                let server_key = legacy::pair_setup(rtsp, &identity.key).await?;
+                self.paired.ecdh_secret =
+                    Some(legacy::pair_verify(rtsp, &identity.key, &server_key).await?);
+                Ok(ConnectOutcome::Ready)
+            }
+            AirPlayPairing::HapTransient => {
+                let (secret, _) = hap::pair_setup(rtsp, &identity, None).await?;
+                let (write, read) = hap::control_keys(&secret)?;
+                rtsp.enable_encryption(&write, &read);
+                self.paired.hap_secret = Some(secret);
+                Ok(ConnectOutcome::Ready)
+            }
+            AirPlayPairing::LegacyPin | AirPlayPairing::Hap => {
+                if self.verify_stored(rtsp, device_id, mode).await? {
+                    return Ok(ConnectOutcome::Ready);
+                }
+                legacy_pin::pin_start(rtsp).await?;
+                Ok(ConnectOutcome::PairingRequired(PairingChallenge::Pin {
+                    digits: 4,
+                }))
+            }
+        }
+    }
+
+    async fn finish_pin_pairing(&mut self, pin: &str) -> Result<()> {
+        let identity = self.identity();
+        let link = self.link()?;
+        let (rtsp, device_id, mode) = (link.rtsp.clone(), link.device_id.clone(), link.mode);
+        let mut rtsp = rtsp.lock().await;
+        match mode {
+            AirPlayPairing::LegacyPin => {
+                let server_key =
+                    legacy_pin::pin_setup(&mut rtsp, &identity.device_id, pin, &identity.key)
+                        .await?;
+                let key = ReceiverKey {
+                    id: String::new(),
+                    public_key: hex::encode(server_key),
+                };
+                if let Err(e) = self.store.save_receiver(&device_id, &key) {
+                    warn!(error = %e, "cannot store AirPlay pairing; the PIN will be asked again");
+                }
+                self.paired.ecdh_secret =
+                    Some(legacy::pair_verify(&mut rtsp, &identity.key, &server_key).await?);
+            }
+            AirPlayPairing::Hap => {
+                let (_, key) = hap::pair_setup(&mut rtsp, &identity, Some(pin)).await?;
+                let key = key.ok_or_else(|| {
+                    FerricastError::Protocol("pair-setup returned no receiver key".into())
+                })?;
+                if let Err(e) = self.store.save_receiver(&device_id, &key) {
+                    warn!(error = %e, "cannot store AirPlay pairing; the PIN will be asked again");
+                }
+                let secret = hap::pair_verify(&mut rtsp, &identity, &key).await?;
+                let (write, read) = hap::control_keys(&secret)?;
+                rtsp.enable_encryption(&write, &read);
+                self.paired.hap_secret = Some(secret);
+            }
+            AirPlayPairing::Legacy | AirPlayPairing::HapTransient => {
+                return Err(FerricastError::Protocol(
+                    "this receiver does not use PIN pairing".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn start_stream(&mut self, config: &StreamConfig) -> Result<Stream> {
+        let identity = self.identity();
+        let link = self.link()?;
+        let (rtsp, uri) = (link.rtsp.clone(), link.session_uri.clone());
+        let mut guard = rtsp.lock().await;
+
+        let fp = fairplay::setup(&mut guard).await?;
+        let base_key = match self.paired.ecdh_secret {
+            Some(ecdh) => sha512_16(&[&fp.aes_key, &ecdh]),
+            None => fp.aes_key,
+        };
+
+        let timing_socket = match config.port_range {
+            Some((start, end)) => ferricast_core::bind_udp_in_range(start, end).await?,
+            None => UdpSocket::bind(("0.0.0.0", 0)).await?,
+        };
+        let timing = TimingServer::start(timing_socket)?;
+
+        let mut setup = Dictionary::new();
+        setup.insert("deviceID".into(), Value::String(identity.device_id.clone()));
+        setup.insert(
+            "macAddress".into(),
+            Value::String(identity.device_id.clone()),
+        );
+        setup.insert(
+            "sessionUUID".into(),
+            Value::String(uuid::Uuid::new_v4().to_string().to_uppercase()),
+        );
+        setup.insert("name".into(), Value::String("ferricast".into()));
+        setup.insert("model".into(), Value::String("Ferricast1,1".into()));
+        setup.insert("osName".into(), Value::String("Linux".into()));
+        setup.insert("sourceVersion".into(), Value::String("550.10".into()));
+        setup.insert("isScreenMirroringSession".into(), Value::Boolean(true));
+        setup.insert("timingProtocol".into(), Value::String("NTP".into()));
+        setup.insert("timingPort".into(), Value::Integer(timing.port().into()));
+        setup.insert("et".into(), Value::Integer(32.into()));
+        setup.insert("ekey".into(), Value::Data(fp.ekey));
+        setup.insert(
+            "eiv".into(),
+            Value::Data(rand::random::<[u8; 16]>().to_vec()),
+        );
+        let reply = guard
+            .request("SETUP", &uri, Some(CONTENT_BPLIST), &bplist(setup)?)
+            .await?
+            .ensure_success("SETUP")?;
+        debug!(reply = ?reply_dict(&reply, "SETUP").ok(), "SETUP session reply");
+
+        // Keep the id below 2^63: receivers parse it into signed integers.
+        let stream_connection_id = rand::random::<u64>() >> 1;
+        let mut stream = Dictionary::new();
+        stream.insert("type".into(), Value::Integer(STREAM_TYPE_MIRROR.into()));
+        stream.insert(
+            "streamConnectionID".into(),
+            Value::Integer(stream_connection_id.into()),
+        );
+        stream.insert("timestampInfo".into(), Value::Array(Vec::new()));
+        let mut setup = Dictionary::new();
+        setup.insert(
+            "streams".into(),
+            Value::Array(vec![Value::Dictionary(stream)]),
+        );
+        let reply = guard
+            .request("SETUP", &uri, Some(CONTENT_BPLIST), &bplist(setup)?)
+            .await?
+            .ensure_success("SETUP mirroring stream")?;
+        let data_port = reply_dict(&reply, "SETUP mirroring stream")?
+            .get("streams")
+            .and_then(Value::as_array)
+            .and_then(|s| {
+                s.iter()
+                    .find_map(|s| s.as_dictionary()?.get("dataPort")?.as_unsigned_integer())
+            })
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|p| *p != 0)
+            .ok_or_else(|| {
+                FerricastError::Protocol("SETUP reply has no mirroring dataPort".into())
+            })?;
+
+        let data_addr = SocketAddr::new(guard.peer_addr().ip(), data_port);
+        let tcp = tokio::time::timeout(DATA_CONNECT_TIMEOUT, TcpStream::connect(data_addr))
+            .await
+            .map_err(|_| {
+                FerricastError::Timeout(format!("mirroring data connection to {data_addr}"))
+            })?
+            .map_err(|e| {
+                FerricastError::Connection(format!("mirroring data connection to {data_addr}: {e}"))
+            })?;
+
+        guard
+            .request("RECORD", &uri, None, &[])
+            .await?
+            .ensure_success("RECORD")?;
+        drop(guard);
+
+        info!(%data_addr, timing_port = timing.port(), "AirPlay mirroring stream established");
+        let feedback = spawn_feedback(rtsp, self.alive.clone());
+        Ok(Stream {
+            mirror: MirrorStream::new(
+                tcp,
+                stream_cipher(&base_key, stream_connection_id),
+                config.width,
+                config.height,
+            ),
+            _timing: timing,
+            _feedback: TaskGuard(feedback),
+        })
+    }
+}
+
+/// Post `/feedback` periodically; the receiver resets the session after a
+/// few seconds without it.
+fn spawn_feedback(rtsp: Arc<Mutex<RtspClient>>, alive: Arc<AtomicBool>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(FEEDBACK_INTERVAL);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let result = rtsp
+                .lock()
+                .await
+                .request("POST", "/feedback", None, &[])
+                .await;
+            match result {
+                Ok(r) if r.is_success() => {}
+                Ok(r) => {
+                    warn!(status = r.status, "AirPlay feedback rejected; session lost");
+                    alive.store(false, Ordering::Relaxed);
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, "AirPlay feedback failed; session lost");
+                    alive.store(false, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    })
 }
 
 impl CastSession for AirPlaySession {
     async fn connect(&mut self, device: &Device) -> Result<ConnectOutcome> {
         if device.protocol != "airplay" {
             return Err(FerricastError::Protocol(format!(
-                "Expected AirPlay device, got {:?}",
+                "expected an AirPlay device, got {:?}",
                 device.protocol
             )));
         }
-
-        if self.state != SessionState::Disconnected {
+        if self.state != State::Disconnected {
             return Err(FerricastError::SessionAlreadyActive(device.name.clone()));
         }
-
-        let device_config = device
-            .capabilities
-            .airplay_config
-            .clone()
-            .expect("Ferricast airplay discovery bug");
-
-        let pair_challange =
-            PairingChallenge::new_airplay(&device_config);
-
-        println!("{:?}", pair_challange);
-
-        info!(addr = %device.addr, port = device.port, "connecting to AirPlay device");
-
-        let mut socket = TcpStream::connect((device.addr, device.port))
-            .await
-            .map_err(|e| {
-                FerricastError::Connection(format!("Cannot connect to AirPlay device: {e}"))
+        let config: AirplayConfig =
+            device.capabilities.airplay_config.clone().ok_or_else(|| {
+                FerricastError::Protocol(format!(
+                    "device {:?} has no AirPlay discovery data",
+                    device.name
+                ))
             })?;
+        let mode = config.pairing_mode();
+        let device_id = config
+            .device_id
+            .clone()
+            .unwrap_or_else(|| device.addr.to_string());
+        info!(addr = %device.addr, port = device.port, ?mode, "connecting to AirPlay receiver");
 
-        let mut manager = RtspManager::new(device_config.features);
-
-        let (read_half, mut write_half) = socket.split();
-        let mut buf_reader = BufReader::new(read_half);
-
-
-        let client_id = Uuid::new_v4();
-
-        crate::pair::pin_pair::pair_pin(
-            &pair_challange,
-            &mut manager,
-            &mut write_half,
-            &mut buf_reader,
-            &client_id,
+        let mut rtsp = RtspClient::connect(
+            &candidate_addrs(device),
+            ClientIdentity::default(),
+            mode.hkp_header(),
         )
         .await?;
-
-        {
-            /*
-
-            let (read_half, mut write_half) = socket.split();
-            let mut buf_reader = BufReader::new(read_half);
-
-            /*
-            manager.builder()
-                .path("*".to_string())
-                .options()
-                .header(("Client-Instance".to_string(), "56B29BB6CB904862".to_string()))
-                .header(("DACP-ID".to_string(), "56B29BB6CB904862".to_string()))
-                .header(("Active-Remote".to_string(), "1986535575".to_string()))
-                .write(&mut write_half)
-                .await?;
-
-            let res = RtspResponse::read(&mut buf_reader).await?;
-
-            let need_pin = !res.is_success();
-
-            if need_pin {
-                manager
-                    .builder()
-                    .path("/pair-pin-start".to_string())
-                    .write(&mut write_half)
-                    .await?;
-
-                RtspResponse::read(&mut buf_reader).await?.is_ok()?;
-
-                info!("Asking for Pin");
-
+        let outcome = match self.pair(&mut rtsp, &device_id, mode).await {
+            Ok(o) => o,
+            Err(e) => {
+                self.reset();
+                return Err(e);
             }
-            */
-
-            let mut pin = String::new();
-
-            if pin_required {
-                manager
-                    .builder()
-                    .path("/pair-pin-start".to_string())
-                    .write(&mut write_half).await?;
-
-                RtspResponse::read(&mut buf_reader)
-                    .await?
-                    .is_ok()?;
-
-                // TODO: pretty way to request the pin
-                let mut pin_buffer = vec![0_u8; 4];
-
-                std::io::stdin().read(&mut pin_buffer)?;
-
-                pin = String::from_utf8(pin_buffer)
-                    .map_err(|_| FerricastError::Protocol("Invalid pin".to_string()))?;
-            }
-
-            // Transient pairing
-
-            let tlv_bytes = tlv::encode(vec![
-                (TLV_TYPE_METHOD, &[0]),
-                (TLV_TYPE_STATE, &[1]),
-               // (TLV_TYPE_FLAGS, &TLV_FLAGS_TRANSIENT),
-            ])?;
-
-            manager
-                .builder()
-                .path("/pair-setup".to_string())
-                .post()
-                .content_type("application/octet-stream".to_string())
-                .body(tlv_bytes)
-                .write(&mut write_half)
-                .await?;
-
-
-
-
-            let res = RtspResponse::read(&mut buf_reader).await?;
-
-
-            res.is_ok()?;
-
-
-            let content =  res.content()?;
-
-
-            let tlv = tlv::decode(&content)?;
-
-
-            let server_pub = tlv.get(&TLV_TYPE_PUBLIC_KEY)
-                .ok_or(FerricastError::Protocol("Invalid TLV response from airplay device".to_string()))?;
-
-            let server_salt = tlv.get(&TLV_TYPE_SALT)
-                .ok_or(FerricastError::Protocol("Invalid TLV response from airplay device".to_string()))?;
-
-
-            /*
-            let mut client_wf: easy_srp::ClientAuthenticationWorkflow<Sha512> = easy_srp::ClientAuthenticationWorkflow::new(&G_2048);
-
-
-            let client_a = client_wf.step1()
-                .map_err(|e| FerricastError::Protocol(format!("SRP error {:?}", e)))?;
-
-
-
-            let step_3 = client_wf.step3(ClientStep3Params {
-                client_a: &client_a.client_public_a,
-                username: String::from("Pair-Setup"),
-                password: String::from("3939"),
-                salt: &server_salt,
-                server_public_b: &server_pub,
-            }).map_err(|e| FerricastError::Protocol(format!("SRP step 3 error {:?}", e)))?;
-
-            let padded_public_key = pad_to(client_a.client_public_a, 384);
-
-
-            let m1_proof_sha = &step_3.proof();
-
-            let m3 = tlv::encode(vec![
-                (TLV_TYPE_STATE, &[0x03_u8]),
-                (TLV_TYPE_PUBLIC_KEY, padded_public_key.as_slice()),
-                (TLV_TYPE_PROOF, &m1_proof_sha),
-            ])?;
-
-            manager.builder()
-                .post()
-                .content_type("application/octet-stream".to_string())
-                .path("/pair-setup".to_string())
-                .body(m3)
-                .write(&mut write_half)
-                .await?;
-
-            let res = RtspResponse::read(&mut buf_reader).await?;
-
-            res.is_ok()?;
-
-            let m4 = res.content()?;
-            let m4 = tlv::decode(m4);
-
-            println!("{:?}", m4);
-
-
-            */
-
-            // request the pin
-
-            println!("{pin}");
-            let inner_hash = sha2::Sha512::digest(format!("Pair-Setup:{pin}").as_bytes());
-
-            let mut x_input = Vec::new();
-
-            x_input.extend_from_slice(server_salt);
-            x_input.extend_from_slice(&inner_hash);
-
-            let x_hash = sha2::Sha512::digest(&x_input);
-
-            let x = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &x_hash);
-
-            let g_2048 = BigInt::new(num_bigint::Sign::Plus, vec![5]);
-
-            let n_2048 = BigInt::new(num_bigint::Sign::Plus, vec![
-                    0xAC6BDB41,
-                    0x324A9A9B,
-                    0xF166DE5E,
-                    0x1389582F,
-                    0xAF72B665,
-                    0x1987EE07,
-                    0xFC319294,
-                    0x3DB56050,
-                    0xA37329CB,
-                    0xB4A099ED,
-                    0x8193E075,
-                    0x7767A13D,
-                    0xD52312AB,
-                    0x4B03310D,
-                    0xCD7F48A9,
-                    0xDA04FD50,
-                    0xE8083969,
-                    0xEDB767B0,
-                    0xCF609517,
-                    0x9A163AB3,
-                    0x661A05FB,
-                    0xD5FAAAE8,
-                    0x2918A996,
-                    0x2F0B93B8,
-                    0x55F97993,
-                    0xEC975EEA,
-                    0xA80D740A,
-                    0xDBF4FF74,
-                    0x7359D041,
-                    0xD5C33EA7,
-                    0x1D281E44,
-                    0x6B14773B,
-                    0xCA97B43A,
-                    0x23FB8016,
-                    0x76BD207A,
-                    0x436C6481,
-                    0xF1D2B907,
-                    0x8717461A,
-                    0x5B9D32E6,
-                    0x88F87748,
-                    0x544523B5,
-                    0x24B0D57D,
-                    0x5EA77A27,
-                    0x75D2ECFA,
-                    0x032CFBDB,
-                    0xF52FB378,
-                    0x61602790,
-                    0x04E57AE6,
-                    0xAF874E73,
-                    0x03CE5329,
-                    0x9CCC041C,
-                    0x7BC308D8,
-                    0x2A5698F3,
-                    0xA8D0C382,
-                    0x71AE35F8,
-                    0xE9DBFBB6,
-                    0x94B5C803,
-                    0xD89F7AE4,
-                    0x35DE236D,
-                    0x525F5475,
-                    0x9B65E372,
-                    0xFCD68EF2,
-                    0x0FA7111F,
-                    0x9E4AFF73
-            ]);
-
-
-            let pad_n = pad_to(g_2048.to_bytes_be().1, 384);
-            let pad_g = pad_to(n_2048.to_bytes_be().1, 384);
-
-
-            let mut k_input = Vec::new();
-
-            k_input.extend_from_slice(&pad_n);
-            k_input.extend_from_slice(&pad_g);
-
-            let k_hash = sha2::Sha512::digest(&k_input);
-
-            let k = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &k_hash);
-
-            let mut a_bytes = [0_u8; 32];
-
-            rand::thread_rng().fill(&mut a_bytes);
-
-            let mut a = num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &a_bytes);
-
-            use num_traits::Zero;
-
-            if a.is_zero() {
-                a = BigInt::from(1u32);
-            }
-
-
-            let A = g_2048.modpow(&a, &n_2048);
-
-            let client_public = A.to_bytes_be();
-
-            let B = BigInt::from_bytes_be(Sign::Plus, server_pub);
-
-            if B.sign() == Sign::NoSign || B.sign() == Sign::Minus || B == n_2048 {
-                return Err(FerricastError::Protocol("Invalid server public key".to_string()));
-            }
-
-            let server_public  = B.to_bytes_be().1;
-
-            let mut u_input = Vec::new();
-
-            u_input.extend(pad_to(client_public.1.clone(), 384));
-            u_input.extend(pad_to(server_public, 384));
-
-            let u_hash = Sha512::digest(&u_input);
-
-            let u = BigInt::from_bytes_be(Sign::Plus, &u_hash);
-
-            let gx = g_2048.modpow(&x, &n_2048);
-
-            let kgx = (k * gx) % n_2048.clone();
-
-            let mut diff = B - kgx;
-
-            if diff.sign() == Sign::Minus {
-                diff += n_2048.clone();
-            }
-
-            let exp = u * x + a;
-
-            let S = diff.modpow(&exp, &n_2048);
-
-            let K = Sha512::digest(S.to_bytes_be().1);
-
-            let hn_hash = Sha512::digest(n_2048.to_bytes_be().1);
-            let hg_hash = Sha512::digest(g_2048.to_bytes_be().1);
-
-            let mut h_xor = vec![0_u8; 64];
-
-            for i in 0..63 {
-                h_xor[i] = hn_hash[i] ^ hg_hash[i];
-            }
-
-            let hu_hash = Sha512::digest("Pair-Setup");
-
-            let mut proof_input = Vec::new();
-
-            proof_input.extend(h_xor);
-            proof_input.extend_from_slice(&hu_hash);
-            proof_input.extend_from_slice(server_salt);
-            proof_input.extend_from_slice(&client_public.1);
-            proof_input.extend_from_slice(&server_pub);
-            proof_input.extend_from_slice(&K);
-
-            let m1_proof = Sha512::digest(&proof_input);
-
-
-            let m3 = tlv::encode(vec![
-                (TLV_TYPE_STATE, &[0x03_u8]),
-                (TLV_TYPE_PUBLIC_KEY, &pad_to(client_public.1, 384)),
-                (TLV_TYPE_PROOF, &m1_proof),
-            ])?;
-
-            manager.builder()
-                .post()
-                .content_type("application/octet-stream".to_string())
-                .path("/pair-setup".to_string())
-                .body(m3)
-                .write(&mut write_half)
-                .await?;
-
-            let res = RtspResponse::read(&mut buf_reader).await?;
-
-            res.is_ok()?;
-
-            let m4 = res.content()?;
-            let m4 = tlv::decode(m4)?;
-
-            println!("{:?}", m4);
-
-            */
-        }
-
-        self.features = Some(device_config.features);
-        self.pending_conn = Some(socket);
-        self.state = SessionState::AwaitingPin;
-
-        info!("AirPlay pair-pin-start sent; waiting for user PIN");
-
-        Ok(ConnectOutcome::Ready)
-        /*Ok(ConnectOutcome::PairingRequired(PairingChallenge::Pin {
-            digits: 4,
-        }))
-        */
+        };
+        let session_uri = format!(
+            "rtsp://{}/{}",
+            rtsp.local_addr().ip(),
+            rand::random::<u32>()
+        );
+        self.link = Some(Link {
+            rtsp: Arc::new(Mutex::new(rtsp)),
+            device_id,
+            mode,
+            session_uri,
+        });
+        self.state = match outcome {
+            ConnectOutcome::Ready => State::Paired,
+            ConnectOutcome::PairingRequired(_) => State::AwaitingPin,
+        };
+        self.alive.store(true, Ordering::Relaxed);
+        Ok(outcome)
     }
 
     async fn submit_pairing(&mut self, response: PairingResponse) -> Result<()> {
+        if self.state != State::AwaitingPin {
+            return Err(FerricastError::Protocol(
+                "AirPlay session is not waiting for a PIN".into(),
+            ));
+        }
         let pin = match response {
-            PairingResponse::Pin(p) => p,
+            PairingResponse::Pin(pin) => pin,
             PairingResponse::Cancelled => {
-                self.state = SessionState::Disconnected;
-                self.pending_conn = None;
+                self.reset();
                 return Err(FerricastError::Protocol("AirPlay pairing cancelled".into()));
             }
             PairingResponse::Confirmed => {
                 return Err(FerricastError::Protocol(
-                    "AirPlay pairing expects a PIN, got Confirmed".into(),
+                    "AirPlay pairing needs a PIN".into(),
                 ));
             }
         };
-
-        let mut socket = self.pending_conn.take().ok_or_else(|| {
-            FerricastError::Protocol("submit_pairing called without a pending connection".into())
-        })?;
-
-        let manager = RtspManager::new(
-            self.features
-                .ok_or_else(|| FerricastError::Protocol("No features".into()))?,
-        );
-
-        {
-            let (read_half, mut write_half) = socket.split();
-            let mut buf_reader = BufReader::new(read_half);
-
-            // TODO: complete SRP exchange using `pin`.
-            // Steps (once SRP crate integration is worked out):
-            //   1. derive verifier from PIN using srp::client::SrpClient<Sha512>
-            //   2. POST /pair-setup with SRP M1 + PIN verifier
-            //   3. read SRP M2 from device (server proof)
-            //   4. verify server proof
-            //   5. POST /pair-verify with our public key
-            //   6. derive session keys
-            let _ = &pin;
-            let _ = &mut buf_reader;
-            let _ = &mut write_half;
+        let pin = pin.trim();
+        if pin.len() != 4 || !pin.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(FerricastError::Protocol(
+                "the AirPlay PIN has 4 digits".into(),
+            ));
         }
-
-        self.pending_conn = Some(socket);
-        self.state = SessionState::Connected;
-        info!("AirPlay pairing complete");
-        Ok(())
+        match self.finish_pin_pairing(pin).await {
+            Ok(()) => {
+                self.state = State::Paired;
+                info!("AirPlay pairing complete");
+                Ok(())
+            }
+            Err(e) => {
+                // Receivers invalidate the PIN after one attempt; a retry
+                // starts over with `connect`.
+                self.reset();
+                Err(e)
+            }
+        }
     }
 
     async fn setup_stream(&mut self, config: &StreamConfig) -> Result<()> {
-        if self.state != SessionState::Connected && self.state != SessionState::Paired {
+        if self.state != State::Paired {
             return Err(FerricastError::Protocol(format!(
-                "Cannot setup stream in state: {}",
+                "cannot set up an AirPlay stream in state {:?}",
                 self.state
             )));
         }
@@ -550,105 +513,80 @@ impl CastSession for AirPlaySession {
                 protocol: "airplay",
             });
         }
-
-        info!(
-            width = config.width,
-            height = config.height,
-            fps = config.fps,
-            bitrate_kbps = config.bitrate_kbps,
-            "setting up AirPlay stream"
-        );
-        self.state = SessionState::Streaming;
+        let stream = match self.start_stream(config).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.alive.store(false, Ordering::Relaxed);
+                return Err(e);
+            }
+        };
+        self.stream = Some(stream);
+        self.state = State::Streaming;
         Ok(())
     }
 
     async fn send_frame(&mut self, frame: &EncodedFrame) -> Result<()> {
-        if self.state != SessionState::Streaming {
-            return Err(FerricastError::Streaming(format!(
-                "Cannot send frame in state: {}",
-                self.state
-            )));
-        }
         if frame.codec != Codec::H264 {
             return Err(FerricastError::UnsupportedCodec {
                 codec: frame.codec,
                 protocol: "airplay",
             });
         }
+        let Some(stream) = self.stream.as_mut() else {
+            return Err(FerricastError::Streaming(format!(
+                "cannot send a frame in state {:?}",
+                self.state
+            )));
+        };
+        if let Err(e) = stream.mirror.send(frame).await {
+            self.alive.store(false, Ordering::Relaxed);
+            return Err(FerricastError::Streaming(format!(
+                "mirroring connection lost: {e}"
+            )));
+        }
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<()> {
-        if self.state == SessionState::Disconnected {
-            return Ok(());
+        if let Some(mut stream) = self.stream.take() {
+            info!(
+                frames = stream.mirror.frames_sent(),
+                "stopping AirPlay mirroring"
+            );
+            drop(stream._feedback);
+            stream.mirror.shutdown().await;
         }
-        info!(
-            session_id = %self.session_id,
-            frames_sent = self.frame_counter,
-            "stopping AirPlay session"
-        );
-        self.state = SessionState::TearingDown;
-        self.pending_conn = None;
+        if let Some(link) = self.link.take() {
+            let mut rtsp = link.rtsp.lock().await;
+            let mut stream = Dictionary::new();
+            stream.insert("type".into(), Value::Integer(STREAM_TYPE_MIRROR.into()));
+            let mut body = Dictionary::new();
+            body.insert(
+                "streams".into(),
+                Value::Array(vec![Value::Dictionary(stream)]),
+            );
+            // The receiver may close the connection after the first
+            // TEARDOWN; neither failure matters on the way out.
+            if let Ok(body) = bplist(body) {
+                let _ = rtsp
+                    .request("TEARDOWN", &link.session_uri, Some(CONTENT_BPLIST), &body)
+                    .await;
+            }
+            let _ = rtsp.request("TEARDOWN", &link.session_uri, None, &[]).await;
+        }
+        self.reset();
         Ok(())
     }
 
     fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Relaxed)
-            && matches!(
-                self.state,
-                SessionState::Connected
-                    | SessionState::Paired
-                    | SessionState::Ready
-                    | SessionState::Streaming
-            )
+        self.alive.load(Ordering::Relaxed) && matches!(self.state, State::Paired | State::Streaming)
     }
 }
 
 impl Drop for AirPlaySession {
     fn drop(&mut self) {
-        if self.state != SessionState::Disconnected {
-            warn!(
-                session_id = %self.session_id,
-                state = %self.state,
-                "AirPlaySession dropped while still active"
-            );
-            self.alive.store(false, Ordering::Relaxed);
+        if self.state != State::Disconnected {
+            debug!(state = ?self.state, "AirPlay session dropped without stop()");
         }
     }
-}
-
-fn generate_device_id() -> String {
-    let bytes: [u8; 6] = rand::random();
-    format!(
-        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
-    )
-}
-
-fn generate_auth_token() -> (String, String) {
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let private_key = signing_key.to_bytes();
-    let hex = hex::encode(private_key);
-    (random_string(16), hex)
-}
-
-fn random_string(len: usize) -> String {
-    let mut string = String::with_capacity(len);
-    let mut rng = rand::thread_rng();
-    for _ in 0..len {
-        string.push(rng.gen_range(48u8..=90) as char);
-    }
-    string
-}
-
-fn pad_to(data: Vec<u8>, size: usize) -> Vec<u8> {
-    if data.len() >= size {
-        return data;
-    }
-
-    let mut padded = vec![0_u8; size];
-
-    padded[size - data.len()..].copy_from_slice(&data);
-
-    padded
 }

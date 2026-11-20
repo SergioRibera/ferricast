@@ -6,6 +6,7 @@ members = [
     "crates/capture",
     "crates/chromecast",
     "crates/airplay",
+    "crates/fairplay",
     "crates/miracast",
     "crates/encoder",
     "crates/decoder",
@@ -31,6 +32,8 @@ ferricast-muxer = { path = "crates/muxer" }
 ferricast-hls = { path = "crates/hls" }
 ferricast-dbus = { path = "crates/dbus" }
 ferricast-airplay = { path = "crates/airplay" }
+# GPL-3.0-or-later; only pulled in through the `airplay` feature below.
+ferricast-fairplay = { path = "crates/fairplay" }
 
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -66,7 +69,10 @@ default = [
     "opus-rs",
 ]
 chromecast = ["dep:ferricast-chromecast"]
-airplay = ["dep:ferricast-airplay"]
+# AirPlay sender. Also enables FairPlay `fp-setup` support, which links the
+# GPL-3.0-or-later `ferricast-fairplay` crate; drop `ferricast-airplay/fairplay`
+# here to build without it.
+airplay = ["dep:ferricast-airplay", "ferricast-airplay/fairplay"]
 
 
 # Capture backends — re-exported from `ferricast-capture`. At least
@@ -113,7 +119,6 @@ wlroots = ["ferricast-capture/wlroots"]
 wayland-direct = ["ferricast-capture/wayland-direct", "wlroots"]
 # Reserved for upcoming protocol crates; toggling on requires
 # uncommenting the matching workspace member + dep below.
-# airplay = ["dep:ferricast-airplay"]
 # miracast = ["dep:ferricast-miracast"]
 
 [dependencies]
@@ -129,7 +134,6 @@ ferricast-decoder.workspace = true
 ferricast-hls.workspace = true
 ferricast-airplay = { workspace = true, optional = true }
 ferricast-chromecast = { workspace = true, optional = true }
-# ferricast-airplay = { workspace = true, optional = true }
 # ferricast-miracast = { workspace = true, optional = true }
 
 tokio.workspace = true
