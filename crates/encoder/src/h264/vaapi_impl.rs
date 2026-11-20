@@ -143,9 +143,6 @@ struct EncoderCfg {
     width_mbs: u16,
     /// Height in 16-pixel macroblocks (rounded up).
     height_mbs: u16,
-    /// Crop offset (in 2-luma units) needed when `height` isn't a
-    /// multiple of 16.
-    height_crop: u32,
     fps: u32,
     bitrate_bps: u32,
     keyframe_interval: u32,
@@ -266,7 +263,7 @@ impl VaapiH264Encoder {
             .create_surfaces(
                 VA_RT_FORMAT_YUV420,
                 Some(VA_FOURCC_NV12),
-                cfg.width,
+                cfg.padded_width(),
                 cfg.padded_height(),
                 Some(UsageHint::USAGE_HINT_ENCODER),
                 recon_descs,
@@ -280,7 +277,7 @@ impl VaapiH264Encoder {
         let context = display
             .create_context(
                 &cfg_handle,
-                cfg.width,
+                cfg.padded_width(),
                 cfg.padded_height(),
                 Some(&recon),
                 /* progressive = */ true,
@@ -299,16 +296,12 @@ impl VaapiH264Encoder {
             log2_max_frame_num_minus4: LOG2_MAX_FRAME_NUM - 4,
             log2_max_pic_order_cnt_lsb_minus4: LOG2_MAX_POC_LSB - 4,
             max_num_ref_frames: 1,
-            frame_cropping: if cfg.height_crop > 0 {
-                Some(FrameCrop {
-                    left: 0,
-                    right: 0,
-                    top: 0,
-                    bottom: cfg.height_crop,
-                })
-            } else {
-                None
-            },
+            frame_cropping: cfg.crop_offsets().map(|(right, bottom)| FrameCrop {
+                left: 0,
+                right,
+                top: 0,
+                bottom,
+            }),
             vui: Some(VuiParams {
                 num_units_in_tick: 1,
                 time_scale: 2 * cfg.fps,
@@ -370,7 +363,7 @@ fn build_vpp(display: &Rc<Display>, cfg: &EncoderCfg) -> Result<(Config, Rc<Cont
     let context = display
         .create_context::<()>(
             &config,
-            cfg.width,
+            cfg.padded_width(),
             cfg.padded_height(),
             None,
             /* progressive = */ true,
@@ -412,7 +405,22 @@ impl EncoderCfg {
 
     /// Size of the surfaces the encoder reads from.
     fn coded_size(&self) -> (u32, u32) {
-        (self.width, self.padded_height())
+        (self.padded_width(), self.padded_height())
+    }
+
+    /// MB-aligned encoded width; see [`Self::crop_offsets`].
+    fn padded_width(&self) -> u32 {
+        u32::from(self.width_mbs) * 16
+    }
+
+    /// `frame_crop_right_offset` / `frame_crop_bottom_offset` that trim
+    /// the macroblock padding back to `width × height`. In 4:2:0 the
+    /// offsets count 2-sample units (CropUnitX = CropUnitY = 2,
+    /// §7.4.2.1.1). `None` when both dimensions are MB-aligned.
+    fn crop_offsets(&self) -> Option<(u32, u32)> {
+        let right = (self.padded_width() - self.width) / 2;
+        let bottom = (self.padded_height() - self.height) / 2;
+        (right > 0 || bottom > 0).then_some((right, bottom))
     }
 }
 
@@ -426,8 +434,6 @@ fn build_encoder_cfg(
     let height = cfg.height.max(16);
     let width_mbs = width.div_ceil(16) as u16;
     let height_mbs = height.div_ceil(16) as u16;
-    let padded_h = (height_mbs as u32) * 16;
-    let height_crop = (padded_h - height) / 2;
     let bitrate_bps = cfg.bitrate_kbps.max(1).saturating_mul(1000);
     let level_idc = pick_level(
         u32::from(width_mbs),
@@ -444,7 +450,6 @@ fn build_encoder_cfg(
         height,
         width_mbs,
         height_mbs,
-        height_crop,
         fps: cfg.fps.max(1),
         bitrate_bps,
         keyframe_interval: cfg.keyframe_interval_frames(),
@@ -792,16 +797,14 @@ fn build_seq_param(cfg: &EncoderCfg) -> EncSequenceParameterBufferH264 {
         /* delta_pic_order_always_zero_flag */ 0,
     );
 
-    let frame_crop = if cfg.height_crop > 0 {
-        Some(H264EncFrameCropOffsets {
+    let frame_crop = cfg
+        .crop_offsets()
+        .map(|(right, bottom)| H264EncFrameCropOffsets {
             left: 0,
-            right: 0,
+            right,
             top: 0,
-            bottom: cfg.height_crop,
-        })
-    } else {
-        None
-    };
+            bottom,
+        });
 
     let vui = Some(H264VuiFields::new(
         /* aspect_ratio_info_present_flag */ 0, /* timing_info_present_flag */ 1,
@@ -1248,6 +1251,25 @@ mod tests {
         assert_eq!(level(1920, 1080, 60, 8_000), 42);
         assert_eq!(level(3840, 2160, 30, 20_000), 51);
         assert_eq!(level(3840, 2160, 60, 20_000), 52);
+    }
+
+    fn crop_for(width: u32, height: u32) -> Option<(u32, u32)> {
+        let cfg = EncoderConfig {
+            width,
+            height,
+            ..EncoderConfig::default()
+        };
+        let enc = build_encoder_cfg(profile::BASELINE, 0b0100_0000, false, &cfg).unwrap();
+        enc.crop_offsets()
+    }
+
+    #[test]
+    fn crop_trims_right_and_bottom_padding() {
+        assert_eq!(crop_for(1280, 720), None);
+        // 1080 → 1088 rows: 8 luma rows = 4 crop units.
+        assert_eq!(crop_for(1920, 1080), Some((0, 4)));
+        // 1366 → 1376 columns: 10 luma columns = 5 crop units.
+        assert_eq!(crop_for(1366, 768), Some((5, 0)));
     }
 
     #[test]
