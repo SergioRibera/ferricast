@@ -11,7 +11,7 @@
 //! use ferricast::prelude::*;
 //!
 //! # async fn run() -> Result<()> {
-//! let (mut manager, mut events) = StreamManager::builder()
+//! let (manager, mut events) = StreamManager::builder()
 //!     .with_chromecast()
 //!     .build_with_events();
 //!
@@ -38,6 +38,9 @@
 //! - [`prelude`] — the everyday types most callers want in scope.
 
 mod manager;
+mod stream;
+#[cfg(test)]
+mod test_support;
 
 pub use manager::{ManagerEvent, StreamManager, StreamManagerBuilder};
 

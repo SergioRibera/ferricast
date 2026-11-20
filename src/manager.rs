@@ -2,27 +2,27 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use ferricast_capture::PipeWireAudioCapture;
+use crate::stream::{CancelRx, ErasedSession, SessionFactory, StreamEnd, StreamRequest};
 use ferricast_core::{
-    AdvertiseInfo, Advertiser, AudioCapture, AudioCaptureConfig, AudioCodec, AudioDecoder,
-    AudioDecoderConfig, AudioEncoder, AudioEncoderConfig, AudioFrame, AudioSource, CaptureConfig,
-    CaptureSource, CapturedFrame, CastSession, Codec, ConnectOutcome, ControlSession, DecodedAudio,
-    DecoderConfig, Device, Discovery, DiscoveryEvent, EncodedFrame, EncoderConfig, FerricastError,
-    FrameSink, MediaCommand, MediaInfo, MediaPacket, MediaPuller, PairingChallenge,
-    PairingResponse, PixelFormat, PlaybackState, ProtocolHandler, PullSpec, ReceiverProtocol,
-    RemoteSender, Result, ScreenCapture, StreamConfig, VideoDecoder, VideoEncoder,
+    AdvertiseInfo, Advertiser, AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame,
+    CaptureSource, CapturedFrame, Codec, ControlSession, DecodedAudio, DecoderConfig, Device,
+    Discovery, DiscoveryEvent, EncodedFrame, FerricastError, FrameSink, MediaCommand, MediaInfo,
+    MediaPacket, MediaPuller, PairingChallenge, PairingResponse, PixelFormat, PlaybackState,
+    ProtocolHandler, PullSpec, ReceiverProtocol, RemoteSender, Result, ScreenCapture, StreamConfig,
+    VideoDecoder, VideoEncoder,
 };
-use ferricast_encoder::aac::AacEncoder;
-#[cfg(feature = "opus-rs")]
-use ferricast_encoder::opus::OpusEncoder;
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// How long `stop_stream` waits for a stream task to clean up before
+/// aborting it.
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 trait ErasedDiscovery: Send + Sync {
     fn start(&mut self, tx: mpsc::Sender<DiscoveryEvent>) -> BoxFut<'_, Result<()>>;
@@ -35,48 +35,6 @@ impl<T: Discovery> ErasedDiscovery for T {
     }
     fn stop(&mut self) -> BoxFut<'_, Result<()>> {
         Box::pin(Discovery::stop(self))
-    }
-}
-
-trait ErasedSession: Send + Sync {
-    fn connect<'a>(&'a mut self, device: &'a Device) -> BoxFut<'a, Result<ConnectOutcome>>;
-    fn submit_pairing(&mut self, response: PairingResponse) -> BoxFut<'_, Result<()>>;
-    fn setup_stream<'a>(&'a mut self, config: &'a StreamConfig) -> BoxFut<'a, Result<()>>;
-    fn send_frame<'a>(&'a mut self, frame: &'a EncodedFrame) -> BoxFut<'a, Result<()>>;
-    fn send_audio_frame<'a>(&'a mut self, frame: &'a AudioFrame) -> BoxFut<'a, Result<()>>;
-    fn stop(&mut self) -> BoxFut<'_, Result<()>>;
-    fn is_alive(&self) -> bool;
-    fn poll_keyframe_request(&mut self) -> bool;
-    fn preferred_audio_codec(&self) -> AudioCodec;
-}
-
-impl<T: CastSession> ErasedSession for T {
-    fn connect<'a>(&'a mut self, device: &'a Device) -> BoxFut<'a, Result<ConnectOutcome>> {
-        Box::pin(CastSession::connect(self, device))
-    }
-    fn submit_pairing(&mut self, response: PairingResponse) -> BoxFut<'_, Result<()>> {
-        Box::pin(CastSession::submit_pairing(self, response))
-    }
-    fn setup_stream<'a>(&'a mut self, config: &'a StreamConfig) -> BoxFut<'a, Result<()>> {
-        Box::pin(CastSession::setup_stream(self, config))
-    }
-    fn send_frame<'a>(&'a mut self, frame: &'a EncodedFrame) -> BoxFut<'a, Result<()>> {
-        Box::pin(CastSession::send_frame(self, frame))
-    }
-    fn send_audio_frame<'a>(&'a mut self, frame: &'a AudioFrame) -> BoxFut<'a, Result<()>> {
-        Box::pin(CastSession::send_audio_frame(self, frame))
-    }
-    fn stop(&mut self) -> BoxFut<'_, Result<()>> {
-        Box::pin(CastSession::stop(self))
-    }
-    fn is_alive(&self) -> bool {
-        CastSession::is_alive(self)
-    }
-    fn poll_keyframe_request(&mut self) -> bool {
-        CastSession::poll_keyframe_request(self)
-    }
-    fn preferred_audio_codec(&self) -> AudioCodec {
-        CastSession::preferred_audio_codec(self)
     }
 }
 
@@ -214,18 +172,125 @@ struct RegisteredProtocol {
     /// receiver-app crash) without tearing down capture/encoder.
     /// Takes `&Device` so the factory can pick the right session type
     /// per-device (e.g. Cast Streaming vs. HLS on Chromecast).
-    create_session: Arc<dyn Fn(&Device) -> Result<Box<dyn ErasedSession>> + Send + Sync>,
+    create_session: SessionFactory,
 }
 
+/// One stream, from the moment its start is accepted until its task
+/// has cleaned up.
 struct ActiveStream {
     device: Device,
+    /// Distinguishes this stream from a later one on the same device,
+    /// so a finishing task only ever removes its own entry.
+    generation: u64,
+    /// Dropping it (or sending on it) stops the stream, during
+    /// start-up as well as while running.
     cancel_tx: mpsc::Sender<()>,
-    /// Handle to the spawned streaming task. Kept so `stop_stream`
-    /// can `await` until the task has actually torn down its
-    /// capture/encoder/session — without this, `shutdown()` can
-    /// return while PipeWire/CASTv2 cleanup is still racing the
-    /// process exit and the OS reaps fds + threads abruptly.
-    task: JoinHandle<()>,
+    /// `None` while the stream is still starting.
+    task: Option<JoinHandle<()>>,
+}
+
+/// Streams by device. Behind a `std` mutex: every critical section is
+/// short and never awaits.
+#[derive(Default)]
+struct StreamRegistry {
+    next_generation: u64,
+    streams: HashMap<Uuid, ActiveStream>,
+}
+
+impl StreamRegistry {
+    /// Claim `device` for a new stream.
+    fn reserve(&mut self, device: &Device) -> Result<(u64, CancelRx)> {
+        if self.streams.contains_key(&device.id) {
+            return Err(FerricastError::SessionAlreadyActive(device.name.clone()));
+        }
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        let (cancel_tx, cancel_rx) = mpsc::channel(1);
+        self.streams.insert(
+            device.id,
+            ActiveStream {
+                device: device.clone(),
+                generation,
+                cancel_tx,
+                task: None,
+            },
+        );
+        Ok((generation, CancelRx::new(cancel_rx)))
+    }
+
+    fn is_current(&self, id: Uuid, generation: u64) -> bool {
+        self.streams
+            .get(&id)
+            .is_some_and(|s| s.generation == generation)
+    }
+
+    /// Attach the running task to its reservation; `false` when the
+    /// reservation is gone (stopped while starting).
+    fn attach(&mut self, id: Uuid, generation: u64, task: JoinHandle<()>) -> bool {
+        match self.streams.get_mut(&id) {
+            Some(s) if s.generation == generation => {
+                s.task = Some(task);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Remove the entry only if it still belongs to `generation`.
+    fn release(&mut self, id: Uuid, generation: u64) -> bool {
+        if self.is_current(id, generation) {
+            self.streams.remove(&id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn take(&mut self, id: Uuid) -> Option<ActiveStream> {
+        self.streams.remove(&id)
+    }
+
+    fn devices(&self) -> Vec<Device> {
+        self.streams.values().map(|s| s.device.clone()).collect()
+    }
+
+    fn ids(&self) -> Vec<Uuid> {
+        self.streams.keys().copied().collect()
+    }
+}
+
+fn lock_registry(
+    registry: &std::sync::Mutex<StreamRegistry>,
+) -> std::sync::MutexGuard<'_, StreamRegistry> {
+    // The registry holds plain bookkeeping that stays consistent
+    // even if a holder panicked.
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Releases a stream reservation if start-up does not get as far as
+/// handing it to a running task (error, cancellation, or the
+/// `start_stream` future being dropped).
+struct Reservation {
+    registry: Arc<std::sync::Mutex<StreamRegistry>>,
+    id: Uuid,
+    generation: u64,
+    armed: bool,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.armed {
+            lock_registry(&self.registry).release(self.id, self.generation);
+        }
+    }
+}
+
+#[derive(Default)]
+struct DiscoveryState {
+    handles: Vec<Box<dyn ErasedDiscovery>>,
+    running: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +303,22 @@ pub enum ManagerEvent {
     },
     StreamStopped {
         device_id: Uuid,
+        /// Why the receiver ended it, when it did (another app took
+        /// over, the user pressed "stop casting" on the TV). `None`
+        /// when stopped from this side or after a `StreamError`.
+        reason: Option<String>,
+    },
+    /// A stream start was accepted; capture (and possibly the portal
+    /// dialog), the device handshake and pairing are in progress.
+    /// Ends with `StreamStarted` or `StreamStopped`.
+    StreamStarting {
+        device_id: Uuid,
+    },
+    /// Non-fatal problem on a running stream (e.g. audio could not be
+    /// captured or encoded; video continues).
+    StreamWarning {
+        device_id: Uuid,
+        message: String,
     },
     /// Fatal stream error — the stream task has terminated and won't
     /// recover on its own. Apps typically surface this to the user
@@ -323,11 +404,10 @@ pub enum ManagerEvent {
 pub struct StreamManager {
     protocols: Vec<RegisteredProtocol>,
     devices: Arc<RwLock<HashMap<Uuid, Device>>>,
-    active_streams: Arc<Mutex<HashMap<Uuid, ActiveStream>>>,
-    discovery_handles: Vec<Box<dyn ErasedDiscovery>>,
+    streams: Arc<std::sync::Mutex<StreamRegistry>>,
+    discovery: Mutex<DiscoveryState>,
     event_tx: mpsc::Sender<ManagerEvent>,
     event_rx: Option<mpsc::Receiver<ManagerEvent>>,
-    running: bool,
 
     // ── receiver-side state ──────────────────────────────────────
     receivers: Vec<RegisteredReceiver>,
@@ -355,11 +435,10 @@ impl Default for StreamManager {
         Self {
             protocols: Vec::new(),
             devices: Arc::new(RwLock::new(HashMap::new())),
-            active_streams: Arc::new(Mutex::new(HashMap::new())),
-            discovery_handles: Vec::new(),
+            streams: Arc::default(),
+            discovery: Mutex::default(),
             event_tx,
             event_rx: Some(event_rx),
-            running: false,
             receivers: Vec::new(),
             video_decoders: HashMap::new(),
             audio_decoders: HashMap::new(),
@@ -467,7 +546,7 @@ impl StreamManager {
     {
         self.sink_factory = Some(Arc::new(move |remote, info| {
             let fut = factory(remote, info);
-            Box::pin(async move { fut.await })
+            Box::pin(fut)
         }));
     }
 
@@ -475,8 +554,15 @@ impl StreamManager {
         self.receivers.iter().map(|r| r.protocol).collect()
     }
 
-    pub async fn start_discovery(&mut self) -> Result<()> {
-        if self.running {
+    /// Start discovery on every registered protocol. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Never fails today: a protocol whose discovery can't start is
+    /// skipped and reported as [`ManagerEvent::DiscoveryError`].
+    pub async fn start_discovery(&self) -> Result<()> {
+        let mut state = self.discovery.lock().await;
+        if state.running {
             return Ok(());
         }
 
@@ -484,11 +570,8 @@ impl StreamManager {
 
         for proto in &self.protocols {
             let mut discovery = (proto.create_discovery)();
-            let tx = disc_tx.clone();
-            match discovery.start(tx).await {
-                Ok(()) => {
-                    self.discovery_handles.push(discovery);
-                }
+            match discovery.start(disc_tx.clone()).await {
+                Ok(()) => state.handles.push(discovery),
                 Err(e) => {
                     tracing::warn!(
                         protocol = proto.protocol,
@@ -533,17 +616,40 @@ impl StreamManager {
             }
         });
 
-        self.running = true;
+        state.running = true;
         Ok(())
     }
 
-    pub async fn stop_discovery(&mut self) -> Result<()> {
-        for discovery in &mut self.discovery_handles {
-            discovery.stop().await?;
+    /// Stop every protocol's discovery and forget the known devices
+    /// (each one is reported as [`ManagerEvent::DeviceLost`]).
+    ///
+    /// # Errors
+    ///
+    /// The first discovery stop error; the others are still stopped
+    /// and logged.
+    pub async fn stop_discovery(&self) -> Result<()> {
+        let mut state = self.discovery.lock().await;
+        let mut first_error = None;
+        for mut discovery in state.handles.drain(..) {
+            if let Err(e) = discovery.stop().await {
+                tracing::warn!(%e, "discovery stop failed");
+                first_error.get_or_insert(e);
+            }
         }
-        self.discovery_handles.clear();
-        self.running = false;
-        Ok(())
+        state.running = false;
+        drop(state);
+
+        let lost: Vec<Uuid> = self
+            .devices
+            .write()
+            .await
+            .drain()
+            .map(|(id, _)| id)
+            .collect();
+        for id in lost {
+            let _ = self.event_tx.send(ManagerEvent::DeviceLost(id)).await;
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Start every registered receiver protocol's advertiser and
@@ -702,25 +808,45 @@ impl StreamManager {
         self.devices.read().await.values().cloned().collect()
     }
 
+    /// Devices with a stream that is starting or running.
+    pub fn active_streams(&self) -> Vec<Device> {
+        lock_registry(&self.streams).devices()
+    }
+
+    /// Start streaming `source` to `device_id`.
+    ///
+    /// Resolves once the stream is up (capture running, encoder sized
+    /// to the device, receiver session set up); the stream then runs
+    /// on its own task until [`Self::stop_stream`], a receiver-side
+    /// stop, or an unrecoverable error. Progress and the outcome are
+    /// also published as `StreamStarting` → `StreamStarted` /
+    /// `StreamError` → `StreamStopped` events. A `stop_stream` while
+    /// starting aborts the start.
+    ///
+    /// # Errors
+    ///
+    /// [`FerricastError::SessionAlreadyActive`] when the device already
+    /// has a stream, [`FerricastError::DeviceNotFound`] for an unknown
+    /// device, otherwise whatever capture, encoder or the receiver
+    /// handshake failed with.
     pub async fn start_stream(
         &self,
         device_id: Uuid,
         source: CaptureSource,
-        mut capture: impl ScreenCapture + 'static,
-        mut encoder: impl VideoEncoder + 'static,
+        capture: impl ScreenCapture + 'static,
+        encoder: impl VideoEncoder + 'static,
         mut config: StreamConfig,
     ) -> Result<()> {
         if config.port_range.is_none() {
             config.port_range = self.port_range;
         }
-        let device = {
-            let devices = self.devices.read().await;
-            devices
-                .get(&device_id)
-                .cloned()
-                .ok_or_else(|| FerricastError::DeviceNotFound(device_id.to_string()))?
-        };
-
+        let device = self
+            .devices
+            .read()
+            .await
+            .get(&device_id)
+            .cloned()
+            .ok_or_else(|| FerricastError::DeviceNotFound(device_id.to_string()))?;
         let proto = self
             .protocols
             .iter()
@@ -729,686 +855,129 @@ impl StreamManager {
                 FerricastError::Protocol(format!("No handler for {}", device.protocol))
             })?;
 
-        // Apply the device's fps ceiling BEFORE start so the
-        // PipeWire worker's internal throttle anchors to the right
-        // rate from buffer 0 — otherwise the worker burns CPU on
-        // Vulkan readbacks at the compositor's refresh (60 Hz
-        // typical) for frames the encoder will never consume.
-        let device_fps_cap = device.capabilities.max_fps;
-        let initial_fps = match device_fps_cap {
-            Some(cap) => config.fps.min(cap),
-            None => config.fps,
+        let (generation, mut cancel) = lock_registry(&self.streams).reserve(&device)?;
+        let mut reservation = Reservation {
+            registry: self.streams.clone(),
+            id: device_id,
+            generation,
+            armed: true,
         };
+        let _ = self
+            .event_tx
+            .send(ManagerEvent::StreamStarting { device_id })
+            .await;
 
-        // Start capture first so the portal picker shows before connecting.
-        let capture_config = CaptureConfig {
-            fps: initial_fps,
-            width: Some(config.width),
-            height: Some(config.height),
-            show_cursor: true,
+        let request = StreamRequest {
+            device,
+            source,
+            capture,
+            encoder,
+            config,
+            create_session: proto.create_session.clone(),
+            event_tx: self.event_tx.clone(),
         };
-
-        capture.start(source, capture_config).await?;
-
-        // Block on the first frame: PipeWire's format negotiation and
-        // buffer setup happen on its main-loop thread asynchronously,
-        // so `capture.start().await` returning doesn't mean the
-        // negotiated format is available yet. Pulling a frame is the
-        // simplest barrier — backends only emit frames once the
-        // format is acked, so by the time this resolves
-        // `get_screen_size` / `get_framerate` are populated.
-        //
-        // Without this the encoder gets configured with (0, 0) and
-        // x264 dies with "invalid width x height (0x0)" while
-        // PipeWire tears its own stream down with "no more input
-        // formats" — same root cause.
-        tracing::info!(device_id = %device_id, "awaiting first frame from capture (30s ceiling)");
-        let first_frame =
-            match tokio::time::timeout(Duration::from_secs(30), capture.next_frame()).await {
-                Ok(Ok(f)) => {
-                    tracing::info!(
-                        device_id = %device_id,
-                        "first frame received from capture"
-                    );
-                    f
-                }
-                Ok(Err(e)) => {
-                    tracing::error!(
-                        device_id = %device_id,
-                        %e,
-                        "capture returned error before first frame"
-                    );
-                    return Err(e);
-                }
-                Err(_) => {
-                    tracing::error!(
-                        device_id = %device_id,
-                        "capture.next_frame() did not return within 30s — \
-                         the capture worker isn't delivering buffers \
-                         (compositor idle, or worker stalled)"
-                    );
-                    return Err(FerricastError::Timeout(
-                        "capture.next_frame() exceeded 30s".into(),
-                    ));
-                }
-            };
-        tracing::info!(device_id = %device_id, "Capture negotiated, connecting to device");
-
-        let (width, height) = capture.get_screen_size();
-        let pixel_format = capture.get_pixel_format();
-        // Prefer the framerate the source actually delivers; fall
-        // back to the user's hint if the backend doesn't report one
-        // (X11 polling or a backend that hasn't negotiated yet).
-        let negotiated_fps = capture.get_framerate();
-        let mut effective_fps = if negotiated_fps > 0 {
-            negotiated_fps
-        } else {
-            config.fps
+        let prepared = tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            r = request.prepare() => Some(r),
         };
-        let mut effective_bitrate_kbps = config.bitrate_kbps;
-        let mut effective_h264_profile: Option<ferricast_core::H264Profile> = None;
-
-        // Apply receiver-side hardware limits before we configure
-        // the encoder. `DeviceCapabilities` is populated by the
-        // protocol's discovery code (chromecast/discovery.rs reads
-        // the `md` mDNS field and maps it to a known device class)
-        // so this caps for the right reason on the right device:
-        // 1st-gen Chromecast → 1080p@30 Main, Ultra → 4K@30 High,
-        // Google TV → 1080p@60 High, etc.
-        let caps = &device.capabilities;
-        if let Some(max_fps) = caps.max_fps {
-            if effective_fps > max_fps {
-                tracing::warn!(
-                    device = %device.name,
-                    requested_fps = effective_fps,
-                    max_fps,
-                    "device cap: lowering encode fps to receiver's decoder ceiling"
-                );
-                effective_fps = max_fps;
-            }
-        }
-        if let Some(max_bitrate) = caps.max_bitrate_kbps {
-            if effective_bitrate_kbps > max_bitrate {
-                tracing::warn!(
-                    device = %device.name,
-                    requested_kbps = effective_bitrate_kbps,
-                    max_kbps = max_bitrate,
-                    "device cap: lowering bitrate to receiver's decoder ceiling"
-                );
-                effective_bitrate_kbps = max_bitrate;
-            }
-        }
-        if let Some(prof) = caps.max_h264_profile {
-            effective_h264_profile = Some(prof);
-        }
-
-        tracing::info!(
-            device = %device.name,
-            model = %device.model.as_deref().unwrap_or(""),
-            width,
-            height,
-            negotiated_fps,
-            effective_fps,
-            effective_bitrate_kbps,
-            ?effective_h264_profile,
-            requires_audio = caps.requires_audio,
-            ?pixel_format,
-            "encoder configured against device capabilities"
-        );
-
-        encoder.configure(&EncoderConfig {
-            pixel_format,
-            width: width as u32,
-            height: height as u32,
-            fps: effective_fps,
-            bitrate_kbps: effective_bitrate_kbps,
-            max_h264_profile: effective_h264_profile,
-            // Natural GOP = 2 s, matching HlsConfig::segment_target_secs.
-            // Keeps encoder's internal IDR cadence aligned with the
-            // segmenter's wall-clock requests so we don't pay for an
-            // extra IDR mid-segment on 60 fps devices.
-            keyframe_interval_secs: 2.0,
-            ..Default::default()
-        })?;
-
-        // Adaptive bitrate state — shared between the receiver's HLS
-        // server (records per-segment delivery pressure) and this
-        // stream task (reads the recommended target on the hot path).
-        // The HLS endpoint inside `session` will pick it up from
-        // `StreamConfig::adaptive` in `setup_stream`. Initial target
-        // is the already-clamped `effective_bitrate_kbps` so the
-        // controller's ceiling matches what the manager negotiated.
-        let adaptive = ferricast_core::AdaptiveBitrateState::new(effective_bitrate_kbps);
-        tracing::info!(
-            initial_kbps = effective_bitrate_kbps,
-            ceiling_kbps = adaptive.ceiling_kbps,
-            floor_kbps = adaptive.floor_kbps,
-            "adaptive: controller initialised; bandwidth probe will fire after first {} segments",
-            ferricast_hls::PROBE_SAMPLES_FOR_DOC,
-        );
-        // Hand the receiver session the *clamped* fps + bitrate
-        // (device-cap-aware) rather than the raw values from the UI.
-        // Without this, the HLS segmenter inside the chromecast
-        // session sizes its synthetic PTS counter to the UI's 60 fps
-        // even when we're really only producing 30, and audio
-        // (whose PTS tracks wall clock through the audio capture
-        // path) drifts ahead of video on the receiver.
-        let mut session = (proto.create_session)(&device)?;
-        match session.connect(&device).await? {
-            ConnectOutcome::Ready => {}
-            ConnectOutcome::PairingRequired(challenge) => {
-                let (respond_tx, respond_rx) = tokio::sync::oneshot::channel::<PairingResponse>();
-                let respond = std::sync::Arc::new(tokio::sync::Mutex::new(Some(respond_tx)));
-                let _ = self
-                    .event_tx
-                    .send(ManagerEvent::PairingRequired {
-                        device_id,
-                        challenge,
-                        respond,
-                    })
+        let task = match prepared {
+            Some(Ok(task)) => task,
+            Some(Err(e)) => {
+                drop(reservation);
+                StreamEnd::Failed(e.to_string())
+                    .report(&self.event_tx, device_id)
                     .await;
-                let response = respond_rx.await.map_err(|_| {
-                    FerricastError::Protocol("pairing response channel dropped".into())
-                })?;
-                session.submit_pairing(response).await?;
+                return Err(e);
             }
-        }
-
-        // Set the codec in session_config *before* setup_stream so that
-        // protocol-level validation (e.g. mirror requires Opus) sees the
-        // correct value. After setup_stream the session may have fallen
-        // back from Mirror to Hls, so we re-read preferred_audio_codec()
-        // below when spawning the encoder task.
-        let mut session_config = StreamConfig {
-            adaptive: Some(adaptive.clone()),
-            fps: effective_fps,
-            bitrate_kbps: effective_bitrate_kbps,
-            ..config.clone()
+            None => {
+                drop(reservation);
+                StreamEnd::Cancelled.report(&self.event_tx, device_id).await;
+                return Err(FerricastError::Streaming(
+                    "stream stopped while starting".into(),
+                ));
+            }
         };
-        if let Some(ref mut audio) = session_config.audio {
-            audio.codec = session.preferred_audio_codec();
-        }
 
-        session.setup_stream(&session_config).await?;
-
-        // Audio pipeline. Spawned *after* `session.connect()` finishes
-        // so PipeWire-captured PCM doesn't pile up while the chromecast
-        // handshake is running (LAUNCH ack + virtual-connect can take
-        // 3-6 s). Without this delay the queue chain
-        // `pipewire → AAC encoder → tx (64) → audio_tx (64)` fills
-        // entirely during the wait, then the segmenter drains stale
-        // frames whose `timestamp_us` is from seconds ago — the
-        // muxer's silent-AAC watermark advances past those PTSes
-        // immediately and the real audio is rejected for the rest
-        // of the stream's life.
-        //
-        // When `config.audio` is `None` (caller didn't opt in), we
-        // skip the whole thing — the chromecast HLS pipeline falls
-        // back to the silent-AAC injection for receivers that
-        // require it.
-        let (audio_task, audio_frame_rx, audio_mute) = match config.audio.clone() {
-            Some(mut audio_cfg) => {
-                audio_cfg.codec = session.preferred_audio_codec();
-                let (tx, rx) = mpsc::channel::<AudioFrame>(64);
-                let mute = audio_cfg.mute.clone();
-                let mute_for_task = mute.clone();
-                let task = tokio::spawn(async move {
-                    if let Err(e) = run_audio_pipeline(audio_cfg, mute_for_task, tx).await {
-                        tracing::error!(%e, "audio pipeline exited with error");
-                    } else {
-                        tracing::info!("audio pipeline exited cleanly");
-                    }
+        // Spawn and attach under the registry lock so the task can't
+        // finish and release its entry before it is attached.
+        let attached = {
+            let mut registry = lock_registry(&self.streams);
+            registry.is_current(device_id, generation) && {
+                let streams = self.streams.clone();
+                let event_tx = self.event_tx.clone();
+                let handle = tokio::spawn(async move {
+                    let end = task.run(cancel).await;
+                    lock_registry(&streams).release(device_id, generation);
+                    end.report(&event_tx, device_id).await;
                 });
-                (Some(task), Some(rx), Some(mute))
+                registry.attach(device_id, generation, handle)
             }
-            None => (None, None, None),
         };
-        let _ = audio_mute; // surfaced separately when UI mute API lands
-
-        // Factory the supervisor uses to rebuild a session on
-        // receiver-side disconnect. Cloned `Arc` — cheap and `Send`.
-        let create_session = proto.create_session.clone();
-
-        let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
-
-        let active_streams = self.active_streams.clone();
-        let event_tx = self.event_tx.clone();
-        let device_name = device.name.clone();
-        let did = device.id;
-        // Task captures the device by move (the reconnect supervisor
-        // hands `&device_clone` to `s.connect`), and `ActiveStream`
-        // below also needs the original — clone once before the spawn.
-        let device_clone = device.clone();
-        let mut audio_frame_rx = audio_frame_rx;
-        let audio_task_handle = audio_task;
-
-        let task = tokio::spawn(async move {
-            let _ = event_tx
-                .send(ManagerEvent::StreamStarted {
-                    device_id: did,
-                    device_name,
-                })
-                .await;
-
-            // The frame we already pulled to barrier on negotiation
-            // is the first frame of this loop — dropping it would
-            // waste an entire keyframe interval on backends that
-            // emit IDR on the very first frame.
-            let mut seed = Some(first_frame);
-
-            // Pacing for event-driven capture sources. Wayland
-            // compositors only emit a new dmabuf when the screen
-            // actually changes — meaning a stream-paused user
-            // (e.g. waiting for the chromecast to start displaying)
-            // can go many seconds with no new frame. Receivers
-            // that need a steady cadence (HLS chromecast, DASH,
-            // anything muxed into MPEG-TS) starve under that:
-            // their segmenter expects 1 keyframe / second and
-            // can't close a segment without two of them.
-            //
-            // Pace at `effective_fps`: if `capture.next_frame()`
-            // doesn't deliver inside one frame period, re-emit
-            // the most recent real frame with its timestamp
-            // bumped forward. The encoder treats it as a fresh
-            // input and produces another encoded frame; the
-            // downstream session sees a steady stream regardless
-            // of what's happening on screen.
-            let frame_period = Duration::from_secs_f64(1.0 / (effective_fps.max(1) as f64));
-            let frame_period_us = (1_000_000.0 / (effective_fps.max(1) as f64)) as u64;
-            let mut last_frame: Option<CapturedFrame> = None;
-
-            // Wall-clock keyframe pacing — see longer comment below.
-            // Pinned to 2 s to match HlsConfig::segment_target_secs;
-            // the segmenter already forces an IDR per segment via
-            // request_keyframe, but this guarantees one even if the
-            // capture stalls between segmenter ticks.
-            let keyframe_interval = Duration::from_secs(2);
-            let mut next_keyframe_at = Instant::now();
-
-            // Mirror of `adaptive.target_kbps()` we've actually
-            // pushed into the encoder. The HLS server may mutate
-            // the atomic between any two frames; we only need to
-            // call `encoder.set_bitrate_kbps` when it differs from
-            // what's currently configured, otherwise every frame
-            // would round-trip into NVENC's reconfigure call.
-            let mut last_applied_kbps: u32 = effective_bitrate_kbps;
-
-            // Auto-reconnect supervisor state. The receiver can die
-            // mid-stream (Chromecast detailedErrorCode=301, Default
-            // Media Receiver app exit, transient TCP RST burst on
-            // a flaky 2.4 GHz link) without it being a permanent
-            // failure of capture or encoder. The pattern here is
-            // session-scoped retry: only the receiver session is
-            // recreated, capture and encoder keep their internal
-            // state. After `MAX_CONSECUTIVE_FAILURES` quick deaths
-            // in a row we surface a fatal `StreamError` so the app
-            // can fall back to whatever its policy is.
-            const MAX_CONSECUTIVE_FAILURES: u32 = 5;
-            // Reset the failure counter when the stream has been
-            // healthy for at least this long — a stream that ran
-            // fine for 10 min then hit one transient is not the
-            // same case as five 301s in 20 s.
-            const HEALTHY_RESET_AFTER: Duration = Duration::from_secs(60);
-
-            let mut consecutive_failures: u32 = 0;
-            let mut last_failure_at: Option<Instant> = None;
-            let mut active_session: Option<Box<dyn ErasedSession>> = Some(session);
-            let mut fatal_error: Option<String> = None;
-            let mut cancelled = false;
-
-            // Outer (supervisor) loop. Acquires a session, runs the
-            // inner frame loop until that session dies or the user
-            // cancels, then decides whether to retry or surface.
-            'supervisor: loop {
-                let mut session: Box<dyn ErasedSession> = match active_session.take() {
-                    Some(s) => s,
-                    None => {
-                        // Reconnect path.
-                        // Reset counter on long-healthy streaks.
-                        if let Some(t) = last_failure_at {
-                            if t.elapsed() > HEALTHY_RESET_AFTER {
-                                consecutive_failures = 0;
-                            }
-                        }
-                        consecutive_failures += 1;
-                        if consecutive_failures > MAX_CONSECUTIVE_FAILURES {
-                            fatal_error = Some(format!(
-                                "receiver-side disconnect; gave up after {} consecutive reconnect attempts",
-                                MAX_CONSECUTIVE_FAILURES
-                            ));
-                            break 'supervisor;
-                        }
-                        // Force the adaptive controller to the floor
-                        // before reconnecting. The previous bitrate
-                        // didn't keep the receiver alive; starting
-                        // low gives us the best chance of getting
-                        // through the soft window after the receiver
-                        // app relaunches, when its buffer is still
-                        // empty and any further pressure would
-                        // trigger 301 again.
-                        let floored = adaptive.drop_to_floor();
-                        // Apply immediately so the next encode is
-                        // already at the lower rate (no waiting for
-                        // the inner loop's first iteration to notice).
-                        if let Err(e) = encoder.set_bitrate_kbps(floored) {
-                            tracing::warn!(%e, "reconnect: encoder set_bitrate_kbps failed");
-                        }
-                        last_applied_kbps = floored;
-                        // Request an IDR so the new HLS sink's
-                        // bootstrap finds SPS/PPS on the very first
-                        // frame instead of waiting for the encoder's
-                        // natural GOP boundary.
-                        encoder.request_keyframe();
-
-                        // Backoff: 1 s, 2 s, 4 s, 8 s, 16 s.
-                        let backoff = Duration::from_secs(
-                            1u64 << (consecutive_failures.saturating_sub(1).min(4) as u64),
-                        );
-                        let reason = format!(
-                            "reconnecting (attempt {}/{}, backing off {:?})",
-                            consecutive_failures, MAX_CONSECUTIVE_FAILURES, backoff
-                        );
-                        tracing::warn!(
-                            ?did,
-                            attempt = consecutive_failures,
-                            ?backoff,
-                            "reconnect: retrying session"
-                        );
-                        let _ = event_tx
-                            .send(ManagerEvent::StreamReconnecting {
-                                device_id: did,
-                                attempt: consecutive_failures,
-                                reason: reason.clone(),
-                            })
-                            .await;
-                        tokio::select! {
-                            _ = cancel_rx.recv() => {
-                                cancelled = true;
-                                break 'supervisor;
-                            }
-                            _ = tokio::time::sleep(backoff) => {}
-                        }
-
-                        let mut s = match (create_session)(&device_clone) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::warn!(%e, "reconnect: create_session failed");
-                                continue 'supervisor;
-                            }
-                        };
-                        match s.connect(&device_clone).await {
-                            Err(e) => {
-                                tracing::warn!(%e, "reconnect: session.connect failed");
-                                continue 'supervisor;
-                            }
-                            Ok(ConnectOutcome::Ready) => {}
-                            Ok(ConnectOutcome::PairingRequired(challenge)) => {
-                                // On reconnect we don't re-ask for pairing —
-                                // the device was already paired this session.
-                                // Surface as a fatal error so the UI can prompt
-                                // the user to start a fresh stream instead.
-                                let msg = format!(
-                                    "reconnect: device requested pairing again ({challenge:?}); \
-                                     giving up"
-                                );
-                                tracing::warn!("{}", msg);
-                                fatal_error = Some(msg);
-                                break 'supervisor;
-                            }
-                        }
-                        if let Err(e) = s.setup_stream(&session_config).await {
-                            tracing::warn!(%e, "reconnect: session.setup_stream failed");
-                            let _ = s.stop().await;
-                            continue 'supervisor;
-                        }
-                        tracing::info!(
-                            ?did,
-                            attempt = consecutive_failures,
-                            "reconnect: session re-established"
-                        );
-                        last_failure_at = Some(Instant::now());
-                        s
-                    }
-                };
-
-                // Inner frame loop. Same hot path as before; on
-                // session death we drop out and let the supervisor
-                // recreate.
-                'inner: loop {
-                    tokio::select! {
-                        // Audio polled before frame arm so slow
-                        // x264 encodes can't starve the AAC queue.
-                        biased;
-                        _ = cancel_rx.recv() => {
-                            tracing::info!(?did, "Stream cancelled");
-                            cancelled = true;
-                            let _ = session.stop().await;
-                            break 'supervisor;
-                        }
-                        audio = recv_audio_frame(&mut audio_frame_rx), if audio_frame_rx.is_some() => {
-                            match audio {
-                                Some(af) => {
-                                    if let Err(e) = session.send_audio_frame(&af).await {
-                                        // Audio errors do NOT kill
-                                        // the stream — video is the
-                                        // primary content. Log and
-                                        // keep going.
-                                        tracing::warn!(%e, "send_audio_frame failed");
-                                    }
-                                    // Drain remaining queued frames
-                                    // in this wake-up.
-                                    if let Some(rx) = audio_frame_rx.as_mut() {
-                                        loop {
-                                            match rx.try_recv() {
-                                                Ok(extra) => {
-                                                    if let Err(e) =
-                                                        session.send_audio_frame(&extra).await
-                                                    {
-                                                        tracing::warn!(
-                                                            %e,
-                                                            "send_audio_frame (drain) failed"
-                                                        );
-                                                    }
-                                                }
-                                                Err(mpsc::error::TryRecvError::Empty) => break,
-                                                Err(mpsc::error::TryRecvError::Disconnected) => {
-                                                    audio_frame_rx = None;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                None => {
-                                    // Audio pipeline exited. For Cast
-                                    // Streaming this is a problem: the
-                                    // Chromecast will never get audio
-                                    // → stays black. Log at WARN so
-                                    // the user can see it in field logs.
-                                    tracing::warn!(
-                                        ?did,
-                                        "audio pipeline exited — \
-                                         Cast Streaming receiver may stay black \
-                                         (no audio keyframe will arrive)"
-                                    );
-                                    audio_frame_rx = None;
-                                }
-                            }
-                        }
-                        frame_result = async {
-                            if let Some(f) = seed.take() {
-                                last_frame = Some(f.clone());
-                                return Ok(f);
-                            }
-                            match tokio::time::timeout(frame_period, capture.next_frame()).await {
-                                Ok(Ok(f)) => {
-                                    last_frame = Some(f.clone());
-                                    Ok(f)
-                                }
-                                Ok(Err(e)) => Err(e),
-                                Err(_) => match last_frame.as_mut() {
-                                    Some(stored) => {
-                                        bump_timestamp(stored, frame_period_us);
-                                        Ok(stored.clone())
-                                    }
-                                    None => capture.next_frame().await,
-                                },
-                            }
-                        } => {
-                            match frame_result {
-                                Ok(raw_frame) => {
-                                    let now = Instant::now();
-                                    if now >= next_keyframe_at {
-                                        encoder.request_keyframe();
-                                        while next_keyframe_at <= now {
-                                            next_keyframe_at += keyframe_interval;
-                                        }
-                                    }
-                                    let want_kbps = adaptive.target_kbps();
-                                    if want_kbps != last_applied_kbps {
-                                        match encoder.set_bitrate_kbps(want_kbps) {
-                                            Ok(()) => {
-                                                tracing::info!(
-                                                    from_kbps = last_applied_kbps,
-                                                    to_kbps = want_kbps,
-                                                    "adaptive: encoder bitrate updated"
-                                                );
-                                                last_applied_kbps = want_kbps;
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(%e, want_kbps, "adaptive: set_bitrate_kbps failed");
-                                                last_applied_kbps = want_kbps;
-                                            }
-                                        }
-                                    }
-
-                                    match encoder.encode(raw_frame) {
-                                        Ok(encoded) => {
-                                            if let Err(e) = session.send_frame(&encoded).await {
-                                                tracing::error!(%e, "Failed to send frame");
-                                                fatal_error = Some(e.to_string());
-                                                let _ = session.stop().await;
-                                                break 'supervisor;
-                                            }
-                                            // PLI from receiver (e.g. Cast
-                                            // Streaming RTCP feedback on
-                                            // packet loss): request an IDR
-                                            // so the receiver can resync.
-                                            if session.poll_keyframe_request() {
-                                                tracing::debug!(?did, "PLI received — requesting keyframe");
-                                                encoder.request_keyframe();
-                                            }
-                                            // Receiver-side liveness: when
-                                            // the chromecast app dies it
-                                            // sends CLOSE / ERROR 301; the
-                                            // session marks itself not
-                                            // alive but `send_frame` keeps
-                                            // accepting (HLS sink is local
-                                            // and stays up). Catching it
-                                            // here pivots us back to the
-                                            // supervisor for a clean
-                                            // reconnect instead of feeding
-                                            // a dead pipe.
-                                            if !session.is_alive() {
-                                                tracing::warn!(?did, "session reports not alive — entering reconnect supervisor");
-                                                let _ = session.stop().await;
-                                                break 'inner;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(%e, "Encoding error");
-                                            fatal_error = Some(e.to_string());
-                                            let _ = session.stop().await;
-                                            break 'supervisor;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!(%e, "Capture error");
-                                    fatal_error = Some(e.to_string());
-                                    let _ = session.stop().await;
-                                    break 'supervisor;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            let _ = capture.stop().await;
-            // Tear the audio task down alongside the video pipeline
-            // so the PipeWire audio thread and AAC encoder don't
-            // outlive the stream. Aborting is safe — the task
-            // doesn't hold any externally-visible resources besides
-            // its own PipeWire loop, which is cleaned up by the
-            // capture's Drop.
-            if let Some(h) = &audio_task_handle {
-                h.abort();
-            }
-            active_streams.lock().await.remove(&did);
-            // Surface a final error if the supervisor gave up.
-            // `StreamStopped` is always emitted afterwards so the
-            // app's "playing → stopped" state machine doesn't need
-            // to special-case error paths — same terminal event,
-            // optional error explainer just before it.
-            if let Some(msg) = fatal_error {
-                let _ = event_tx
-                    .send(ManagerEvent::StreamError {
-                        device_id: did,
-                        message: msg,
-                    })
-                    .await;
-            }
-            let _ = cancelled; // bookkeeping; not all paths read it
-            let _ = event_tx
-                .send(ManagerEvent::StreamStopped { device_id: did })
-                .await;
-        });
-
-        self.active_streams.lock().await.insert(
-            device_id,
-            ActiveStream {
-                device,
-                cancel_tx,
-                task,
-            },
-        );
-
+        if !attached {
+            drop(reservation);
+            StreamEnd::Cancelled.report(&self.event_tx, device_id).await;
+            return Err(FerricastError::Streaming(
+                "stream stopped while starting".into(),
+            ));
+        }
+        reservation.armed = false;
         Ok(())
     }
 
+    /// Stop the stream on `device_id` (also aborts one that is still
+    /// starting) and wait for its cleanup, at most 5 s.
+    ///
+    /// # Errors
+    ///
+    /// [`FerricastError::NoActiveSession`] when the device has no
+    /// stream.
     pub async fn stop_stream(&self, device_id: Uuid) -> Result<()> {
-        let stream = self.active_streams.lock().await.remove(&device_id);
-        if let Some(stream) = stream {
-            tracing::info!(name = %stream.device.name, "Stopping stream");
-            // Signal the loop to break, then wait for the task to
-            // actually finish — capture.stop() / session.stop() run
-            // *inside* the task and we want them done before we
-            // return so the caller (e.g. ctrl-c handler) can rely on
-            // "stop_stream returned" meaning "no more PipeWire
-            // worker thread / TLS connection / HLS listener alive".
-            let _ = stream.cancel_tx.send(()).await;
-            // 5s ceiling: if cleanup wedges (PipeWire main loop
-            // refusing to quit, TLS write blocked behind a dead
-            // peer) we'd rather log + move on than hang forever.
-            match tokio::time::timeout(std::time::Duration::from_secs(5), stream.task).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(?e, "stream task panicked during shutdown"),
-                Err(_) => {
-                    tracing::warn!(name = %stream.device.name, "stream task did not finish in 5s, abandoning")
-                }
+        let stream = lock_registry(&self.streams)
+            .take(device_id)
+            .ok_or(FerricastError::NoActiveSession)?;
+        tracing::info!(name = %stream.device.name, "Stopping stream");
+        // Dropping the sender is the stop signal.
+        drop(stream.cancel_tx);
+        let Some(task) = stream.task else {
+            // Still starting: `start_stream` sees the signal, cleans up
+            // and reports the outcome itself.
+            return Ok(());
+        };
+        let abort = task.abort_handle();
+        match tokio::time::timeout(STOP_TIMEOUT, task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(?e, "stream task panicked during shutdown"),
+            Err(_) => {
+                tracing::warn!(name = %stream.device.name, "stream task did not finish in time; aborting");
+                abort.abort();
+                let _ = self
+                    .event_tx
+                    .send(ManagerEvent::StreamStopped {
+                        device_id,
+                        reason: None,
+                    })
+                    .await;
             }
-            Ok(())
-        } else {
-            Err(FerricastError::NoActiveSession)
         }
+        Ok(())
     }
 
-    pub async fn shutdown(&mut self) -> Result<()> {
-        let ids: Vec<Uuid> = self.active_streams.lock().await.keys().copied().collect();
+    /// Stop every stream.
+    pub async fn stop_all_streams(&self) {
+        let ids = lock_registry(&self.streams).ids();
         for id in ids {
             let _ = self.stop_stream(id).await;
         }
+    }
+
+    /// Stop streams, receivers and discovery.
+    ///
+    /// # Errors
+    ///
+    /// The discovery stop error, if any.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.stop_all_streams().await;
         let _ = self.stop_receivers().await;
         self.stop_discovery().await
     }
@@ -1687,19 +1256,6 @@ async fn run_pump(
     let _ = puller.close().await;
 }
 
-/// Forward `frame`'s timestamp by `delta_us` microseconds. Used by
-/// the manager loop's pacing fallback: when the upstream capture
-/// stalls (Wayland compositor not emitting frames because nothing
-/// on screen has changed) we re-emit the most recent real frame
-/// with a synthetic monotonic timestamp so the downstream encoder
-/// + segmenter keeps producing output at the configured fps.
-fn bump_timestamp(frame: &mut CapturedFrame, delta_us: u64) {
-    match frame {
-        CapturedFrame::Cpu(r) => r.timestamp_us = r.timestamp_us.saturating_add(delta_us),
-        CapturedFrame::Gpu(g) => g.timestamp_us = g.timestamp_us.saturating_add(delta_us),
-    }
-}
-
 impl StreamManager {
     /// Start a builder for ergonomic construction.
     ///
@@ -1838,99 +1394,189 @@ impl StreamManagerBuilder {
     }
 }
 
-/// Helper for the supervisor's `tokio::select!` arm reading from
-/// the optional audio frame channel. `select!` can't dispatch on an
-/// `Option<&mut Receiver<_>>` directly, so we resolve it here:
-/// returns `None` when no receiver is wired (the arm's `if` guard
-/// disables it anyway, but we keep the future well-formed).
-async fn recv_audio_frame(chan: &mut Option<mpsc::Receiver<AudioFrame>>) -> Option<AudioFrame> {
-    match chan {
-        Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
+#[cfg(test)]
+mod tests {
+    use ferricast_core::DeviceCapabilities;
+
+    use super::*;
+    use crate::test_support::{FakeCapture, FakeEncoder, SessionScript, device, session_factory};
+
+    struct NoDiscovery;
+
+    impl ErasedDiscovery for NoDiscovery {
+        fn start(&mut self, _tx: mpsc::Sender<DiscoveryEvent>) -> BoxFut<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn stop(&mut self) -> BoxFut<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
     }
-}
 
-/// Dispatch to the right encoder backend based on `audio_cfg.codec`.
-async fn run_audio_pipeline(
-    audio_cfg: ferricast_core::AudioStreamConfig,
-    mute: ferricast_core::AudioMuteHandle,
-    tx: mpsc::Sender<AudioFrame>,
-) -> Result<()> {
-    match audio_cfg.codec {
-        #[cfg(feature = "opus-rs")]
-        AudioCodec::Opus => run_audio_pipeline_with(OpusEncoder::new(), audio_cfg, mute, tx).await,
-        _ => run_audio_pipeline_with(AacEncoder::new(), audio_cfg, mute, tx).await,
+    async fn manager_with(scripts: Vec<SessionScript>) -> (StreamManager, Device) {
+        let mut manager = StreamManager::default();
+        let (factory, _log) = session_factory(scripts);
+        manager.protocols.push(RegisteredProtocol {
+            protocol: "fake",
+            create_discovery: Box::new(|| Box::new(NoDiscovery) as Box<dyn ErasedDiscovery>),
+            create_session: factory,
+        });
+        let device = device(DeviceCapabilities::default());
+        manager
+            .devices
+            .write()
+            .await
+            .insert(device.id, device.clone());
+        (manager, device)
     }
-}
 
-/// Run the PipeWire audio capture → encoder pipeline forever.
-/// Lives in its own task so the blocking PipeWire main-loop thread
-/// doesn't interfere with the supervisor's video hot path.
-///
-/// The encoder is configured lazily on the first PCM chunk using
-/// whatever rate / channels PipeWire actually negotiated, so we
-/// never drive the codec at the wrong sample-rate index.
-async fn run_audio_pipeline_with<E: AudioEncoder>(
-    mut encoder: E,
-    audio_cfg: ferricast_core::AudioStreamConfig,
-    mute: ferricast_core::AudioMuteHandle,
-    tx: mpsc::Sender<AudioFrame>,
-) -> Result<()> {
-    let mut capture = PipeWireAudioCapture::new();
-    let cap_cfg = AudioCaptureConfig {
-        sample_rate: audio_cfg.sample_rate,
-        channels: audio_cfg.channels,
-    };
-    capture
-        .start(AudioSource::DefaultMonitor, cap_cfg, mute)
-        .await?;
-    tracing::info!(
-        requested_sample_rate = audio_cfg.sample_rate,
-        requested_channels = audio_cfg.channels,
-        bitrate_kbps = audio_cfg.bitrate_kbps,
-        codec = ?audio_cfg.codec,
-        "audio capture started; encoder will be configured on first PCM chunk"
-    );
+    fn source() -> CaptureSource {
+        CaptureSource::FullScreen { monitor: None }
+    }
 
-    let mut encoder_configured = false;
+    fn drain(rx: &mut mpsc::Receiver<ManagerEvent>) -> Vec<ManagerEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
 
-    loop {
-        let pcm = match capture.next_frame().await {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(%e, "audio capture next_frame failed; stopping pipeline");
-                break;
+    #[test]
+    fn registry_rejects_a_second_reservation() {
+        let mut reg = StreamRegistry::default();
+        let d = device(DeviceCapabilities::default());
+        assert!(reg.reserve(&d).is_ok());
+        assert!(matches!(
+            reg.reserve(&d),
+            Err(FerricastError::SessionAlreadyActive(_))
+        ));
+    }
+
+    #[test]
+    fn registry_release_only_removes_its_own_generation() {
+        let mut reg = StreamRegistry::default();
+        let d = device(DeviceCapabilities::default());
+        let (old, _rx) = reg.reserve(&d).unwrap();
+        assert!(reg.take(d.id).is_some());
+        let (new, _rx2) = reg.reserve(&d).unwrap();
+        assert_ne!(old, new);
+        // The old task finishing must not remove the new stream.
+        assert!(!reg.release(d.id, old));
+        assert!(reg.is_current(d.id, new));
+        assert!(reg.release(d.id, new));
+        assert!(reg.devices().is_empty());
+    }
+
+    #[tokio::test]
+    async fn registry_refuses_to_attach_after_stop() {
+        let mut reg = StreamRegistry::default();
+        let d = device(DeviceCapabilities::default());
+        let (generation, _rx) = reg.reserve(&d).unwrap();
+        reg.take(d.id);
+        assert!(!reg.attach(d.id, generation, tokio::spawn(async {})));
+    }
+
+    #[test]
+    fn dropped_reservation_frees_the_device() {
+        let registry = Arc::new(std::sync::Mutex::new(StreamRegistry::default()));
+        let d = device(DeviceCapabilities::default());
+        let (generation, _rx) = lock_registry(&registry).reserve(&d).unwrap();
+        drop(Reservation {
+            registry: registry.clone(),
+            id: d.id,
+            generation,
+            armed: true,
+        });
+        assert!(lock_registry(&registry).devices().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_start_is_rejected_and_stop_cleans_up() {
+        let (mut manager, device) = manager_with(vec![SessionScript::default()]).await;
+        let mut events = manager.take_event_rx().unwrap();
+        let start = || {
+            manager.start_stream(
+                device.id,
+                source(),
+                FakeCapture::new(&[(64, 36)]),
+                FakeEncoder::default(),
+                StreamConfig::default(),
+            )
+        };
+        start().await.unwrap();
+        assert_eq!(manager.active_streams().len(), 1);
+        assert!(matches!(
+            start().await,
+            Err(FerricastError::SessionAlreadyActive(_))
+        ));
+
+        manager.stop_stream(device.id).await.unwrap();
+        assert!(manager.active_streams().is_empty());
+        let events = drain(&mut events);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ManagerEvent::StreamStopped { reason: None, .. }))
+        );
+
+        // The device is free again.
+        start().await.unwrap();
+        manager.stop_all_streams().await;
+        assert!(manager.active_streams().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_while_starting_aborts_the_start() {
+        let (manager, device) = manager_with(vec![SessionScript::default()]).await;
+        let manager = Arc::new(manager);
+        let starting = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .start_stream(
+                        device.id,
+                        source(),
+                        FakeCapture::new(&[(64, 36)])
+                            .with_first_frame_delay(Duration::from_secs(20)),
+                        FakeEncoder::default(),
+                        StreamConfig::default(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(manager.active_streams().len(), 1);
+        manager.stop_stream(device.id).await.unwrap();
+        assert!(starting.await.unwrap().is_err());
+        assert!(manager.active_streams().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_stop_frees_the_device_and_reports_the_reason() {
+        let (mut manager, device) = manager_with(vec![SessionScript {
+            remote_stop_after: Some(3),
+            ..SessionScript::default()
+        }])
+        .await;
+        let mut events = manager.take_event_rx().unwrap();
+        manager
+            .start_stream(
+                device.id,
+                source(),
+                FakeCapture::new(&[(64, 36)]),
+                FakeEncoder::default(),
+                StreamConfig::default(),
+            )
+            .await
+            .unwrap();
+        let reason = loop {
+            match events.recv().await {
+                Some(ManagerEvent::StreamStopped { reason, .. }) => break reason,
+                Some(_) => {}
+                None => panic!("event channel closed"),
             }
         };
-        if !encoder_configured {
-            encoder.configure(&AudioEncoderConfig {
-                codec: audio_cfg.codec,
-                sample_rate: pcm.sample_rate,
-                channels: pcm.channels,
-                bitrate_kbps: audio_cfg.bitrate_kbps,
-            })?;
-            tracing::info!(
-                sample_rate = pcm.sample_rate,
-                channels = pcm.channels,
-                bitrate_kbps = audio_cfg.bitrate_kbps,
-                codec = ?audio_cfg.codec,
-                "audio encoder configured against PipeWire's negotiated format"
-            );
-            encoder_configured = true;
-        }
-        if let Err(e) = encoder.encode(&pcm) {
-            tracing::warn!(%e, "audio encode failed; dropping chunk");
-            continue;
-        }
-        for frame in encoder.take_output() {
-            if tx.send(frame).await.is_err() {
-                tracing::info!("audio supervisor dropped receiver; exiting pipeline");
-                let _ = capture.stop().await;
-                return Ok(());
-            }
-        }
+        assert_eq!(reason.as_deref(), Some("stopped on the TV"));
+        assert!(manager.active_streams().is_empty());
+        assert!(matches!(
+            manager.stop_stream(device.id).await,
+            Err(FerricastError::NoActiveSession)
+        ));
     }
-
-    let _ = capture.stop().await;
-    Ok(())
 }

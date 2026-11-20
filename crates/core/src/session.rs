@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::adaptive::AdaptiveBitrateState;
 use crate::capture::AudioMuteHandle;
 use crate::device::Device;
-use crate::error::Result;
+use crate::error::{FerricastError, Result};
 use crate::frame::{AudioCodec, EncodedFrame};
 use crate::pairing::{PairingChallenge, PairingResponse};
 
@@ -161,6 +161,14 @@ pub trait CastSession: Send + Sync {
     fn stop(&mut self) -> impl Future<Output = Result<()>> + Send;
     fn is_alive(&self) -> bool;
 
+    /// Why the session stopped being alive, when it knows. Read by the
+    /// manager once [`Self::is_alive`] turns false:
+    /// [`FerricastError::RemoteStopped`] ends the stream without
+    /// reconnecting; anything else (or `None`) triggers a reconnect.
+    fn end_reason(&self) -> Option<&FerricastError> {
+        None
+    }
+
     /// Returns `true` (and clears the flag) if the receiver sent a PLI
     /// requesting a keyframe. The manager calls this after each `send_frame`
     /// and forwards the signal to the encoder via `request_keyframe()`.
@@ -185,5 +193,16 @@ pub trait CastSession: Send + Sync {
     /// again; others keep their configured bitrate.
     fn feeds_adaptive_bitrate(&self) -> bool {
         false
+    }
+
+    /// Wall-clock interval at which the manager forces an IDR, on top of
+    /// the encoder's own GOP. Segment-based transports (HLS) need one
+    /// per segment even when capture stalls; transports with receiver
+    /// feedback (RTP + PLI) should return `None`, since unrequested IDRs
+    /// only cost bitrate and show up as periodic quality pulses.
+    ///
+    /// Default: every 2 s, matching the HLS segment target.
+    fn forced_keyframe_interval(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(2))
     }
 }

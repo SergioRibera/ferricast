@@ -32,6 +32,7 @@ use yuv::{YuvChromaSubsampling, YuvPlanarImageMut, bgra_to_yuv420, rgba_to_yuv42
 
 use crate::frame_view::FrameView;
 use crate::h264::utils::extract_sps_pps;
+use crate::scale::{FrameScaler, FrameSize};
 
 const X264_PRESET_VAR: &str = "FERRICAST_X264_PRESET";
 const X264_TUNE_VAR: &str = "FERRICAST_TUNE_PRESET";
@@ -57,6 +58,8 @@ pub struct X264Encoder {
     /// Set by [`VideoEncoder::request_keyframe`]; cleared once a
     /// picture typed IDR has been accepted by libx264.
     pending_keyframe: bool,
+    /// Fits frames whose size differs from the session into it.
+    scaler: FrameScaler,
 }
 
 impl VideoEncoder for X264Encoder {
@@ -97,6 +100,9 @@ impl VideoEncoder for X264Encoder {
         let session = self.session.as_mut().ok_or_else(|| {
             FerricastError::Encoder("x264: encode called before configure()".into())
         })?;
+        let raw = self
+            .scaler
+            .fit(raw, FrameSize::new(session.width, session.height))?;
         let view = FrameView::new(&raw, session.width, session.height)?;
         let planar = self
             .planar
@@ -715,9 +721,10 @@ mod tests {
     }
 
     #[test]
-    fn size_change_is_an_error_not_a_panic() {
+    fn size_change_is_scaled_into_the_session() {
         let mut enc = configured();
-        assert!(enc.encode(bgra_frame(640, 480, 2560, 0)).is_err());
+        assert!(enc.encode(bgra_frame(640, 480, 2560, 0)).is_ok());
+        assert!(enc.encode(bgra_frame(500, 240, 2000, 0)).is_ok());
         assert!(enc.encode(bgra_frame(320, 240, 1280, 0)).is_ok());
     }
 

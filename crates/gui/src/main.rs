@@ -6,17 +6,17 @@ use clap::Parser;
 use ferricast::ManagerEvent;
 use ferricast::prelude::*;
 use freya::{prelude::*, radio::*};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
-use uuid::Uuid;
 
 use crate::app::ReceiverWindowReq;
-use crate::daemon::PickerRequest;
+use crate::daemon::{PickerRequest, SharedManager};
 
 mod app;
 mod cli;
 mod client;
 mod daemon;
+mod pairing;
 mod picker;
 mod receiver_window;
 
@@ -65,12 +65,17 @@ async fn main() -> anyhow::Result<()> {
     let (receiver_window_tx, receiver_window_rx) = mpsc::channel::<ReceiverWindowReq>(16);
     let receiver_window_tx_factory = receiver_window_tx.clone();
 
-    let mut manager_builder = StreamManager::builder()
-        .with_chromecast()
-        .with_airplay()
-        .with_chromecast_receiver()
-        .with_h264_decoder()
-        .with_aac_decoder();
+    let manager_builder = StreamManager::builder();
+    #[cfg(feature = "chromecast")]
+    let manager_builder = manager_builder.with_chromecast();
+    #[cfg(feature = "airplay")]
+    let manager_builder = manager_builder.with_airplay();
+    #[cfg(feature = "chromecast")]
+    let manager_builder = manager_builder.with_chromecast_receiver();
+    let manager_builder = manager_builder.with_h264_decoder();
+    #[cfg(feature = "aac")]
+    let manager_builder = manager_builder.with_aac_decoder();
+    let mut manager_builder = manager_builder;
 
     if let (Some(min), Some(max)) = (args.port_min, args.port_max) {
         if max < min {
@@ -139,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
             }
         })
         .build_with_events();
-    let manager = Arc::new(Mutex::new(manager));
+    let manager: SharedManager = Arc::new(tokio::sync::RwLock::new(manager));
 
     // Source enumerator: picks wlroots → x11 → stub at runtime. The
     // daemon doesn't need to know which backend it is — the trait
@@ -182,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let sm = manager.clone();
         tokio::spawn(async move {
-            if let Err(e) = sm.lock().await.start_discovery().await {
+            if let Err(e) = sm.read().await.start_discovery().await {
                 tracing::error!(%e, "Failed to start discovery");
             } else {
                 tracing::info!("Discovery started for all protocols");
@@ -196,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let sm = manager.clone();
         tokio::spawn(async move {
-            if let Err(e) = sm.lock().await.start_receivers().await {
+            if let Err(e) = sm.write().await.start_receivers().await {
                 tracing::error!(%e, "Failed to start receivers");
             } else {
                 tracing::info!("Receivers advertising on the LAN");
@@ -216,24 +221,49 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     run_window(
-        manager,
+        manager.clone(),
         ui_rx,
         picker_rx,
         receiver_window_rx,
         args.background,
     );
+    shutdown_manager(&manager).await;
     Ok(())
 }
 
+/// Stop streams (receivers get a STOP, nothing keeps showing our
+/// splash), receivers and discovery (mDNS goodbye) before exiting.
+async fn shutdown_manager(manager: &SharedManager) {
+    const WRITE_LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+    tracing::info!("shutting down streams, receivers and discovery");
+    // Cancels in-flight starts too, which releases their read locks.
+    manager.read().await.stop_all_streams().await;
+    match tokio::time::timeout(WRITE_LOCK_GRACE, manager.write()).await {
+        Ok(mut m) => {
+            if let Err(e) = m.shutdown().await {
+                tracing::warn!(%e, "manager shutdown");
+            }
+        }
+        Err(_) => {
+            tracing::warn!("manager still busy; stopping discovery only");
+            if let Err(e) = manager.read().await.stop_discovery().await {
+                tracing::warn!(%e, "stop discovery");
+            }
+        }
+    }
+}
+
 fn run_window(
-    stream_manager: Arc<Mutex<StreamManager>>,
+    stream_manager: SharedManager,
     mut ui_rx: mpsc::Receiver<ManagerEvent>,
     picker_rx: mpsc::Receiver<PickerRequest>,
     receiver_window_rx: mpsc::Receiver<ReceiverWindowReq>,
     hidden: bool,
 ) {
     let radio_station = RadioStation::create_global(AppState::default());
-    let mut radio_events = radio_station.clone();
+    let mut radio_events = radio_station;
+    // Pump → window listener: pairing prompts and receiver lifecycle.
+    let (ui_cmd_tx, ui_cmd_rx) = mpsc::channel::<UiCommand>(16);
 
     let mut window_config = WindowConfig::new_app(FerricastApp {
         stream_manager,
@@ -244,6 +274,7 @@ fn run_window(
         // listener; subsequent renders see `None` and skip.
         picker_req_rx: Rc::new(RefCell::new(Some(picker_rx))),
         receiver_req_rx: Rc::new(RefCell::new(Some(receiver_window_rx))),
+        ui_cmd_rx: Rc::new(RefCell::new(Some(ui_cmd_rx))),
     })
     .with_title("Ferricast")
     .with_size(800., 600.);
@@ -276,75 +307,60 @@ fn run_window(
                         .await;
                 };
                 let pump = async {
-                    loop {
-                        match ui_rx.recv().await {
-                            Some(ManagerEvent::DeviceFound(device)) => {
-                                radio_events
-                                    .write_channel(AppChannel::Devices)
-                                    .devices
-                                    .entry(device.id)
-                                    .insert_entry(device);
-                            }
-                            Some(ManagerEvent::DeviceLost(id)) => {
-                                radio_events
-                                    .write_channel(AppChannel::Devices)
-                                    .devices
-                                    .remove(&id);
-                                radio_events
-                                    .write_channel(AppChannel::Streaming)
-                                    .streaming
-                                    .retain(|&s| s != id);
-                            }
-                            Some(ManagerEvent::StreamStarted { device_id, .. }) => {
-                                let mut state = radio_events.write_channel(AppChannel::Streaming);
-                                if !state.streaming.contains(&device_id) {
-                                    state.streaming.push(device_id);
-                                }
-                            }
-                            Some(ManagerEvent::StreamStopped { device_id }) => {
-                                radio_events
-                                    .write_channel(AppChannel::Streaming)
-                                    .streaming
-                                    .retain(|&s| s != device_id);
-                            }
-                            Some(ManagerEvent::ReceiverIncoming {
-                                protocol, remote, ..
-                            }) => {
+                    while let Some(event) = ui_rx.recv().await {
+                        let command = match &event {
+                            ManagerEvent::PairingRequired {
+                                device_id,
+                                challenge,
+                                respond,
+                            } => radio_events
+                                .write_channel(AppChannel::Notices)
+                                .pairing_prompt(*device_id, challenge, respond),
+                            ManagerEvent::ReceiverIncoming {
+                                receiver_id,
+                                protocol,
+                                remote,
+                            } => {
                                 tracing::info!(
                                     protocol,
                                     sender = %remote.addr,
                                     "receiver: sender connected — waiting for LOAD"
                                 );
+                                Some(UiCommand::ReceiverSession {
+                                    receiver_id: *receiver_id,
+                                    remote_id: remote.id,
+                                })
                             }
-                            Some(ManagerEvent::ReceiverStarted { remote, info, .. }) => {
-                                // Window has already been requested
-                                // from `sink_factory`; this event is
-                                // diagnostic only.
+                            ManagerEvent::ReceiverStarted { remote, info, .. } => {
+                                // The window was already requested by
+                                // the sink factory.
                                 tracing::info!(
                                     sender = %remote.addr,
                                     audio = info.audio.is_some(),
                                     video = info.video.is_some(),
                                     "receiver: LOAD acknowledged, pipeline running"
                                 );
+                                None
                             }
-                            Some(ManagerEvent::ReceiverStateChanged { receiver_id, state }) => {
+                            ManagerEvent::ReceiverStateChanged { receiver_id, state } => {
                                 tracing::debug!(?receiver_id, ?state, "receiver state");
+                                None
                             }
-                            Some(ManagerEvent::ReceiverStopped { receiver_id })
-                            | Some(ManagerEvent::ReceiverError { receiver_id, .. }) => {
-                                // TODO follow-up: close the
-                                // associated receiver window here.
-                                // Tracking the WindowId requires the
-                                // app listener to bubble it back
-                                // (`launch_window` returns the id
-                                // on the freya local thread only) —
-                                // small wire-up out of scope this
-                                // turn. User closes the window
-                                // manually in the meantime.
-                                let _ = receiver_id;
+                            ManagerEvent::ReceiverStopped { receiver_id }
+                            | ManagerEvent::ReceiverError { receiver_id, .. } => {
+                                Some(UiCommand::ReceiverEnded {
+                                    receiver_id: *receiver_id,
+                                })
                             }
-                            None => break,
-                            _ => {}
+                            _ => None,
+                        };
+                        radio_events
+                            .write_channel(AppChannel::Devices)
+                            .apply(&event);
+                        if let Some(command) = command
+                            && ui_cmd_tx.send(command).await.is_err()
+                        {
+                            tracing::warn!("window listener gone; dropping UI command");
                         }
                     }
                 };

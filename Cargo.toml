@@ -136,6 +136,11 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+bytes.workspace = true
+# Paused clock for the pipeline tests (reconnect backoff, pacing).
+tokio = { workspace = true, features = ["test-util"] }
+
 # Optimise hot-path crates in dev: x264/yuv/fdk-aac at opt=0 are
 # 5-10× slower and starve the audio pipeline.
 [profile.dev.package.yuv]

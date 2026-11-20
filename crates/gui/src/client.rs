@@ -15,14 +15,14 @@ use crate::cli::SourceKind;
 /// a friendly message. Everything else passes through unchanged.
 fn rewrap(err: zbus::Error) -> anyhow::Error {
     use zbus::fdo::Error as FdoError;
-    if let zbus::Error::FDO(boxed) = &err {
-        if let FdoError::ServiceUnknown(_) | FdoError::NameHasNoOwner(_) = boxed.as_ref() {
-            return anyhow::anyhow!(
-                "no ferricast daemon is running on the session bus \
+    if let zbus::Error::FDO(boxed) = &err
+        && let FdoError::ServiceUnknown(_) | FdoError::NameHasNoOwner(_) = boxed.as_ref()
+    {
+        return anyhow::anyhow!(
+            "no ferricast daemon is running on the session bus \
                  (looked for `{BUS_NAME}`). Start one with \
                  `ferricast-gui --background` and try again."
-            );
-        }
+        );
     }
     anyhow::Error::new(err)
 }

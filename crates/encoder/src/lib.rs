@@ -13,3 +13,4 @@ pub mod h265;
 pub mod nvenc;
 #[cfg(feature = "opus-rs")]
 pub mod opus;
+pub mod scale;

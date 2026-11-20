@@ -102,3 +102,5 @@ fdk-aac = { version = "0.8", optional = true }
 x264-sys = { version = "0.2", optional = true }
 yuv = "0.8.16"
 opus-rs = { version = "0.1.23", optional = true }
+# SIMD resampler for the encoder scaling stage (source size != output size).
+fast_image_resize = { version = "6.2", features = ["only_u8x4"] }

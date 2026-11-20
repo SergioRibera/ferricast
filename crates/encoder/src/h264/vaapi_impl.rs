@@ -44,11 +44,13 @@ use super::headers::{
     self, ColourDescription, FrameCrop, PpsParams, SpsParams, VuiParams, profile,
 };
 use super::yuv::{
-    self, VPP_INPUT_STANDARD, VPP_OUTPUT_STANDARD, vpp_input_colour, vpp_output_colour,
+    self, VPP_BACKGROUND_BLACK, VPP_INPUT_STANDARD, VPP_OUTPUT_STANDARD, vpp_input_colour,
+    vpp_output_colour,
 };
 use crate::config_ext::EncoderConfigExt;
 use crate::frame_view::FrameView;
 use crate::gop::GopState;
+use crate::scale::{FrameScaler, FrameSize};
 
 const RENDER_NODES: &[&str] = &[
     "/dev/dri/renderD128",
@@ -138,6 +140,9 @@ pub struct VaapiH264Encoder {
 
     /// The configuration this session was opened for.
     requested: EncoderConfig,
+
+    /// Fits CPU frames whose size differs from the session into it.
+    scaler: FrameScaler,
 }
 
 #[derive(Clone)]
@@ -360,6 +365,7 @@ impl VaapiH264Encoder {
             pps_nal,
             state,
             requested,
+            scaler: FrameScaler::default(),
         })
     }
 }
@@ -451,14 +457,19 @@ impl EncoderCfg {
         (self.height_mbs as u32) * 16
     }
 
-    /// Top-left `width × height` rectangle: where VPP writes the picture
-    /// inside the padded surface.
-    fn visible_region(&self) -> VARectangle {
+    /// Aspect-preserving placement of a `src_width × src_height`
+    /// picture inside the top-left `width × height` (visible) part of the padded
+    /// surface.
+    fn letterbox_region(&self, src_width: u32, src_height: u32) -> VARectangle {
+        let p = FrameSize::new(src_width, src_height)
+            .letterbox_in(FrameSize::new(self.width, self.height));
+        let clamp = |v: u32| i16::try_from(v).unwrap_or(i16::MAX);
+        let clamp_u = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
         VARectangle {
-            x: 0,
-            y: 0,
-            width: u16::try_from(self.width).unwrap_or(u16::MAX),
-            height: u16::try_from(self.height).unwrap_or(u16::MAX),
+            x: clamp(p.x),
+            y: clamp(p.y),
+            width: clamp_u(p.size.width),
+            height: clamp_u(p.size.height),
         }
     }
 
@@ -627,7 +638,10 @@ impl VaapiH264Encoder {
                 self.upload_dmabuf_via_vpp(target_recon_idx, &g)?;
             }
             other => {
-                let raw = other.into_cpu()?;
+                let raw = self.scaler.fit(
+                    other.into_cpu()?,
+                    FrameSize::new(self.cfg.width, self.cfg.height),
+                )?;
                 let view = FrameView::new(&raw, self.cfg.width, self.cfg.height)?;
                 yuv::upload_to_surface(target_surface, self.cfg.coded_size(), &view)?;
             }
@@ -1239,8 +1253,11 @@ impl VaapiH264Encoder {
             imported.id(),
             None, // surface_region = full
             VPP_INPUT_STANDARD,
-            Some(self.cfg.visible_region()), // never stretch into the MB padding
-            0,                               // output_background_color
+            // Inside the visible region (never the MB padding), aspect
+            // kept: a source whose size changed mid-stream is
+            // letterboxed and the driver fills the rest black.
+            Some(self.cfg.letterbox_region(g.width, g.height)),
+            VPP_BACKGROUND_BLACK,
             VPP_OUTPUT_STANDARD,
             0, // pipeline_flags
             0, // filter_flags
