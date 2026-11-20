@@ -46,6 +46,11 @@ enum Cmd {
     Close,
 }
 
+/// How long [`HlsPuller::close`] waits for the worker before aborting
+/// it. Past that point the worker can only be blocked on network I/O,
+/// which the abort cancels cleanly.
+const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub struct HlsPuller {
     rx: Option<mpsc::Receiver<Result<MediaPacket>>>,
     cmd_tx: Option<mpsc::Sender<Cmd>>,
@@ -130,13 +135,24 @@ impl MediaPuller for HlsPuller {
 
     fn close(&mut self) -> impl std::future::Future<Output = Result<()>> + Send {
         async move {
-            if let Some(tx) = self.cmd_tx.take() {
-                let _ = tx.send(Cmd::Close).await;
-            }
-            if let Some(task) = self.task.take() {
-                let _ = task.await;
-            }
+            // Drop the packet receiver first: a worker parked in
+            // `packet_tx.send().await` on a full channel then wakes
+            // with a send error and exits instead of waiting forever
+            // for a consumer that is busy joining it.
             self.rx = None;
+            if let Some(tx) = self.cmd_tx.take() {
+                // `try_send`: the command channel may be full too, and
+                // the dropped receiver already guarantees an exit.
+                let _ = tx.try_send(Cmd::Close);
+            }
+            if let Some(mut task) = self.task.take()
+                && tokio::time::timeout(WORKER_JOIN_TIMEOUT, &mut task)
+                    .await
+                    .is_err()
+            {
+                tracing::warn!("HLS worker did not stop in time; aborting it");
+                task.abort();
+            }
             Ok(())
         }
     }
