@@ -184,10 +184,17 @@ pub async fn connect(
     // some 1st/2nd-gen models reject ClientHellos that *also*
     // advertise TLS 1.3 (which rustls 0.23 does by default). The
     // safer floor is to negotiate exactly what the receiver wants.
-    let config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
-        .with_no_client_auth();
+    //
+    // The provider is pinned: the workspace enables both ring and
+    // aws-lc-rs, so the process-level default is ambiguous unless the
+    // binary installed one, and rustls panics in that case.
+    let config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .map_err(|e| FerricastError::Connection(format!("tls config: {e}")))?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+            .with_no_client_auth();
 
     let connector = TlsConnector::from(Arc::new(config));
     let server_name = ServerName::IpAddress(addr.into());
