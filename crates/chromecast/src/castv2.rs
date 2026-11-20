@@ -30,6 +30,9 @@ pub enum CastV2Error {
     #[error("frame too large: {size} bytes (max {max})")]
     FrameTooLarge { size: usize, max: usize },
 
+    #[error("payload_type {payload_type:?} does not match the payload fields present")]
+    PayloadMismatch { payload_type: Option<i32> },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -37,11 +40,18 @@ pub enum CastV2Error {
 pub type Result<T> = std::result::Result<T, CastV2Error>;
 
 // ---------------------------------------------------------------------------
-// Maximum frame size (Chromecast uses 64 KiB default, but can go up to 1 MiB
-// for media payloads).
+// Frame size limits
 // ---------------------------------------------------------------------------
 
-pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1 MiB
+/// Largest message body the CASTv2 protocol allows (openscreen
+/// `message_framer.cc` `kMaxBodySize`). Every message we emit must fit;
+/// receivers drop the connection on larger frames.
+pub const MAX_BODY_SIZE: usize = 64 * 1024;
+
+/// Largest inbound body we accept. Deliberately looser than
+/// [`MAX_BODY_SIZE`] so a peer that overshoots the spec does not cost us
+/// the session, while still bounding the read buffer.
+pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 pub const LENGTH_PREFIX_SIZE: usize = 4;
 
 /// Payload type enumeration matching the CASTv2 `.proto` definition.
@@ -243,7 +253,7 @@ pub struct ReceiverStatus {
 /// continue, never finding the app it was looking for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplicationInfo {
-    #[serde(rename = "appId")]
+    #[serde(rename = "appId", default)]
     pub app_id: String,
 
     #[serde(rename = "displayName", default)]
@@ -354,8 +364,10 @@ pub struct MediaStatusPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaStatus {
-    #[serde(rename = "mediaSessionId")]
-    pub media_session_id: i64,
+    /// Absent on some transitional statuses; never fail the whole
+    /// payload over it.
+    #[serde(rename = "mediaSessionId", default)]
+    pub media_session_id: Option<i64>,
 
     #[serde(rename = "playerState", skip_serializing_if = "Option::is_none")]
     pub player_state: Option<String>,
@@ -411,7 +423,9 @@ pub struct MediaStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveSeekableRange {
+    #[serde(default)]
     pub start: f64,
+    #[serde(default)]
     pub end: f64,
     #[serde(rename = "isMovingWindow", default)]
     pub is_moving_window: bool,
@@ -421,10 +435,12 @@ pub struct LiveSeekableRange {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaInfo {
-    #[serde(rename = "contentId")]
+    // `default` only affects parsing: receivers echo `media` back in
+    // MEDIA_STATUS and sometimes trim it.
+    #[serde(rename = "contentId", default)]
     pub content_id: String,
 
-    #[serde(rename = "contentType")]
+    #[serde(rename = "contentType", default)]
     pub content_type: String,
 
     #[serde(rename = "streamType", skip_serializing_if = "Option::is_none")]
@@ -432,6 +448,17 @@ pub struct MediaInfo {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
+
+    /// HLS audio segment container (`"ts"` = AAC inside MPEG-TS).
+    #[serde(rename = "hlsSegmentFormat", skip_serializing_if = "Option::is_none")]
+    pub hls_segment_format: Option<String>,
+
+    /// HLS video segment container (`"mpeg2_ts"` or `"fmp4"`).
+    #[serde(
+        rename = "hlsVideoSegmentFormat",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hls_video_segment_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -514,15 +541,19 @@ impl CastMessage {
     /// Encode this message into a length-prefixed byte buffer ready for the wire.
     pub fn encode_length_prefixed(&self) -> Result<Vec<u8>> {
         let proto_len = self.encoded_len();
-        if proto_len > MAX_MESSAGE_SIZE {
+        if proto_len > MAX_BODY_SIZE {
             return Err(CastV2Error::FrameTooLarge {
                 size: proto_len,
-                max: MAX_MESSAGE_SIZE,
+                max: MAX_BODY_SIZE,
             });
         }
+        let prefix = u32::try_from(proto_len).map_err(|_| CastV2Error::FrameTooLarge {
+            size: proto_len,
+            max: MAX_BODY_SIZE,
+        })?;
 
         let mut buf = Vec::with_capacity(LENGTH_PREFIX_SIZE + proto_len);
-        buf.put_u32(proto_len as u32);
+        buf.put_u32(prefix);
         self.encode(&mut buf)?;
 
         debug!(
@@ -569,6 +600,32 @@ impl CastMessage {
             "decoded cast message"
         );
         Ok(Some(msg))
+    }
+
+    /// Check that `payload_type` agrees with the payload field that is
+    /// actually set (`STRING` ⇒ `payload_utf8`, `BINARY` ⇒
+    /// `payload_binary`). A missing `payload_type` is tolerated as
+    /// long as exactly one payload is present.
+    ///
+    /// # Errors
+    ///
+    /// [`CastV2Error::PayloadMismatch`] when they disagree.
+    pub fn validate(&self) -> Result<()> {
+        let has_utf8 = self.payload_utf8.is_some();
+        let has_binary = self.payload_binary.is_some();
+        let consistent = match self.payload_type.map(PayloadType::try_from) {
+            Some(Ok(PayloadType::String)) => has_utf8,
+            Some(Ok(PayloadType::Binary)) => has_binary,
+            Some(Err(_)) => false,
+            None => has_utf8 != has_binary,
+        };
+        if consistent {
+            Ok(())
+        } else {
+            Err(CastV2Error::PayloadMismatch {
+                payload_type: self.payload_type,
+            })
+        }
     }
 
     pub fn parse_payload<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
@@ -618,6 +675,27 @@ pub fn pong_message() -> Result<CastMessage> {
     CastMessage::new_json(
         DEFAULT_SENDER_ID,
         DEFAULT_RECEIVER_ID,
+        namespace::HEARTBEAT,
+        &HeartbeatPayload::pong(),
+    )
+}
+
+/// Build the PONG answering `ping`, addressed back to whoever sent it.
+/// A broadcast destination (`*`) cannot be a reply source, so we fall
+/// back to our own sender id.
+pub fn pong_reply(ping: &CastMessage) -> Result<CastMessage> {
+    let source = match ping.destination_id.as_str() {
+        "" | "*" => DEFAULT_SENDER_ID,
+        dst => dst,
+    };
+    let destination = if ping.source_id.is_empty() {
+        DEFAULT_RECEIVER_ID
+    } else {
+        ping.source_id.as_str()
+    };
+    CastMessage::new_json(
+        source,
+        destination,
         namespace::HEARTBEAT,
         &HeartbeatPayload::pong(),
     )
@@ -911,6 +989,131 @@ mod tests {
         let mut buf = BytesMut::from(&encoded[..half]);
         let result = CastMessage::decode_length_prefixed(&mut buf).unwrap();
         assert!(result.is_none());
+    }
+
+    fn frame(msg: &CastMessage) -> Vec<u8> {
+        msg.encode_length_prefixed().unwrap()
+    }
+
+    #[test]
+    fn decodes_multiple_frames_from_one_buffer() {
+        let ping = ping_message().unwrap();
+        let pong = pong_message().unwrap();
+        let mut bytes = frame(&ping);
+        bytes.extend(frame(&pong));
+        let mut buf = BytesMut::from(&bytes[..]);
+        let first = CastMessage::decode_length_prefixed(&mut buf)
+            .unwrap()
+            .unwrap();
+        let second = CastMessage::decode_length_prefixed(&mut buf)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, ping);
+        assert_eq!(second, pong);
+        assert!(
+            CastMessage::decode_length_prefixed(&mut buf)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn decodes_byte_by_byte() {
+        let ping = ping_message().unwrap();
+        let bytes = frame(&ping);
+        let mut buf = BytesMut::new();
+        for (i, b) in bytes.iter().enumerate() {
+            buf.extend_from_slice(&[*b]);
+            let out = CastMessage::decode_length_prefixed(&mut buf).unwrap();
+            if i + 1 < bytes.len() {
+                assert!(out.is_none(), "decoded early at byte {i}");
+            } else {
+                assert_eq!(out.unwrap(), ping);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_inbound_frame_over_limit() {
+        let len = u32::try_from(MAX_MESSAGE_SIZE + 1).unwrap();
+        let mut buf = BytesMut::from(&len.to_be_bytes()[..]);
+        assert!(matches!(
+            CastMessage::decode_length_prefixed(&mut buf),
+            Err(CastV2Error::FrameTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_outbound_body_over_protocol_limit() {
+        let msg = CastMessage::new_binary("a", "b", "ns", vec![0; MAX_BODY_SIZE]);
+        assert!(matches!(
+            msg.encode_length_prefixed(),
+            Err(CastV2Error::FrameTooLarge {
+                max: MAX_BODY_SIZE,
+                ..
+            })
+        ));
+        let small = CastMessage::new_binary("a", "b", "ns", vec![0; MAX_BODY_SIZE - 64]);
+        assert!(small.encode_length_prefixed().is_ok());
+    }
+
+    #[test]
+    fn validate_checks_payload_type() {
+        assert!(ping_message().unwrap().validate().is_ok());
+        assert!(
+            CastMessage::new_binary("a", "b", "ns", vec![1])
+                .validate()
+                .is_ok()
+        );
+        let mut wrong = ping_message().unwrap();
+        wrong.payload_type = Some(PayloadType::Binary as i32);
+        assert!(wrong.validate().is_err());
+        wrong.payload_type = Some(7);
+        assert!(wrong.validate().is_err());
+        wrong.payload_type = None;
+        assert!(wrong.validate().is_ok());
+    }
+
+    #[test]
+    fn pong_reply_swaps_addresses() {
+        let mut ping = ping_message().unwrap();
+        ping.source_id = "receiver-0".into();
+        ping.destination_id = "*".into();
+        let pong = pong_reply(&ping).unwrap();
+        assert_eq!(pong.source_id, DEFAULT_SENDER_ID);
+        assert_eq!(pong.destination_id, "receiver-0");
+        assert_eq!(pong.message_type().as_deref(), Some("PONG"));
+    }
+
+    #[test]
+    fn media_status_tolerates_missing_and_unknown_fields() {
+        let json = r#"{"type":"MEDIA_STATUS","status":[{"playerState":"WEIRD_NEW",
+            "idleReason":"SOMETHING","media":{"streamType":"LIVE"},
+            "liveSeekableRange":{"end":12.5},"newField":{"x":"ñ😀"}}]}"#;
+        let parsed: MediaStatusPayload = serde_json::from_str(json).unwrap();
+        let s = &parsed.status[0];
+        assert_eq!(s.media_session_id, None);
+        assert_eq!(s.player_state.as_deref(), Some("WEIRD_NEW"));
+        assert!((s.live_seekable_range.as_ref().unwrap().end - 12.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn load_payload_carries_hls_formats() {
+        let media = MediaInfo {
+            content_id: "http://[fe80::1]:8080/index.m3u8".into(),
+            content_type: "application/x-mpegurl".into(),
+            stream_type: Some("LIVE".into()),
+            duration: None,
+            hls_segment_format: Some("ts".into()),
+            hls_video_segment_format: Some("mpeg2_ts".into()),
+        };
+        let v = serde_json::to_value(LoadPayload::new(3, media)).unwrap();
+        assert_eq!(v["type"], "LOAD");
+        assert_eq!(v["autoplay"], true);
+        assert_eq!(v["media"]["streamType"], "LIVE");
+        assert_eq!(v["media"]["hlsSegmentFormat"], "ts");
+        assert_eq!(v["media"]["hlsVideoSegmentFormat"], "mpeg2_ts");
+        assert!(v["media"].get("duration").is_none());
     }
 
     #[test]
