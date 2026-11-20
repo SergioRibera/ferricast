@@ -71,17 +71,20 @@ fn parameter_sets(packet: &EncodedFrame, is_slice: impl Fn(u8) -> bool) -> Encod
 #[test]
 fn openh264_puts_b_frames_out_in_presentation_order() {
     let packets = packets("h264.mp4");
-    let mut decoder: ferricast_decoder::h264::OpenH264Decoder = configured(false);
-    assert_eq!(
-        decode_all(&mut decoder, &packets),
-        presentation_order(&packets)
-    );
+    for low_latency in [false, true] {
+        let mut decoder: ferricast_decoder::h264::OpenH264Decoder = configured(low_latency);
+        assert_eq!(
+            decode_all(&mut decoder, &packets),
+            presentation_order(&packets),
+            "low_latency = {low_latency}"
+        );
+    }
 }
 
 #[test]
 fn openh264_packets_rejected_before_the_first_idr_do_not_shift_later_pictures() {
     let packets = packets("h264.mp4");
-    let mut decoder: ferricast_decoder::h264::OpenH264Decoder = configured(false);
+    let mut decoder: ferricast_decoder::h264::OpenH264Decoder = configured(true);
     let sets = parameter_sets(&packets[0], |header| header & 0x1f == 5);
     assert!(decoder.decode(sets).unwrap().is_none());
     // Joining mid-GOP: these pictures reference pictures never seen.

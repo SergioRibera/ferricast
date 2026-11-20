@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::marker::PhantomData;
 use std::os::raw::c_int;
 use std::ptr::{addr_of_mut, from_mut, null_mut};
@@ -6,6 +7,8 @@ use ferricast_core::{
     CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, PixelFormat, Result,
     VideoDecoder,
 };
+use h264_reader::nal::sps::SeqParameterSet;
+use h264_reader::rbsp::{BitReader, decode_nal};
 use openh264::{
     OpenH264API,
     decoder::{Decoder, DecoderConfig as Oh264DecoderConfig, Flush},
@@ -16,10 +19,15 @@ use openh264_sys2::{
 
 use crate::nv12::{self, Colour, OutputFormat, Planar};
 
+/// `profile_idc` of Baseline and Constrained Baseline, which have no B
+/// slices and so never reorder pictures.
+const PROFILE_BASELINE: u8 = 66;
+
 #[derive(Default)]
 pub struct OpenH264Decoder {
     session: Option<Session>,
     format: OutputFormat,
+    low_latency: bool,
     release: Release,
 }
 
@@ -35,6 +43,50 @@ enum Release {
     Immediately,
 }
 
+impl Release {
+    /// The policy the last SPS in an Annex B packet calls for, if the
+    /// packet carries one.
+    fn for_packet(data: &[u8]) -> Option<Self> {
+        openh264::nal_units(data)
+            .filter_map(strip_start_code)
+            .filter(|nal| nal.first().is_some_and(|header| header & 0x1f == 7))
+            .filter_map(Self::for_sps)
+            .last()
+    }
+
+    fn for_sps(nal: &[u8]) -> Option<Self> {
+        let rbsp = decode_nal(nal).ok()?;
+        let profile_idc = *rbsp.first()?;
+        // An SPS h264-reader cannot read still names its profile, which is
+        // enough to tell whether B slices are allowed.
+        let max_num_reorder_frames =
+            SeqParameterSet::from_bits(BitReader::new(Cursor::new(rbsp.as_ref())))
+                .ok()
+                .and_then(|sps| sps.vui_parameters)
+                .and_then(|vui| vui.bitstream_restrictions)
+                .map(|restrictions| restrictions.max_num_reorder_frames);
+        Some(Self::for_stream(profile_idc, max_num_reorder_frames))
+    }
+
+    /// Display order whenever the stream may reorder: its VUI says so or,
+    /// without a VUI bound, its profile allows B slices.
+    fn for_stream(profile_idc: u8, max_num_reorder_frames: Option<u32>) -> Self {
+        let reorders =
+            max_num_reorder_frames.map_or(profile_idc != PROFILE_BASELINE, |frames| frames > 0);
+        if reorders {
+            Self::DisplayOrder
+        } else {
+            Self::Immediately
+        }
+    }
+}
+
+/// An Annex B unit from `openh264::nal_units` without its start code.
+fn strip_start_code(unit: &[u8]) -> Option<&[u8]> {
+    let one = unit.iter().position(|&byte| byte != 0)?;
+    (unit[one] == 1).then(|| &unit[one + 1..])
+}
+
 impl VideoDecoder for OpenH264Decoder {
     const CODEC: Codec = Codec::H264;
 
@@ -47,7 +99,9 @@ impl VideoDecoder for OpenH264Decoder {
         }
         self.session = Some(Session::open()?);
         self.format = OutputFormat(config.pixel_format);
-        // Low latency trades display order for not waiting on reordering.
+        self.low_latency = config.low_latency;
+        // Low latency releases pictures at once until an SPS says the
+        // stream may reorder.
         self.release = if config.low_latency {
             Release::Immediately
         } else {
@@ -57,6 +111,13 @@ impl VideoDecoder for OpenH264Decoder {
     }
 
     fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+        if self.low_latency
+            && let Some(release) = Release::for_packet(&frame.data)
+            && release != self.release
+        {
+            tracing::debug!(?release, "openh264 picture release follows the new SPS");
+            self.release = release;
+        }
         let format = self.format.0;
         let release = self.release;
         let session = self.session.as_mut().ok_or_else(|| {
@@ -253,5 +314,47 @@ impl Picture<'_> {
         )
         .map(|raw| Some(CapturedFrame::Cpu(raw)))
         .ok_or_else(short)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stream_reorders_when_its_vui_says_so_or_its_profile_allows_b_slices() {
+        assert_eq!(Release::for_stream(100, Some(2)), Release::DisplayOrder);
+        assert_eq!(Release::for_stream(100, Some(0)), Release::Immediately);
+        assert_eq!(Release::for_stream(77, None), Release::DisplayOrder);
+        assert_eq!(Release::for_stream(100, None), Release::DisplayOrder);
+        assert_eq!(Release::for_stream(66, None), Release::Immediately);
+        assert_eq!(Release::for_stream(66, Some(1)), Release::DisplayOrder);
+    }
+
+    #[test]
+    fn the_release_follows_the_last_sps_in_a_packet() {
+        // Constrained Baseline 3.0 and High 3.0 SPS headers, no VUI.
+        let baseline = [0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1e, 0xf4, 0x41, 0x04, 0x60];
+        let high = [
+            0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1e, 0xac, 0xd9, 0x41, 0x04, 0x60,
+        ];
+        let slice = [0, 0, 1, 0x65, 0x88];
+        assert_eq!(Release::for_packet(&baseline), Some(Release::Immediately));
+        assert_eq!(Release::for_packet(&high), Some(Release::DisplayOrder));
+        assert_eq!(
+            Release::for_packet(&[&high[..], &baseline[..]].concat()),
+            Some(Release::Immediately)
+        );
+        assert_eq!(Release::for_packet(&slice), None);
+    }
+
+    #[test]
+    fn start_codes_of_either_length_are_stripped() {
+        assert_eq!(
+            strip_start_code(&[0, 0, 0, 1, 0x67, 9]),
+            Some(&[0x67, 9][..])
+        );
+        assert_eq!(strip_start_code(&[0, 0, 1, 0x68]), Some(&[0x68][..]));
+        assert_eq!(strip_start_code(&[0, 0, 2]), None);
     }
 }
