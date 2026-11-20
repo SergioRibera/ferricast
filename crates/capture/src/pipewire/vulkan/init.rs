@@ -45,6 +45,37 @@ const REQUIRED_DEVICE_EXTS: &[&CStr] = &[
 /// explicitly does no harm and helps on older loaders.
 const INSTANCE_EXTS: &[&CStr] = &[ash::khr::external_memory_capabilities::NAME];
 
+/// Khronos validation layer. Opt-in only: it is rarely installed on
+/// user machines (requesting a missing layer makes `vkCreateInstance`
+/// fail with `ERROR_LAYER_NOT_PRESENT`, killing the dmabuf path) and
+/// costs a lot of CPU per call even where it is.
+const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
+
+/// Set to `1` / `true` to request [`VALIDATION_LAYER`].
+const VALIDATION_ENV: &str = "FERRICAST_VK_VALIDATION";
+
+fn validation_requested() -> bool {
+    std::env::var(VALIDATION_ENV).is_ok_and(|v| env_flag_enabled(&v))
+}
+
+fn env_flag_enabled(value: &str) -> bool {
+    let value = value.trim();
+    value == "1" || value.eq_ignore_ascii_case("true")
+}
+
+fn validation_layer_available(entry: &ash::Entry) -> bool {
+    // SAFETY: plain loader query; no handles involved.
+    match unsafe { entry.enumerate_instance_layer_properties() } {
+        Ok(layers) => layers
+            .iter()
+            .any(|l| l.layer_name_as_c_str().is_ok_and(|n| n == VALIDATION_LAYER)),
+        Err(e) => {
+            warn!(error = %e, "enumerate_instance_layer_properties failed");
+            false
+        }
+    }
+}
+
 pub(super) fn build() -> Result<Inner> {
     let entry = unsafe {
         ash::Entry::load()
@@ -109,11 +140,19 @@ fn create_instance(entry: &ash::Entry) -> Result<ash::Instance> {
 
     let ext_ptrs: Vec<*const i8> = INSTANCE_EXTS.iter().map(|c| c.as_ptr()).collect();
 
-    let layer_names = [std::ffi::CString::new("VK_LAYER_KHRONOS_validation").unwrap()];
-    let layer_names_raw: Vec<*const i8> = layer_names
-        .iter()
-        .map(|raw_name| raw_name.as_ptr())
-        .collect();
+    let layer_names_raw: Vec<*const i8> = if validation_requested() {
+        if validation_layer_available(entry) {
+            info!("enabling {VALIDATION_LAYER:?} ({VALIDATION_ENV}=1)");
+            vec![VALIDATION_LAYER.as_ptr()]
+        } else {
+            warn!(
+                "{VALIDATION_ENV}=1 but {VALIDATION_LAYER:?} is not installed; continuing without it"
+            );
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
 
     let create_info = vk::InstanceCreateInfo::default()
         .application_info(&app_info)
@@ -228,4 +267,18 @@ fn create_device(
 
     unsafe { instance.create_device(physical_device, &create_info, None) }
         .map_err(|e| FerricastError::Capture(format!("create_device: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_flag_enabled;
+
+    #[test]
+    fn validation_env_flag_parsing() {
+        assert!(env_flag_enabled("1"));
+        assert!(env_flag_enabled(" TRUE "));
+        assert!(!env_flag_enabled("0"));
+        assert!(!env_flag_enabled(""));
+        assert!(!env_flag_enabled("yes please"));
+    }
 }
