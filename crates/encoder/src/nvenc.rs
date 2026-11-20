@@ -46,7 +46,7 @@ use shiguredo_nvcodec::RegisteredResource;
 #[cfg(feature = "nvenc-zero-copy")]
 use std::collections::HashMap;
 #[cfg(feature = "nvenc-zero-copy")]
-use std::os::fd::RawFd;
+use ferricast_core::DmaBufId;
 #[cfg(feature = "nvenc-zero-copy")]
 use tracing::warn;
 
@@ -172,13 +172,13 @@ struct NvencCfg {
 }
 
 /// Stable identity of a DMA-BUF for registration caching. Keyed on
-/// `(fd, modifier, dims)` rather than `fd` alone because some
-/// compositors recycle fd numbers after `close(2)` and a stale
-/// `RegisteredResource` would happily encode garbage.
+/// `(buffer identity, modifier, dims)`, not the fd number: every
+/// frame carries its own `dup` of the fd, so fd numbers are recycled
+/// across frames and a stale `RegisteredResource` would encode garbage.
 #[cfg(feature = "nvenc-zero-copy")]
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct DmabufKey {
-    fd: RawFd,
+    buffer: DmaBufId,
     modifier: u64,
     width: u32,
     height: u32,
@@ -324,7 +324,9 @@ impl<C: NvencCodec> NvencEncoder<C> {
         };
 
         let key = DmabufKey {
-            fd: g.plane.fd,
+            buffer: g.plane.fd.buffer_id().map_err(|e| {
+                FerricastError::Encoder(format!("NVENC ({}) fstat(dmabuf): {e}", C::NAME))
+            })?,
             modifier: g.plane.modifier,
             width: g.width,
             height: g.height,
@@ -335,7 +337,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
             let registered = self
                 .encoder
                 .register_external_dmabuf(
-                    g.plane.fd,
+                    g.plane.fd.as_raw_fd(),
                     g.plane.modifier,
                     g.width,
                     g.height,

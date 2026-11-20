@@ -10,7 +10,7 @@ description = "PipeWire and X11 screen capture for ferricast"
 # a Wayland-only desktop appliance) can opt out via
 # `default-features = false` + the backend they want.
 default = ["pipewire", "wlroots", "wayland-direct"]
-pipewire = ["dep:ashpd", "dep:pipewire", "dep:libspa", "dep:ash"]
+pipewire = ["dep:ashpd", "dep:pipewire", "dep:libspa", "dep:ash", "dep:futures-util"]
 
 # wayland (window/monitor enumeration). "wlroots" is the historical
 # name and stays for backward compat, but the backend now also
@@ -74,3 +74,5 @@ libspa = { version = "0.8", features = ["v0_3_75"], optional = true }
 # fails (no Vulkan loader / driver) the capture path falls back to
 # SHM-only EnumFormat advertising.
 ash = { version = "0.38", optional = true }
+# Polls the xdg-portal session's `Closed` signal stream (pipewire backend).
+futures-util = { workspace = true, optional = true }

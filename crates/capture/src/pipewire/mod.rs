@@ -20,8 +20,11 @@ use std::sync::{Arc, RwLock};
 use ferricast_core::{
     CaptureConfig, CaptureSource, CapturedFrame, FerricastError, PixelFormat, Result, ScreenCapture,
 };
-use tracing::info;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
 
+use self::portal::PortalSession;
 use self::stream::{SharedFormat, WorkerHandle};
 
 /// Screen capture backend using PipeWire via `xdg-desktop-portal`.
@@ -37,15 +40,66 @@ use self::stream::{SharedFormat, WorkerHandle};
 pub struct PipeWireCapture {
     /// `None` until `start()` succeeds, then `Some` until `stop()` is called.
     worker: Option<WorkerHandle>,
+    /// Portal session backing the running capture. `Some` exactly
+    /// when `worker` is; closed in `stop()`.
+    portal: Option<ActivePortal>,
     /// Filled by the PW thread once the format negotiation completes.
     /// Read by the synchronous getters (`get_screen_size`, etc.).
     shared_format: SharedFormat,
+}
+
+/// The portal session plus a task watching its `Closed` signal.
+struct ActivePortal {
+    session: PortalSession,
+    /// Flips to `true` when the portal reports the session closed
+    /// ("Stop sharing", compositor revoked the cast).
+    closed: watch::Receiver<bool>,
+    /// `None` when `start()` ran outside a Tokio runtime, in which
+    /// case only the PipeWire stream state reports the end of the cast.
+    watcher: Option<JoinHandle<()>>,
+}
+
+impl ActivePortal {
+    fn new(session: PortalSession) -> Self {
+        let (closed_tx, closed) = watch::channel(false);
+        let watcher = match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                let session = session.clone();
+                Some(rt.spawn(async move {
+                    match session.closed().await {
+                        Ok(()) => {
+                            info!("portal session closed by the compositor or user");
+                            closed_tx.send_replace(true);
+                        }
+                        Err(e) => warn!(error = %e, "can't watch portal session Closed signal"),
+                    }
+                }))
+            }
+            Err(_) => {
+                warn!("no Tokio runtime; portal Closed signal not watched");
+                None
+            }
+        };
+        Self {
+            session,
+            closed,
+            watcher,
+        }
+    }
+
+    async fn close(self) {
+        if let Some(watcher) = self.watcher {
+            watcher.abort();
+        }
+        self.session.close().await;
+    }
 }
 
 impl PipeWireCapture {
     pub fn new() -> Self {
         Self {
             worker: None,
+            portal: None,
             shared_format: Arc::new(RwLock::new(None)),
         }
     }
@@ -54,6 +108,24 @@ impl PipeWireCapture {
     /// read lock on the small `RwLock` populated by the worker.
     fn snapshot(&self) -> Option<format::NegotiatedFormat> {
         self.shared_format.read().ok().and_then(|g| *g)
+    }
+}
+
+impl Drop for PipeWireCapture {
+    /// Best-effort close for captures dropped without `stop()`: the
+    /// portal session would otherwise keep the cast alive.
+    fn drop(&mut self) {
+        let Some(portal) = self.portal.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(portal.close());
+            }
+            Err(_) => {
+                warn!("PipeWireCapture dropped outside a Tokio runtime; portal session left open")
+            }
+        }
     }
 }
 
@@ -79,9 +151,16 @@ impl ScreenCapture for PipeWireCapture {
             *g = None;
         }
 
-        let portal_stream = portal::open_session(&source, &config).await?;
-        let worker = stream::spawn(portal_stream, config, Arc::clone(&self.shared_format))?;
+        let (portal_stream, session) = portal::open_session(&source, &config).await?;
+        let worker = match stream::spawn(portal_stream, config, Arc::clone(&self.shared_format)) {
+            Ok(worker) => worker,
+            Err(e) => {
+                session.close().await;
+                return Err(e);
+            }
+        };
         self.worker = Some(worker);
+        self.portal = Some(ActivePortal::new(session));
 
         info!("PipeWire capture started");
         Ok(())
@@ -92,6 +171,18 @@ impl ScreenCapture for PipeWireCapture {
             .worker
             .as_mut()
             .ok_or_else(|| FerricastError::Capture("capture not started".into()))?;
+        let portal_closed = async {
+            match self.portal.as_mut() {
+                // `Err` = watcher gone without seeing `Closed`; that
+                // must not end the capture, so wait forever instead.
+                Some(p) => {
+                    if p.closed.wait_for(|closed| *closed).await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
 
         tokio::select! {
             // Errors take precedence so the user sees the real cause.
@@ -99,6 +190,9 @@ impl ScreenCapture for PipeWireCapture {
             err = worker.errors.recv() => {
                 let msg = err.unwrap_or_else(|| "PipeWire worker exited".into());
                 Err(FerricastError::Capture(format!("PipeWire: {msg}")))
+            }
+            () = portal_closed => {
+                Err(FerricastError::Capture("PipeWire: screencast portal session closed".into()))
             }
             frame = worker.frames.recv() => {
                 let mut latest = frame
@@ -128,6 +222,11 @@ impl ScreenCapture for PipeWireCapture {
             // makes the intent obvious and lets us return after the
             // worker thread has actually joined.
             worker.shutdown();
+        }
+        // Close the portal session last: the compositor tears the
+        // cast down (and clears its sharing indicator) only on Close.
+        if let Some(portal) = self.portal.take() {
+            portal.close().await;
         }
         if let Ok(mut g) = self.shared_format.write() {
             *g = None;

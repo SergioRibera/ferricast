@@ -23,17 +23,13 @@
 //!
 //! Performance note: the importer keeps a `RING_DEPTH`-slot ring of
 //! `(command_buffer, fence, staging)` plus a `HashMap<BufferId,
-//! VkImage>` cache, allowing GPU work for frame N+1 to overlap with
-//! the CPU memcpy of frame N. PipeWire reuses the same handful of
-//! underlying dmabuf objects from a small pool, but compositors
-//! (notably Mutter on NVIDIA) routinely hand out a fresh `dup`'d fd
-//! for each buffer borrow, so the `RawFd` number is not stable. We
-//! key the cache on `(st_dev, st_ino)` of the fd instead, which is
-//! invariant across `dup`. With that key the expensive
-//! `vkAllocateMemory` + `vkBindImageMemory` only pay once per pool
-//! entry; subsequent frames record-and-submit on a free ring slot
-//! and return the previous slot's bytes (see
-//! [`VulkanImporter::submit_and_take_previous`]).
+//! VkImage>` cache. PipeWire reuses the same handful of underlying
+//! dmabuf objects from a small pool, but every frame carries its own
+//! `dup`'d fd, so the `RawFd` number is not stable. We key the cache
+//! on `(st_dev, st_ino)` of the fd instead, which is invariant across
+//! `dup`. With that key the expensive `vkAllocateMemory` +
+//! `vkBindImageMemory` only pay once per pool entry; subsequent
+//! frames just record, submit and wait on a ring slot.
 
 mod format;
 mod import;
@@ -41,7 +37,7 @@ mod init;
 mod modifiers;
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::RawFd;
+
 use std::sync::Mutex;
 
 use ash::vk;
@@ -90,6 +86,9 @@ pub(super) struct Inner {
     pub(super) drm_modifier: ash::ext::image_drm_format_modifier::Device,
     #[allow(dead_code)] // used for the future GPU-handoff encoder path
     pub(super) external_memory_fd: ash::khr::external_memory_fd::Device,
+    /// `Some` when the device can import a `sync_file` into a
+    /// semaphore; used to wait on the dmabuf's implicit write fence.
+    pub(super) external_semaphore_fd: Option<ash::khr::external_semaphore_fd::Device>,
 
     /// Memory type indices grouped by the property flags we care
     /// about. Set up once during init so each import / readback
@@ -113,83 +112,43 @@ pub(super) struct BufferId {
 /// exceeded, the oldest entry (by insertion order) is destroyed.
 pub(super) const MAX_IMPORT_CACHE: usize = 16;
 
-/// Number of `(command_buffer, fence, staging)` slots in the
-/// pipeline ring. Two is enough to hide the GPU blit behind one
-/// CPU memcpy: while the worker memcopies frame N out of slot A,
-/// the GPU is already blitting frame N+1 into slot B. A deeper ring
-/// would only buy more latency without throughput, since the GPU
-/// queue serialises blits anyway.
+/// Number of `(command_buffer, fence, staging)` slots in the ring.
+/// Readback is synchronous (submit + wait in one call), so a single
+/// slot would do; two keep a spare staging buffer warm when frame
+/// sizes alternate.
 pub(super) const RING_DEPTH: usize = 2;
 
-/// Per-frame mutable cache. Lives behind a `Mutex` because the PW
-/// worker thread is the only consumer and the borrow is scoped to a
-/// single `import_and_readback` / `submit_and_take_previous` call.
+/// Per-frame mutable cache. Lives behind a `Mutex`; the borrow is
+/// scoped to a single `import_and_readback` call.
 pub(super) struct State {
-    /// `RING_DEPTH` independent submission slots. Entry 0 is also
-    /// what the synchronous `import_and_readback` path uses (after
-    /// flushing any in-flight pipelined submissions).
+    /// `RING_DEPTH` independent submission slots.
     pub(super) slots: Vec<Slot>,
-    /// Round-robin counter. The next pipelined submit lands on
-    /// `slots[next_slot_idx]`, and `next_slot_idx` advances modulo
-    /// `RING_DEPTH` afterwards.
+    /// Round-robin counter: the next submit lands on
+    /// `slots[next_slot_idx]`, which then advances modulo `RING_DEPTH`.
     pub(super) next_slot_idx: usize,
-    /// Slot indices with a submission currently in flight, in the
-    /// order they were submitted (oldest first). Drained from the
-    /// front by [`VulkanImporter::submit_and_take_previous`].
-    pub(super) pending: VecDeque<usize>,
     /// Imported dmabuf images keyed by stable buffer identity (see
     /// [`BufferId`]). Cleared by `reset_cache` on renegotiation.
     pub(super) imports: HashMap<BufferId, ImportedImage>,
     /// FIFO of cache keys in insertion order, used to evict the
     /// oldest entry once `imports.len() > MAX_IMPORT_CACHE`.
     pub(super) import_order: VecDeque<BufferId>,
-    /// `false` until the very first pipelined submission has been
-    /// drained back to the consumer. While `false`,
-    /// [`run_pipelined`] drains synchronously instead of returning
-    /// `Ok(None)` — this avoids the priming deadlock when the
-    /// upstream (event-driven Wayland compositors) only sends a
-    /// new buffer when the screen actually changes. Reset to
-    /// `false` by [`reset_cache`] on renegotiation.
-    pub(super) primed: bool,
 }
 
 /// One ring entry: command buffer that records the blit, fence that
-/// signals when the GPU is done, persistent host-visible staging the
-/// blit copies into, and the metadata of any submission currently in
-/// flight on this slot.
+/// signals when the GPU is done, and persistent host-visible staging
+/// the blit copies into.
 pub(super) struct Slot {
     pub(super) command_buffer: vk::CommandBuffer,
     pub(super) fence: vk::Fence,
+    /// Binary semaphore that temporarily receives the dmabuf's
+    /// implicit-sync `sync_file` before each submit on this slot.
+    /// Null when `Inner::external_semaphore_fd` is `None`.
+    pub(super) acquire_semaphore: vk::Semaphore,
     pub(super) staging: Option<Staging>,
-    /// `Some` while the slot has a submitted-but-not-yet-drained
-    /// blit. The metadata travels alongside the bytes when the slot
-    /// is drained so the caller can reconstruct a `RawFrame`.
-    pub(super) pending_meta: Option<PendingMeta>,
-}
-
-/// Everything needed to rebuild a `RawFrame` from a slot's staging
-/// buffer once its blit completes.
-#[derive(Clone, Copy)]
-pub(super) struct PendingMeta {
-    pub(super) width: u32,
-    pub(super) height: u32,
-    pub(super) stride: u32,
-    pub(super) format: PixelFormat,
-    pub(super) timestamp_us: u64,
-    pub(super) byte_size: u64,
-}
-
-/// Result of a pipelined `submit_and_take_previous` call. The bytes
-/// belong to the *previously* submitted frame (one ring step back);
-/// the metadata travels with them so the caller can rebuild a
-/// `RawFrame`.
-pub(crate) struct ReadyFrame {
-    pub(crate) bytes: Bytes,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) stride: u32,
-    pub(crate) format: PixelFormat,
-    pub(crate) timestamp_us: u64,
+    /// `true` between a successful submit and the completed wait +
+    /// reset of `fence`. Only then may the fence be (or become)
+    /// signalled; waiting on it otherwise would block forever.
+    pub(super) in_flight: bool,
 }
 
 pub(super) struct Staging {
@@ -264,17 +223,12 @@ impl VulkanImporter {
         }
     }
 
-    /// Synchronous import + readback. Drains any in-flight pipeline
-    /// first (so the result is for *this* fd, not the previous one)
-    /// and returns the linear pixel bytes. Used by the
-    /// `DmaBufImporter` trait for any caller that hasn't switched to
-    /// the pipelined API.
-    pub(crate) fn import_and_readback(
+    /// Synchronous import + readback of one plane. Returns tightly
+    /// packed rows (`width * bpp` bytes each), see
+    /// [`DmaBufImporter::readback`].
+    fn import_and_readback(
         &self,
-        fd: RawFd,
-        plane_offset: u32,
-        plane_stride: u32,
-        modifier: u64,
+        plane: &DmaBufPlane,
         width: u32,
         height: u32,
         format: PixelFormat,
@@ -284,69 +238,26 @@ impl VulkanImporter {
                 "Vulkan: unsupported PixelFormat {format:?}"
             )));
         };
-        let mut state = self.state.lock().expect("vulkan state mutex poisoned");
-        import::run_sync(
-            &self.inner,
-            &mut state,
-            fd,
-            plane_offset,
-            plane_stride,
-            modifier,
+        let import = import::PlaneImport {
+            fd: plane.fd.as_raw_fd(),
+            offset: plane.offset,
+            stride: plane.stride,
+            modifier: plane.modifier,
             width,
             height,
             vk_format,
-            format,
-        )
-    }
-
-    /// Pipelined entry point used by the PW worker. Submits a blit
-    /// for `fd` to a fresh ring slot and returns the bytes (with
-    /// original metadata) of the *previous* frame submitted on
-    /// another slot, if any. The very first call after startup or
-    /// after `reset_cache` returns `Ok(None)` — there's nothing in
-    /// flight yet — and every subsequent call returns one frame.
-    /// Net effect: GPU work for frame N+1 overlaps with the CPU
-    /// memcpy for frame N.
-    ///
-    /// Public name spelled `import_pipelined` (instead of
-    /// `submit_and_take_previous`) because that's how it reads at
-    /// the call site in `handle_process`.
-    pub(crate) fn import_pipelined(
-        &self,
-        fd: RawFd,
-        plane_offset: u32,
-        plane_stride: u32,
-        modifier: u64,
-        width: u32,
-        height: u32,
-        format: PixelFormat,
-        timestamp_us: u64,
-    ) -> Result<Option<ReadyFrame>> {
-        let Some(vk_format) = format::pixel_format_to_vk(format) else {
-            return Err(FerricastError::Capture(format!(
-                "Vulkan: unsupported PixelFormat {format:?}"
-            )));
         };
-        let mut state = self.state.lock().expect("vulkan state mutex poisoned");
-        import::run_pipelined(
-            &self.inner,
-            &mut state,
-            fd,
-            plane_offset,
-            plane_stride,
-            modifier,
-            width,
-            height,
-            vk_format,
-            format,
-            timestamp_us,
-        )
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| FerricastError::Capture("Vulkan importer state poisoned".into()))?;
+        import::run_sync(&self.inner, &mut state, &import, format)
     }
 
-    /// Wipe the imported-image cache and drop any in-flight
-    /// pipelined work. Called when PipeWire renegotiates: the old
-    /// fds are about to be closed and any new stream may pick a
-    /// different format, so cached `VkImage`s would be stale.
+    /// Wipe the imported-image cache. Called when PipeWire
+    /// renegotiates: the old buffers are about to be released and
+    /// any new stream may pick a different format, so cached
+    /// `VkImage`s would be stale.
     pub(crate) fn reset_cache(&self) {
         let mut state = self.state.lock().expect("vulkan state mutex poisoned");
         // Wait until any in-flight submit completes before we destroy
@@ -360,17 +271,19 @@ impl VulkanImporter {
         }
         state.imports.clear();
         state.import_order.clear();
-        // Drop any in-flight pipeline state — the bytes those slots
-        // were going to produce are now meaningless because the
-        // images they reference are gone.
-        for slot in state.slots.iter_mut() {
-            slot.pending_meta = None;
+        // A slot left `in_flight` (its wait failed) has a fence that
+        // is now signalled (the device is idle) but was never reset;
+        // reset it so the next submit gets the unsignalled fence
+        // `vkQueueSubmit` requires.
+        for slot in &mut state.slots {
+            if std::mem::take(&mut slot.in_flight) {
+                // SAFETY: the device is idle, so the fence isn't
+                // referenced by any pending queue submission.
+                if let Err(e) = unsafe { self.inner.device.reset_fences(&[slot.fence]) } {
+                    warn!(error = %e, "reset_fences after cache reset failed");
+                }
+            }
         }
-        state.pending.clear();
-        // Renegotiation = a fresh stream that will need to be
-        // primed again. Clear the flag so the next first frame
-        // drains synchronously.
-        state.primed = false;
         debug!("Vulkan import cache cleared");
     }
 }
@@ -379,6 +292,10 @@ impl VulkanImporter {
 /// `GpuFrame`. The capture path stores the importer in an `Arc<Self>`
 /// once and clones the Arc into each frame; consumers (encoders)
 /// call `readback` on demand.
+///
+/// `readback` returns tightly packed rows (`width * bpp` bytes each):
+/// the copy uses `bufferRowLength = 0`, so the DMA-BUF pitch in
+/// `plane.stride` is only used to describe the source image.
 impl DmaBufImporter for VulkanImporter {
     fn readback(
         &self,
@@ -387,15 +304,7 @@ impl DmaBufImporter for VulkanImporter {
         height: u32,
         format: PixelFormat,
     ) -> Result<Bytes> {
-        self.import_and_readback(
-            plane.fd,
-            plane.offset,
-            plane.stride,
-            plane.modifier,
-            width,
-            height,
-            format,
-        )
+        self.import_and_readback(plane, width, height, format)
     }
 }
 
@@ -417,21 +326,31 @@ impl State {
                     .create_fence(&vk::FenceCreateInfo::default(), None)
             }
             .map_err(|e| FerricastError::Capture(format!("vk create_fence: {e}")))?;
+            let acquire_semaphore = if inner.external_semaphore_fd.is_some() {
+                // SAFETY: valid device, default create info.
+                unsafe {
+                    inner
+                        .device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                }
+                .map_err(|e| FerricastError::Capture(format!("vk create_semaphore: {e}")))?
+            } else {
+                vk::Semaphore::null()
+            };
             slots.push(Slot {
                 command_buffer: cmd,
                 fence,
+                acquire_semaphore,
                 staging: None,
-                pending_meta: None,
+                in_flight: false,
             });
         }
 
         Ok(Self {
             slots,
             next_slot_idx: 0,
-            pending: VecDeque::new(),
             imports: HashMap::new(),
             import_order: VecDeque::new(),
-            primed: false,
         })
     }
 }
@@ -463,7 +382,6 @@ impl Drop for VulkanImporter {
             }
             state.imports.clear();
             state.import_order.clear();
-            state.pending.clear();
             // Tear down each ring slot. `device_wait_idle` above
             // guarantees the GPU isn't still touching any of these
             // resources, so destruction order within the slot is
@@ -479,6 +397,9 @@ impl Drop for VulkanImporter {
                 }
                 if slot.fence != vk::Fence::null() {
                     dev.destroy_fence(slot.fence, None);
+                }
+                if slot.acquire_semaphore != vk::Semaphore::null() {
+                    dev.destroy_semaphore(slot.acquire_semaphore, None);
                 }
                 if slot.command_buffer != vk::CommandBuffer::null() {
                     cmd_to_free.push(slot.command_buffer);

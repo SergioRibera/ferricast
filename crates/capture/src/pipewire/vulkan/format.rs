@@ -18,7 +18,7 @@ pub(super) fn pixel_format_to_vk(p: PixelFormat) -> Option<vk::Format> {
         PixelFormat::Rgba => vk::Format::R8G8B8A8_UNORM,
         // NV12 / I420 are multi-plane and currently routed through
         // the SHM path; we don't import those via Vulkan.
-        _ => return None,
+        PixelFormat::Nv12 | PixelFormat::I420 => return None,
     })
 }
 
@@ -39,15 +39,5 @@ pub(super) fn bytes_per_pixel(p: PixelFormat) -> Option<u32> {
     Some(match p {
         PixelFormat::Bgra | PixelFormat::Rgba => 4,
         PixelFormat::Nv12 | PixelFormat::I420 => return None,
-    })
-}
-
-/// Map a SPA `VideoFormat` to the public `PixelFormat`. Used by the
-/// PipeWire stream worker once the source has negotiated a format.
-pub(crate) fn video_format_to_pixel(spa: VideoFormat) -> Option<PixelFormat> {
-    Some(match spa {
-        VideoFormat::BGRA | VideoFormat::BGRx => PixelFormat::Bgra,
-        VideoFormat::RGBA | VideoFormat::RGBx => PixelFormat::Rgba,
-        _ => return None,
     })
 }

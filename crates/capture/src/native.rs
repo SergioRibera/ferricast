@@ -35,20 +35,25 @@ pub enum NativeCapture {
 }
 
 impl NativeCapture {
+    /// Never panics: an unsupported or unknown selection (X11, a
+    /// backend that wasn't compiled in, a typo) logs a warning and
+    /// falls back to the preferred compiled-in backend, whose
+    /// `start()` then reports the real failure as an error.
     pub fn new() -> Self {
         if let Ok(v) = std::env::var("FERRICAST_CAPTURE") {
-            return match v.as_str() {
+            match v.as_str() {
                 #[cfg(feature = "pipewire")]
-                "pipewire" => Self::Pipewire(PipeWireCapture::new()),
+                "pipewire" => return Self::Pipewire(PipeWireCapture::new()),
                 #[cfg(feature = "wayland-direct")]
-                "wayland-direct" => Self::WaylandDirect(WaylandDirectCapture::new()),
-                "x11" => panic!("X11 is not supported"),
-                other => panic!(
-                    "FERRICAST_CAPTURE={other:?} but the matching backend was \
-                     not compiled in (check the `pipewire` / \
-                     `wayland-direct` features)"
+                "wayland-direct" => return Self::WaylandDirect(WaylandDirectCapture::new()),
+                "x11" => tracing::warn!(
+                    "FERRICAST_CAPTURE=x11: X11 capture is not supported, using the default backend"
                 ),
-            };
+                other => tracing::warn!(
+                    "FERRICAST_CAPTURE={other:?} but the matching backend was not compiled in \
+                     (check the `pipewire` / `wayland-direct` features), using the default backend"
+                ),
+            }
         }
 
         if let Ok(v) = std::env::var("XDG_SESSION_TYPE") {
@@ -57,7 +62,9 @@ impl NativeCapture {
                 "wayland" => return Self::WaylandDirect(WaylandDirectCapture::new()),
                 #[cfg(all(not(feature = "wayland-direct"), feature = "pipewire"))]
                 "wayland" => return Self::Pipewire(PipeWireCapture::new()),
-                "x11" => panic!("X11 is not supported"),
+                "x11" => tracing::warn!(
+                    "X11 session: X11 capture is not supported, trying the Wayland/portal backends"
+                ),
                 _ => {}
             }
         }
@@ -66,20 +73,23 @@ impl NativeCapture {
     }
 
     /// Whichever backend is compiled in, in order of preference:
-    /// wayland-direct (GPU, no portal) → pipewire (portal) → x11.
+    /// wayland-direct (GPU, no portal) → pipewire (portal). This
+    /// module only builds with `pipewire`, so a variant always exists.
     fn fallback() -> Self {
         #[cfg(feature = "wayland-direct")]
         {
-            return Self::WaylandDirect(WaylandDirectCapture::new());
+            Self::WaylandDirect(WaylandDirectCapture::new())
         }
-        #[cfg(all(not(feature = "wayland-direct"), feature = "pipewire"))]
+        #[cfg(not(feature = "wayland-direct"))]
         {
-            return Self::Pipewire(PipeWireCapture::new());
+            Self::Pipewire(PipeWireCapture::new())
         }
-        #[cfg(all(not(feature = "wayland-direct"), not(feature = "pipewire"),))]
-        {
-            panic!("X11 is not supported")
-        }
+    }
+}
+
+impl Default for NativeCapture {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

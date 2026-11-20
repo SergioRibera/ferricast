@@ -165,9 +165,12 @@ pub trait AudioCapture: Send {
 
     /// Pull the next chunk of PCM samples. Returns `AudioCodec::Pcm`
     /// in `AudioFrame::codec` with interleaved S16LE samples in
-    /// `data`. The `timestamp_us` field is the same monotonic
-    /// `CLOCK_MONOTONIC`-equivalent the screen-capture path uses, so
-    /// downstream PTS computation can share one origin.
+    /// `data`. The `timestamp_us` field is wall-clock time in
+    /// microseconds since `UNIX_EPOCH` (`SystemTime`), the same clock
+    /// the screen-capture backends stamp video frames with, so
+    /// downstream PTS computation can share one origin. It is *not*
+    /// `CLOCK_MONOTONIC`: the HLS segmenter measures audio staleness
+    /// as `SystemTime::now() - timestamp_us`.
     fn next_frame(&mut self) -> impl Future<Output = Result<AudioFrame>> + Send;
 
     fn stop(&mut self) -> impl Future<Output = Result<()>> + Send;

@@ -10,9 +10,12 @@
 //! what wlx-capture does and what was needed to make capture work
 //! reliably on Niri+portal-gnome.
 
-use ashpd::desktop::PersistMode;
+use std::sync::Arc;
+
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
+use ashpd::desktop::{PersistMode, Session};
 use ferricast_core::{CaptureConfig, CaptureSource, FerricastError, Result};
+use futures_util::StreamExt;
 use tracing::{debug, info};
 
 /// Result of the portal handshake — everything `stream.rs` needs.
@@ -28,15 +31,61 @@ pub(super) struct PortalStream {
     pub position_hint: Option<(i32, i32)>,
 }
 
+/// Live xdg-desktop-portal ScreenCast session. The compositor keeps
+/// the cast (and its "sharing" indicator) alive until the session is
+/// closed, so the owner must call [`PortalSession::close`] on stop;
+/// dropping it only drops the D-Bus proxy.
+#[derive(Clone)]
+pub(super) struct PortalSession(Arc<Session<'static, Screencast<'static>>>);
+
+impl PortalSession {
+    /// Close the portal session, ending the compositor-side cast.
+    pub(super) async fn close(&self) {
+        match self.0.close().await {
+            Ok(()) => debug!("portal session closed"),
+            // Already closed by the compositor / user: nothing to do.
+            Err(e) => debug!(error = %e, "portal session close failed"),
+        }
+    }
+
+    /// Resolve once the portal emits `Closed` (user hit "Stop
+    /// sharing", compositor revoked the cast). Returns immediately
+    /// with an error if the signal can't be subscribed to.
+    pub(super) async fn closed(&self) -> Result<()> {
+        let mut signal = std::pin::pin!(self.0.receive_closed().await.map_err(portal_err)?);
+        signal.next().await;
+        Ok(())
+    }
+}
+
 pub(super) async fn open_session(
     source: &CaptureSource,
     config: &CaptureConfig,
-) -> Result<PortalStream> {
+) -> Result<(PortalStream, PortalSession)> {
     let proxy = Screencast::new().await.map_err(portal_err)?;
     debug!("portal proxy created");
 
-    let session = proxy.create_session().await.map_err(portal_err)?;
+    let session = PortalSession(Arc::new(proxy.create_session().await.map_err(portal_err)?));
     debug!("portal session created");
+
+    // Close the session on any handshake failure so a half-set-up
+    // cast doesn't linger on the compositor side.
+    match negotiate(&proxy, &session, source, config).await {
+        Ok(stream) => Ok((stream, session)),
+        Err(e) => {
+            session.close().await;
+            Err(e)
+        }
+    }
+}
+
+async fn negotiate(
+    proxy: &Screencast<'static>,
+    session: &PortalSession,
+    source: &CaptureSource,
+    config: &CaptureConfig,
+) -> Result<PortalStream> {
+    let session = &*session.0;
 
     let source_type = match source {
         CaptureSource::FullScreen { .. } => SourceType::Monitor,
@@ -51,7 +100,7 @@ pub(super) async fn open_session(
 
     proxy
         .select_sources(
-            &session,
+            session,
             cursor_mode,
             source_type.into(),
             false,
@@ -68,7 +117,7 @@ pub(super) async fn open_session(
     );
 
     let response = proxy
-        .start(&session, None)
+        .start(session, None)
         .await
         .map_err(portal_err)?
         .response()
@@ -91,10 +140,6 @@ pub(super) async fn open_session(
         "portal handshake complete"
     );
 
-    // ashpd uses a process-wide dbus connection internally, so dropping
-    // `proxy` / `session` here only drops the Rust handles — the
-    // Mutter-side session keeps running as long as the dbus connection
-    // stays open (which is forever, in practice).
     Ok(portal_stream)
 }
 

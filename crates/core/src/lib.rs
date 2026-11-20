@@ -39,8 +39,8 @@ pub use discovery::{Discovery, MdnsDiscovery};
 pub use encoder::{AudioEncoder, AudioEncoderConfig, EncoderConfig, VideoEncoder};
 pub use error::{FerricastError, Result};
 pub use frame::{
-    AudioCodec, AudioFrame, CapturedFrame, DmaBufImporter, DmaBufPlane, EncodedFrame, GpuFrame,
-    PixelFormat, RawFrame,
+    AudioCodec, AudioFrame, CapturedFrame, DmaBufFd, DmaBufId, DmaBufImporter, DmaBufPlane,
+    EncodedFrame, GpuFrame, PixelFormat, RawFrame,
 };
 #[cfg(feature = "net")]
 pub use net::{bind_in_range, bind_udp_in_range, local_addr_for};

@@ -20,14 +20,16 @@
 //! manually. Tiled / compressed modifiers need GPU-import and are
 //! dropped with a warning until that path is wired up.
 
-use std::os::fd::RawFd;
+use std::cell::RefCell;
+use std::os::fd::{BorrowedFd, RawFd};
 use std::ptr;
+use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ferricast_core::{
-    CaptureConfig, CapturedFrame, DmaBufPlane, FerricastError, GpuFrame, RawFrame, Result,
+    CaptureConfig, CapturedFrame, DmaBufFd, DmaBufPlane, FerricastError, GpuFrame, RawFrame, Result,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -79,6 +81,10 @@ struct UserData {
     /// dropped). Used together with `frame_period` to decide
     /// whether to skip the next arriving buffer.
     last_processed_at: Option<Instant>,
+    /// `true` while buffers sit unprocessed in the stream queue
+    /// because they arrived inside the throttle window; the throttle
+    /// timer processes the newest once the window closes.
+    deferred: bool,
     /// `Some` when Vulkan came up successfully and we can import
     /// the dmabuf modifiers we advertised. The PW worker thread
     /// invokes `importer.readback(...)` directly inside
@@ -87,6 +93,18 @@ struct UserData {
     /// previous frame. `None` collapses the dmabuf path to a warning
     /// + drop and we rely on the SHM fallback.
     importer: Option<Arc<VulkanImporter>>,
+}
+
+impl UserData {
+    /// Whether a buffer arriving at `now` falls inside the throttle
+    /// window opened by the last processed frame.
+    fn is_throttled(&self, now: Instant) -> bool {
+        is_within_period(self.last_processed_at, now, self.frame_period)
+    }
+}
+
+fn is_within_period(last: Option<Instant>, now: Instant, period: Duration) -> bool {
+    last.is_some_and(|prev| now.saturating_duration_since(prev) < period)
 }
 
 pub(super) struct WorkerHandle {
@@ -99,10 +117,10 @@ pub(super) struct WorkerHandle {
 impl WorkerHandle {
     pub(super) fn shutdown(&mut self) {
         let _ = self.terminator.send(Terminate);
-        if let Some(handle) = self.join.take() {
-            if let Err(panic) = handle.join() {
-                error!(?panic, "PipeWire worker panicked during shutdown");
-            }
+        if let Some(handle) = self.join.take()
+            && let Err(panic) = handle.join()
+        {
+            error!(?panic, "PipeWire worker panicked during shutdown");
         }
     }
 }
@@ -168,16 +186,19 @@ fn run(
         .connect(None)
         .map_err(|e| FerricastError::Capture(format!("Context::connect: {e}")))?;
 
-    let stream = Stream::new(
-        &core,
-        "ferricast-capture",
-        properties! {
-            *pw::keys::MEDIA_TYPE => "Video",
-            *pw::keys::MEDIA_CATEGORY => "Capture",
-            *pw::keys::MEDIA_ROLE => "Screen",
-        },
-    )
-    .map_err(|e| FerricastError::Capture(format!("Stream::new: {e}")))?;
+    // `Rc`: the throttle timer below needs the stream too.
+    let stream = Rc::new(
+        Stream::new(
+            &core,
+            "ferricast-capture",
+            properties! {
+                *pw::keys::MEDIA_TYPE => "Video",
+                *pw::keys::MEDIA_CATEGORY => "Capture",
+                *pw::keys::MEDIA_ROLE => "Screen",
+            },
+        )
+        .map_err(|e| FerricastError::Capture(format!("Stream::new: {e}")))?,
+    );
 
     let enum_params = EnumFormatParams {
         default_width: portal.size_hint.map(|(w, _)| w).unwrap_or(1920),
@@ -219,7 +240,9 @@ fn run(
         None => Vec::new(),
     };
 
-    let user_data = UserData {
+    // Shared between the stream listener and the throttle timer; both
+    // run on this thread's PipeWire loop, never re-entrantly.
+    let user_data = Rc::new(RefCell::new(UserData {
         video_info: VideoInfoRaw::default(),
         negotiated: None,
         shared: Arc::clone(&shared),
@@ -232,34 +255,58 @@ fn run(
         // being dropped by a hair.
         frame_period: Duration::from_secs_f64(0.95 / (config.fps.max(1) as f64)),
         last_processed_at: None,
+        deferred: false,
         importer,
-    };
+    }));
+    let frame_period = user_data.borrow().frame_period;
 
     let _listener = stream
-        .add_local_listener_with_user_data(user_data)
+        .add_local_listener_with_user_data(Rc::clone(&user_data))
         .state_changed({
             let mainloop = mainloop.clone();
             let error_tx = error_tx.clone();
             move |_, _, old, new| {
                 info!(?old, ?new, "stream state changed");
-                if let StreamState::Error(msg) = new {
-                    error!(%msg, "stream entered Error state");
-                    let _ = error_tx.try_send(msg.to_string());
+                if let Some(msg) = fatal_state_transition(&old, &new) {
+                    error!(%msg, "PipeWire stream ended");
+                    let _ = error_tx.try_send(msg);
                     mainloop.quit();
                 }
             }
         })
         .param_changed(|stream, ud, id, param| {
-            handle_param_changed(stream, ud, id, param);
+            handle_param_changed(stream, &mut ud.borrow_mut(), id, param);
         })
         .process({
             let frame_tx = frame_tx.clone();
             move |stream, ud| {
-                handle_process(stream, ud, &frame_tx);
+                handle_process(stream, &mut ud.borrow_mut(), &frame_tx);
             }
         })
         .register()
         .map_err(|e| FerricastError::Capture(format!("listener register: {e}")))?;
+
+    // Flushes buffers that `handle_process` left queued while
+    // throttled, once the frame period has expired. Without it the
+    // last buffer of a burst would wait for the *next* damage event —
+    // on damage-driven compositors that can be never, leaving the
+    // receiver on a stale frame.
+    let throttle_timer = mainloop.loop_().add_timer({
+        let stream = Rc::clone(&stream);
+        let user_data = Rc::clone(&user_data);
+        let frame_tx = frame_tx.clone();
+        move |_| {
+            let mut ud = user_data.borrow_mut();
+            if ud.deferred && !ud.is_throttled(Instant::now()) {
+                handle_process(&stream, &mut ud, &frame_tx);
+            }
+        }
+    });
+    let tick = (frame_period / 4).max(Duration::from_millis(2));
+    throttle_timer
+        .update_timer(Some(tick), Some(tick))
+        .into_result()
+        .map_err(|e| FerricastError::Capture(format!("arm throttle timer: {e}")))?;
 
     let pod_storage = format::initial_enum_format_list(&enum_params, &gpu_formats);
     info!(
@@ -274,7 +321,12 @@ fn run(
         .connect(
             Direction::Input,
             Some(portal.node_id),
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+            // DONT_RECONNECT: when the portal node goes away ("Stop
+            // sharing", window closed) the session manager must not
+            // re-link us to some other video source; the stream
+            // drops to Unconnected instead, which
+            // `fatal_state_transition` reports.
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::DONT_RECONNECT,
             pods.as_mut_slice(),
         )
         .map_err(|e| FerricastError::Capture(format!("Stream::connect: {e}")))?;
@@ -295,6 +347,21 @@ fn run(
 
     info!("PipeWire main loop exited cleanly");
     Ok(())
+}
+
+/// Error message for a stream state transition that ends the capture:
+/// an explicit `Error`, or falling back to `Unconnected` after the
+/// stream had connected (source node removed, user hit "Stop
+/// sharing"). Without the latter `next_frame` would wait forever.
+fn fatal_state_transition(old: &StreamState, new: &StreamState) -> Option<String> {
+    match (old, new) {
+        (_, StreamState::Error(msg)) => Some(msg.clone()),
+        (
+            StreamState::Connecting | StreamState::Paused | StreamState::Streaming,
+            StreamState::Unconnected,
+        ) => Some("stream disconnected (screencast source removed or sharing stopped)".into()),
+        _ => None,
+    }
 }
 
 fn handle_param_changed(
@@ -346,10 +413,8 @@ fn handle_param_changed(
                 }
                 None => true,
             };
-            if format_changed {
-                if let Some(imp) = ud.importer.as_ref() {
-                    imp.reset_cache();
-                }
+            if format_changed && let Some(imp) = ud.importer.as_ref() {
+                imp.reset_cache();
             }
 
             ud.negotiated = Some(neg);
@@ -390,26 +455,25 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
 
     // Throttle to `ud.frame_period`. The Wayland compositor emits
     // a buffer per refresh (60 Hz typical) regardless of what
-    // framerate the consumer wants. Doing the full Vulkan import
-    // + blit + ~8 MB readback on every one of those buffers when
-    // the encoder only consumes at 30 fps is pure CPU/PCIe waste
-    // (≈ 240 MB/s of memcpy + GPU work we throw away). When the
-    // arrival is too soon after the last processed frame, drain
-    // and discard everything — quick path, no GPU work, no
-    // memcpy. PW reuses the buffer slot on the next round.
+    // framerate the consumer wants; copying / importing every one
+    // when the encoder only consumes at 30 fps is pure waste. When
+    // the arrival is too soon after the last processed frame, leave
+    // the buffers queued in the stream and let the throttle timer
+    // (see `run`) process the newest one once the period expires —
+    // dropping them here would lose the final frame of a burst on
+    // damage-driven compositors. Holding them for at most one
+    // period also back-pressures the compositor, which skips
+    // renders while it has no free buffer instead of rendering
+    // frames we'd discard.
     let now = Instant::now();
-    if let Some(prev) = ud.last_processed_at {
-        if now.duration_since(prev) < ud.frame_period {
-            let mut dropped = 0;
-            while stream.dequeue_buffer().is_some() {
-                dropped += 1;
-            }
-            if dropped > 0 {
-                trace!(dropped, "throttle: discarded buffer(s) before Vulkan path");
-            }
-            return;
+    if ud.is_throttled(now) {
+        if !ud.deferred {
+            trace!("throttle: deferring buffer(s) to the period timer");
         }
+        ud.deferred = true;
+        return;
     }
+    ud.deferred = false;
 
     // Drain stale buffers and keep only the newest.
     let mut drained = 0;
@@ -470,10 +534,18 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
     }
 
     if stride == 0 {
-        stride = neg.width.saturating_mul(bytes_per_pixel(neg.pixel_format));
+        stride = neg.pixel_format.packed_row_bytes(neg.width);
     }
 
-    let plane_size = (stride as usize).saturating_mul(neg.height as usize);
+    // `RawFrame::stride` promises "bytes per row of `data`", so the
+    // CPU paths below only emit a frame when the mapped plane really
+    // holds `height` rows of `stride` bytes (the last row may omit
+    // its trailing padding).
+    let layout = PlaneLayout {
+        stride,
+        row_bytes: neg.pixel_format.packed_row_bytes(neg.width),
+        height: neg.height,
+    };
     let timestamp_us = now_us();
 
     // Hot decision tree:
@@ -497,7 +569,7 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
     //   negotiated those modifiers in the first place.
     let captured: CapturedFrame = match plane_type {
         DataType::MemFd | DataType::MemPtr => {
-            let Some(bytes) = read_cpu_buffer(plane, chunk_offset, plane_size) else {
+            let Some(bytes) = read_cpu_buffer(plane, chunk_offset, layout) else {
                 return;
             };
             CapturedFrame::Cpu(RawFrame {
@@ -510,7 +582,7 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
             })
         }
         DataType::DmaBuf if neg.modifier_is_cpu_readable() => {
-            let Some(bytes) = read_dmabuf_mmap(plane, chunk_offset, plane_size) else {
+            let Some(bytes) = read_dmabuf_mmap(plane, chunk_offset, layout) else {
                 return;
             };
             CapturedFrame::Cpu(RawFrame {
@@ -537,10 +609,42 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
             };
             let modifier = neg.modifier.unwrap_or(0);
             let raw = plane.as_raw();
-            if raw.fd < 0 {
+            let Ok(raw_fd) = RawFd::try_from(raw.fd) else {
+                warn!(fd = raw.fd, "DmaBuf plane has out-of-range fd");
+                return;
+            };
+            if raw_fd < 0 {
                 warn!("DmaBuf plane has invalid fd");
                 return;
             }
+            // PipeWire re-queues this buffer as soon as `process`
+            // returns, and closes its fd on renegotiation / stop. The
+            // frame must therefore own its own duplicate so a
+            // consumer on another thread never imports a closed or
+            // recycled descriptor (= a different object).
+            //
+            // Known limitation: owning the fd pins the DMA-BUF
+            // *object*, not its *contents*. Once re-queued, the
+            // compositor may render the next frame into the same
+            // buffer while the encoder is still reading it, which can
+            // show up as tearing under load. Keeping the pw_buffer
+            // dequeued until the consumer drops the frame would fix
+            // that, but needs raw `pw_stream_{de,}queue_buffer`
+            // handling with buffer-generation tracking across
+            // renegotiation and risks starving the compositor's small
+            // buffer pool, so it is deliberately not done here.
+            // SAFETY: `raw_fd` is the live descriptor PipeWire owns
+            // for this dequeued buffer; it stays open for the whole
+            // `process` callback, and we only borrow it long enough to
+            // `dup` it.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+            let fd = match DmaBufFd::dup(borrowed) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    warn!(error = %e, "dup(DmaBuf fd) failed — frame dropped");
+                    return;
+                }
+            };
             // DMA-BUF object size: use maxsize directly (the total
             // buffer including tiling padding). Do NOT subtract
             // chunk_offset — VA-API's objects[0].size expects the
@@ -565,7 +669,7 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
                 format: neg.pixel_format,
                 timestamp_us,
                 plane: DmaBufPlane {
-                    fd: raw.fd as RawFd,
+                    fd,
                     offset: chunk_offset,
                     stride,
                     modifier,
@@ -605,26 +709,56 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
     }
 }
 
-fn bytes_per_pixel(format: ferricast_core::PixelFormat) -> u32 {
-    use ferricast_core::PixelFormat;
-    match format {
-        PixelFormat::Bgra | PixelFormat::Rgba => 4,
-        PixelFormat::Nv12 | PixelFormat::I420 => 0,
+/// Row geometry of a CPU-readable plane, used to cut exactly one
+/// frame out of a mapped buffer.
+#[derive(Debug, Clone, Copy)]
+struct PlaneLayout {
+    /// Bytes between the starts of consecutive rows.
+    stride: u32,
+    /// Bytes of pixel data in one row (`<= stride` when valid).
+    row_bytes: u32,
+    height: u32,
+}
+
+impl PlaneLayout {
+    /// Byte range of the frame inside a mapping of `len` bytes, with
+    /// the frame starting at `offset`. Covers `height` full strides
+    /// when they fit, otherwise accepts a last row trimmed to
+    /// `row_bytes`. `None` when the stride can't hold a row or the
+    /// mapping is too short — emitting such a frame would break the
+    /// `RawFrame::stride` contract for every consumer.
+    fn frame_range(self, len: usize, offset: u32) -> Option<std::ops::Range<usize>> {
+        let (stride, row_bytes) = (self.stride as usize, self.row_bytes as usize);
+        if self.height == 0 || row_bytes == 0 || stride < row_bytes {
+            return None;
+        }
+        let start = offset as usize;
+        let full = stride.checked_mul(self.height as usize)?;
+        let min = full.checked_sub(stride)?.checked_add(row_bytes)?;
+        let available = len.checked_sub(start)?;
+        if available < min {
+            return None;
+        }
+        Some(start..start + full.min(available))
     }
 }
 
 fn read_cpu_buffer(
     plane: &mut pw::spa::buffer::Data,
     chunk_offset: u32,
-    plane_size: usize,
+    layout: PlaneLayout,
 ) -> Option<Bytes> {
     let slice = plane.data()?;
-    let start = (chunk_offset as usize).min(slice.len());
-    let end = start.saturating_add(plane_size).min(slice.len());
-    if end <= start {
+    let Some(range) = layout.frame_range(slice.len(), chunk_offset) else {
+        warn!(
+            ?layout,
+            len = slice.len(),
+            chunk_offset,
+            "SHM plane too small for frame"
+        );
         return None;
-    }
-    Some(Bytes::copy_from_slice(&slice[start..end]))
+    };
+    slice.get(range).map(Bytes::copy_from_slice)
 }
 
 /// Linear / INVALID-modifier DmaBuf: we can read the bytes directly
@@ -633,7 +767,7 @@ fn read_cpu_buffer(
 fn read_dmabuf_mmap(
     plane: &mut pw::spa::buffer::Data,
     chunk_offset: u32,
-    plane_size: usize,
+    layout: PlaneLayout,
 ) -> Option<Bytes> {
     let raw = plane.as_raw();
 
@@ -668,12 +802,15 @@ fn read_dmabuf_mmap(
 
     let bytes = unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const u8, maxsize);
-        let start = (chunk_offset as usize).min(slice.len());
-        let end = start.saturating_add(plane_size).min(slice.len());
-        if end <= start {
-            None
-        } else {
-            Some(Bytes::copy_from_slice(&slice[start..end]))
+        match layout.frame_range(slice.len(), chunk_offset) {
+            Some(range) => slice.get(range).map(Bytes::copy_from_slice),
+            None => {
+                warn!(
+                    ?layout,
+                    maxsize, chunk_offset, "DmaBuf plane too small for frame"
+                );
+                None
+            }
         }
     };
 
@@ -689,4 +826,73 @@ fn now_us() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlaneLayout, StreamState, fatal_state_transition, is_within_period};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn throttle_window() {
+        let period = Duration::from_millis(30);
+        let t0 = Instant::now();
+        assert!(!is_within_period(None, t0, period));
+        assert!(is_within_period(
+            Some(t0),
+            t0 + Duration::from_millis(29),
+            period
+        ));
+        assert!(!is_within_period(Some(t0), t0 + period, period));
+        // A clock that appears to go backwards must not panic.
+        assert!(is_within_period(Some(t0 + period), t0, period));
+    }
+
+    #[test]
+    fn unconnected_after_connect_and_errors_are_fatal() {
+        use StreamState::{Connecting, Paused, Streaming, Unconnected};
+        assert!(fatal_state_transition(&Streaming, &Unconnected).is_some());
+        assert!(fatal_state_transition(&Paused, &Unconnected).is_some());
+        assert!(fatal_state_transition(&Connecting, &Unconnected).is_some());
+        assert_eq!(
+            fatal_state_transition(&Streaming, &StreamState::Error("boom".into())).as_deref(),
+            Some("boom")
+        );
+        assert!(fatal_state_transition(&Unconnected, &Connecting).is_none());
+        assert!(fatal_state_transition(&Streaming, &Paused).is_none());
+        assert!(fatal_state_transition(&Paused, &Streaming).is_none());
+    }
+
+    const LAYOUT: PlaneLayout = PlaneLayout {
+        stride: 64,
+        row_bytes: 40,
+        height: 3,
+    };
+
+    #[test]
+    fn frame_range_takes_full_strides_when_available() {
+        assert_eq!(LAYOUT.frame_range(1024, 16), Some(16..16 + 192));
+    }
+
+    #[test]
+    fn frame_range_accepts_trimmed_last_row() {
+        // 2 full strides + 40 bytes of the last row.
+        assert_eq!(LAYOUT.frame_range(168, 0), Some(0..168));
+    }
+
+    #[test]
+    fn frame_range_rejects_short_or_inconsistent_planes() {
+        assert_eq!(LAYOUT.frame_range(167, 0), None);
+        assert_eq!(LAYOUT.frame_range(100, 200), None);
+        let narrow = PlaneLayout {
+            stride: 32,
+            ..LAYOUT
+        };
+        assert_eq!(narrow.frame_range(1024, 0), None);
+        let empty = PlaneLayout {
+            height: 0,
+            ..LAYOUT
+        };
+        assert_eq!(empty.frame_range(1024, 0), None);
+    }
 }

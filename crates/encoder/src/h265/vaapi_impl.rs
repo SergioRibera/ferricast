@@ -1005,7 +1005,7 @@ impl VaapiH265Encoder {
         };
 
         let import = DmaBufImport {
-            fd: g.plane.fd,
+            fd: g.plane.fd.as_raw_fd(),
             width: g.width,
             height: g.height,
             va_fourcc,

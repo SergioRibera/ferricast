@@ -899,6 +899,12 @@ fn run_worker(
                 //      hosts where we haven't hoisted the Vulkan
                 //      importer out of the pipewire submodule yet.
                 if let Some(importer) = importer.clone() {
+                    // Minimal compile fix for the owned `DmaBufFd` plane type.
+                    let Ok(fd) = ferricast_core::DmaBufFd::dup(alloc.fd.as_fd()) else {
+                        warn!("wayland-direct: dup(dmabuf fd) failed — dropping frame");
+                        buffer.destroy();
+                        continue;
+                    };
                     CapturedFrame::Gpu(GpuFrame {
                         width: alloc.width,
                         height: alloc.height,
@@ -906,7 +912,7 @@ fn run_worker(
                         format: alloc.format,
                         timestamp_us: now_us(),
                         plane: DmaBufPlane {
-                            fd: alloc.fd.as_raw_fd(),
+                            fd,
                             offset: 0,
                             stride: alloc.stride,
                             modifier: alloc.modifier,
