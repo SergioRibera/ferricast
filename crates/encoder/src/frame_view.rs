@@ -25,6 +25,10 @@ pub(crate) struct FrameView<'a> {
     stride: usize,
 }
 
+#[allow(
+    dead_code,
+    reason = "shared by every video backend; each feature combination uses a different subset"
+)]
 impl<'a> FrameView<'a> {
     /// Validate `raw` against the size the encoder was configured for.
     ///

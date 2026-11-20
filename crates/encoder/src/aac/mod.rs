@@ -73,6 +73,10 @@ impl AudioEncoder for AacEncoder {
         Ok(())
     }
 
+    #[cfg_attr(
+        not(feature = "fdk-aac"),
+        expect(unused_variables, reason = "only the fdk-aac arm consumes the frame")
+    )]
     fn encode(&mut self, frame: &AudioFrame) -> Result<()> {
         match self {
             AacEncoder::Pending => Err(FerricastError::Encoder(
