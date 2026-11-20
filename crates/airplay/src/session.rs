@@ -578,6 +578,12 @@ impl CastSession for AirPlaySession {
         Ok(())
     }
 
+    fn poll_keyframe_request(&mut self) -> bool {
+        self.stream
+            .as_mut()
+            .is_some_and(|s| s.mirror.take_keyframe_request())
+    }
+
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed) && matches!(self.state, State::Paired | State::Streaming)
     }

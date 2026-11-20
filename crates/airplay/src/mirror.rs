@@ -139,6 +139,9 @@ pub(crate) struct MirrorStream {
     /// Nothing is sent until the first IDR; the receiver needs SPS/PPS first.
     started: bool,
     frames_sent: u64,
+    /// A frame was dropped while waiting for an IDR; the encoder should
+    /// be asked for one.
+    keyframe_wanted: bool,
 }
 
 impl MirrorStream {
@@ -153,7 +156,13 @@ impl MirrorStream {
             params: None,
             started: false,
             frames_sent: 0,
+            keyframe_wanted: false,
         }
+    }
+
+    /// Returns (and clears) whether frames were dropped waiting for an IDR.
+    pub fn take_keyframe_request(&mut self) -> bool {
+        std::mem::take(&mut self.keyframe_wanted)
     }
 
     pub fn frames_sent(&self) -> u64 {
@@ -192,6 +201,7 @@ impl MirrorStream {
         }
         let can_start = idr && self.params.is_some();
         if !(self.started || can_start) {
+            self.keyframe_wanted = true;
             return Ok(());
         }
         if payload.is_empty() {
