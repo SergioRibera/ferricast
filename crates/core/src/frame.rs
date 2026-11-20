@@ -13,6 +13,19 @@ pub enum PixelFormat {
     I420,
 }
 
+impl PixelFormat {
+    /// Bytes per row of a tightly packed (no padding) image `width`
+    /// pixels wide. For the planar YUV formats this is the row size
+    /// of the luma plane, which is what `RawFrame::stride` describes.
+    #[must_use]
+    pub const fn packed_row_bytes(self, width: u32) -> u32 {
+        match self {
+            PixelFormat::Bgra | PixelFormat::Rgba => width.saturating_mul(4),
+            PixelFormat::Nv12 | PixelFormat::I420 => width,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RawFrame {
     pub width: u32,
@@ -162,6 +175,17 @@ pub struct DmaBufId {
 /// memory on demand. Implemented by the Vulkan importer; held inside
 /// `GpuFrame` as `Arc<dyn DmaBufImporter>`.
 pub trait DmaBufImporter: Send + Sync {
+    /// Copy the plane's pixels into CPU memory.
+    ///
+    /// Contract: the returned bytes are **tightly packed** —
+    /// `height` rows of exactly
+    /// [`PixelFormat::packed_row_bytes(width)`](PixelFormat::packed_row_bytes)
+    /// bytes each, regardless of the DMA-BUF's own pitch
+    /// (`plane.stride`). [`CapturedFrame::into_cpu`] relies on this
+    /// to label the resulting `RawFrame::stride`.
+    ///
+    /// # Errors
+    /// Implementation-defined import / copy failures.
     fn readback(
         &self,
         plane: &DmaBufPlane,
@@ -227,7 +251,9 @@ impl CapturedFrame {
                 Ok(RawFrame {
                     width: g.width,
                     height: g.height,
-                    stride: g.stride,
+                    // `readback` returns packed rows, not the
+                    // DMA-BUF pitch (`g.stride` / `g.plane.stride`).
+                    stride: g.format.packed_row_bytes(g.width),
                     format: g.format,
                     data: bytes,
                     timestamp_us: g.timestamp_us,
@@ -301,5 +327,54 @@ mod tests {
         assert_eq!(owned.buffer_id().expect("fstat after close"), source_id);
         let other = DmaBufFd::from(memfd(c"ferricast-dmabuf-fd-b"));
         assert_ne!(other.buffer_id().expect("fstat"), source_id);
+    }
+
+    /// Honours the `readback` contract: packed rows.
+    struct PackedImporter;
+
+    impl DmaBufImporter for PackedImporter {
+        fn readback(
+            &self,
+            _plane: &DmaBufPlane,
+            width: u32,
+            height: u32,
+            format: PixelFormat,
+        ) -> Result<Bytes> {
+            let len = format.packed_row_bytes(width) as usize * height as usize;
+            Ok(Bytes::from(vec![0u8; len]))
+        }
+    }
+
+    #[test]
+    fn into_cpu_labels_packed_stride_not_dmabuf_pitch() {
+        let (width, height, pitch) = (1366, 4, 5632);
+        let frame = CapturedFrame::Gpu(GpuFrame {
+            width,
+            height,
+            stride: pitch,
+            format: PixelFormat::Bgra,
+            timestamp_us: 7,
+            plane: DmaBufPlane {
+                fd: DmaBufFd::from(memfd(c"ferricast-into-cpu")),
+                offset: 0,
+                stride: pitch,
+                modifier: 0,
+                size: pitch * height,
+            },
+            importer: Some(Arc::new(PackedImporter)),
+        });
+        let raw = frame.into_cpu().expect("readback");
+        assert_eq!(raw.stride, width * 4);
+        assert_eq!(raw.data.len(), (raw.stride * raw.height) as usize);
+        assert_eq!(raw.timestamp_us, 7);
+    }
+
+    #[test]
+    fn packed_row_bytes_per_format() {
+        assert_eq!(PixelFormat::Bgra.packed_row_bytes(10), 40);
+        assert_eq!(PixelFormat::Rgba.packed_row_bytes(10), 40);
+        assert_eq!(PixelFormat::Nv12.packed_row_bytes(10), 10);
+        assert_eq!(PixelFormat::I420.packed_row_bytes(10), 10);
+        assert_eq!(PixelFormat::Bgra.packed_row_bytes(u32::MAX), u32::MAX);
     }
 }

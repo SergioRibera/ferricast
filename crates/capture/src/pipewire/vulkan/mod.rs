@@ -389,6 +389,10 @@ impl VulkanImporter {
 /// `GpuFrame`. The capture path stores the importer in an `Arc<Self>`
 /// once and clones the Arc into each frame; consumers (encoders)
 /// call `readback` on demand.
+///
+/// `readback` returns tightly packed rows (`width * bpp` bytes each):
+/// the copy uses `bufferRowLength = 0`, so the DMA-BUF pitch in
+/// `plane.stride` is only used to describe the source image.
 impl DmaBufImporter for VulkanImporter {
     fn readback(
         &self,

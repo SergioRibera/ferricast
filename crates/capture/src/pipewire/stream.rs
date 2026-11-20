@@ -470,10 +470,18 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
     }
 
     if stride == 0 {
-        stride = neg.width.saturating_mul(bytes_per_pixel(neg.pixel_format));
+        stride = neg.pixel_format.packed_row_bytes(neg.width);
     }
 
-    let plane_size = (stride as usize).saturating_mul(neg.height as usize);
+    // `RawFrame::stride` promises "bytes per row of `data`", so the
+    // CPU paths below only emit a frame when the mapped plane really
+    // holds `height` rows of `stride` bytes (the last row may omit
+    // its trailing padding).
+    let layout = PlaneLayout {
+        stride,
+        row_bytes: neg.pixel_format.packed_row_bytes(neg.width),
+        height: neg.height,
+    };
     let timestamp_us = now_us();
 
     // Hot decision tree:
@@ -497,7 +505,7 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
     //   negotiated those modifiers in the first place.
     let captured: CapturedFrame = match plane_type {
         DataType::MemFd | DataType::MemPtr => {
-            let Some(bytes) = read_cpu_buffer(plane, chunk_offset, plane_size) else {
+            let Some(bytes) = read_cpu_buffer(plane, chunk_offset, layout) else {
                 return;
             };
             CapturedFrame::Cpu(RawFrame {
@@ -510,7 +518,7 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
             })
         }
         DataType::DmaBuf if neg.modifier_is_cpu_readable() => {
-            let Some(bytes) = read_dmabuf_mmap(plane, chunk_offset, plane_size) else {
+            let Some(bytes) = read_dmabuf_mmap(plane, chunk_offset, layout) else {
                 return;
             };
             CapturedFrame::Cpu(RawFrame {
@@ -637,26 +645,56 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
     }
 }
 
-fn bytes_per_pixel(format: ferricast_core::PixelFormat) -> u32 {
-    use ferricast_core::PixelFormat;
-    match format {
-        PixelFormat::Bgra | PixelFormat::Rgba => 4,
-        PixelFormat::Nv12 | PixelFormat::I420 => 0,
+/// Row geometry of a CPU-readable plane, used to cut exactly one
+/// frame out of a mapped buffer.
+#[derive(Debug, Clone, Copy)]
+struct PlaneLayout {
+    /// Bytes between the starts of consecutive rows.
+    stride: u32,
+    /// Bytes of pixel data in one row (`<= stride` when valid).
+    row_bytes: u32,
+    height: u32,
+}
+
+impl PlaneLayout {
+    /// Byte range of the frame inside a mapping of `len` bytes, with
+    /// the frame starting at `offset`. Covers `height` full strides
+    /// when they fit, otherwise accepts a last row trimmed to
+    /// `row_bytes`. `None` when the stride can't hold a row or the
+    /// mapping is too short — emitting such a frame would break the
+    /// `RawFrame::stride` contract for every consumer.
+    fn frame_range(self, len: usize, offset: u32) -> Option<std::ops::Range<usize>> {
+        let (stride, row_bytes) = (self.stride as usize, self.row_bytes as usize);
+        if self.height == 0 || row_bytes == 0 || stride < row_bytes {
+            return None;
+        }
+        let start = offset as usize;
+        let full = stride.checked_mul(self.height as usize)?;
+        let min = full.checked_sub(stride)?.checked_add(row_bytes)?;
+        let available = len.checked_sub(start)?;
+        if available < min {
+            return None;
+        }
+        Some(start..start + full.min(available))
     }
 }
 
 fn read_cpu_buffer(
     plane: &mut pw::spa::buffer::Data,
     chunk_offset: u32,
-    plane_size: usize,
+    layout: PlaneLayout,
 ) -> Option<Bytes> {
     let slice = plane.data()?;
-    let start = (chunk_offset as usize).min(slice.len());
-    let end = start.saturating_add(plane_size).min(slice.len());
-    if end <= start {
+    let Some(range) = layout.frame_range(slice.len(), chunk_offset) else {
+        warn!(
+            ?layout,
+            len = slice.len(),
+            chunk_offset,
+            "SHM plane too small for frame"
+        );
         return None;
-    }
-    Some(Bytes::copy_from_slice(&slice[start..end]))
+    };
+    slice.get(range).map(Bytes::copy_from_slice)
 }
 
 /// Linear / INVALID-modifier DmaBuf: we can read the bytes directly
@@ -665,7 +703,7 @@ fn read_cpu_buffer(
 fn read_dmabuf_mmap(
     plane: &mut pw::spa::buffer::Data,
     chunk_offset: u32,
-    plane_size: usize,
+    layout: PlaneLayout,
 ) -> Option<Bytes> {
     let raw = plane.as_raw();
 
@@ -700,12 +738,15 @@ fn read_dmabuf_mmap(
 
     let bytes = unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const u8, maxsize);
-        let start = (chunk_offset as usize).min(slice.len());
-        let end = start.saturating_add(plane_size).min(slice.len());
-        if end <= start {
-            None
-        } else {
-            Some(Bytes::copy_from_slice(&slice[start..end]))
+        match layout.frame_range(slice.len(), chunk_offset) {
+            Some(range) => slice.get(range).map(Bytes::copy_from_slice),
+            None => {
+                warn!(
+                    ?layout,
+                    maxsize, chunk_offset, "DmaBuf plane too small for frame"
+                );
+                None
+            }
         }
     };
 
@@ -721,4 +762,42 @@ fn now_us() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PlaneLayout;
+
+    const LAYOUT: PlaneLayout = PlaneLayout {
+        stride: 64,
+        row_bytes: 40,
+        height: 3,
+    };
+
+    #[test]
+    fn frame_range_takes_full_strides_when_available() {
+        assert_eq!(LAYOUT.frame_range(1024, 16), Some(16..16 + 192));
+    }
+
+    #[test]
+    fn frame_range_accepts_trimmed_last_row() {
+        // 2 full strides + 40 bytes of the last row.
+        assert_eq!(LAYOUT.frame_range(168, 0), Some(0..168));
+    }
+
+    #[test]
+    fn frame_range_rejects_short_or_inconsistent_planes() {
+        assert_eq!(LAYOUT.frame_range(167, 0), None);
+        assert_eq!(LAYOUT.frame_range(100, 200), None);
+        let narrow = PlaneLayout {
+            stride: 32,
+            ..LAYOUT
+        };
+        assert_eq!(narrow.frame_range(1024, 0), None);
+        let empty = PlaneLayout {
+            height: 0,
+            ..LAYOUT
+        };
+        assert_eq!(empty.frame_range(1024, 0), None);
+    }
 }
