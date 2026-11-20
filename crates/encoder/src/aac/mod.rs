@@ -16,12 +16,18 @@
 //! running.
 
 #[cfg(feature = "fdk-aac")]
+mod eld;
+#[cfg(feature = "fdk-aac")]
 mod fdk_impl;
+#[cfg(feature = "fdk-aac")]
+mod resample;
 
 use ferricast_core::{
     AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame, FerricastError, Result,
 };
 
+#[cfg(feature = "fdk-aac")]
+pub use eld::{ELD_AUDIO_SPECIFIC_CONFIG, ELD_FRAME_SAMPLES, ELD_SAMPLE_RATE, FdkEldEncoder};
 #[cfg(feature = "fdk-aac")]
 pub use fdk_impl::FdkAacEncoder;
 

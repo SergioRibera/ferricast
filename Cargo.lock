@@ -2047,6 +2047,7 @@ dependencies = [
  "cros-libva",
  "fast_image_resize",
  "fdk-aac",
+ "fdk-aac-sys",
  "ferricast-core",
  "opus-rs",
  "shiguredo_nvcodec",

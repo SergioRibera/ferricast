@@ -42,7 +42,7 @@ nvenc-hevc = ["nvenc"]
 # `nvenc-hevc` so the H.265 facade can be enabled without forcing
 # both hardware paths to compile.
 vaapi-hevc = ["vaapi"]
-fdk-aac = ["dep:fdk-aac"]
+fdk-aac = ["dep:fdk-aac", "dep:fdk-aac-sys"]
 
 # Zero-copy DMA-BUF input on NVENC. Requires a forked
 # `shiguredo_nvcodec` that exposes `Encoder::register_external_dmabuf`
@@ -97,6 +97,9 @@ shiguredo_nvcodec = { version = "2026.1.0", optional = true }
 # reference AAC implementation; oxideav-aac is the fallback for
 # environments where pulling in the C library is impractical.
 fdk-aac = { version = "0.8", optional = true }
+# Raw bindings for the AAC-ELD encoder: the safe wrapper above cannot set
+# the 480-sample granule AirPlay mirroring audio uses.
+fdk-aac-sys = { version = "0.5", optional = true }
 # Raw libx264 bindings. The safe `x264` wrapper hides zerolatency/VBV
 # params, per-picture IDR forcing and delayed-frame draining.
 x264-sys = { version = "0.2", optional = true }

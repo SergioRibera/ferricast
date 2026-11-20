@@ -333,7 +333,11 @@ pub struct AudioFrame {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AudioCodec {
+    /// AAC-LC, ADTS-framed.
     Aac,
+    /// AAC-ELD (enhanced low delay), raw access units of 480 samples at
+    /// 44.1 kHz: the audio format of AirPlay screen mirroring.
+    AacEld,
     Opus,
     Pcm,
     Alac,
