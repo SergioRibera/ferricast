@@ -41,6 +41,19 @@ const TRANSMUX_RAW: u32 = 0;
 const MODE_MONO: u32 = 1;
 const MODE_STEREO: u32 = 2;
 
+// UxPlay drops every AAC-ELD frame whose first byte is not 0x80-0x82 or
+// 0x8c-0x8e (what Apple's encoder emits). That byte follows the coded
+// bandwidth: fdk-aac's automatic bandwidth starts frames at 0x14-0x82
+// depending on bitrate, while a fixed 20 kHz bandwidth gives 0x8c-0x8e
+// like Apple's from 96 kbps up, and digital silence always codes as 0x14.
+/// Coded audio bandwidth.
+const BANDWIDTH_HZ: u32 = 20_000;
+/// Lowest bitrate at which every frame keeps the full bandwidth.
+const MIN_BITRATE_KBPS: u32 = 96;
+/// Peak of the noise that replaces digitally silent frames: inaudible
+/// (about -90 dBFS) but enough to keep the full-bandwidth frame layout.
+const SILENCE_DITHER: i16 = 1;
+
 fn check(what: &str, code: sys::AACENC_ERROR) -> Result<()> {
     if code == sys::AACENC_ERROR_AACENC_OK {
         Ok(())
@@ -176,6 +189,8 @@ struct Configured {
     converted: Vec<i16>,
     clock: AudioClock,
     scratch: Vec<u8>,
+    /// State of the generator behind [`SILENCE_DITHER`].
+    dither: u32,
 }
 
 /// AAC-ELD encoder producing raw 480-sample access units at 44.1 kHz.
@@ -220,13 +235,19 @@ impl FdkEldEncoder {
             "granule length",
         )?;
         handle.set(sys::AACENC_PARAM_AACENC_BITRATEMODE, 0, "bitrate mode")?;
+        let bitrate_kbps = config.bitrate_kbps.max(MIN_BITRATE_KBPS);
         handle.set(
             sys::AACENC_PARAM_AACENC_BITRATE,
-            config.bitrate_kbps.saturating_mul(1000),
+            bitrate_kbps.saturating_mul(1000),
             "bitrate",
         )?;
         handle.set(sys::AACENC_PARAM_AACENC_TRANSMUX, TRANSMUX_RAW, "transport")?;
         handle.set(sys::AACENC_PARAM_AACENC_AFTERBURNER, 1, "afterburner")?;
+        handle.set(
+            sys::AACENC_PARAM_AACENC_BANDWIDTH,
+            BANDWIDTH_HZ,
+            "bandwidth",
+        )?;
         handle.initialize()?;
 
         let info = handle.info()?;
@@ -243,7 +264,7 @@ impl FdkEldEncoder {
         info!(
             input_rate = config.sample_rate,
             channels = config.channels,
-            bitrate_kbps = config.bitrate_kbps,
+            bitrate_kbps,
             asc = %hex_bytes(asc),
             "AAC-ELD encoder backend: fdk-aac (libfdk-aac)"
         );
@@ -264,6 +285,7 @@ impl FdkEldEncoder {
             converted: Vec::new(),
             clock: AudioClock::new(ELD_SAMPLE_RATE),
             scratch: vec![0; OUTPUT_SCRATCH],
+            dither: 0x2545_f491,
         })
     }
 }
@@ -273,6 +295,22 @@ fn hex_bytes(bytes: &[u8]) -> String {
 }
 
 impl Configured {
+    /// Replace the first `len` (all-zero) samples with [`SILENCE_DITHER`]-level
+    /// noise.
+    fn dither_silence(&mut self, len: usize) {
+        for s in &mut self.pcm[..len] {
+            // xorshift32: cheap, and its low bits are noise enough here.
+            self.dither ^= self.dither << 13;
+            self.dither ^= self.dither >> 17;
+            self.dither ^= self.dither << 5;
+            *s = match self.dither % 3 {
+                0 => -SILENCE_DITHER,
+                1 => 0,
+                _ => SILENCE_DITHER,
+            };
+        }
+    }
+
     fn push(&mut self, frame: &AudioFrame, pending: &mut Vec<AudioFrame>) -> Result<()> {
         let channels = usize::from(self.channels.max(1));
         let samples: Vec<i16> = frame
@@ -321,6 +359,9 @@ impl Configured {
 
         let per_frame = ELD_FRAME_SAMPLES * channels;
         while self.pcm.len() >= per_frame {
+            if self.pcm[..per_frame].iter().all(|&s| s == 0) {
+                self.dither_silence(per_frame);
+            }
             let (consumed, written) = self
                 .handle
                 .encode(&self.pcm[..per_frame], &mut self.scratch)?;
@@ -461,6 +502,80 @@ mod tests {
                 .iter()
                 .all(|f| f.codec == AudioCodec::AacEld && !f.data.is_empty())
         );
+    }
+
+    /// First bytes UxPlay accepts for AAC-ELD frames.
+    const ACCEPTED_FIRST_BYTES: [u8; 6] = [0x80, 0x81, 0x82, 0x8c, 0x8d, 0x8e];
+
+    #[test]
+    fn frames_pass_the_receiver_first_byte_check() {
+        let mut seed = 0x1234_5678_u32;
+        let mut noise = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            f64::from(seed >> 16) / 32768.0 - 1.0
+        };
+        type Signal = Box<dyn FnMut(f64) -> (f64, f64)>;
+        let signals: [(&str, Signal); 4] = [
+            ("silence", Box::new(|_| (0.0, 0.0))),
+            (
+                "tone",
+                Box::new(|t| {
+                    let v = (t * 440.0 * std::f64::consts::TAU).sin() * 6000.0;
+                    (v, v)
+                }),
+            ),
+            (
+                "quiet",
+                Box::new(|t| {
+                    let v = (t * 440.0 * std::f64::consts::TAU).sin() * 60.0;
+                    (v, -v)
+                }),
+            ),
+            (
+                "noise",
+                Box::new(move |_| (noise() * 8000.0, noise() * 8000.0)),
+            ),
+        ];
+        for (name, mut signal) in signals {
+            for kbps in [32, 96, 128, 256] {
+                let mut enc = FdkEldEncoder::new();
+                enc.configure(&AudioEncoderConfig {
+                    bitrate_kbps: kbps,
+                    ..config(ELD_SAMPLE_RATE)
+                })
+                .expect("configure");
+                let mut frames = Vec::new();
+                for chunk in 0..100_u64 {
+                    let mut pcm = Vec::with_capacity(960 * 4);
+                    for i in 0..960 {
+                        let t = (chunk * 960 + i) as f64 / f64::from(ELD_SAMPLE_RATE);
+                        let (l, r) = signal(t);
+                        pcm.extend_from_slice(&(l as i16).to_le_bytes());
+                        pcm.extend_from_slice(&(r as i16).to_le_bytes());
+                    }
+                    enc.encode(&AudioFrame {
+                        codec: AudioCodec::Pcm,
+                        data: Bytes::from(pcm),
+                        timestamp_us: 1_000_000 + chunk * 21_768,
+                        sample_rate: ELD_SAMPLE_RATE,
+                        channels: 2,
+                    })
+                    .expect("encode");
+                    frames.extend(enc.take_output());
+                }
+                let rejected: Vec<u8> = frames
+                    .iter()
+                    .map(|f| f.data[0])
+                    .filter(|b| !ACCEPTED_FIRST_BYTES.contains(b))
+                    .collect();
+                assert!(
+                    rejected.is_empty(),
+                    "{name} at {kbps} kbps: rejected first bytes {rejected:02x?}"
+                );
+            }
+        }
     }
 
     #[test]
