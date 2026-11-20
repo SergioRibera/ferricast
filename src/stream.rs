@@ -62,6 +62,7 @@ pub(crate) trait ErasedSession: Send + Sync {
     fn send_audio_frame<'a>(&'a mut self, frame: &'a AudioFrame) -> BoxFut<'a, Result<()>>;
     fn stop(&mut self) -> BoxFut<'_, Result<()>>;
     fn is_alive(&self) -> bool;
+    fn end_reason(&self) -> Option<&FerricastError>;
     fn poll_keyframe_request(&mut self) -> bool;
     fn preferred_audio_codec(&self) -> AudioCodec;
     fn feeds_adaptive_bitrate(&self) -> bool;
@@ -89,6 +90,9 @@ impl<T: CastSession> ErasedSession for T {
     }
     fn is_alive(&self) -> bool {
         CastSession::is_alive(self)
+    }
+    fn end_reason(&self) -> Option<&FerricastError> {
+        CastSession::end_reason(self)
     }
     fn poll_keyframe_request(&mut self) -> bool {
         CastSession::poll_keyframe_request(self)
@@ -899,7 +903,15 @@ where
                     // The receiver app can die while the local side
                     // keeps accepting frames (HLS serves from here).
                     if !session.is_alive() {
-                        return PumpExit::Lost("receiver session ended".into());
+                        return match session.end_reason() {
+                            Some(FerricastError::RemoteStopped(why)) => {
+                                let why = why.clone();
+                                let _ = session.stop().await;
+                                PumpExit::End(StreamEnd::RemoteStopped(why))
+                            }
+                            Some(e) => PumpExit::Lost(e.to_string()),
+                            None => PumpExit::Lost("receiver session ended".into()),
+                        };
                     }
                 }
             }
@@ -1194,6 +1206,32 @@ mod tests {
             !run.events
                 .iter()
                 .any(|e| matches!(e, ManagerEvent::StreamError { .. }))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_ended_by_the_receiver_is_not_reconnected() {
+        let scripts = vec![SessionScript {
+            dies_after: Some(3),
+            dies_remotely: true,
+            ..SessionScript::default()
+        }];
+        let run = run_stream(
+            DeviceCapabilities::default(),
+            &[(64, 36)],
+            scripts,
+            StreamConfig::default(),
+        )
+        .await;
+        assert_eq!(
+            run.end,
+            StreamEnd::RemoteStopped("another app took over".into())
+        );
+        assert_eq!(run.sessions.lock().unwrap().created, 1);
+        assert!(
+            !run.events
+                .iter()
+                .any(|e| matches!(e, ManagerEvent::StreamReconnecting { .. }))
         );
     }
 

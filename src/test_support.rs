@@ -165,6 +165,9 @@ pub(crate) struct SessionScript {
     pub feeds_adaptive: bool,
     pub forced_keyframes: Option<Duration>,
     pub connect_fails: bool,
+    /// When the session dies (`dies_after`), `end_reason` reports a
+    /// receiver-side stop.
+    pub dies_remotely: bool,
 }
 
 impl Default for SessionScript {
@@ -176,6 +179,7 @@ impl Default for SessionScript {
             feeds_adaptive: false,
             forced_keyframes: None,
             connect_fails: false,
+            dies_remotely: false,
         }
     }
 }
@@ -193,6 +197,7 @@ pub(crate) struct FakeSession {
     script: SessionScript,
     log: Arc<Mutex<SessionLog>>,
     frames: usize,
+    remote_end: Option<FerricastError>,
 }
 
 impl CastSession for FakeSession {
@@ -230,6 +235,13 @@ impl CastSession for FakeSession {
         self.script.dies_after.is_none_or(|n| self.frames < n)
     }
 
+    fn end_reason(&self) -> Option<&FerricastError> {
+        if CastSession::is_alive(self) {
+            return None;
+        }
+        self.remote_end.as_ref()
+    }
+
     fn preferred_audio_codec(&self) -> AudioCodec {
         self.script.audio_codec
     }
@@ -258,10 +270,14 @@ pub(crate) fn session_factory(
             .cloned()
             .unwrap_or_default();
         log.created += 1;
+        let remote_end = script
+            .dies_remotely
+            .then(|| FerricastError::RemoteStopped("another app took over".into()));
         Ok(Box::new(FakeSession {
             script,
             log: log_for_factory.clone(),
             frames: 0,
+            remote_end,
         }) as Box<dyn ErasedSession>)
     });
     (factory, log)
