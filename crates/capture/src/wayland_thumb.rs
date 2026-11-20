@@ -881,15 +881,18 @@ fn wl_shm_format(raw: u32) -> Result<wl_shm::Format, SourceError> {
     }
 }
 
-/// Orientation hints for [`encode_png`]. `transform` is the wl_output
-/// transform of the captured monitor (rotated displays come out
-/// sideways from the framebuffer otherwise); `y_invert` is the
-/// `Y_INVERT` bit from the screencopy `flags` event (some
-/// compositors emit pixels bottom-up).
-#[derive(Clone, Copy)]
-struct Orientation {
-    transform: wl_output::Transform,
-    y_invert: bool,
+/// How a captured output framebuffer must be re-oriented to match
+/// what the user sees. `transform` is the wl_output transform of the
+/// captured monitor (rotated displays come out sideways from the
+/// framebuffer otherwise); `y_invert` is the `Y_INVERT` bit from the
+/// screencopy `flags` event (some compositors emit pixels bottom-up).
+///
+/// Shared with `wayland_direct`, whose CPU path applies the same
+/// correction to every streamed frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Orientation {
+    pub(crate) transform: wl_output::Transform,
+    pub(crate) y_invert: bool,
 }
 
 impl Default for Orientation {
@@ -898,6 +901,39 @@ impl Default for Orientation {
             transform: wl_output::Transform::Normal,
             y_invert: false,
         }
+    }
+}
+
+impl Orientation {
+    /// `true` when [`Self::apply`] would return the image unchanged.
+    pub(crate) fn is_identity(self) -> bool {
+        !self.y_invert && self.transform == wl_output::Transform::Normal
+    }
+
+    /// `true` when [`Self::apply`] swaps width and height.
+    pub(crate) fn swaps_axes(self) -> bool {
+        use wl_output::Transform;
+        matches!(
+            self.transform,
+            Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270
+        )
+    }
+
+    /// Apply `Y_INVERT` first (it's defined on the buffer's
+    /// framebuffer axis), then the wl_output transform — the
+    /// composition the compositor applies before scanning out to the
+    /// user's eye, so rotated + inverted captures come out the way
+    /// the user sees them.
+    ///
+    /// Channel order is irrelevant here (pure pixel moves), so the
+    /// `RgbaImage` may just as well hold BGRA bytes.
+    pub(crate) fn apply(self, img: image::RgbaImage) -> image::RgbaImage {
+        let img = if self.y_invert {
+            image::imageops::flip_vertical(&img)
+        } else {
+            img
+        };
+        apply_wl_transform(img, self.transform)
     }
 }
 
@@ -936,19 +972,9 @@ fn encode_png(
     }
     drop(mmap);
 
-    let mut img = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+    let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
         .ok_or_else(|| SourceError::Backend("rgba from_raw failed".into()))?;
-
-    // Apply Y_INVERT first (it's defined on the buffer's framebuffer
-    // axis), then the wl_output transform — which is the
-    // composition the compositor would apply before scanning out to
-    // the user's eye. Doing them in the same order the spec describes
-    // means rotated + inverted captures (some VR / mobile-ish
-    // displays) come out the way the user sees them.
-    if orientation.y_invert {
-        img = image::imageops::flip_vertical(&img);
-    }
-    img = apply_wl_transform(img, orientation.transform);
+    let img = orientation.apply(img);
 
     let (final_w, final_h) = (img.width(), img.height());
     let (tw, th) = crate::fit_box(final_w, final_h, max_w, max_h);
@@ -975,16 +1001,16 @@ fn encode_png(
 /// per the wayland spec — same operation order as wlroots' renderer.
 fn apply_wl_transform(img: image::RgbaImage, transform: wl_output::Transform) -> image::RgbaImage {
     use image::imageops as ops;
-    use wl_output::Transform::*;
+    use wl_output::Transform;
     match transform {
-        Normal => img,
-        _90 => ops::rotate90(&img),
-        _180 => ops::rotate180(&img),
-        _270 => ops::rotate270(&img),
-        Flipped => ops::flip_horizontal(&img),
-        Flipped90 => ops::rotate90(&ops::flip_horizontal(&img)),
-        Flipped180 => ops::rotate180(&ops::flip_horizontal(&img)),
-        Flipped270 => ops::rotate270(&ops::flip_horizontal(&img)),
+        Transform::Normal => img,
+        Transform::_90 => ops::rotate90(&img),
+        Transform::_180 => ops::rotate180(&img),
+        Transform::_270 => ops::rotate270(&img),
+        Transform::Flipped => ops::flip_horizontal(&img),
+        Transform::Flipped90 => ops::rotate90(&ops::flip_horizontal(&img)),
+        Transform::Flipped180 => ops::rotate180(&ops::flip_horizontal(&img)),
+        Transform::Flipped270 => ops::rotate270(&ops::flip_horizontal(&img)),
         // Future-proof: an unknown variant lands here. Treat as
         // Normal so the thumbnail is still readable, just at the
         // wrong orientation — better than dropping the frame.

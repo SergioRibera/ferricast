@@ -53,7 +53,7 @@ use ferricast_core::{
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
-use crate::wayland_thumb::EventQueueExt;
+use crate::wayland_thumb::{EventQueueExt, Orientation};
 
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, WEnum,
@@ -593,6 +593,7 @@ fn run_worker(
         frame_info: None,
         buffer_done: false,
         status: FrameStatus::Pending,
+        y_invert: false,
         dmabuf_v3_modifiers: HashMap::new(),
     };
     let mut size_tx = Some(size_tx);
@@ -605,7 +606,11 @@ fn run_worker(
             if let Some(om) = xdg_om.as_ref() {
                 om.get_xdg_output(&out, &qh, ());
             }
-            state.outputs.push((out, None));
+            state.outputs.push(OutputSlot {
+                proxy: out,
+                name: None,
+                transform: wl_output::Transform::Normal,
+            });
         }
     }
     queue
@@ -615,8 +620,8 @@ fn run_worker(
     let target = state
         .outputs
         .iter()
-        .find(|(_, n)| n.as_deref() == Some(output_name.as_str()))
-        .map(|(o, _)| o.clone())
+        .find(|o| o.name.as_deref() == Some(output_name.as_str()))
+        .map(|o| o.proxy.clone())
         .ok_or_else(|| FerricastError::Capture(format!("no output named {output_name:?}")))?;
     state.target = Some(target.clone());
 
@@ -692,6 +697,7 @@ fn run_worker(
     let mut dmabuf_disabled = false;
     let mut dmabuf_consecutive_failures: u32 = 0;
     const DMABUF_FAILURE_THRESHOLD: u32 = 3;
+    let mut gpu_orientation_warned = false;
 
     loop {
         // Cooperative stop — check between frames. A disconnected
@@ -711,6 +717,7 @@ fn run_worker(
         state.frame_info = None;
         state.buffer_done = false;
         state.status = FrameStatus::Pending;
+        state.y_invert = false;
 
         let frame = screencopy.capture_output(0, &target, &qh, ());
 
@@ -735,7 +742,14 @@ fn run_worker(
         }
 
         if let Some(tx) = size_tx.take() {
-            let _ = tx.send((info.width, info.height));
+            // Report the size frames come out with *after* the
+            // orientation correction below (90°/270° swap the axes).
+            let size = if state.frame_orientation().swaps_axes() {
+                (info.height, info.width)
+            } else {
+                (info.width, info.height)
+            };
+            let _ = tx.send(size);
         }
 
         // Only offers in a format we can hand downstream count
@@ -928,11 +942,67 @@ fn run_worker(
         };
         buffer.destroy();
 
+        // The compositor hands us the framebuffer in its native
+        // orientation; undo `Y_INVERT` and the output transform so the
+        // receiver sees what the user sees.
+        let orientation = state.frame_orientation();
+        let captured = match captured {
+            CapturedFrame::Cpu(raw) => CapturedFrame::Cpu(orient_raw_frame(raw, orientation)),
+            CapturedFrame::Gpu(gpu) => {
+                // A GPU frame goes to the encoder untouched — there is
+                // no GPU-side rotate step yet. Unreachable today
+                // (`try_build_importer` returns `None`, so dmabufs are
+                // read back to CPU above), hence log instead of fixing.
+                if !orientation.is_identity() && !gpu_orientation_warned {
+                    gpu_orientation_warned = true;
+                    warn!(
+                        ?orientation,
+                        "wayland-direct: output is rotated / y-inverted but GPU frames \
+                         can't be re-oriented — the stream will appear transformed"
+                    );
+                }
+                CapturedFrame::Gpu(gpu)
+            }
+        };
+
         if frame_tx.try_send(captured).is_err() {
             trace!("consumer behind — dropping frame");
         }
     }
     Ok(())
+}
+
+/// Re-orient a CPU frame (see [`Orientation`]). Identity is free;
+/// otherwise this costs a repack plus one full-frame pixel shuffle,
+/// paid only on rotated / y-inverted outputs. The result is tightly
+/// packed (`stride == width * 4`) with width/height swapped for
+/// 90°/270° transforms.
+fn orient_raw_frame(raw: RawFrame, orientation: Orientation) -> RawFrame {
+    if orientation.is_identity() {
+        return raw;
+    }
+    let row_bytes = raw.width as usize * 4;
+    let stride = (raw.stride as usize).max(row_bytes).max(1);
+    let mut packed = Vec::with_capacity(row_bytes * raw.height as usize);
+    for row in raw.data.chunks(stride).take(raw.height as usize) {
+        let Some(pixels) = row.get(..row_bytes) else {
+            break;
+        };
+        packed.extend_from_slice(pixels);
+    }
+    // Pixel moves only, so BGRA bytes ride through an `RgbaImage` fine.
+    let Some(img) = image::RgbaImage::from_raw(raw.width, raw.height, packed) else {
+        warn!("wayland-direct: frame shorter than declared — emitting it un-oriented");
+        return raw;
+    };
+    let img = orientation.apply(img);
+    RawFrame {
+        width: img.width(),
+        height: img.height(),
+        stride: img.width() * 4,
+        data: Bytes::from(img.into_raw()),
+        ..raw
+    }
 }
 
 fn try_build_importer() -> Option<Arc<dyn DmaBufImporter>> {
@@ -1228,22 +1298,46 @@ enum FrameStatus {
     Failed,
 }
 
+struct OutputSlot {
+    proxy: WlOutput,
+    name: Option<String>,
+    /// Latest `geometry.transform`; the compositor re-sends it when
+    /// the user rotates the display mid-stream.
+    transform: wl_output::Transform,
+}
+
 struct WorkerState {
-    outputs: Vec<(WlOutput, Option<String>)>,
-    /// Stashed for diagnostics so we can log "started capturing
-    /// $name" without re-querying. Held for `Drop` ordering — the
-    /// proxy survives until the worker thread ends.
-    #[allow(dead_code)]
+    outputs: Vec<OutputSlot>,
+    /// The output being captured; its live transform decides how
+    /// each frame is re-oriented.
     target: Option<WlOutput>,
     frame_info: Option<FrameInfo>,
     /// `buffer_done` seen for the in-flight frame: every offer
     /// (`buffer` / `linux_dmabuf`) has been announced.
     buffer_done: bool,
     status: FrameStatus,
+    /// `Y_INVERT` from the in-flight frame's `flags` event.
+    y_invert: bool,
     /// `(fourcc → modifiers)` from the v3 `zwp_linux_dmabuf_v1.modifier`
     /// events. Only populated when the global is bound below v4 (v4
     /// compositors use the feedback object instead).
     dmabuf_v3_modifiers: HashMap<u32, Vec<u64>>,
+}
+
+impl WorkerState {
+    /// Orientation correction for the in-flight frame: its
+    /// `Y_INVERT` flag plus the target output's current transform.
+    fn frame_orientation(&self) -> Orientation {
+        let transform = self
+            .target
+            .as_ref()
+            .and_then(|t| self.outputs.iter().find(|o| &o.proxy == t))
+            .map_or(wl_output::Transform::Normal, |o| o.transform);
+        Orientation {
+            transform,
+            y_invert: self.y_invert,
+        }
+    }
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for WorkerState {
@@ -1266,13 +1360,20 @@ impl Dispatch<WlOutput, ()> for WorkerState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Name { name } = event {
-            for (out, slot) in &mut state.outputs {
-                if out == proxy {
-                    *slot = Some(name.clone());
-                    break;
-                }
+        let Some(slot) = state.outputs.iter_mut().find(|o| &o.proxy == proxy) else {
+            return;
+        };
+        match event {
+            wl_output::Event::Name { name } => slot.name = Some(name),
+            wl_output::Event::Geometry { transform, .. } => {
+                // An unknown (future) transform falls back to Normal:
+                // a mis-rotated stream beats a dropped one.
+                slot.transform = match transform {
+                    WEnum::Value(t) => t,
+                    WEnum::Unknown(_) => wl_output::Transform::Normal,
+                };
             }
+            _ => {}
         }
     }
 }
@@ -1300,11 +1401,8 @@ impl Dispatch<ZxdgOutputV1, ()> for WorkerState {
             // xdg-output `name` fills in for wl_output v3- (no
             // Name event there). Best-effort: assign to the first
             // output that doesn't have a name yet.
-            for (_, slot) in &mut state.outputs {
-                if slot.is_none() {
-                    *slot = Some(name.clone());
-                    break;
-                }
+            if let Some(slot) = state.outputs.iter_mut().find(|o| o.name.is_none()) {
+                slot.name = Some(name);
             }
         }
     }
@@ -1458,6 +1556,12 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for WorkerState {
                 // got nothing, frame_info stays None and the worker
                 // bails out.
                 state.buffer_done = true;
+            }
+            Event::Flags { flags } => {
+                state.y_invert = match flags {
+                    WEnum::Value(f) => f.contains(zwlr_screencopy_frame_v1::Flags::YInvert),
+                    WEnum::Unknown(bits) => bits & 1 != 0,
+                };
             }
             Event::Ready { .. } => state.status = FrameStatus::Ready,
             Event::Failed => state.status = FrameStatus::Failed,
@@ -1760,4 +1864,76 @@ fn decode_dev_t(device: &[u8]) -> Option<u64> {
     Some(u64::from_ne_bytes([
         device[0], device[1], device[2], device[3], device[4], device[5], device[6], device[7],
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(width: u32, height: u32, stride: u32, data: Vec<u8>) -> RawFrame {
+        RawFrame {
+            width,
+            height,
+            stride,
+            format: PixelFormat::Bgra,
+            data: Bytes::from(data),
+            timestamp_us: 7,
+        }
+    }
+
+    #[test]
+    fn identity_orientation_keeps_frame_untouched() {
+        let frame = raw(1, 1, 8, vec![1, 2, 3, 4, 0, 0, 0, 0]);
+        let out = orient_raw_frame(frame, Orientation::default());
+        assert_eq!(out.stride, 8);
+        assert_eq!(out.data.len(), 8);
+    }
+
+    #[test]
+    fn y_invert_flips_rows_and_drops_stride_padding() {
+        // 1×2, stride 8 (4 bytes of padding per row).
+        let frame = raw(
+            1,
+            2,
+            8,
+            vec![1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 0],
+        );
+        let out = orient_raw_frame(
+            frame,
+            Orientation {
+                transform: wl_output::Transform::Normal,
+                y_invert: true,
+            },
+        );
+        assert_eq!((out.width, out.height, out.stride), (1, 2, 4));
+        assert_eq!(out.data.as_ref(), &[2, 2, 2, 2, 1, 1, 1, 1]);
+        assert_eq!(out.timestamp_us, 7);
+    }
+
+    #[test]
+    fn rotation_by_90_swaps_axes() {
+        // 2×1 row [A, B] rotated clockwise → 1×2 column [A; B].
+        let frame = raw(2, 1, 8, vec![1, 1, 1, 1, 2, 2, 2, 2]);
+        let orientation = Orientation {
+            transform: wl_output::Transform::_90,
+            y_invert: false,
+        };
+        assert!(orientation.swaps_axes());
+        let out = orient_raw_frame(frame, orientation);
+        assert_eq!((out.width, out.height, out.stride), (1, 2, 4));
+        assert_eq!(out.data.as_ref(), &[1, 1, 1, 1, 2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn short_buffer_is_emitted_unoriented() {
+        let frame = raw(2, 2, 8, vec![0; 8]);
+        let out = orient_raw_frame(
+            frame,
+            Orientation {
+                transform: wl_output::Transform::_180,
+                y_invert: false,
+            },
+        );
+        assert_eq!((out.width, out.height, out.data.len()), (2, 2, 8));
+    }
 }
