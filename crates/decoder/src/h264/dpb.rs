@@ -1,8 +1,11 @@
-use super::slice::{Mmco, PocKind, RefMod, SliceHeader, SliceType, Sps};
+use super::slice::{MAX_DPB_FRAMES, Mmco, PocKind, RefMod, SliceHeader, SliceType, Sps};
 
 #[derive(Debug, Clone)]
 pub(super) struct Frame {
-    pub handle: usize,
+    /// Surface holding the picture; `None` for a "non-existing" frame
+    /// inferred from a `frame_num` gap (8.2.5.2), which only occupies a
+    /// short-term reference slot.
+    pub handle: Option<usize>,
     pub frame_num: u32,
     pub top_poc: i32,
     pub bottom_poc: i32,
@@ -58,16 +61,29 @@ pub(super) struct Dpb {
     max_num_ref_frames: u32,
     reorder: u32,
     poc: PocKind,
+    gaps_allowed: bool,
     prev_poc_msb: i32,
     prev_poc_lsb: u32,
     prev_frame_num: u32,
     prev_frame_num_offset: u32,
+    /// `PrevRefFrameNum`; `None` until the first picture anchors the
+    /// sequence, so joining mid-stream is not mistaken for a gap.
+    prev_ref_frame_num: Option<u32>,
+    /// Set after a `frame_num` gap the SPS forbids: references were lost,
+    /// so every picture until the next IDR would decode corrupt.
+    awaiting_idr: bool,
     max_long_term_idx: Option<u32>,
+}
+
+/// Never panics on out-of-range input: `Ord::clamp` would assert when
+/// `max_num_ref_frames` exceeds the ceiling.
+fn bounded_dpb_size(size: u32, sps: &Sps) -> u32 {
+    size.max(sps.max_num_ref_frames.max(1)).min(MAX_DPB_FRAMES)
 }
 
 pub(super) fn dpb_size(sps: &Sps) -> u32 {
     if let Some(size) = sps.max_dec_frame_buffering {
-        return size.clamp(sps.max_num_ref_frames.max(1), 16);
+        return bounded_dpb_size(size, sps);
     }
     let level_limit = match sps.level_idc {
         9 | 10 => 396,
@@ -84,28 +100,37 @@ pub(super) fn dpb_size(sps: &Sps) -> u32 {
         51 | 52 => 184_320,
         _ => 696_320,
     };
-    (level_limit / (sps.width_mbs * sps.height_mbs).max(1)).clamp(sps.max_num_ref_frames.max(1), 16)
+    let picture_mbs = sps.width_mbs.saturating_mul(sps.height_mbs).max(1);
+    bounded_dpb_size(level_limit / picture_mbs, sps)
 }
 
 impl Dpb {
+    /// `sps` must have passed [`Sps::check_valid`]; out-of-range values
+    /// are clamped rather than trusted.
     pub(super) fn new(sps: &Sps, low_latency: bool) -> Self {
-        let reorder = if low_latency {
-            0
-        } else {
-            sps.num_reorder_frames
-                .unwrap_or_else(|| dpb_size(sps))
-                .min(dpb_size(sps))
+        let size = dpb_size(sps);
+        // The VUI reorder depth is authoritative when present: a real
+        // low-latency stream signals 0 there, while a B-frame stream
+        // needs its depth honoured even on a low-latency session or
+        // pictures come out in decode order.
+        let reorder = match sps.num_reorder_frames {
+            Some(frames) => frames.min(size),
+            None if low_latency => 0,
+            None => size,
         };
         Self {
             frames: Vec::new(),
-            max_frame_num: 1 << sps.log2_max_frame_num,
-            max_num_ref_frames: sps.max_num_ref_frames,
+            max_frame_num: 1 << sps.log2_max_frame_num.min(16),
+            max_num_ref_frames: sps.max_num_ref_frames.min(MAX_DPB_FRAMES),
             reorder,
             poc: sps.poc.clone(),
+            gaps_allowed: sps.gaps_allowed,
             prev_poc_msb: 0,
             prev_poc_lsb: 0,
             prev_frame_num: 0,
             prev_frame_num_offset: 0,
+            prev_ref_frame_num: None,
+            awaiting_idr: false,
             max_long_term_idx: None,
         }
     }
@@ -118,14 +143,41 @@ impl Dpb {
         &self.frames[index]
     }
 
+    /// Referenced pictures that have a surface; "non-existing" gap frames
+    /// hold reference slots but cannot be handed to the hardware.
     pub(super) fn reference_frames(&self) -> impl Iterator<Item = &Frame> {
-        self.frames.iter().filter(|frame| frame.referenced)
+        self.frames
+            .iter()
+            .filter(|frame| frame.referenced && frame.handle.is_some())
     }
 
-    pub(super) fn start(&mut self, header: &SliceHeader) -> (Current, Released) {
+    /// Begins a picture. `None` means it must be skipped: a `frame_num`
+    /// gap the SPS does not allow showed that data was lost, and nothing
+    /// decodes cleanly again before the next IDR.
+    ///
+    /// POC arithmetic wraps instead of panicking; conforming streams
+    /// never get near the `i32` edges (8.2.1).
+    pub(super) fn start(&mut self, header: &SliceHeader) -> Option<(Current, Released)> {
         let mut released = Released::default();
         if header.idr {
+            self.awaiting_idr = false;
             self.flush_into(&mut released);
+        } else if self.awaiting_idr {
+            return None;
+        } else if let Some(prev_ref) = self.prev_ref_frame_num
+            && header.frame_num != prev_ref
+            && header.frame_num != (prev_ref + 1) % self.max_frame_num
+        {
+            if !self.gaps_allowed {
+                tracing::warn!(
+                    expected = (prev_ref + 1) % self.max_frame_num,
+                    got = header.frame_num,
+                    "H.264 frame_num gap: references were lost; skipping to the next IDR"
+                );
+                self.awaiting_idr = true;
+                return None;
+            }
+            self.fill_gap(prev_ref, header.frame_num, &mut released);
         }
         let mut current = Current {
             frame_num: header.frame_num,
@@ -136,7 +188,7 @@ impl Dpb {
         };
         match &self.poc {
             PocKind::Lsb { log2_max_lsb } => {
-                let max_lsb = 1i32 << log2_max_lsb;
+                let max_lsb = 1i32 << (*log2_max_lsb).min(16);
                 let (prev_msb, prev_lsb) = if header.idr {
                     (0, 0)
                 } else {
@@ -144,14 +196,16 @@ impl Dpb {
                 };
                 let lsb = header.pic_order_cnt_lsb as i32;
                 current.poc_msb = if lsb < prev_lsb && prev_lsb - lsb >= max_lsb / 2 {
-                    prev_msb + max_lsb
+                    prev_msb.wrapping_add(max_lsb)
                 } else if lsb > prev_lsb && lsb - prev_lsb > max_lsb / 2 {
-                    prev_msb - max_lsb
+                    prev_msb.wrapping_sub(max_lsb)
                 } else {
                     prev_msb
                 };
-                current.top_poc = current.poc_msb + lsb;
-                current.bottom_poc = current.top_poc + header.delta_pic_order_cnt_bottom;
+                current.top_poc = current.poc_msb.wrapping_add(lsb);
+                current.bottom_poc = current
+                    .top_poc
+                    .wrapping_add(header.delta_pic_order_cnt_bottom);
             }
             PocKind::Cycle {
                 offset_for_non_ref_pic,
@@ -159,38 +213,46 @@ impl Dpb {
                 offsets_for_ref_frame,
                 ..
             } => {
-                current.frame_num_offset = self.frame_num_offset(header);
+                current.frame_num_offset = self.frame_num_offset(header.idr, header.frame_num);
                 let cycle_len = offsets_for_ref_frame.len() as i32;
                 let mut absolute = if cycle_len != 0 {
-                    (current.frame_num_offset + header.frame_num) as i32
+                    current.frame_num_offset.wrapping_add(header.frame_num) as i32
                 } else {
                     0
                 };
                 if header.nal_ref_idc == 0 && absolute > 0 {
                     absolute -= 1;
                 }
-                let mut expected = 0;
+                let sum = |offsets: &[i32]| {
+                    offsets
+                        .iter()
+                        .fold(0i32, |total, offset| total.wrapping_add(*offset))
+                };
+                let mut expected = 0i32;
                 if absolute > 0 {
                     let cycle = (absolute - 1) / cycle_len;
                     let in_cycle = ((absolute - 1) % cycle_len) as usize;
-                    let per_cycle: i32 = offsets_for_ref_frame.iter().sum();
-                    expected =
-                        cycle * per_cycle + offsets_for_ref_frame[..=in_cycle].iter().sum::<i32>();
+                    let per_cycle = sum(offsets_for_ref_frame);
+                    let partial = offsets_for_ref_frame.get(..=in_cycle).map_or(0, sum);
+                    expected = cycle.wrapping_mul(per_cycle).wrapping_add(partial);
                 }
                 if header.nal_ref_idc == 0 {
-                    expected += offset_for_non_ref_pic;
+                    expected = expected.wrapping_add(*offset_for_non_ref_pic);
                 }
-                current.top_poc = expected + header.delta_pic_order_cnt[0];
-                current.bottom_poc =
-                    current.top_poc + offset_for_top_to_bottom + header.delta_pic_order_cnt[1];
+                current.top_poc = expected.wrapping_add(header.delta_pic_order_cnt[0]);
+                current.bottom_poc = current
+                    .top_poc
+                    .wrapping_add(*offset_for_top_to_bottom)
+                    .wrapping_add(header.delta_pic_order_cnt[1]);
             }
             PocKind::FrameNum => {
-                current.frame_num_offset = self.frame_num_offset(header);
-                let base = 2 * (current.frame_num_offset + header.frame_num) as i32;
+                current.frame_num_offset = self.frame_num_offset(header.idr, header.frame_num);
+                let base = (current.frame_num_offset.wrapping_add(header.frame_num) as i32)
+                    .wrapping_mul(2);
                 let poc = if header.idr {
                     0
                 } else if header.nal_ref_idc == 0 {
-                    base - 1
+                    base.wrapping_sub(1)
                 } else {
                     base
                 };
@@ -198,17 +260,42 @@ impl Dpb {
                 current.bottom_poc = poc;
             }
         }
-        (current, released)
+        Some((current, released))
     }
 
-    fn frame_num_offset(&self, header: &SliceHeader) -> u32 {
-        if header.idr {
+    fn frame_num_offset(&self, idr: bool, frame_num: u32) -> u32 {
+        if idr {
             0
-        } else if self.prev_frame_num > header.frame_num {
-            self.prev_frame_num_offset + self.max_frame_num
+        } else if self.prev_frame_num > frame_num {
+            self.prev_frame_num_offset.wrapping_add(self.max_frame_num)
         } else {
             self.prev_frame_num_offset
         }
+    }
+
+    /// 8.2.5.2: every skipped `frame_num` becomes a "non-existing"
+    /// short-term reference, entered through the sliding window so the
+    /// reference set ends up as if those pictures had been decoded.
+    fn fill_gap(&mut self, prev_ref: u32, frame_num: u32, released: &mut Released) {
+        let mut missing = (prev_ref + 1) % self.max_frame_num;
+        while missing != frame_num {
+            self.slide(missing);
+            let frame_num_offset = self.frame_num_offset(false, missing);
+            self.frames.push(Frame {
+                handle: None,
+                frame_num: missing,
+                top_poc: 0,
+                bottom_poc: 0,
+                long_term_idx: None,
+                referenced: true,
+                awaiting_output: false,
+                timestamp_us: 0,
+            });
+            (self.prev_frame_num, self.prev_frame_num_offset) = (missing, frame_num_offset);
+            self.prev_ref_frame_num = Some(missing);
+            missing = (missing + 1) % self.max_frame_num;
+        }
+        self.collect_free(released);
     }
 
     pub(super) fn finish(
@@ -220,7 +307,7 @@ impl Dpb {
     ) -> Released {
         let mut released = Released::default();
         let mut frame = Frame {
-            handle,
+            handle: Some(handle),
             frame_num: header.frame_num,
             top_poc: current.top_poc,
             bottom_poc: current.bottom_poc,
@@ -241,8 +328,8 @@ impl Dpb {
         if cleared {
             self.bump_all(&mut released);
             let base = frame.poc();
-            frame.top_poc -= base;
-            frame.bottom_poc -= base;
+            frame.top_poc = frame.top_poc.wrapping_sub(base);
+            frame.bottom_poc = frame.bottom_poc.wrapping_sub(base);
             frame.frame_num = 0;
         }
         if header.nal_ref_idc != 0 {
@@ -251,6 +338,7 @@ impl Dpb {
             } else {
                 (current.poc_msb, header.pic_order_cnt_lsb)
             };
+            self.prev_ref_frame_num = Some(frame.frame_num);
         }
         (self.prev_frame_num, self.prev_frame_num_offset) = if cleared {
             (0, 0)
@@ -272,6 +360,8 @@ impl Dpb {
         self.prev_poc_lsb = 0;
         self.prev_frame_num = 0;
         self.prev_frame_num_offset = 0;
+        self.prev_ref_frame_num = None;
+        self.awaiting_idr = false;
         released
     }
 
@@ -312,18 +402,20 @@ impl Dpb {
             .min_by_key(|frame| frame.poc());
         if let Some(frame) = next {
             frame.awaiting_output = false;
-            released.output.push(Output {
-                handle: frame.handle,
-                timestamp_us: frame.timestamp_us,
-            });
+            if let Some(handle) = frame.handle {
+                released.output.push(Output {
+                    handle,
+                    timestamp_us: frame.timestamp_us,
+                });
+            }
         }
     }
 
     fn collect_free(&mut self, released: &mut Released) {
         self.frames.retain(|frame| {
             let keep = frame.referenced || frame.awaiting_output;
-            if !keep {
-                released.free.push(frame.handle);
+            if !keep && let Some(handle) = frame.handle {
+                released.free.push(handle);
             }
             keep
         });
@@ -373,9 +465,12 @@ impl Dpb {
         }
     }
 
-    fn short_term(&self, pic_num: i32, current_frame_num: u32) -> Option<usize> {
+    /// `pic_num` is `i64` because it is derived from unbounded `ue(v)`
+    /// differences; an out-of-range one simply matches nothing.
+    fn short_term(&self, pic_num: i64, current_frame_num: u32) -> Option<usize> {
         self.frames.iter().position(|frame| {
-            frame.is_short() && self.frame_num_wrap(frame.frame_num, current_frame_num) == pic_num
+            frame.is_short()
+                && i64::from(self.frame_num_wrap(frame.frame_num, current_frame_num)) == pic_num
         })
     }
 
@@ -388,7 +483,8 @@ impl Dpb {
     }
 
     fn apply(&mut self, operation: Mmco, current_frame_num: u32, current: &mut Frame) {
-        let pic_num = |diff_minus1: u32| current_frame_num as i32 - (diff_minus1 as i32 + 1);
+        let pic_num =
+            |diff_minus1: u32| i64::from(current_frame_num) - (i64::from(diff_minus1) + 1);
         match operation {
             Mmco::UnmarkShort { diff_minus1 } => {
                 if let Some(index) = self.short_term(pic_num(diff_minus1), current_frame_num) {
@@ -458,6 +554,8 @@ impl Dpb {
         long.sort_by_key(|&index| self.frames[index].long_term_idx);
         let mut initial: [Vec<usize>; 2] = Default::default();
         if header.slice_type == SliceType::B {
+            // Gap frames have no POC to order them by.
+            short.retain(|&index| self.frames[index].handle.is_some());
             let mut before: Vec<usize> = short
                 .iter()
                 .copied()
@@ -493,6 +591,11 @@ impl Dpb {
             lists[list] = initial[list].iter().map(|&index| Some(index)).collect();
             lists[list].resize(active, None);
             self.modify(&mut lists[list], &header.ref_mods[list], current.frame_num);
+            // A slice predicting from a gap frame references data that
+            // never arrived; the hardware gets an invalid entry instead.
+            for entry in &mut lists[list] {
+                *entry = entry.filter(|&index| self.frames[index].handle.is_some());
+            }
         }
         lists
     }
@@ -502,26 +605,23 @@ impl Dpb {
         if active == 0 {
             return;
         }
-        let max_pic_num = self.max_frame_num as i32;
-        let current_pic_num = current_frame_num as i32;
+        let max_pic_num = i64::from(self.max_frame_num);
+        let current_pic_num = i64::from(current_frame_num);
         let mut predicted = current_pic_num;
         let mut position = 0;
         list.push(None);
         for operation in operations {
             let target = match *operation {
                 RefMod::ShortMinus(abs_diff_minus1) | RefMod::ShortPlus(abs_diff_minus1) => {
-                    let diff = abs_diff_minus1 as i32 + 1;
-                    let no_wrap = if matches!(operation, RefMod::ShortMinus(_)) {
-                        if predicted - diff < 0 {
-                            predicted - diff + max_pic_num
-                        } else {
-                            predicted - diff
-                        }
-                    } else if predicted + diff >= max_pic_num {
-                        predicted + diff - max_pic_num
+                    let diff = i64::from(abs_diff_minus1) + 1;
+                    let signed = if matches!(operation, RefMod::ShortMinus(_)) {
+                        -diff
                     } else {
-                        predicted + diff
+                        diff
                     };
+                    // Equals the spec's single +/- MaxPicNum correction
+                    // for every conforming `abs_diff_pic_num_minus1`.
+                    let no_wrap = (predicted + signed).rem_euclid(max_pic_num);
                     predicted = no_wrap;
                     let pic_num = if no_wrap > current_pic_num {
                         no_wrap - max_pic_num
@@ -579,7 +679,7 @@ mod tests {
     }
 
     fn decode(dpb: &mut Dpb, header: &SliceHeader, handle: usize) -> (Current, Released) {
-        let (current, mut released) = dpb.start(header);
+        let (current, mut released) = dpb.start(header).expect("the picture is decodable");
         let finished = dpb.finish(current, header, handle, handle as u64 * 1000);
         released.output.extend(finished.output);
         released.free.extend(finished.free);
@@ -673,7 +773,7 @@ mod tests {
             let header = if index == 0 {
                 idr()
             } else {
-                header(index as u32 % 2 + 1, lsb, reference)
+                header(index.min(2) as u32, lsb, reference)
             };
             let (_, released) = decode(&mut dpb, &header, index);
             out.extend(handles(&released.output));
@@ -704,12 +804,183 @@ mod tests {
     }
 
     #[test]
-    fn low_latency_outputs_every_picture_as_it_is_decoded() {
-        let mut dpb = Dpb::new(&lsb_sps(8), true);
+    fn low_latency_without_a_signalled_depth_outputs_every_picture_as_it_is_decoded() {
+        let sps = Sps {
+            num_reorder_frames: None,
+            ..lsb_sps(8)
+        };
+        let mut dpb = Dpb::new(&sps, true);
         let (_, first) = decode(&mut dpb, &idr(), 0);
         let (_, second) = decode(&mut dpb, &header(1, 2, 1), 1);
         assert_eq!(handles(&first.output), [0]);
         assert_eq!(handles(&second.output), [1]);
+    }
+
+    #[test]
+    fn low_latency_still_honours_a_signalled_reorder_depth() {
+        let sps = Sps {
+            num_reorder_frames: Some(1),
+            ..lsb_sps(8)
+        };
+        let mut dpb = Dpb::new(&sps, true);
+        let mut out = Vec::new();
+        for (handle, (frame_num, lsb, reference)) in
+            [(0, 0, 3), (1, 4, 2), (2, 2, 0), (2, 8, 2), (3, 6, 0)]
+                .into_iter()
+                .enumerate()
+        {
+            let header = if handle == 0 {
+                idr()
+            } else {
+                header(frame_num, lsb, reference)
+            };
+            out.extend(handles(&decode(&mut dpb, &header, handle).1.output));
+        }
+        out.extend(handles(&dpb.flush().output));
+        assert_eq!(out, [0, 2, 1, 4, 3]);
+    }
+
+    #[test]
+    fn a_forbidden_frame_num_gap_skips_pictures_until_the_next_idr() {
+        let mut dpb = Dpb::new(&lsb_sps(8), true);
+        decode(&mut dpb, &idr(), 0);
+        decode(&mut dpb, &header(1, 2, 1), 1);
+        assert!(dpb.start(&header(3, 6, 1)).is_none());
+        assert!(dpb.start(&header(4, 8, 1)).is_none());
+        let restart = SliceHeader {
+            pic_order_cnt_lsb: 0,
+            ..idr()
+        };
+        let (_, released) = dpb.start(&restart).expect("an IDR resumes decoding");
+        assert_eq!(handles(&released.output), [0, 1]);
+    }
+
+    #[test]
+    fn an_allowed_frame_num_gap_inserts_non_existing_short_term_frames() {
+        let sps = Sps {
+            gaps_allowed: true,
+            max_num_ref_frames: 3,
+            num_reorder_frames: Some(0),
+            ..lsb_sps(8)
+        };
+        let mut dpb = Dpb::new(&sps, true);
+        decode(&mut dpb, &idr(), 0);
+        decode(&mut dpb, &header(1, 2, 1), 1);
+        let (current, released) = decode(&mut dpb, &header(4, 8, 1), 2);
+        assert_eq!(current.frame_num, 4);
+        assert_eq!(handles(&released.output), [2]);
+        // Window of three: gap frame 3 slid out frame 0, and the decoded
+        // picture's own window step slid out frame 1.
+        let existing: Vec<u32> = dpb.reference_frames().map(|f| f.frame_num).collect();
+        assert_eq!(existing, [4]);
+        let mut free = released.free;
+        free.sort_unstable();
+        assert_eq!(free, [0, 1]);
+        let probe = header(5, 10, 1);
+        let current = Current {
+            frame_num: 5,
+            top_poc: 10,
+            bottom_poc: 10,
+            poc_msb: 0,
+            frame_num_offset: 0,
+        };
+        let lists = dpb.ref_lists(&probe, &current);
+        assert_eq!(
+            list_frame_nums(&dpb, &lists[0]),
+            [Some(4), None, None, None]
+        );
+    }
+
+    #[test]
+    fn a_gap_across_the_frame_num_wrap_is_filled_in_order() {
+        let sps = Sps {
+            gaps_allowed: true,
+            log2_max_frame_num: 2,
+            max_num_ref_frames: 16,
+            num_reorder_frames: Some(0),
+            ..lsb_sps(8)
+        };
+        let mut dpb = Dpb::new(&sps, true);
+        decode(&mut dpb, &idr(), 0);
+        decode(&mut dpb, &header(1, 2, 1), 1);
+        decode(&mut dpb, &header(2, 4, 1), 2);
+        decode(&mut dpb, &header(1, 12, 1), 3);
+        let all: Vec<(u32, bool)> = dpb
+            .frames
+            .iter()
+            .map(|f| (f.frame_num, f.handle.is_some()))
+            .collect();
+        assert_eq!(
+            all,
+            [
+                (0, true),
+                (1, true),
+                (2, true),
+                (3, false),
+                (0, false),
+                (1, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn joining_mid_stream_is_not_a_gap() {
+        let mut dpb = Dpb::new(&lsb_sps(8), true);
+        let (_, released) = decode(&mut dpb, &header(9, 4, 1), 0);
+        assert!(released.free.is_empty());
+        assert!(dpb.start(&header(10, 6, 1)).is_some());
+    }
+
+    #[test]
+    fn oversized_reference_counts_are_capped_instead_of_panicking() {
+        let mut huge = sps();
+        huge.max_num_ref_frames = 40;
+        assert_eq!(dpb_size(&huge), 16);
+        huge.max_dec_frame_buffering = None;
+        assert_eq!(dpb_size(&huge), 16);
+        let dpb = Dpb::new(&huge, false);
+        assert_eq!(dpb.capacity(), 16 + 2 + 2);
+    }
+
+    #[test]
+    fn out_of_range_list_modifications_match_nothing_instead_of_overflowing() {
+        let dpb = filled(3);
+        let mut probe = header(3, 6, 1);
+        probe.num_ref_idx_active = [2, 0];
+        probe.ref_mods[0] = vec![RefMod::ShortMinus(u32::MAX), RefMod::ShortPlus(u32::MAX)];
+        let current = Current {
+            frame_num: 3,
+            top_poc: 6,
+            bottom_poc: 6,
+            poc_msb: 0,
+            frame_num_offset: 0,
+        };
+        let lists = dpb.ref_lists(&probe, &current);
+        assert_eq!(lists[0].len(), 2);
+        let mut unmark = header(3, 6, 1);
+        unmark.marking.adaptive = Some(vec![Mmco::UnmarkShort {
+            diff_minus1: u32::MAX,
+        }]);
+        let mut dpb = filled(3);
+        decode(&mut dpb, &unmark, 3);
+        assert_eq!(dpb.reference_frames().count(), 4);
+    }
+
+    #[test]
+    fn poc_type_1_with_extreme_offsets_wraps_instead_of_overflowing() {
+        let sps = Sps {
+            poc: PocKind::Cycle {
+                delta_always_zero: true,
+                offset_for_non_ref_pic: i32::MIN,
+                offset_for_top_to_bottom: i32::MAX,
+                offsets_for_ref_frame: vec![i32::MAX, i32::MAX],
+            },
+            ..sps()
+        };
+        let mut dpb = Dpb::new(&sps, false);
+        decode(&mut dpb, &idr(), 0);
+        decode(&mut dpb, &header(1, 0, 1), 1);
+        decode(&mut dpb, &header(2, 0, 0), 2);
     }
 
     #[test]
@@ -718,7 +989,7 @@ mod tests {
         decode(&mut dpb, &idr(), 0);
         decode(&mut dpb, &header(1, 4, 1), 1);
         decode(&mut dpb, &header(2, 2, 1), 2);
-        let (_, released) = dpb.start(&idr());
+        let (_, released) = dpb.start(&idr()).expect("an IDR always decodes");
         assert_eq!(handles(&released.output), [2, 1]);
         let mut free = released.free;
         free.sort_unstable();

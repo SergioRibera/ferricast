@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, PixelFormat, RawFrame,
-    Result, VideoDecoder,
+    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, PixelFormat, Result,
+    VideoDecoder,
 };
 use h264_reader::{
     Context as H264Context,
@@ -32,8 +32,48 @@ use libva::{
 };
 
 use super::dpb::{Dpb, Frame as DpbFrame, Released};
-use super::slice::{self, PocKind, Pps, SliceHeader, SliceType, Sps};
+use super::slice::{self, PocKind, Pps, SliceHeader, SliceType, Sps, Unsupported};
 use crate::nv12::{self, Nv12Planes};
+
+/// Why a VA-API decode call failed, split so the facade can tell a
+/// stream it should hand to another backend from a real failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaapiH264Error {
+    /// Valid H.264 using a feature this backend does not implement
+    /// (interlacing, 4:2:2, high bit depth, scaling matrices, FMO).
+    Unsupported(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for VaapiH264Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported(what) | Self::Failed(what) => f.write_str(what),
+        }
+    }
+}
+
+impl std::error::Error for VaapiH264Error {}
+
+impl From<FerricastError> for VaapiH264Error {
+    fn from(error: FerricastError) -> Self {
+        Self::Failed(error.to_string())
+    }
+}
+
+impl From<Unsupported> for VaapiH264Error {
+    fn from(error: Unsupported) -> Self {
+        Self::Unsupported(error.to_string())
+    }
+}
+
+impl From<VaapiH264Error> for FerricastError {
+    fn from(error: VaapiH264Error) -> Self {
+        FerricastError::Decode(error.to_string())
+    }
+}
+
+type WorkerResult<T> = std::result::Result<T, VaapiH264Error>;
 
 pub struct VaapiH264Decoder {
     cmd_tx: SyncSender<Cmd>,
@@ -50,7 +90,11 @@ enum Cmd {
 
 enum Reply {
     Configured,
-    Frames(std::result::Result<Vec<CapturedFrame>, String>),
+    /// Pictures finished before `error` (if any) are still good output.
+    Frames {
+        frames: Vec<CapturedFrame>,
+        error: Option<VaapiH264Error>,
+    },
 }
 
 impl VaapiH264Decoder {
@@ -89,14 +133,31 @@ impl VaapiH264Decoder {
         self.reply_rx.recv().map_err(|_| gone())
     }
 
-    fn frames(&self, cmd: Cmd) -> Result<Vec<CapturedFrame>> {
+    /// Queues every finished picture, then reports the error that cut the
+    /// command short, if any.
+    fn frames(&mut self, cmd: Cmd) -> WorkerResult<()> {
         match self.send(cmd)? {
-            Reply::Frames(Ok(frames)) => Ok(frames),
-            Reply::Frames(Err(e)) => Err(FerricastError::Decode(e)),
-            Reply::Configured => Err(FerricastError::Decode(
+            Reply::Frames { frames, error } => {
+                self.ready.extend(frames);
+                error.map_or(Ok(()), Err)
+            }
+            Reply::Configured => Err(VaapiH264Error::Failed(
                 "VA-API worker returned an unexpected reply".into(),
             )),
         }
+    }
+
+    /// [`VideoDecoder::decode`] with the error class kept, so a caller can
+    /// switch backends on [`VaapiH264Error::Unsupported`]. Pictures
+    /// finished before an error stay queued for the next call.
+    ///
+    /// # Errors
+    ///
+    /// [`VaapiH264Error::Unsupported`] when the stream needs a feature
+    /// this backend lacks, [`VaapiH264Error::Failed`] otherwise.
+    pub fn decode_packet(&mut self, frame: EncodedFrame) -> WorkerResult<Option<CapturedFrame>> {
+        self.frames(Cmd::Decode(frame))?;
+        Ok(self.ready.pop_front())
     }
 }
 
@@ -112,23 +173,27 @@ impl VideoDecoder for VaapiH264Decoder {
     fn configure(&mut self, config: &DecoderConfig) -> Result<()> {
         match self.send(Cmd::Configure(config.clone()))? {
             Reply::Configured => Ok(()),
-            Reply::Frames(Err(e)) => Err(FerricastError::Decode(e)),
-            Reply::Frames(Ok(_)) => Err(FerricastError::Decode(
+            Reply::Frames { .. } => Err(FerricastError::Decode(
                 "VA-API worker returned an unexpected reply".into(),
             )),
         }
     }
 
     fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
-        let frames = self.frames(Cmd::Decode(frame))?;
-        self.ready.extend(frames);
-        Ok(self.ready.pop_front())
+        Ok(self.decode_packet(frame)?)
     }
 
     fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
-        let frames = self.frames(Cmd::Flush)?;
-        self.ready.extend(frames);
-        Ok(self.ready.drain(..).collect())
+        let flushed = self.frames(Cmd::Flush);
+        let frames: Vec<CapturedFrame> = self.ready.drain(..).collect();
+        match flushed {
+            Err(error) if frames.is_empty() => Err(error.into()),
+            Err(error) => {
+                tracing::warn!(%error, "VA-API H.264 flush failed part-way; returning what was read back");
+                Ok(frames)
+            }
+            Ok(()) => Ok(frames),
+        }
     }
 }
 
@@ -169,7 +234,7 @@ fn run_worker(
     let mut worker = Worker {
         display,
         config,
-        nv12: false,
+        format: PixelFormat::Nv12,
         low_latency: false,
         parser: H264Context::default(),
         sps: HashMap::new(),
@@ -179,12 +244,20 @@ fn run_worker(
     while let Ok(cmd) = cmd_rx.recv() {
         let reply = match cmd {
             Cmd::Configure(config) => {
-                worker.nv12 = config.pixel_format == PixelFormat::Nv12;
+                worker.format = config.pixel_format;
                 worker.low_latency = config.low_latency;
                 Reply::Configured
             }
-            Cmd::Decode(frame) => Reply::Frames(worker.decode(frame).map_err(|e| e.to_string())),
-            Cmd::Flush => Reply::Frames(worker.flush().map_err(|e| e.to_string())),
+            Cmd::Decode(frame) => {
+                let mut frames = Vec::new();
+                let result = worker.decode(&frame, &mut frames);
+                Reply::from_partial(frames, result)
+            }
+            Cmd::Flush => {
+                let mut frames = Vec::new();
+                let result = worker.flush(&mut frames);
+                Reply::from_partial(frames, result)
+            }
             Cmd::Shutdown => break,
         };
         if reply_tx.send(reply).is_err() {
@@ -193,10 +266,28 @@ fn run_worker(
     }
 }
 
+impl Reply {
+    fn from_partial(frames: Vec<CapturedFrame>, result: WorkerResult<()>) -> Self {
+        if let Err(error) = &result
+            && !frames.is_empty()
+        {
+            tracing::warn!(
+                %error,
+                kept = frames.len(),
+                "VA-API H.264 failed part-way through a packet; keeping the pictures already finished"
+            );
+        }
+        Reply::Frames {
+            frames,
+            error: result.err(),
+        }
+    }
+}
+
 struct Worker {
     display: Rc<Display>,
     config: Config,
-    nv12: bool,
+    format: PixelFormat,
     low_latency: bool,
     parser: H264Context,
     sps: HashMap<u32, Sps>,
@@ -205,9 +296,9 @@ struct Worker {
 }
 
 impl Worker {
-    fn decode(&mut self, frame: EncodedFrame) -> Result<Vec<CapturedFrame>> {
+    /// Pictures finished before an error are left in `out`.
+    fn decode(&mut self, frame: &EncodedFrame, out: &mut Vec<CapturedFrame>) -> WorkerResult<()> {
         let nals = split_annex_b(&frame.data);
-        let mut out = Vec::new();
         let mut picture: Vec<&[u8]> = Vec::new();
         for nal in nals {
             let Some(&header) = nal.first() else {
@@ -215,7 +306,7 @@ impl Worker {
             };
             match header & 0x1f {
                 7 | 8 => {
-                    out.extend(self.picture(&picture, frame.timestamp_us)?);
+                    self.picture(&picture, frame.timestamp_us, out)?;
                     picture.clear();
                     if header & 0x1f == 7 {
                         self.add_sps(nal)?;
@@ -225,7 +316,7 @@ impl Worker {
                 }
                 1 | 5 => {
                     if first_mb_in_slice(nal)? == 0 && !picture.is_empty() {
-                        out.extend(self.picture(&picture, frame.timestamp_us)?);
+                        self.picture(&picture, frame.timestamp_us, out)?;
                         picture.clear();
                     }
                     picture.push(nal);
@@ -233,8 +324,7 @@ impl Worker {
                 _ => {}
             }
         }
-        out.extend(self.picture(&picture, frame.timestamp_us)?);
-        Ok(out)
+        self.picture(&picture, frame.timestamp_us, out)
     }
 
     fn add_sps(&mut self, nal: &[u8]) -> Result<()> {
@@ -261,9 +351,14 @@ impl Worker {
         Ok(())
     }
 
-    fn picture(&mut self, nals: &[&[u8]], timestamp_us: u64) -> Result<Vec<CapturedFrame>> {
+    fn picture(
+        &mut self,
+        nals: &[&[u8]],
+        timestamp_us: u64,
+        out: &mut Vec<CapturedFrame>,
+    ) -> WorkerResult<()> {
         let Some(first) = nals.first() else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let rbsp = decode_nal(first)
             .map_err(|e| FerricastError::Decode(format!("VA-API: slice unescape: {e}")))?;
@@ -278,10 +373,10 @@ impl Worker {
             .ok_or_else(|| FerricastError::Decode("VA-API: PPS names a missing SPS".into()))?
             .clone();
         sps.check_supported(&pps)?;
+        sps.check_valid()?;
         let header = slice::parse(&rbsp, first[0], &sps, &pps)?;
-        let mut out = Vec::new();
         if self.active.as_ref().is_none_or(|active| active.sps != sps) {
-            out.extend(self.flush()?);
+            self.flush(out)?;
             self.active = Some(Active::new(
                 &self.display,
                 &self.config,
@@ -290,22 +385,22 @@ impl Worker {
             )?);
         }
         let Some(active) = self.active.as_mut() else {
-            return Ok(out);
+            return Ok(());
         };
         if !header.idr
             && header.slice_type.is_inter()
             && active.dpb.reference_frames().next().is_none()
         {
-            return Ok(out);
+            return Ok(());
         }
-        out.extend(active.decode(nals, &sps, &pps, timestamp_us, self.nv12)?);
-        Ok(out)
+        active.decode(nals, &sps, &pps, timestamp_us, self.format, out)?;
+        Ok(())
     }
 
-    fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
+    fn flush(&mut self, out: &mut Vec<CapturedFrame>) -> WorkerResult<()> {
         match self.active.as_mut() {
-            Some(active) => active.flush(self.nv12),
-            None => Ok(Vec::new()),
+            Some(active) => Ok(active.flush(self.format, out)?),
+            None => Ok(()),
         }
     }
 }
@@ -362,30 +457,39 @@ impl Active {
         })
     }
 
-    fn flush(&mut self, nv12: bool) -> Result<Vec<CapturedFrame>> {
-        let mut out = Vec::new();
+    fn flush(&mut self, format: PixelFormat, out: &mut Vec<CapturedFrame>) -> Result<()> {
         let released = self.dpb.flush();
-        self.release(released, &mut out, nv12)?;
-        Ok(out)
+        self.release(released, out, format)
     }
 
+    /// Returns surfaces to the pool before reading anything back, and
+    /// keeps reading past a failed picture, so one bad readback neither
+    /// leaks handles nor drops the pictures after it. The first error is
+    /// reported once everything has been released.
     fn release(
         &mut self,
         released: Released,
         out: &mut Vec<CapturedFrame>,
-        nv12: bool,
+        format: PixelFormat,
     ) -> Result<()> {
-        for output in released.output {
-            out.push(self.read(output.handle, output.timestamp_us, nv12)?);
-        }
         self.free.extend(released.free);
-        Ok(())
+        let mut first_error = None;
+        for output in released.output {
+            match self.read(output.handle, output.timestamp_us, format) {
+                Ok(frame) => out.push(frame),
+                Err(error) => {
+                    tracing::warn!(%error, handle = output.handle, "VA-API readback failed");
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
-    fn take_surface(&mut self, out: &mut Vec<CapturedFrame>, nv12: bool) -> Result<usize> {
+    fn take_surface(&mut self, out: &mut Vec<CapturedFrame>, format: PixelFormat) -> Result<usize> {
         if self.free.is_empty() {
             let released = self.dpb.make_room();
-            self.release(released, out, nv12)?;
+            self.release(released, out, format)?;
         }
         self.free
             .pop()
@@ -398,8 +502,9 @@ impl Active {
         sps: &Sps,
         pps: &Pps,
         timestamp_us: u64,
-        nv12: bool,
-    ) -> Result<Vec<CapturedFrame>> {
+        format: PixelFormat,
+        out: &mut Vec<CapturedFrame>,
+    ) -> Result<()> {
         let mut slices = Vec::with_capacity(nals.len());
         for nal in nals {
             let rbsp = decode_nal(nal)
@@ -407,7 +512,10 @@ impl Active {
             let header = slice::parse(&rbsp, nal[0], sps, pps)?;
             slices.push((*nal, header));
         }
-        let first = slices[0].1.clone();
+        let Some((_, first)) = slices.first() else {
+            return Ok(());
+        };
+        let first = first.clone();
         if slices
             .iter()
             .any(|(_, header)| header.pps_id != first.pps_id)
@@ -416,14 +524,36 @@ impl Active {
                 "VA-API: slices of one picture use different PPS".into(),
             ));
         }
-        let (current, released) = self.dpb.start(&first);
-        let mut out = Vec::new();
-        self.release(released, &mut out, nv12)?;
-        let handle = self.take_surface(&mut out, nv12)?;
-        let surface = Rc::clone(&self.surfaces[handle]);
+        let Some((current, released)) = self.dpb.start(&first) else {
+            return Ok(());
+        };
+        self.release(released, out, format)?;
+        let handle = self.take_surface(out, format)?;
+        if let Err(error) = self.submit(handle, &slices, sps, pps, &current, timestamp_us) {
+            // The picture never reached the DPB, so nothing else will
+            // hand its surface back.
+            self.free.push(handle);
+            return Err(error);
+        }
+        let finished = self.dpb.finish(current, &first, handle, timestamp_us);
+        self.release(finished, out, format)
+    }
 
+    fn submit(
+        &self,
+        handle: usize,
+        slices: &[(&[u8], SliceHeader)],
+        sps: &Sps,
+        pps: &Pps,
+        current: &super::dpb::Current,
+        timestamp_us: u64,
+    ) -> Result<()> {
+        let Some((_, first)) = slices.first() else {
+            return Ok(());
+        };
+        let surface = Rc::clone(&self.surfaces[handle]);
         let mut picture = Picture::new(timestamp_us, Rc::clone(&self.ctx), Rc::clone(&surface));
-        let pic_param = self.pic_param(sps, pps, &first, &current, surface.id());
+        let pic_param = self.pic_param(sps, pps, first, current, surface.id());
         self.add(
             &mut picture,
             BufferType::PictureParameter(PictureParameter::H264(pic_param)),
@@ -435,8 +565,8 @@ impl Active {
                 [[16; 64]; 2],
             ))),
         )?;
-        for (nal, header) in &slices {
-            let lists = self.dpb.ref_lists(header, &current);
+        for (nal, header) in slices {
+            let lists = self.dpb.ref_lists(header, current);
             let param = self.slice_param(nal, header, &lists);
             self.add(
                 &mut picture,
@@ -454,10 +584,7 @@ impl Active {
         ended
             .sync::<()>()
             .map_err(|(e, _)| FerricastError::Decode(format!("vaSyncSurface: {e:?}")))?;
-
-        let finished = self.dpb.finish(current, &first, handle, timestamp_us);
-        self.release(finished, &mut out, nv12)?;
-        Ok(out)
+        Ok(())
     }
 
     fn add(
@@ -474,17 +601,14 @@ impl Active {
     }
 
     fn va_picture(&self, frame: &DpbFrame) -> PictureH264 {
+        let Some(surface) = frame.handle.and_then(|handle| self.surfaces.get(handle)) else {
+            return invalid_picture();
+        };
         let (index, flags) = match frame.long_term_idx {
             Some(idx) => (idx, VA_PICTURE_H264_LONG_TERM_REFERENCE),
             None => (frame.frame_num, VA_PICTURE_H264_SHORT_TERM_REFERENCE),
         };
-        PictureH264::new(
-            self.surfaces[frame.handle].id(),
-            index,
-            flags,
-            frame.top_poc,
-            frame.bottom_poc,
-        )
+        PictureH264::new(surface.id(), index, flags, frame.top_poc, frame.bottom_poc)
     }
 
     fn pic_param(
@@ -495,17 +619,16 @@ impl Active {
         current: &super::dpb::Current,
         surface_id: u32,
     ) -> PictureParameterBufferH264 {
-        let invalid = || PictureH264::new(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0);
         let mut references: Vec<PictureH264> = self
             .dpb
             .reference_frames()
             .take(16)
             .map(|frame| self.va_picture(frame))
             .collect();
-        references.resize_with(16, invalid);
+        references.resize_with(16, invalid_picture);
         let references: [PictureH264; 16] = references
             .try_into()
-            .unwrap_or_else(|_| std::array::from_fn(|_| invalid()));
+            .unwrap_or_else(|_| std::array::from_fn(|_| invalid_picture()));
         let (log2_max_pic_order_cnt_lsb_minus4, poc_type, delta_pic_order_always_zero) =
             match &sps.poc {
                 PocKind::Lsb { log2_max_lsb } => (log2_max_lsb - 4, 0, 0),
@@ -572,14 +695,15 @@ impl Active {
         header: &SliceHeader,
         lists: &[Vec<Option<usize>>; 2],
     ) -> SliceParameterBufferH264 {
-        let invalid = || PictureH264::new(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0);
         let list = |entries: &[Option<usize>]| -> [PictureH264; 32] {
             std::array::from_fn(|index| {
                 entries
                     .get(index)
                     .copied()
                     .flatten()
-                    .map_or_else(invalid, |frame| self.va_picture(self.dpb.frame(frame)))
+                    .map_or_else(invalid_picture, |frame| {
+                        self.va_picture(self.dpb.frame(frame))
+                    })
             })
         };
         let weights = header.weights.clone().unwrap_or_default();
@@ -704,6 +828,13 @@ impl Active {
                 }
             }
         }
+        let Some(copy) = copy else {
+            // Nothing worked yet; probe again on the next picture rather
+            // than locking in a method that just failed.
+            return Err(FerricastError::Decode(
+                "VA-API: no way to read a picture back".into(),
+            ));
+        };
         let chosen = if best[1] < best[0] {
             Readback::Get
         } else {
@@ -716,40 +847,43 @@ impl Active {
             ?chosen,
             "VA-API readback chosen"
         );
-        copy.ok_or_else(|| FerricastError::Decode("VA-API: no way to read a picture back".into()))
+        Ok(copy)
     }
 
-    fn read(&self, handle: usize, timestamp_us: u64, as_nv12: bool) -> Result<CapturedFrame> {
+    fn read(&self, handle: usize, timestamp_us: u64, format: PixelFormat) -> Result<CapturedFrame> {
         let (data, stride) = match self.readback.get() {
             Readback::Unknown => self.pick_readback(handle)?,
             how => self.copy_out(handle, how)?,
         };
         let (_, _, width, height) = self.sps.visible_rect();
-        let (width, height) = (width as usize, height as usize);
-        let (data, stride, format) = if as_nv12 {
-            (data, stride, PixelFormat::Nv12)
-        } else {
-            let bgra = nv12::to_bgra(&data, stride, width, height)
-                .ok_or_else(|| FerricastError::Decode("VA-API: NV12 to BGRA failed".into()))?;
-            (bgra.into(), width * 4, PixelFormat::Bgra)
-        };
-        Ok(CapturedFrame::Cpu(RawFrame {
-            width: width as u32,
-            height: height as u32,
-            stride: stride as u32,
-            format,
-            data,
-            timestamp_us,
-        }))
+        let size = (width as usize, height as usize);
+        let colour = nv12::Colour::signalled(
+            self.sps.matrix_coefficients.map(u32::from),
+            self.sps.full_range,
+            size.1,
+        );
+        nv12::deliver(data, stride, size, timestamp_us, format, colour)
+            .map(CapturedFrame::Cpu)
+            .ok_or_else(|| FerricastError::Decode("VA-API: NV12 conversion failed".into()))
     }
 }
 
+fn invalid_picture() -> PictureH264 {
+    PictureH264::new(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0)
+}
+
+/// Stream-controlled sizes saturate here; [`Sps::check_valid`] then
+/// rejects whatever ended up out of range.
 fn convert_sps(sps: &SeqParameterSet, rbsp: &[u8]) -> Sps {
     let frame_mbs_only = matches!(sps.frame_mbs_flags, FrameMbsFlags::Frames);
     let restrictions = sps
         .vui_parameters
         .as_ref()
         .and_then(|vui| vui.bitstream_restrictions.as_ref());
+    let signal = sps
+        .vui_parameters
+        .as_ref()
+        .and_then(|vui| vui.video_signal_type.as_ref());
     Sps {
         profile_idc: u8::from(sps.profile_idc),
         level_idc: sps.level_idc,
@@ -762,8 +896,8 @@ fn convert_sps(sps: &SeqParameterSet, rbsp: &[u8]) -> Sps {
             ChromaFormat::Invalid(value) => value as u8,
         },
         separate_colour_plane: sps.chroma_info.separate_colour_plane_flag,
-        bit_depth_luma: sps.chroma_info.bit_depth_luma_minus8 + 8,
-        bit_depth_chroma: sps.chroma_info.bit_depth_chroma_minus8 + 8,
+        bit_depth_luma: sps.chroma_info.bit_depth_luma_minus8.saturating_add(8),
+        bit_depth_chroma: sps.chroma_info.bit_depth_chroma_minus8.saturating_add(8),
         log2_max_frame_num: u32::from(sps.log2_max_frame_num_minus4) + 4,
         poc: match &sps.pic_order_cnt {
             PicOrderCntType::TypeZero {
@@ -785,9 +919,13 @@ fn convert_sps(sps: &SeqParameterSet, rbsp: &[u8]) -> Sps {
             PicOrderCntType::TypeTwo => PocKind::FrameNum,
         },
         max_num_ref_frames: sps.max_num_ref_frames,
+        gaps_allowed: sps.gaps_in_frame_num_value_allowed_flag,
         frame_mbs_only,
-        width_mbs: sps.pic_width_in_mbs_minus1 + 1,
-        height_mbs: (sps.pic_height_in_map_units_minus1 + 1) * if frame_mbs_only { 1 } else { 2 },
+        width_mbs: sps.pic_width_in_mbs_minus1.saturating_add(1),
+        height_mbs: sps
+            .pic_height_in_map_units_minus1
+            .saturating_add(1)
+            .saturating_mul(if frame_mbs_only { 1 } else { 2 }),
         direct_8x8_inference: sps.direct_8x8_inference_flag,
         crop: sps.frame_cropping.as_ref().map_or((0, 0, 0, 0), |crop| {
             (
@@ -800,6 +938,10 @@ fn convert_sps(sps: &SeqParameterSet, rbsp: &[u8]) -> Sps {
         num_reorder_frames: restrictions.map(|r| r.max_num_reorder_frames),
         max_dec_frame_buffering: restrictions.map(|r| r.max_dec_frame_buffering),
         scaling_matrix_present: slice::sps_has_scaling_matrix(rbsp),
+        matrix_coefficients: signal
+            .and_then(|signal| signal.colour_description.as_ref())
+            .map(|description| description.matrix_coefficients),
+        full_range: signal.is_some_and(|signal| signal.video_full_range_flag),
     }
 }
 
@@ -836,7 +978,7 @@ fn first_mb_in_slice(nal: &[u8]) -> Result<u32> {
     slice::BitReader::new(&rbsp).read_ue()
 }
 
-fn split_annex_b(buf: &[u8]) -> Vec<&[u8]> {
+pub(super) fn split_annex_b(buf: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut start = None;
     let mut index = 0;
@@ -945,10 +1087,11 @@ mod tests {
             let pps = &ppss[&slice::peek_pps_id(&rbsp).unwrap()];
             let sps = &spss[&pps.sps_id];
             sps.check_supported(pps).unwrap();
+            sps.check_valid().unwrap();
             simulation.reference_limit = sps.max_num_ref_frames as usize;
             let dpb = dpb.get_or_insert_with(|| Dpb::new(sps, false));
             let header = slice::parse(&rbsp, first[0], sps, pps).unwrap();
-            let (current, released) = dpb.start(&header);
+            let (current, released) = dpb.start(&header).expect("fixture has no frame_num gaps");
             take(released, &mut simulation.output_order, &mut free);
             if free.is_empty() {
                 take(dpb.make_room(), &mut simulation.output_order, &mut free);

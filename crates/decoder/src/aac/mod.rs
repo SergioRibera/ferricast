@@ -6,31 +6,161 @@
 //! and symphonia's perf is fine — a single AAC stream is well
 //! under 1% of a modern core.
 //!
-//! Input format: ADTS-framed AAC packets as they come out of an
-//! MPEG-TS demuxer or HLS segmenter. Each [`AudioFrame`] carries
-//! exactly one ADTS frame in [`AudioFrame::data`]; the decoder
-//! parses the ADTS header to discover sample rate / channel
-//! configuration if it wasn't supplied at `configure` time.
+//! Input format: either ADTS-framed AAC as it comes out of an MPEG-TS
+//! demuxer or HLS segmenter (one PES payload may hold several ADTS
+//! frames back to back), or bare `raw_data_block()`s as carried by
+//! RTP / MP4. Symphonia's decoder only accepts raw blocks, so ADTS
+//! headers are parsed and stripped here, and a header that disagrees
+//! with the configured sample rate / channels reconfigures the decoder.
 //!
-//! Output format: interleaved signed-16-bit little-endian PCM, the
-//! format every Linux audio sink (PipeWire, ALSA, PulseAudio)
-//! accepts without further conversion.
+//! Output format: interleaved signed-16-bit PCM, the format every
+//! Linux audio sink (PipeWire, ALSA, PulseAudio) accepts without
+//! further conversion.
+
+mod adts;
+
+use std::collections::VecDeque;
 
 use ferricast_core::{
     AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame, DecodedAudio, FerricastError, Result,
 };
 use symphonia::core::{
-    audio::{AudioBufferRef, Signal},
+    audio::{AudioBufferRef, Channels, Signal},
     codecs::{CODEC_TYPE_AAC, CodecParameters, Decoder as SymphoniaDecoder, DecoderOptions},
     formats::Packet,
 };
 use symphonia::default::codecs::AacDecoder as SymphoniaAacDecoder;
 
-#[derive(Default)]
-pub struct AacDecoder {
-    inner: Option<SymphoniaAacDecoder>,
+const MICROS_PER_SECOND: u64 = 1_000_000;
+
+/// Sample rate and channel count one decoder instance is built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Shape {
     sample_rate: u32,
     channels: u16,
+}
+
+impl Shape {
+    /// The configured shape, or `None` when the stream metadata left it
+    /// unknown (zero rate or channels) and the first ADTS header decides.
+    fn from_config(config: &AudioDecoderConfig) -> Result<Option<Self>> {
+        if config.sample_rate == 0 || config.channels == 0 {
+            return Ok(None);
+        }
+        let shape = Self {
+            sample_rate: config.sample_rate,
+            channels: config.channels,
+        };
+        shape.channel_mask()?;
+        Ok(Some(shape))
+    }
+
+    fn channel_mask(self) -> Result<Channels> {
+        match self.channels {
+            1 => Ok(Channels::FRONT_LEFT),
+            2 => Ok(Channels::FRONT_LEFT | Channels::FRONT_RIGHT),
+            other => Err(FerricastError::Decode(format!(
+                "AAC with {other} channels is unsupported (symphonia decodes mono and stereo AAC-LC)"
+            ))),
+        }
+    }
+
+    /// Without an AudioSpecificConfig symphonia takes the shape from the
+    /// codec parameters, and refuses to build when channels are missing.
+    fn decoder(self) -> Result<SymphoniaAacDecoder> {
+        let mut params = CodecParameters::new();
+        params
+            .for_codec(CODEC_TYPE_AAC)
+            .with_sample_rate(self.sample_rate)
+            .with_channels(self.channel_mask()?);
+        SymphoniaAacDecoder::try_new(&params, &DecoderOptions::default())
+            .map_err(|e| FerricastError::Decode(format!("symphonia AAC init: {e}")))
+    }
+
+    fn micros(self, samples: u64) -> u64 {
+        samples * MICROS_PER_SECOND / u64::from(self.sample_rate)
+    }
+}
+
+struct Active {
+    decoder: SymphoniaAacDecoder,
+    shape: Shape,
+}
+
+#[derive(Default)]
+pub struct AacDecoder {
+    configured: bool,
+    active: Option<Active>,
+    /// Decoded runs not yet handed out: a payload whose frames change
+    /// shape mid-way yields one run per shape, but `decode` returns one.
+    pending: VecDeque<DecodedAudio>,
+}
+
+impl AacDecoder {
+    fn decoder_for(&mut self, shape: Option<Shape>) -> Result<&mut Active> {
+        if let Some(wanted) = shape
+            && self
+                .active
+                .as_ref()
+                .is_none_or(|active| active.shape != wanted)
+        {
+            if let Some(active) = &self.active {
+                tracing::info!(
+                    from = ?active.shape,
+                    to = ?wanted,
+                    "AAC stream shape differs from the configured one; reconfiguring"
+                );
+            }
+            self.active = Some(Active {
+                decoder: wanted.decoder()?,
+                shape: wanted,
+            });
+        }
+        self.active.as_mut().ok_or_else(|| {
+            FerricastError::Decode(
+                "AAC: raw (non-ADTS) input with no sample rate / channels configured".into(),
+            )
+        })
+    }
+
+    /// Decodes every access unit of one payload into `runs`, one run per
+    /// stretch of identically shaped frames. Each frame after the first
+    /// is stamped `n` samples after the payload's timestamp.
+    fn decode_units(&mut self, frame: &AudioFrame, runs: &mut Vec<DecodedAudio>) -> Result<()> {
+        let mut base_us = frame.timestamp_us;
+        let mut samples = 0u64;
+        let mut run_shape: Option<Shape> = None;
+        for unit in adts::units(&frame.data) {
+            let unit = unit.map_err(|e| FerricastError::Decode(format!("AAC: {e}")))?;
+            let active = self.decoder_for(unit.shape)?;
+            let shape = active.shape;
+            if let Some(previous) = run_shape
+                && previous != shape
+            {
+                base_us += previous.micros(samples);
+                samples = 0;
+            }
+            let packet = Packet::new_from_slice(0, 0, 0, unit.payload);
+            let buf = active
+                .decoder
+                .decode(&packet)
+                .map_err(|e| FerricastError::Decode(format!("symphonia AAC decode: {e}")))?;
+            let decoded = buf.frames() as u64;
+            let pcm = interleave_s16(buf);
+            match runs.last_mut() {
+                Some(run) if run_shape == Some(shape) => run.pcm.extend(pcm),
+                _ => runs.push(DecodedAudio {
+                    pcm,
+                    sample_rate: shape.sample_rate,
+                    channels: shape.channels,
+                    timestamp_us: base_us,
+                }),
+            }
+            samples += decoded;
+            run_shape = Some(shape);
+        }
+        Ok(())
+    }
 }
 
 impl AudioDecoder for AacDecoder {
@@ -43,60 +173,37 @@ impl AudioDecoder for AacDecoder {
                 config.codec
             )));
         }
-        // Symphonia's AAC decoder discovers sample rate / channels
-        // from the ADTS header in the first packet — the
-        // CodecParameters we supply here are advisory. We still
-        // pass them through so the decoder reports the expected
-        // shape in its returned `Spec` immediately, which keeps the
-        // first push to the sink from re-allocating its ring buffer
-        // when the bitstream confirms what we already knew.
-        let mut params = CodecParameters::new();
-        params.for_codec(CODEC_TYPE_AAC);
-        params.with_sample_rate(config.sample_rate);
-
-        let inner = SymphoniaAacDecoder::try_new(&params, &DecoderOptions::default())
-            .map_err(|e| FerricastError::Decode(format!("symphonia AAC init: {e}")))?;
-        self.inner = Some(inner);
-        self.sample_rate = config.sample_rate;
-        self.channels = config.channels;
+        self.active = match Shape::from_config(config)? {
+            Some(shape) => Some(Active {
+                decoder: shape.decoder()?,
+                shape,
+            }),
+            None => None,
+        };
+        self.pending.clear();
+        self.configured = true;
         Ok(())
     }
 
     fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
-        let decoder = self.inner.as_mut().ok_or_else(|| {
-            FerricastError::Decode("AacDecoder::decode before configure()".into())
-        })?;
-
-        let ts = frame.timestamp_us;
-        let packet = Packet::new_from_slice(0, ts, 0, &frame.data);
-        let buf = decoder
-            .decode(&packet)
-            .map_err(|e| FerricastError::Decode(format!("symphonia AAC decode: {e}")))?;
-
-        // The decoder's first successful decode is when the bitstream
-        // confirms its real sample rate / channel layout; refresh
-        // our cached values so they're correct on the returned
-        // DecodedAudio (the configure hint can be wrong if the
-        // upstream sniffed the stream differently than we did).
-        let spec = *buf.spec();
-        self.sample_rate = spec.rate;
-        self.channels = spec.channels.count() as u16;
-
-        let pcm = interleave_s16(buf);
-
-        Ok(Some(DecodedAudio {
-            pcm,
-            sample_rate: self.sample_rate,
-            channels: self.channels,
-            timestamp_us: ts,
-        }))
+        if !self.configured {
+            return Err(FerricastError::Decode(
+                "AacDecoder::decode before configure()".into(),
+            ));
+        }
+        let mut runs = Vec::new();
+        let decoded = self.decode_units(&frame, &mut runs);
+        // Frames decoded before a bad one in the same payload are still
+        // good audio; queue them before reporting the failure.
+        self.pending.extend(runs);
+        decoded?;
+        Ok(self.pending.pop_front())
     }
 
     fn flush(&mut self) -> Result<Vec<DecodedAudio>> {
-        // Symphonia decoders don't buffer across packets — every
-        // input frame produces exactly one decoded buffer (or an
-        // error). Nothing to drain at end-of-stream.
-        Ok(Vec::new())
+        // Symphonia decoders don't buffer across packets; only runs split
+        // off by a mid-payload shape change can still be waiting.
+        Ok(self.pending.drain(..).collect())
     }
 }
 
@@ -146,4 +253,112 @@ fn interleave_s16(buf: AudioBufferRef<'_>) -> Vec<i16> {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::adts::tests::frame;
+    use super::*;
+
+    /// A silent mono `raw_data_block()`: one SCE with max_sfb = 0, then END.
+    const SILENT_MONO: [u8; 4] = [0x00, 0xC8, 0x00, 0x07];
+    const RATE_48K: u8 = 3;
+    const RATE_44K1: u8 = 4;
+
+    fn config(sample_rate: u32, channels: u16) -> AudioDecoderConfig {
+        AudioDecoderConfig {
+            codec: AudioCodec::Aac,
+            sample_rate,
+            channels,
+        }
+    }
+
+    fn packet(data: Vec<u8>, timestamp_us: u64) -> AudioFrame {
+        AudioFrame {
+            codec: AudioCodec::Aac,
+            data: Bytes::from(data),
+            timestamp_us,
+            sample_rate: 48_000,
+            channels: 1,
+        }
+    }
+
+    #[test]
+    fn configure_succeeds_for_mono_and_stereo_and_with_unknown_shape() {
+        for (rate, channels) in [(48_000, 1), (44_100, 2), (0, 0)] {
+            AacDecoder::default()
+                .configure(&config(rate, channels))
+                .unwrap();
+        }
+        assert!(AacDecoder::default().configure(&config(48_000, 6)).is_err());
+    }
+
+    #[test]
+    fn every_adts_frame_of_a_payload_is_decoded_into_one_run() {
+        let mut decoder = AacDecoder::default();
+        decoder.configure(&config(48_000, 1)).unwrap();
+        let mut data = frame(RATE_48K, 1, false, &SILENT_MONO);
+        data.extend(frame(RATE_48K, 1, true, &SILENT_MONO));
+        let audio = decoder.decode(packet(data, 5_000)).unwrap().unwrap();
+        assert_eq!(audio.pcm.len(), 2048);
+        assert_eq!((audio.sample_rate, audio.channels), (48_000, 1));
+        assert_eq!(audio.timestamp_us, 5_000);
+        assert!(decoder.flush().unwrap().is_empty());
+    }
+
+    #[test]
+    fn raw_blocks_decode_with_the_configured_shape() {
+        let mut decoder = AacDecoder::default();
+        decoder.configure(&config(48_000, 1)).unwrap();
+        let audio = decoder
+            .decode(packet(SILENT_MONO.to_vec(), 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(audio.pcm.len(), 1024);
+    }
+
+    #[test]
+    fn raw_blocks_without_a_known_shape_are_refused() {
+        let mut decoder = AacDecoder::default();
+        decoder.configure(&config(0, 0)).unwrap();
+        assert!(decoder.decode(packet(SILENT_MONO.to_vec(), 0)).is_err());
+    }
+
+    #[test]
+    fn an_adts_header_that_disagrees_with_the_config_reconfigures() {
+        let mut decoder = AacDecoder::default();
+        decoder.configure(&config(48_000, 2)).unwrap();
+        let audio = decoder
+            .decode(packet(frame(RATE_44K1, 1, false, &SILENT_MONO), 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!((audio.sample_rate, audio.channels), (44_100, 1));
+    }
+
+    #[test]
+    fn a_shape_change_inside_a_payload_starts_a_new_run_at_the_right_time() {
+        let mut decoder = AacDecoder::default();
+        decoder.configure(&config(48_000, 1)).unwrap();
+        let mut data = frame(RATE_48K, 1, false, &SILENT_MONO);
+        data.extend(frame(RATE_44K1, 1, false, &SILENT_MONO));
+        let first = decoder.decode(packet(data, 1_000_000)).unwrap().unwrap();
+        assert_eq!((first.sample_rate, first.timestamp_us), (48_000, 1_000_000));
+        let rest = decoder.flush().unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(
+            (rest[0].sample_rate, rest[0].timestamp_us),
+            (44_100, 1_021_333)
+        );
+    }
+
+    #[test]
+    fn decode_before_configure_is_an_error() {
+        assert!(
+            AacDecoder::default()
+                .decode(packet(SILENT_MONO.to_vec(), 0))
+                .is_err()
+        );
+    }
 }

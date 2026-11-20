@@ -1,14 +1,14 @@
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, PixelFormat, RawFrame,
-    Result, VideoDecoder,
+    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
 };
 use vp8_decoder::DecodeError;
 
-use crate::nv12::{self, Planar};
+use crate::nv12::{self, Colour, OutputFormat, Planar};
 
 #[derive(Default)]
 pub struct Vp8Decoder {
     decoder: Option<vp8_decoder::Decoder>,
+    format: OutputFormat,
 }
 
 impl VideoDecoder for Vp8Decoder {
@@ -22,6 +22,7 @@ impl VideoDecoder for Vp8Decoder {
             )));
         }
         self.decoder = Some(vp8_decoder::Decoder::new());
+        self.format = OutputFormat(config.pixel_format);
         Ok(())
     }
 
@@ -34,24 +35,33 @@ impl VideoDecoder for Vp8Decoder {
             Ok(None) | Err(DecodeError::NeedKeyframe) => return Ok(None),
             Err(e) => return Err(FerricastError::Decode(format!("vp8 decode: {e}"))),
         };
+        let short = || FerricastError::Decode("vp8 returned short planes".into());
+        let (width, height) = (picture.width as usize, picture.height as usize);
         let (data, stride) = nv12::from_i420(&Planar {
-            width: picture.width as usize,
-            height: picture.height as usize,
+            width,
+            height,
             y: picture.y,
             y_stride: picture.y_stride,
             u: picture.u,
             v: picture.v,
             uv_stride: picture.uv_stride,
         })
-        .ok_or_else(|| FerricastError::Decode("vp8 returned short planes".into()))?;
-        Ok(Some(CapturedFrame::Cpu(RawFrame {
-            width: picture.width,
-            height: picture.height,
-            stride: stride as u32,
-            format: PixelFormat::Nv12,
+        .ok_or_else(short)?;
+        // VP8 is always BT.601 (RFC 6386 §9.2).
+        let colour = Colour {
+            matrix: nv12::Matrix::Bt601,
+            full_range: false,
+        };
+        nv12::deliver(
             data,
-            timestamp_us: frame.timestamp_us,
-        })))
+            stride,
+            (width, height),
+            frame.timestamp_us,
+            self.format.0,
+            colour,
+        )
+        .map(|raw| Some(CapturedFrame::Cpu(raw)))
+        .ok_or_else(short)
     }
 
     fn flush(&mut self) -> Result<Vec<CapturedFrame>> {

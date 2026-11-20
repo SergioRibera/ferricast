@@ -1,17 +1,20 @@
 use std::collections::VecDeque;
 
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, PixelFormat, RawFrame,
-    Result, VideoDecoder,
+    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
 };
-use rusty_vp9::DecodedFrame;
+use rusty_vp9::{DecodedFrame, Error as Vp9Error};
 
-use crate::nv12::{self, Planar};
+use crate::nv12::{self, Colour, OutputFormat, Planar};
+
+/// A VP9 superframe index holds at most eight frames (Annex B.3).
+const SUPERFRAME_MAX_FRAMES: usize = 8;
 
 #[derive(Default)]
 pub struct Vp9Decoder {
     decoder: Option<rusty_vp9::Vp9Decoder>,
     ready: VecDeque<CapturedFrame>,
+    format: OutputFormat,
 }
 
 impl VideoDecoder for Vp9Decoder {
@@ -26,6 +29,7 @@ impl VideoDecoder for Vp9Decoder {
         }
         self.decoder = Some(rusty_vp9::Vp9Decoder::new());
         self.ready.clear();
+        self.format = OutputFormat(config.pixel_format);
         Ok(())
     }
 
@@ -36,8 +40,16 @@ impl VideoDecoder for Vp9Decoder {
         decoder
             .push(&frame.data, Some(frame.timestamp_us as i64))
             .map_err(|e| FerricastError::Decode(format!("vp9 decode: {e:?}")))?;
-        while let Ok(decoded) = decoder.next_frame() {
-            self.ready.push_back(picture(&decoded)?);
+        // `Again` means "hidden frame decoded" as well as "queue empty",
+        // and the two cannot be told apart, so every frame one superframe
+        // can carry gets a turn; an empty queue answers instantly.
+        for _ in 0..=SUPERFRAME_MAX_FRAMES {
+            match decoder.next_frame() {
+                Ok(decoded) => self.ready.push_back(picture(&decoded, self.format)?),
+                Err(Vp9Error::Again) => {}
+                Err(Vp9Error::Eof) => break,
+                Err(e) => return Err(FerricastError::Decode(format!("vp9 decode: {e:?}"))),
+            }
         }
         Ok(self.ready.pop_front())
     }
@@ -45,15 +57,22 @@ impl VideoDecoder for Vp9Decoder {
     fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
         if let Some(decoder) = self.decoder.as_mut() {
             decoder.flush();
-            while let Ok(decoded) = decoder.next_frame() {
-                self.ready.push_back(picture(&decoded)?);
+            // Every call consumes one queued frame, so this ends at `Eof`
+            // even when some frames fail.
+            loop {
+                match decoder.next_frame() {
+                    Ok(decoded) => self.ready.push_back(picture(&decoded, self.format)?),
+                    Err(Vp9Error::Again) => {}
+                    Err(Vp9Error::Eof) => break,
+                    Err(e) => tracing::warn!(error = ?e, "vp9 frame failed while flushing"),
+                }
             }
         }
         Ok(self.ready.drain(..).collect())
     }
 }
 
-fn picture(decoded: &DecodedFrame) -> Result<CapturedFrame> {
+fn picture(decoded: &DecodedFrame, format: OutputFormat) -> Result<CapturedFrame> {
     let short = || FerricastError::Decode("vp9 returned short planes".into());
     if (decoded.subsampling_x, decoded.subsampling_y) != (1, 1) {
         return Err(FerricastError::Decode(format!(
@@ -102,12 +121,15 @@ fn picture(decoded: &DecodedFrame) -> Result<CapturedFrame> {
         }
     }
     .ok_or_else(short)?;
-    Ok(CapturedFrame::Cpu(RawFrame {
-        width: decoded.width,
-        height: decoded.height,
-        stride: stride as u32,
-        format: PixelFormat::Nv12,
+    // rusty_vp9 does not expose the header's color_space.
+    nv12::deliver(
         data,
-        timestamp_us: decoded.pts.map_or(0, |pts| pts as u64),
-    }))
+        stride,
+        (width, height),
+        decoded.pts.map_or(0, |pts| pts as u64),
+        format.0,
+        Colour::guess(height),
+    )
+    .map(CapturedFrame::Cpu)
+    .ok_or_else(short)
 }

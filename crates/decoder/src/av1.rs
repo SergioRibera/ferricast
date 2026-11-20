@@ -3,8 +3,7 @@ use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, PixelFormat, RawFrame,
-    Result, VideoDecoder,
+    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
 };
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
@@ -14,14 +13,16 @@ use rav1d::src::lib::{
     dav1d_open, dav1d_picture_unref, dav1d_send_data,
 };
 
-use crate::nv12::{self, Planar};
+use crate::nv12::{self, Colour, OutputFormat, Planar};
 
 const I420: u32 = 1;
+const MAX_FRAME_PIXELS: u32 = 8192 * 8192;
 
 #[derive(Default)]
 pub struct Av1Decoder {
     context: Option<Dav1dContext>,
     ready: VecDeque<CapturedFrame>,
+    format: OutputFormat,
 }
 
 // SAFETY: the context is an Arc-backed rav1d decoder that is only ever used through
@@ -39,6 +40,7 @@ impl VideoDecoder for Av1Decoder {
             )));
         }
         self.close();
+        self.format = OutputFormat(config.pixel_format);
         let mut settings = MaybeUninit::<Dav1dSettings>::uninit();
         // SAFETY: `settings` is valid for writes and dav1d_default_settings initialises all of it.
         let mut settings = unsafe {
@@ -47,6 +49,9 @@ impl VideoDecoder for Av1Decoder {
         };
         settings.n_threads = 1;
         settings.max_frame_delay = 1;
+        // A corrupt or hostile sequence header can claim 65536x65536;
+        // refuse anything past 8K-square before rav1d allocates for it.
+        settings.frame_size_limit = MAX_FRAME_PIXELS;
         let mut context = None;
         // SAFETY: both pointers come from live references and `context` is only read back once
         // dav1d_open has reported success.
@@ -130,7 +135,7 @@ impl Av1Decoder {
                     got.0
                 )));
             }
-            let frame = nv12_frame(&picture);
+            let frame = nv12_frame(&picture, self.format);
             // SAFETY: `picture` was filled by dav1d_get_picture and is unreferenced exactly once.
             unsafe { dav1d_picture_unref(Some(NonNull::from(&mut picture))) };
             self.ready.push_back(frame?);
@@ -155,7 +160,7 @@ impl Drop for Av1Decoder {
     }
 }
 
-fn nv12_frame(picture: &Dav1dPicture) -> Result<CapturedFrame> {
+fn nv12_frame(picture: &Dav1dPicture, format: OutputFormat) -> Result<CapturedFrame> {
     let short = || FerricastError::Decode("rav1d returned short planes".into());
     if picture.p.layout != I420 {
         return Err(FerricastError::Decode(format!(
@@ -212,12 +217,23 @@ fn nv12_frame(picture: &Dav1dPicture) -> Result<CapturedFrame> {
         }
     }
     .ok_or_else(short)?;
-    Ok(CapturedFrame::Cpu(RawFrame {
-        width: width as u32,
-        height: height as u32,
-        stride: stride as u32,
-        format: PixelFormat::Nv12,
+    let colour = match picture.seq_hdr {
+        Some(header) => {
+            // SAFETY: a picture returned by dav1d_get_picture holds a reference on its sequence
+            // header, and the caller unreferences the picture only after this function returns.
+            let header = unsafe { header.as_ref() };
+            Colour::signalled(Some(header.mtrx), header.color_range != 0, height)
+        }
+        None => Colour::guess(height),
+    };
+    nv12::deliver(
         data,
-        timestamp_us: picture.m.timestamp as u64,
-    }))
+        stride,
+        (width, height),
+        picture.m.timestamp as u64,
+        format.0,
+        colour,
+    )
+    .map(CapturedFrame::Cpu)
+    .ok_or_else(short)
 }

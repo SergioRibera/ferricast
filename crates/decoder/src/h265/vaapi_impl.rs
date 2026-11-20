@@ -323,7 +323,7 @@ fn open_render_node() -> Option<Rc<Display>> {
 
 fn profile_has_vld(display: &Display, profile: VAProfile::Type) -> bool {
     match display.query_config_entrypoints(profile) {
-        Ok(eps) => eps.iter().any(|e| *e == VAEntrypoint::VAEntrypointVLD),
+        Ok(eps) => eps.contains(&VAEntrypoint::VAEntrypointVLD),
         Err(_) => false,
     }
 }
