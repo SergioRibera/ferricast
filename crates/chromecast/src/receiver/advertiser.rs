@@ -51,11 +51,8 @@ impl ChromecastReceiverAdvertiser {
 impl Advertiser for ChromecastReceiverAdvertiser {
     const PROTOCOL: &'static str = "chromecast";
 
-    fn start(
-        &mut self,
-        info: AdvertiseInfo,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
+    async fn start(&mut self, info: AdvertiseInfo) -> Result<()> {
+        {
             let daemon = ServiceDaemon::new()
                 .map_err(|e| FerricastError::Receiver(format!("mDNS daemon: {e}")))?;
 
@@ -98,13 +95,14 @@ impl Advertiser for ChromecastReceiverAdvertiser {
             // 3-byte "rs=") differently from `key` (2-byte "rs")
             // and prefer the key-only form for empty values. We
             // emit `key` only.
-            let mut props: Vec<(String, String)> = Vec::new();
-            props.push(("id".into(), info.device_id.clone()));
-            props.push(("fn".into(), info.friendly_name.clone()));
-            props.push(("md".into(), "Chromecast Ultra".into()));
-            props.push(("ca".into(), "5".into()));
-            props.push(("ic".into(), "/setup/icon.png".into()));
-            props.push(("ve".into(), "05".into()));
+            let mut props: Vec<(String, String)> = vec![
+                ("id".into(), info.device_id.clone()),
+                ("fn".into(), info.friendly_name.clone()),
+                ("md".into(), "Chromecast Ultra".into()),
+                ("ca".into(), "5".into()),
+                ("ic".into(), "/setup/icon.png".into()),
+                ("ve".into(), "05".into()),
+            ];
             // Also emit the keys real Chromecast firmware advertises
             // alongside the basic set. Some Cast Discovery
             // implementations on Android refuse to mark a service
@@ -191,8 +189,8 @@ impl Advertiser for ChromecastReceiverAdvertiser {
         }
     }
 
-    fn stop(&mut self) -> impl std::future::Future<Output = Result<()>> + Send {
-        async move {
+    async fn stop(&mut self) -> Result<()> {
+        {
             if let (Some(daemon), Some(fullname)) = (self.daemon.take(), self.fullname.take()) {
                 let _ = daemon.unregister(&fullname);
                 let _ = daemon.shutdown();

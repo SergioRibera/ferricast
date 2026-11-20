@@ -41,10 +41,10 @@ pub fn detect_advertise_ips() -> Vec<IpAddr> {
         }
     }
 
-    if let Some(ip) = detect_default_route_ipv4() {
-        if !ips.contains(&ip) {
-            ips.push(ip);
-        }
+    if let Some(ip) = detect_default_route_ipv4()
+        && !ips.contains(&ip)
+    {
+        ips.push(ip);
     }
 
     // Loopback gets appended last as a fallback — strict TLS clients

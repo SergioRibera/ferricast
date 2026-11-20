@@ -15,31 +15,30 @@
 //!    the playlist + segments and demuxes them into
 //!    [`ferricast_core::MediaPacket`]s.
 //!
-//! Device-auth caveat: modern Cast senders (YouTube, Spotify) issue
-//! a `deviceauth` challenge before LOADing and refuse to talk to a
-//! receiver that can't sign with a Google Cast CA cert. Ferricast
-//! advertises and accepts the wire correctly but can't satisfy
-//! that signature (no third-party software can — the certs are
-//! issued only to licensed manufacturers). So:
-//!
-//! - Senders that bypass auth in dev mode: works.
-//! - VLC, BubbleUPnP receivers, casttube, Stream2Chromecast: works.
-//! - YouTube official: connects but won't LOAD.
-//! - Spotify official: same.
-//!
-//! Tracking the YouTube-TV-Android emulation path as future work.
+//! Device-auth caveat: Chrome and the Android / iOS Cast SDKs send a
+//! `deviceauth` challenge right after connecting and only continue
+//! when it is signed by a device certificate chaining to Google's
+//! Cast root CA. Those certificates are issued to licensed hardware
+//! only, so this receiver answers with an auth error and those
+//! senders drop it. Senders that skip device authentication drive it
+//! fine: ferricast's own Chromecast sender, pychromecast-based tools
+//! (catt, mkchromecast), go-chromecast, and anything else that speaks
+//! plain CASTV2 to the Default Media Receiver (`CC1AD845`).
 
 mod advertiser;
 mod control;
 mod tls;
 mod util;
 
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use ferricast_core::{
-    AdvertiseInfo, Codec, DeviceCapabilities, H264Profile, H265Profile, ReceiverProtocol, Result,
+    AdvertiseInfo, Codec, DeviceCapabilities, FerricastError, H264Profile, H265Profile,
+    ReceiverProtocol, Result,
 };
 use ferricast_hls::HlsPuller;
+use tokio::net::{TcpListener, TcpSocket};
 use uuid::Uuid;
 
 pub use advertiser::ChromecastReceiverAdvertiser;
@@ -58,6 +57,55 @@ struct Inner {
     port: u16,
     device_id: String,
     friendly_name: String,
+    /// The bound TLS listener, shared by every live control. Held
+    /// weakly so the port is released once all controls are gone
+    /// (receivers stopped) and re-bound by the next `create_control`.
+    listener: Mutex<Weak<TcpListener>>,
+    /// TLS config and volume, created on first use.
+    shared: Mutex<Weak<Shared>>,
+}
+
+/// Receiver volume (Cast `volume` object).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Volume {
+    pub(crate) level: f64,
+    pub(crate) muted: bool,
+}
+
+impl Default for Volume {
+    fn default() -> Self {
+        Self {
+            level: 1.0,
+            muted: false,
+        }
+    }
+}
+
+/// State shared by every control of one receiver: one TLS identity
+/// and one volume, whichever sender is asking.
+pub(crate) struct Shared {
+    tls_config: Arc<rustls::server::ServerConfig>,
+    volume: Mutex<Volume>,
+}
+
+impl Shared {
+    pub(crate) fn volume(&self) -> Volume {
+        *self.volume.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn set_volume_level(&self, level: f64) {
+        self.volume
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .level = level;
+    }
+
+    pub(crate) fn set_muted(&self, muted: bool) {
+        self.volume
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .muted = muted;
+    }
 }
 
 impl ChromecastReceiver {
@@ -71,8 +119,70 @@ impl ChromecastReceiver {
                 port,
                 device_id: Uuid::new_v4().simple().to_string(),
                 friendly_name: friendly_name.into(),
+                listener: Mutex::new(Weak::new()),
+                shared: Mutex::new(Weak::new()),
             }),
         }
+    }
+
+    /// The TLS listener, bound on first use and shared until every
+    /// control holding it is dropped.
+    fn listener(&self) -> Result<Arc<TcpListener>> {
+        let mut slot = self
+            .inner
+            .listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(listener) = slot.upgrade() {
+            return Ok(listener);
+        }
+        // Binding needs a runtime with I/O enabled; fail instead of
+        // panicking when called outside one.
+        tokio::runtime::Handle::try_current().map_err(|e| {
+            FerricastError::Receiver(format!("receiver control needs a tokio runtime: {e}"))
+        })?;
+        let addr = SocketAddr::from(([0, 0, 0, 0], self.inner.port));
+        let bind = || -> std::io::Result<TcpListener> {
+            let socket = TcpSocket::new_v4()?;
+            // Rebinding right after a restart must not fail on
+            // connections lingering in TIME_WAIT.
+            socket.set_reuseaddr(true)?;
+            socket.bind(addr)?;
+            socket.listen(128)
+        };
+        let listener = Arc::new(
+            bind().map_err(|e| FerricastError::Receiver(format!("bind tcp {addr}: {e}")))?,
+        );
+        tracing::info!(
+            addr = %listener.local_addr().unwrap_or(addr),
+            "Chromecast receiver TLS listener up"
+        );
+        *slot = Arc::downgrade(&listener);
+        Ok(listener)
+    }
+
+    fn shared(&self) -> Result<Arc<Shared>> {
+        let mut slot = self
+            .inner
+            .shared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(shared) = slot.upgrade() {
+            return Ok(shared);
+        }
+        // The TLS cert SANs must include every host the sender will
+        // resolve us as. Most senders dial the IP they got from mDNS
+        // directly (`192.168.x.x`), so the crucial SAN is the
+        // LAN-facing IPv4. Without it, strict-validating TLS clients
+        // (VLC mobile's GnuTLS in particular) abort the handshake.
+        // `FERRICAST_CAST_INTERFACE` pins the IP like the advertiser.
+        let ips = util::detect_advertise_ips();
+        let shared = Arc::new(Shared {
+            tls_config: tls::build_server_config(&ips)?,
+            volume: Mutex::new(Volume::default()),
+        });
+        *slot = Arc::downgrade(&shared);
+        Ok(shared)
     }
 }
 
@@ -94,20 +204,13 @@ impl ReceiverProtocol for ChromecastReceiver {
         ChromecastReceiverAdvertiser::new()
     }
 
+    /// Binds the shared listener on first use, so a port conflict
+    /// surfaces here, before anything is advertised.
     fn create_control(&self) -> Result<Self::Control> {
-        // The TLS cert SANs must include every host the sender will
-        // resolve us as. Most senders dial the IP they got from mDNS
-        // directly (`192.168.x.x`), so the *crucial* SAN is the
-        // LAN-facing IPv4. Without it, strict-validating TLS clients
-        // (VLC mobile's GnuTLS in particular) abort the handshake
-        // with a generic "Interrupted system call" error before any
-        // Cast traffic flows.
-        //
-        // The same detection logic the mDNS advertiser uses runs
-        // here; if the user pinned a specific NIC via
-        // `FERRICAST_CAST_INTERFACE`, we honour the pinned IP.
-        let ips = util::detect_advertise_ips();
-        ChromecastReceiverControl::new(self.inner.port, ips)
+        Ok(ChromecastReceiverControl::new(
+            self.listener()?,
+            self.shared()?,
+        ))
     }
 
     fn create_puller(&self) -> Result<Self::Puller> {
