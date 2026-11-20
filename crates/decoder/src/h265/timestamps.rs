@@ -1,4 +1,9 @@
-//! Presentation timestamps for the software HEVC decoder.
+//! Presentation timestamps for HEVC pictures.
+//!
+//! [`Headers`] reads what every HEVC backend needs to put a time on a
+//! picture: the parameter sets and the first slice segment of each
+//! picture, which say whether the picture is shown, which coded video
+//! sequence it belongs to, its POC LSBs and whether a decoder skips it.
 //!
 //! rust_h265 releases pictures in display order but carries no
 //! timestamps, only each picture's POC. Every packet's pictures are noted
@@ -15,22 +20,43 @@ use rust_h265::{NalUnit, NalUnitType};
 
 /// Pictures noted at most. A stream whose pictures never come out cannot
 /// grow the list without bound; the earliest are forgotten first.
+#[cfg(feature = "hevc-decode")]
 const MAX_PENDING: usize = 64;
 /// `sps_max_sub_layers_minus1` ceiling (H.265 7.4.3.2.1).
 const MAX_SUB_LAYERS_MINUS1: u8 = 6;
 /// `log2_max_pic_order_cnt_lsb` ceiling (H.265 7.4.3.2.1).
 const MAX_LOG2_POC_LSB: u32 = 16;
 
+/// Parameter sets and sequence state read from the bitstream.
 #[derive(Default)]
-pub(super) struct Timestamps {
+pub struct Headers {
     sps: HashMap<u32, Sps>,
     pps: HashMap<u32, Pps>,
-    pending: Vec<Pending>,
     /// Coded video sequences started so far; POCs restart with each.
     sequence: u32,
     /// An end-of-sequence NAL unit came last, so a CRA starts a new
     /// sequence.
     after_sequence_end: bool,
+    /// An IRAP picture came already: decoding can start.
+    after_irap: bool,
+    /// The latest IRAP picture has `NoRaslOutputFlag` set, so the RASL
+    /// pictures that follow it are skipped (H.265 8.1.3).
+    skipping_rasl: bool,
+}
+
+/// A picture whose first slice segment says it is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Picture {
+    pub(crate) sequence: u32,
+    /// `None` when the slice header could not be read: its parameter sets
+    /// were never seen.
+    pub(crate) poc_lsb: Option<PocLsb>,
+    /// A conforming decoder never outputs it: it precedes the first IRAP
+    /// picture, or is a RASL picture of an IRAP that starts decoding.
+    pub(crate) skipped: bool,
+    /// `sps_max_num_reorder_pics` of the highest sub-layer, when the SPS
+    /// could be read that far.
+    pub(crate) max_num_reorder: Option<u32>,
 }
 
 /// What a slice header needs from the SPS.
@@ -38,6 +64,7 @@ pub(super) struct Timestamps {
 struct Sps {
     log2_max_poc_lsb: u32,
     separate_colour_plane: bool,
+    max_num_reorder: Option<u32>,
 }
 
 /// What a slice header needs from the PPS.
@@ -48,24 +75,15 @@ struct Pps {
     num_extra_slice_header_bits: u8,
 }
 
-/// A picture decoded from a packet and not released yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Pending {
-    sequence: u32,
-    /// `None` when the slice header could not be read: its parameter sets
-    /// were never seen.
-    poc_lsb: Option<PocLsb>,
-    timestamp_us: u64,
-}
-
 /// `slice_pic_order_cnt_lsb` and the power of two it wraps at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PocLsb {
+pub(crate) struct PocLsb {
     value: u32,
     log2_max: u32,
 }
 
 impl PocLsb {
+    #[cfg(feature = "hevc-decode")]
     fn matches(self, poc: i32) -> bool {
         i64::from(poc).rem_euclid(1 << self.log2_max) == i64::from(self.value)
     }
@@ -75,12 +93,17 @@ impl PocLsb {
 enum Output {
     /// `pic_output_flag` is 0: the picture is decoded but never shown.
     Hidden,
-    Shown(PocLsb),
+    Shown {
+        poc_lsb: PocLsb,
+        max_num_reorder: Option<u32>,
+    },
 }
 
-impl Timestamps {
-    /// Notes the parameter sets and the pictures in one packet.
-    pub(super) fn observe(&mut self, nals: &[NalUnit<'_>], timestamp_us: u64) {
+impl Headers {
+    /// Notes the parameter sets in one packet and returns the pictures
+    /// it starts that are meant to be shown.
+    pub(crate) fn pictures(&mut self, nals: &[NalUnit<'_>]) -> Vec<Picture> {
+        let mut pictures = Vec::new();
         // Enhancement layers are not decoded.
         for nal in nals.iter().filter(|nal| nal.nuh_layer_id == 0) {
             match nal.nal_unit_type {
@@ -95,45 +118,21 @@ impl Timestamps {
                     }
                 }
                 NalUnitType::Eos => self.after_sequence_end = true,
-                kind if kind.is_vcl() => self.slice(kind, &nal.rbsp, timestamp_us),
+                kind if kind.is_vcl() => pictures.extend(self.slice(kind, &nal.rbsp)),
                 _ => {}
             }
         }
+        pictures
     }
 
-    /// The timestamp of the picture with `poc` the decoder just released.
-    ///
-    /// Pictures come out in display order, so a pending picture of the
-    /// same sequence with an earlier timestamp, or of an earlier sequence,
-    /// can never come out after it: the decoder dropped them.
-    pub(super) fn claim(&mut self, poc: i32) -> Option<u64> {
-        let candidates = || self.pending.iter().enumerate();
-        let earliest = |(_, pending): &(usize, &Pending)| (pending.sequence, pending.timestamp_us);
-        let (index, _) = candidates()
-            .filter(|(_, pending)| pending.poc_lsb.is_some_and(|lsb| lsb.matches(poc)))
-            .min_by_key(earliest)
-            .or_else(|| {
-                candidates()
-                    .filter(|(_, pending)| pending.poc_lsb.is_none())
-                    .min_by_key(earliest)
-            })?;
-        let claimed = self.pending.swap_remove(index);
-        self.pending.retain(|pending| {
-            pending.sequence > claimed.sequence
-                || pending.sequence == claimed.sequence
-                    && pending.timestamp_us >= claimed.timestamp_us
-        });
-        Some(claimed.timestamp_us)
-    }
-
-    fn slice(&mut self, kind: NalUnitType, rbsp: &[u8], timestamp_us: u64) {
+    fn slice(&mut self, kind: NalUnitType, rbsp: &[u8]) -> Option<Picture> {
         let mut bits = BitReader::new(rbsp);
         // Only the first slice segment of a picture starts one.
         if !bits
             .read_bool("first_slice_segment_in_pic_flag")
             .unwrap_or(false)
         {
-            return;
+            return None;
         }
         let starts_sequence = matches!(
             kind,
@@ -146,26 +145,29 @@ impl Timestamps {
         if starts_sequence || self.sequence == 0 {
             self.sequence += 1;
         }
-        self.after_sequence_end = false;
-        let poc_lsb = match self.first_slice(kind, &mut bits) {
-            Ok(Output::Hidden) => return,
-            Ok(Output::Shown(lsb)) => Some(lsb),
-            Err(_) => None,
-        };
-        if self.pending.len() >= MAX_PENDING
-            && let Some((index, _)) = self
-                .pending
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, pending)| (pending.sequence, pending.timestamp_us))
-        {
-            self.pending.swap_remove(index);
+        if kind.is_irap() {
+            // IDR and BLA always discard their RASL pictures; a CRA does
+            // when decoding starts at it (H.265 8.1.3).
+            self.skipping_rasl = starts_sequence || !self.after_irap;
+            self.after_irap = true;
         }
-        self.pending.push(Pending {
+        self.after_sequence_end = false;
+        let skipped = !self.after_irap
+            || self.skipping_rasl && matches!(kind, NalUnitType::RaslN | NalUnitType::RaslR);
+        let (poc_lsb, max_num_reorder) = match self.first_slice(kind, &mut bits) {
+            Ok(Output::Hidden) => return None,
+            Ok(Output::Shown {
+                poc_lsb,
+                max_num_reorder,
+            }) => (Some(poc_lsb), max_num_reorder),
+            Err(_) => (None, None),
+        };
+        Some(Picture {
             sequence: self.sequence,
             poc_lsb,
-            timestamp_us,
-        });
+            skipped,
+            max_num_reorder,
+        })
     }
 
     /// Reads a first slice segment header up to `slice_pic_order_cnt_lsb`
@@ -194,15 +196,90 @@ impl Timestamps {
         } else {
             bits.read_u32(sps.log2_max_poc_lsb, "slice_pic_order_cnt_lsb")?
         };
-        Ok(Output::Shown(PocLsb {
-            value,
-            log2_max: sps.log2_max_poc_lsb,
-        }))
+        Ok(Output::Shown {
+            poc_lsb: PocLsb {
+                value,
+                log2_max: sps.log2_max_poc_lsb,
+            },
+            max_num_reorder: sps.max_num_reorder,
+        })
+    }
+}
+
+/// Timestamps for a decoder that reports each released picture's POC.
+#[cfg(feature = "hevc-decode")]
+#[derive(Default)]
+pub(super) struct Timestamps {
+    headers: Headers,
+    pending: Vec<Pending>,
+}
+
+/// A picture decoded from a packet and not released yet.
+#[cfg(feature = "hevc-decode")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pending {
+    sequence: u32,
+    /// `None` when the slice header could not be read.
+    poc_lsb: Option<PocLsb>,
+    timestamp_us: u64,
+}
+
+#[cfg(feature = "hevc-decode")]
+impl Timestamps {
+    /// Notes the parameter sets and the pictures in one packet.
+    pub(super) fn observe(&mut self, nals: &[NalUnit<'_>], timestamp_us: u64) {
+        for picture in self.headers.pictures(nals) {
+            self.note(picture, timestamp_us);
+        }
+    }
+
+    /// The timestamp of the picture with `poc` the decoder just released.
+    ///
+    /// Pictures come out in display order, so a pending picture of the
+    /// same sequence with an earlier timestamp, or of an earlier sequence,
+    /// can never come out after it: the decoder dropped them.
+    pub(super) fn claim(&mut self, poc: i32) -> Option<u64> {
+        let candidates = || self.pending.iter().enumerate();
+        let earliest = |(_, pending): &(usize, &Pending)| (pending.sequence, pending.timestamp_us);
+        let (index, _) = candidates()
+            .filter(|(_, pending)| pending.poc_lsb.is_some_and(|lsb| lsb.matches(poc)))
+            .min_by_key(earliest)
+            .or_else(|| {
+                candidates()
+                    .filter(|(_, pending)| pending.poc_lsb.is_none())
+                    .min_by_key(earliest)
+            })?;
+        let claimed = self.pending.swap_remove(index);
+        self.pending.retain(|pending| {
+            pending.sequence > claimed.sequence
+                || pending.sequence == claimed.sequence
+                    && pending.timestamp_us >= claimed.timestamp_us
+        });
+        Some(claimed.timestamp_us)
+    }
+
+    /// Skipped pictures are noted too: the POC match forgets them once a
+    /// later picture comes out.
+    fn note(&mut self, picture: Picture, timestamp_us: u64) {
+        if self.pending.len() >= MAX_PENDING
+            && let Some((index, _)) = self
+                .pending
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, pending)| (pending.sequence, pending.timestamp_us))
+        {
+            self.pending.swap_remove(index);
+        }
+        self.pending.push(Pending {
+            sequence: picture.sequence,
+            poc_lsb: picture.poc_lsb,
+            timestamp_us,
+        });
     }
 }
 
 impl Sps {
-    /// Reads an SPS up to `log2_max_pic_order_cnt_lsb_minus4`
+    /// Reads an SPS up to `sps_max_num_reorder_pics`
     /// (H.265 7.3.2.2.1), returning its id.
     fn parse(rbsp: &[u8]) -> Result<(u32, Self), Unreadable> {
         let mut bits = BitReader::new(rbsp);
@@ -229,13 +306,37 @@ impl Sps {
         if log2_max_poc_lsb > MAX_LOG2_POC_LSB {
             return Err(Unreadable::OutOfRange);
         }
+        // Only the timestamp bookkeeping of NVDEC wants it; a truncated
+        // SPS still serves the slice headers.
+        let max_num_reorder = Self::max_num_reorder(&mut bits, max_sub_layers_minus1).ok();
         Ok((
             id,
             Self {
                 log2_max_poc_lsb,
                 separate_colour_plane,
+                max_num_reorder,
             },
         ))
+    }
+
+    /// `sps_max_num_reorder_pics` of the highest sub-layer, the last one
+    /// the sub-layer ordering info lists.
+    fn max_num_reorder(
+        bits: &mut impl BitRead,
+        max_sub_layers_minus1: u8,
+    ) -> Result<u32, Unreadable> {
+        let listed = if bits.read_bool("sps_sub_layer_ordering_info_present_flag")? {
+            0..=max_sub_layers_minus1
+        } else {
+            max_sub_layers_minus1..=max_sub_layers_minus1
+        };
+        let mut max_num_reorder = 0;
+        for _ in listed {
+            bits.read_ue("sps_max_dec_pic_buffering_minus1")?;
+            max_num_reorder = bits.read_ue("sps_max_num_reorder_pics")?;
+            bits.read_ue("sps_max_latency_increase_plus1")?;
+        }
+        Ok(max_num_reorder)
     }
 }
 
@@ -308,7 +409,7 @@ fn skip(bits: &mut impl BitRead, mut count: u32) -> Result<(), BitReaderError> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "hevc-decode"))]
 mod tests {
     use super::*;
 
@@ -402,13 +503,71 @@ mod tests {
         let packet = demuxer.next_frame().unwrap().unwrap();
         let mut timestamps = Timestamps::default();
         timestamps.observe(&rust_h265::parse_annex_b(&packet.data), 7);
-        assert!(!timestamps.sps.is_empty());
-        assert!(!timestamps.pps.is_empty());
+        assert!(!timestamps.headers.sps.is_empty());
+        assert!(!timestamps.headers.pps.is_empty());
+        assert!(
+            timestamps
+                .headers
+                .sps
+                .values()
+                .all(|sps| sps.max_num_reorder.is_some())
+        );
         assert_eq!(timestamps.pending.len(), 1);
         assert_eq!(
             timestamps.pending[0].poc_lsb.map(|lsb| lsb.value),
             Some(0),
             "an IDR starts at POC 0"
+        );
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    const TRAIL_R: u8 = 1;
+    const RASL_N: u8 = 8;
+    const IDR_W_RADL: u8 = 19;
+    const CRA: u8 = 21;
+    const EOS: u8 = 36;
+
+    /// One Annex B NAL unit; a slice starts its picture and carries no
+    /// readable header past that, as if its parameter sets were lost.
+    fn nal(kind: u8) -> Vec<u8> {
+        vec![0, 0, 1, kind << 1, 1, 0x80]
+    }
+
+    /// `(sequence, skipped)` of each picture, one packet per NAL type.
+    fn pictures(kinds: &[u8]) -> Vec<(u32, bool)> {
+        let mut headers = Headers::default();
+        kinds
+            .iter()
+            .flat_map(|&kind| headers.pictures(&rust_h265::parse_annex_b(&nal(kind))))
+            .map(|picture| (picture.sequence, picture.skipped))
+            .collect()
+    }
+
+    #[test]
+    fn pictures_before_the_first_irap_are_skipped() {
+        assert_eq!(
+            pictures(&[TRAIL_R, TRAIL_R, IDR_W_RADL, TRAIL_R]),
+            [(1, true), (1, true), (2, false), (2, false)]
+        );
+    }
+
+    #[test]
+    fn rasl_pictures_are_skipped_only_when_decoding_starts_at_their_cra() {
+        assert_eq!(
+            pictures(&[CRA, RASL_N, TRAIL_R, CRA, RASL_N]),
+            [(1, false), (1, true), (1, false), (1, false), (1, false)]
+        );
+    }
+
+    #[test]
+    fn a_cra_after_an_end_of_sequence_starts_a_sequence_and_skips_its_rasl() {
+        assert_eq!(
+            pictures(&[IDR_W_RADL, TRAIL_R, EOS, CRA, RASL_N, TRAIL_R]),
+            [(1, false), (1, false), (2, false), (2, true), (2, false)]
         );
     }
 }

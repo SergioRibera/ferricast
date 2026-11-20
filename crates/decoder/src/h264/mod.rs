@@ -282,7 +282,7 @@ impl ParameterSets {
     const START_CODE: [u8; 4] = [0, 0, 0, 1];
 
     fn remember(&mut self, packet: &[u8]) {
-        for nal in vaapi_impl::split_annex_b(packet) {
+        for nal in split_annex_b(packet) {
             match nal.first().map(|header| header & 0x1f) {
                 Some(7) => self.sps = Some(Bytes::copy_from_slice(nal)),
                 Some(8) => self.pps = Some(Bytes::copy_from_slice(nal)),
@@ -327,5 +327,52 @@ mod tests {
     fn a_packet_is_untouched_when_no_parameter_sets_were_seen() {
         let packet = Bytes::from_static(&[0, 0, 1, 0x65, 1]);
         assert_eq!(ParameterSets::default().prepend(&packet), packet);
+    }
+}
+
+/// The NAL units of an Annex B buffer, start codes stripped.
+#[cfg(any(feature = "nvdec-decode", feature = "vaapi-decode"))]
+pub(crate) fn split_annex_b(buf: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut start = None;
+    let mut index = 0;
+    while index + 3 <= buf.len() {
+        if buf[index] == 0 && buf[index + 1] == 0 && buf[index + 2] == 1 {
+            if let Some(begin) = start {
+                let end = if index > begin && buf[index - 1] == 0 {
+                    index - 1
+                } else {
+                    index
+                };
+                out.push(&buf[begin..end]);
+            }
+            index += 3;
+            start = Some(index);
+            continue;
+        }
+        index += 1;
+    }
+    if let Some(begin) = start {
+        out.push(&buf[begin..]);
+    }
+    out
+}
+
+#[cfg(all(test, any(feature = "nvdec-decode", feature = "vaapi-decode")))]
+mod annex_b_tests {
+    use super::split_annex_b;
+
+    #[test]
+    fn annex_b_units_are_split_at_three_and_four_byte_start_codes() {
+        let stream = [
+            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 4,
+        ];
+        let units = split_annex_b(&stream);
+        assert_eq!(units, [&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 4][..]]);
+    }
+
+    #[test]
+    fn a_stream_without_start_codes_has_no_units() {
+        assert!(split_annex_b(&[1, 2, 3, 4]).is_empty());
     }
 }

@@ -13,9 +13,14 @@
 //! that need BGRA pay the conversion cost on their side — sinks that
 //! upload directly to a GPU texture (eframe / wgpu) can consume NV12
 //! through a fragment-shader colour conversion at zero CPU cost.
+//!
+//! The binding drops CUVID timestamps, so each picture's is worked out
+//! from the slice headers instead (see the `timestamps` module).
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+mod h264;
+mod timestamps;
+
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 
 use bytes::Bytes;
@@ -27,7 +32,9 @@ use shiguredo_nvcodec::{
 };
 use tracing::{debug, info};
 
+use self::sealed::Headers as _;
 use crate::nv12::{self, Colour, OutputFormat};
+use timestamps::{Picture, Timestamps};
 
 /// Sealed marker pinning a [`NvdecDecoder`] to one bitstream codec.
 pub trait NvdecCodec: sealed::Sealed + Send + 'static {
@@ -41,12 +48,24 @@ pub trait NvdecCodec: sealed::Sealed + Send + 'static {
 }
 
 mod sealed {
-    pub trait Sealed {}
+    use super::Picture;
+
+    pub trait Sealed {
+        /// Reads what timing the pictures needs from the bitstream.
+        type Headers: Headers;
+    }
+
+    pub trait Headers: Default {
+        /// The pictures in one packet that NVDEC is expected to show.
+        fn shown(&mut self, packet: &[u8]) -> Vec<Picture>;
+    }
 }
 
 /// H.264 marker.
 pub struct H264;
-impl sealed::Sealed for H264 {}
+impl sealed::Sealed for H264 {
+    type Headers = h264::Headers;
+}
 impl NvdecCodec for H264 {
     const FERRICAST_CODEC: Codec = Codec::H264;
     const NV_CODEC: DecoderCodec = DecoderCodec::H264;
@@ -57,12 +76,34 @@ impl NvdecCodec for H264 {
 #[cfg(feature = "nvdec-hevc-decode")]
 pub struct Hevc;
 #[cfg(feature = "nvdec-hevc-decode")]
-impl sealed::Sealed for Hevc {}
+impl sealed::Sealed for Hevc {
+    type Headers = crate::h265::timestamps::Headers;
+}
 #[cfg(feature = "nvdec-hevc-decode")]
 impl NvdecCodec for Hevc {
     const FERRICAST_CODEC: Codec = Codec::H265;
     const NV_CODEC: DecoderCodec = DecoderCodec::Hevc;
     const NAME: &'static str = "HEVC";
+}
+
+impl sealed::Headers for h264::Headers {
+    fn shown(&mut self, packet: &[u8]) -> Vec<Picture> {
+        self.picture(packet).into_iter().collect()
+    }
+}
+
+#[cfg(feature = "nvdec-hevc-decode")]
+impl sealed::Headers for crate::h265::timestamps::Headers {
+    fn shown(&mut self, packet: &[u8]) -> Vec<Picture> {
+        self.pictures(&rust_h265::parse_annex_b(packet))
+            .into_iter()
+            .filter(|picture| !picture.skipped)
+            .map(|picture| Picture {
+                sequence: picture.sequence,
+                max_waiting: picture.max_num_reorder,
+            })
+            .collect()
+    }
 }
 
 /// Codec-generic NVDEC decoder.
@@ -71,6 +112,7 @@ pub struct NvdecDecoder<C: NvdecCodec> {
     /// One packet can release several pictures (a B-frame run ending);
     /// they wait here so none is dropped.
     ready: VecDeque<CapturedFrame>,
+    headers: C::Headers,
     timestamps: Timestamps,
     format: OutputFormat,
     _codec: PhantomData<C>,
@@ -81,48 +123,11 @@ impl<C: NvdecCodec> Default for NvdecDecoder<C> {
         Self {
             decoder: None,
             ready: VecDeque::new(),
+            headers: C::Headers::default(),
             timestamps: Timestamps::default(),
             format: OutputFormat::default(),
             _codec: PhantomData,
         }
-    }
-}
-
-/// Input timestamps waiting for their pictures. `shiguredo_nvcodec`
-/// does not carry timestamps through the parser, and pictures leave in
-/// display order, so each one takes the smallest timestamp still pending:
-/// that is a FIFO for streams without reordering and the right answer
-/// for B-frames.
-#[derive(Default)]
-struct Timestamps {
-    pending: BinaryHeap<Reverse<u64>>,
-    last: u64,
-}
-
-impl Timestamps {
-    /// Assumes one picture per packet (access-unit packetisation, which
-    /// every ferricast source delivers); the cap bounds the heap when a
-    /// stream breaks that and pictures never claim their entries.
-    const CAPACITY: usize = 32;
-
-    fn push(&mut self, timestamp_us: u64) {
-        self.pending.push(Reverse(timestamp_us));
-        if self.pending.len() > Self::CAPACITY {
-            self.pending.pop();
-        }
-    }
-
-    /// Falls back to the previous picture's timestamp once the inputs
-    /// run out, which only happens for pictures the parser invented.
-    fn next(&mut self) -> u64 {
-        if let Some(Reverse(timestamp_us)) = self.pending.pop() {
-            self.last = timestamp_us;
-        }
-        self.last
-    }
-
-    fn clear(&mut self) {
-        self.pending.clear();
     }
 }
 
@@ -148,7 +153,7 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
                 Bytes::from(data),
                 y_stride,
                 (width, height),
-                self.timestamps.next(),
+                self.timestamps.claim(),
                 self.format.0,
                 Colour::guess(height),
             )
@@ -227,7 +232,8 @@ impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
         self.decoder = Some(decoder);
         self.ready.clear();
         self.format = OutputFormat(config.pixel_format);
-        self.timestamps.clear();
+        self.headers = C::Headers::default();
+        self.timestamps = Timestamps::default();
         Ok(())
     }
 
@@ -236,13 +242,19 @@ impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
             FerricastError::Decode(format!("NVDEC ({}) decode before configure()", C::NAME))
         })?;
 
+        // Read before NVDEC sees the packet so its parameter sets are
+        // known whatever happens to the decode.
+        let pictures = self.headers.shown(&frame.data);
         // NVDEC's parser owns picture-boundary detection; one packet may
         // release 0, 1 or N pictures depending on the GOP structure.
         decoder
             .decode(&frame.data)
             .map_err(|e| FerricastError::Decode(format!("NVDEC ({}) decode: {e}", C::NAME)))?;
-        self.timestamps.push(frame.timestamp_us);
+        for picture in pictures {
+            self.timestamps.push(picture, frame.timestamp_us);
+        }
         self.drain()?;
+        self.timestamps.settle();
         Ok(self.ready.pop_front())
     }
 
@@ -251,9 +263,11 @@ impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
             decoder
                 .finish()
                 .map_err(|e| FerricastError::Decode(format!("NVDEC ({}) finish: {e}", C::NAME)))?;
+            // Everything left comes out now, in display order, so the
+            // pending timestamps are handed out earliest first.
             self.drain()?;
         }
-        self.timestamps.clear();
+        self.timestamps = Timestamps::default();
         Ok(self.ready.drain(..).collect())
     }
 }
@@ -265,30 +279,3 @@ pub type NvdecH264Decoder = NvdecDecoder<H264>;
 /// HEVC alias. Only present when `nvdec-hevc-decode` is on.
 #[cfg(feature = "nvdec-hevc-decode")]
 pub type NvdecH265Decoder = NvdecDecoder<Hevc>;
-
-#[cfg(test)]
-mod tests {
-    use super::Timestamps;
-
-    #[test]
-    fn pictures_take_the_smallest_pending_timestamp() {
-        let mut timestamps = Timestamps::default();
-        for pts in [0, 40, 20, 80, 60] {
-            timestamps.push(pts);
-        }
-        let order: Vec<u64> = (0..5).map(|_| timestamps.next()).collect();
-        assert_eq!(order, [0, 20, 40, 60, 80]);
-    }
-
-    #[test]
-    fn running_out_repeats_the_last_timestamp_and_stale_entries_are_evicted() {
-        let mut timestamps = Timestamps::default();
-        timestamps.push(7);
-        assert_eq!(timestamps.next(), 7);
-        assert_eq!(timestamps.next(), 7);
-        for pts in 0..40 {
-            timestamps.push(pts);
-        }
-        assert_eq!(timestamps.next(), 8);
-    }
-}

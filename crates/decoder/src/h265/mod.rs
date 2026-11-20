@@ -28,8 +28,8 @@ compile_error!(
 
 #[cfg(feature = "hevc-decode")]
 mod software_impl;
-#[cfg(feature = "hevc-decode")]
-mod timestamps;
+#[cfg(any(feature = "hevc-decode", feature = "nvdec-hevc-decode"))]
+pub(crate) mod timestamps;
 #[cfg(feature = "vaapi-hevc-decode")]
 mod vaapi_impl;
 
@@ -52,7 +52,7 @@ pub enum H265Decoder {
     #[default]
     Pending,
     #[cfg(feature = "nvdec-hevc-decode")]
-    Nvdec(NvdecH265Decoder),
+    Nvdec(Box<NvdecH265Decoder>),
     #[cfg(feature = "vaapi-hevc-decode")]
     Vaapi(VaapiH265Decoder),
     #[cfg(feature = "hevc-decode")]
@@ -97,7 +97,7 @@ impl VideoDecoder for H265Decoder {
                                     height = config.height,
                                     "H.265 decoder backend: NVDEC"
                                 );
-                                *self = H265Decoder::Nvdec(d);
+                                *self = H265Decoder::Nvdec(Box::new(d));
                                 return Ok(());
                             }
                             Err(e) => tracing::warn!(

@@ -34,11 +34,13 @@ vaapi-decode = ["dep:cros-libva", "dep:h264-reader"]
 vaapi-hevc-decode = ["dep:cros-libva"]
 # NVDEC hardware decode (NVIDIA). Carries the generic `NvdecDecoder<C>`
 # whose codec marker selects H.264 today; the HEVC marker lives
-# behind `nvdec-hevc-decode` below.
-nvdec-decode = ["dep:shiguredo_nvcodec"]
+# behind `nvdec-hevc-decode` below. h264-reader (and rust_h265 for
+# HEVC) read the slice headers that time NVDEC's pictures: the binding
+# drops the CUVID timestamps.
+nvdec-decode = ["dep:shiguredo_nvcodec", "dep:h264-reader"]
 # NVDEC HEVC decode. Builds on top of `nvdec-decode`; only the codec
 # marker is gated, the dispatcher and CUDA plumbing are shared.
-nvdec-hevc-decode = ["nvdec-decode"]
+nvdec-hevc-decode = ["nvdec-decode", "dep:rust_h265"]
 
 [dependencies]
 ferricast-core = { path = "../core", default-features = false }
