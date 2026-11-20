@@ -2011,6 +2011,7 @@ dependencies = [
  "bytes",
  "drm-fourcc",
  "ferricast-core",
+ "futures-util",
  "gbm",
  "image",
  "libc",
