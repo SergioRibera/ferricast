@@ -3,6 +3,9 @@ use ferricast_core::{
     AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame, FerricastError, Result,
 };
 use opus_rs::{Application, OpusEncoder as RawEncoder};
+use tracing::debug;
+
+use crate::audio_clock::{AudioClock, ClockEvent};
 
 // 20 ms at 48 kHz — valid for Hybrid mode (frame_rate = 50).
 // Chromecast Cast Streaming receivers expect RFC 7587 packets at
@@ -22,8 +25,8 @@ pub struct OpusEncoder {
     // Interleaved f32 PCM accumulated across PipeWire chunks until
     // we have at least FRAME_SAMPLES × channels samples to give Opus.
     pcm_buf: Vec<f32>,
-    pts_anchor_us: Option<u64>,
-    samples_emitted: u64,
+    // Output timestamps; created by `configure()` with the input rate.
+    clock: Option<AudioClock>,
     pending: Vec<AudioFrame>,
 }
 
@@ -64,6 +67,7 @@ impl AudioEncoder for OpusEncoder {
         self.sample_rate = config.sample_rate;
         self.channels = config.channels;
         self.pcm_buf = Vec::with_capacity(FRAME_SAMPLES * config.channels as usize * 4);
+        self.clock = Some(AudioClock::new(config.sample_rate));
         Ok(())
     }
 
@@ -78,8 +82,16 @@ impl AudioEncoder for OpusEncoder {
             FerricastError::Encoder("opus-rs: encode called before configure".into())
         })?;
 
-        if self.pts_anchor_us.is_none() {
-            self.pts_anchor_us = Some(frame.timestamp_us);
+        let clock = self.clock.as_mut().ok_or_else(|| {
+            FerricastError::Encoder("opus-rs: encode called before configure".into())
+        })?;
+        // Anchor on the first chunk and jump forward after capture gaps.
+        let buffered = (self.pcm_buf.len() / usize::from(self.channels.max(1))) as u64;
+        if let ClockEvent::Resynced { gap_us } = clock.observe(frame.timestamp_us, buffered) {
+            debug!(
+                gap_us,
+                "opus-rs: capture gap, re-anchoring output timestamps"
+            );
         }
 
         // S16LE bytes → interleaved f32 in [-1.0, 1.0].
@@ -102,12 +114,7 @@ impl AudioEncoder for OpusEncoder {
             self.pcm_buf.drain(..samples_per_frame);
 
             if n > 0 {
-                let pts_offset_us =
-                    self.samples_emitted.saturating_mul(1_000_000) / self.sample_rate.max(1) as u64;
-                let timestamp_us = self
-                    .pts_anchor_us
-                    .unwrap_or(0)
-                    .saturating_add(pts_offset_us);
+                let timestamp_us = clock.next_timestamp_us();
                 self.pending.push(AudioFrame {
                     codec: AudioCodec::Opus,
                     data: Bytes::copy_from_slice(&out[..n]),
@@ -115,7 +122,7 @@ impl AudioEncoder for OpusEncoder {
                     sample_rate: self.sample_rate,
                     channels: self.channels,
                 });
-                self.samples_emitted = self.samples_emitted.saturating_add(FRAME_SAMPLES as u64);
+                clock.advance(FRAME_SAMPLES as u64);
             }
         }
         Ok(())

@@ -8,17 +8,19 @@
 //! 1024-sample AAC-LC frame size with a PTS derived from the
 //! upstream capture clock so audio shares a timeline with video.
 //!
-//! Timestamp scheme: we anchor on the first PCM chunk's
-//! `timestamp_us`, then advance the per-output PTS by exactly
-//! `1024 / sample_rate × 1e6` µs per emitted AAC frame. That keeps
-//! audio frame deltas exact (no quantisation drift) and co-monotonic
-//! with the video PTS source.
+//! Timestamp scheme: see [`AudioClock`] — anchored on the first PCM
+//! chunk, advanced by exactly `1024 / sample_rate × 1e6` µs per
+//! emitted AAC frame (no quantisation drift, co-monotonic with video),
+//! and re-anchored when the capture timestamps jump forward past a gap.
 
 use bytes::Bytes;
 use fdk_aac::enc::{
     AudioObjectType, BitRate, ChannelMode, EncodeInfo, Encoder, EncoderParams, Transport,
 };
 use ferricast_core::{AudioCodec, AudioEncoderConfig, AudioFrame, FerricastError, Result};
+use tracing::debug;
+
+use crate::audio_clock::{AudioClock, ClockEvent};
 
 /// AAC-LC frame size in samples per channel. Fixed by the codec —
 /// every other parameter (bitrate, profile) can change but this is
@@ -39,13 +41,8 @@ pub struct FdkAacEncoder {
     /// (`AAC_LC_FRAME_SAMPLES × channels` i16s), then drain in one
     /// or more `enc.encode()` calls.
     pcm_buffer: Vec<i16>,
-    /// PTS anchor — set from the first PCM chunk's `timestamp_us`.
-    /// All subsequent output frames derive their PTS from this
-    /// plus `samples_emitted / sample_rate`.
-    pts_anchor_us: Option<u64>,
-    /// Sample count (per channel) we've already emitted as
-    /// AAC frames. Used to compute the next output PTS.
-    samples_emitted: u64,
+    /// Output timestamps, anchored on the capture clock.
+    clock: AudioClock,
     /// Scratch buffer reused across `aacEncEncode` calls to avoid
     /// per-frame allocations.
     out_scratch: Vec<u8>,
@@ -82,8 +79,7 @@ impl FdkAacEncoder {
             pcm_buffer: Vec::with_capacity(
                 AAC_LC_FRAME_SAMPLES * config.channels.max(1) as usize * 4,
             ),
-            pts_anchor_us: None,
-            samples_emitted: 0,
+            clock: AudioClock::new(config.sample_rate),
             out_scratch: vec![0u8; ENC_OUTPUT_SCRATCH],
             pending: Vec::new(),
         })
@@ -102,11 +98,15 @@ impl FdkAacEncoder {
                 self.sample_rate, self.channels, frame.sample_rate, frame.channels
             )));
         }
-        // Anchor PTS on the very first sample we ever see so the
-        // audio elementary stream starts from the same clock origin
-        // as the video capture path.
-        if self.pts_anchor_us.is_none() {
-            self.pts_anchor_us = Some(frame.timestamp_us);
+        // Anchor on the first chunk (same clock origin as video) and
+        // jump forward after capture gaps so frames never go stale.
+        let channels = usize::from(self.channels.max(1));
+        let buffered = (self.pcm_buffer.len() / channels) as u64;
+        if let ClockEvent::Resynced { gap_us } = self.clock.observe(frame.timestamp_us, buffered) {
+            debug!(
+                gap_us,
+                "fdk-aac: capture gap, re-anchoring output timestamps"
+            );
         }
 
         // Reinterpret the raw S16LE bytes as i16 slices, append to
@@ -149,17 +149,7 @@ impl FdkAacEncoder {
 
             if info.output_size > 0 {
                 let adts = Bytes::copy_from_slice(&self.out_scratch[..info.output_size]);
-                // PTS = anchor + samples_emitted / sample_rate.
-                // Using µs ticks here (1e6) keeps the math in u64
-                // with no rounding error worth worrying about at
-                // 48 kHz; downstream MPEG-TS conversion scales by
-                // 9/100 to land in 90 kHz ticks.
-                let pts_offset_us =
-                    self.samples_emitted.saturating_mul(1_000_000) / self.sample_rate.max(1) as u64;
-                let timestamp_us = self
-                    .pts_anchor_us
-                    .unwrap_or(0)
-                    .saturating_add(pts_offset_us);
+                let timestamp_us = self.clock.next_timestamp_us();
 
                 self.pending.push(AudioFrame {
                     codec: AudioCodec::Aac,
@@ -168,9 +158,7 @@ impl FdkAacEncoder {
                     sample_rate: self.sample_rate,
                     channels: self.channels,
                 });
-                self.samples_emitted = self
-                    .samples_emitted
-                    .saturating_add(AAC_LC_FRAME_SAMPLES as u64);
+                self.clock.advance(AAC_LC_FRAME_SAMPLES as u64);
             }
         }
 
@@ -202,12 +190,7 @@ impl FdkAacEncoder {
                 break;
             }
             let adts = Bytes::copy_from_slice(&self.out_scratch[..info.output_size]);
-            let pts_offset_us =
-                self.samples_emitted.saturating_mul(1_000_000) / self.sample_rate.max(1) as u64;
-            let timestamp_us = self
-                .pts_anchor_us
-                .unwrap_or(0)
-                .saturating_add(pts_offset_us);
+            let timestamp_us = self.clock.next_timestamp_us();
             self.pending.push(AudioFrame {
                 codec: AudioCodec::Aac,
                 data: adts,
@@ -215,10 +198,55 @@ impl FdkAacEncoder {
                 sample_rate: self.sample_rate,
                 channels: self.channels,
             });
-            self.samples_emitted = self
-                .samples_emitted
-                .saturating_add(AAC_LC_FRAME_SAMPLES as u64);
+            self.clock.advance(AAC_LC_FRAME_SAMPLES as u64);
         }
         Ok(std::mem::take(&mut self.pending))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SR: u32 = 48_000;
+
+    fn pcm(timestamp_us: u64) -> AudioFrame {
+        // One AAC frame of stereo silence, S16LE.
+        AudioFrame {
+            codec: AudioCodec::Pcm,
+            data: Bytes::from(vec![0u8; AAC_LC_FRAME_SAMPLES * 2 * 2]),
+            timestamp_us,
+            sample_rate: SR,
+            channels: 2,
+        }
+    }
+
+    /// A capture gap must move output timestamps forward instead of
+    /// continuing the pre-gap sample count (which the HLS segmenter
+    /// would drop as stale forever).
+    #[test]
+    fn output_resyncs_after_capture_gap() {
+        let mut enc = FdkAacEncoder::new(&AudioEncoderConfig {
+            codec: AudioCodec::Aac,
+            sample_rate: SR,
+            channels: 2,
+            bitrate_kbps: 128,
+        })
+        .expect("fdk-aac");
+        let frame_us = 1_000_000 * AAC_LC_FRAME_SAMPLES as u64 / u64::from(SR);
+        let start = 1_000_000;
+        let mut before = Vec::new();
+        for i in 0..8 {
+            enc.encode(&pcm(start + i * frame_us)).expect("encode");
+            before.extend(enc.take_output());
+        }
+        assert!(!before.is_empty());
+        assert!(before.iter().all(|f| f.timestamp_us < start + 8 * frame_us));
+
+        let resumed = start + 5_000_000;
+        enc.encode(&pcm(resumed)).expect("encode");
+        let after = enc.take_output();
+        assert!(!after.is_empty());
+        assert_eq!(after[0].timestamp_us, resumed);
     }
 }
