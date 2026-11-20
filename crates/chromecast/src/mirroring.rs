@@ -245,6 +245,7 @@ impl CastSession for ChromecastMirrorSession {
                 answers: answer_tx,
                 launch: Some(launch_tx),
                 app_session_id: None,
+                app_transport_id: None,
                 last_status_nudge: None,
             }
             .run(reader),
@@ -551,6 +552,8 @@ struct ControlReader {
     launch: Option<oneshot::Sender<Result<(String, String)>>>,
     /// Session id of our app once launched.
     app_session_id: Option<String>,
+    /// Transport id of our app once launched.
+    app_transport_id: Option<String>,
     last_status_nudge: Option<Instant>,
 }
 
@@ -602,6 +605,15 @@ impl ControlReader {
                 }
                 None
             }
+            // The app closing its own virtual connection is how the receiver ends
+            // a session on purpose (user stopped casting, app exited).
+            (namespace::CONNECTION, Some("CLOSE"))
+                if self.app_transport_id.as_deref() == Some(msg.source_id.as_str()) =>
+            {
+                Some(ControlEnd::RemoteStopped(
+                    "mirroring app closed the connection".into(),
+                ))
+            }
             (namespace::CONNECTION, Some("CLOSE")) => Some(ControlEnd::Lost(format!(
                 "receiver sent CLOSE from {}",
                 msg.source_id
@@ -636,32 +648,25 @@ impl ControlReader {
 
     async fn on_receiver_status(&mut self, msg: &CastMessage) -> Option<ControlEnd> {
         let payload: ReceiverStatusPayload = msg.parse_payload().ok()?;
-        let applications = payload.status.map(|s| s.applications).unwrap_or_default();
-        if let Some(session_id) = &self.app_session_id {
-            if applications.iter().any(|a| &a.session_id == session_id) {
+        // Statuses without an application list (e.g. volume-only) say
+        // nothing about our app.
+        let applications = payload.status?.applications;
+        match classify_status(self.app_session_id.as_deref(), &applications) {
+            StatusVerdict::Running => return None,
+            StatusVerdict::Stopped(why) => return Some(ControlEnd::RemoteStopped(why)),
+            StatusVerdict::Launched {
+                transport_id,
+                session_id,
+            } => {
+                info!(%transport_id, "mirroring app launched");
+                self.app_session_id = Some(session_id.clone());
+                self.app_transport_id = Some(transport_id.clone());
+                if let Some(tx) = self.launch.take() {
+                    let _ = tx.send(Ok((transport_id, session_id)));
+                }
                 return None;
             }
-            let replaced_by = applications
-                .iter()
-                .find(|a| !a.display_name.is_empty())
-                .map(|a| a.display_name.clone());
-            return Some(ControlEnd::RemoteStopped(replaced_by.map_or_else(
-                || "mirroring app stopped on the receiver".to_owned(),
-                |name| format!("mirroring replaced by {name}"),
-            )));
-        }
-        let launched = applications.iter().find(|a| {
-            a.app_id.eq_ignore_ascii_case(MIRRORING_APP_ID)
-                && !a.transport_id.is_empty()
-                && !a.session_id.is_empty()
-        });
-        if let Some(app) = launched {
-            info!(transport_id = %app.transport_id, "mirroring app launched");
-            self.app_session_id = Some(app.session_id.clone());
-            if let Some(tx) = self.launch.take() {
-                let _ = tx.send(Ok((app.transport_id.clone(), app.session_id.clone())));
-            }
-            return None;
+            StatusVerdict::NotReady => {}
         }
         debug!(payload = ?msg.payload_utf8, "RECEIVER_STATUS: mirroring app not ready");
         let now = Instant::now();
@@ -677,6 +682,45 @@ impl ControlReader {
         }
         None
     }
+}
+
+/// What a RECEIVER_STATUS application list means for our mirroring app.
+#[derive(Debug, PartialEq, Eq)]
+enum StatusVerdict {
+    Running,
+    Stopped(String),
+    Launched {
+        transport_id: String,
+        session_id: String,
+    },
+    NotReady,
+}
+
+fn classify_status(
+    app_session_id: Option<&str>,
+    applications: &[crate::castv2::ApplicationInfo],
+) -> StatusVerdict {
+    if let Some(session_id) = app_session_id {
+        if applications.iter().any(|a| a.session_id == session_id) {
+            return StatusVerdict::Running;
+        }
+        let replaced_by = applications.iter().find(|a| !a.display_name.is_empty());
+        return StatusVerdict::Stopped(replaced_by.map_or_else(
+            || "mirroring app stopped on the receiver".to_owned(),
+            |a| format!("mirroring replaced by {}", a.display_name),
+        ));
+    }
+    applications
+        .iter()
+        .find(|a| {
+            a.app_id.eq_ignore_ascii_case(MIRRORING_APP_ID)
+                && !a.transport_id.is_empty()
+                && !a.session_id.is_empty()
+        })
+        .map_or(StatusVerdict::NotReady, |a| StatusVerdict::Launched {
+            transport_id: a.transport_id.clone(),
+            session_id: a.session_id.clone(),
+        })
 }
 
 async fn heartbeat_loop(writer: SharedWriter, shared: Arc<ControlShared>) {

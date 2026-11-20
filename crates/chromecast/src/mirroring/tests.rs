@@ -369,3 +369,44 @@ async fn audio_frames_are_single_packet_key_frames() {
     // 20 ms at 48 kHz.
     assert_eq!(got[1].rtp_timestamp.wrapping_sub(got[0].rtp_timestamp), 960);
 }
+
+fn app(app_id: &str, name: &str, transport: &str, session: &str) -> crate::castv2::ApplicationInfo {
+    serde_json::from_value(serde_json::json!({
+        "appId": app_id,
+        "displayName": name,
+        "transportId": transport,
+        "sessionId": session,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn receiver_status_classification() {
+    use super::{MIRRORING_APP_ID, StatusVerdict, classify_status};
+
+    let partial = app(MIRRORING_APP_ID, "", "t-1", "");
+    assert_eq!(classify_status(None, &[partial]), StatusVerdict::NotReady);
+
+    let ours = app(MIRRORING_APP_ID, "Chrome Mirroring", "t-1", "s-1");
+    assert_eq!(
+        classify_status(None, std::slice::from_ref(&ours)),
+        StatusVerdict::Launched {
+            transport_id: "t-1".into(),
+            session_id: "s-1".into()
+        }
+    );
+    assert_eq!(
+        classify_status(Some("s-1"), &[ours]),
+        StatusVerdict::Running
+    );
+
+    let other = app("CC1AD845", "Default Media Receiver", "t-2", "s-2");
+    assert_eq!(
+        classify_status(Some("s-1"), &[other]),
+        StatusVerdict::Stopped("mirroring replaced by Default Media Receiver".into())
+    );
+    assert_eq!(
+        classify_status(Some("s-1"), &[]),
+        StatusVerdict::Stopped("mirroring app stopped on the receiver".into())
+    );
+}
