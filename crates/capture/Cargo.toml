@@ -29,6 +29,7 @@ wlroots = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols
 # `libgbm` is needed at runtime for DMA-BUF allocation — ubiquitous
 # (mesa ships it on every desktop Linux distribution).
 wayland-direct = [
+    "vulkan",
     "wlroots",
     "dep:gbm",
     "dep:drm-fourcc",
