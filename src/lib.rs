@@ -38,6 +38,7 @@
 //! - [`prelude`] — the everyday types most callers want in scope.
 
 mod manager;
+mod receiver;
 
 pub use manager::{ManagerEvent, StreamManager, StreamManagerBuilder};
 
