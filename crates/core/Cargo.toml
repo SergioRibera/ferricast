@@ -16,6 +16,5 @@ bytes.workspace = true
 uuid.workspace = true
 bitflags = "2.13.1"
 async-trait = { workspace = true }
-# `fstat` for DMA-BUF identity and `clock_gettime(CLOCK_MONOTONIC)` for
-# capture timestamps (see `frame.rs`).
+# `fstat` for DMA-BUF identity (`DmaBufFd::buffer_id` in `frame.rs`).
 libc = "0.2.183"
