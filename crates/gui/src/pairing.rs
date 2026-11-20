@@ -1,5 +1,5 @@
-//! PIN prompt shown when a receiver asks to pair (AirPlay displays a
-//! one-time PIN on the TV).
+//! PIN or password prompt shown when a receiver asks to pair (AirPlay
+//! displays a one-time PIN on the TV, or wants its access password).
 //!
 //! Opens in its own top-level window, like the source picker, so it
 //! also appears when the main window is hidden (`--background`).
@@ -29,19 +29,62 @@ pub fn answer(respond: &PairingResponder, response: PairingResponse) {
     }
 }
 
-/// Ask for a `digits`-long PIN for `device_name` and hand the answer
-/// (or `Cancelled`) to the manager.
-pub fn open_pin_dialog(
+/// What the pairing dialog asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Secret {
+    /// A PIN of `digits` digits shown on the receiver.
+    Pin { digits: u8 },
+    /// The receiver's access password.
+    Password,
+}
+
+impl Secret {
+    /// Whether `text` can still become a valid answer while typing.
+    fn accepts_partial(self, text: &str) -> bool {
+        match self {
+            Self::Pin { digits } => is_partial_pin(text, usize::from(digits)),
+            Self::Password => true,
+        }
+    }
+
+    /// Whether `text` is a complete answer.
+    fn is_complete(self, text: &str) -> bool {
+        match self {
+            Self::Pin { digits } => {
+                text.len() == usize::from(digits) && is_partial_pin(text, usize::from(digits))
+            }
+            Self::Password => !text.is_empty(),
+        }
+    }
+
+    fn response(self, text: String) -> PairingResponse {
+        match self {
+            Self::Pin { .. } => PairingResponse::Pin(text),
+            Self::Password => PairingResponse::Password(text),
+        }
+    }
+
+    fn prompt(self, device_name: &str) -> String {
+        match self {
+            Self::Pin { digits } => format!("Enter the {digits}-digit PIN shown on {device_name}"),
+            Self::Password => format!("Enter the AirPlay password of {device_name}"),
+        }
+    }
+}
+
+/// Ask for `secret` for `device_name` and hand the answer (or
+/// `Cancelled`) to the manager.
+pub fn open_pairing_dialog(
     platform: Platform,
     device_name: String,
-    digits: u8,
+    secret: Secret,
     respond: PairingResponder,
 ) {
     spawn(async move {
         let (tx, rx) = oneshot::channel::<PairingResponse>();
-        let app = PinDialog {
+        let app = PairingDialog {
             device_name: device_name.clone(),
-            digits,
+            secret,
             done: Rc::new(RefCell::new(Some(tx))),
         };
         let config = WindowConfig::new_app(app)
@@ -69,13 +112,13 @@ fn is_partial_pin(text: &str, digits: usize) -> bool {
     text.len() <= digits && text.chars().all(|c| c.is_ascii_digit())
 }
 
-struct PinDialog {
+struct PairingDialog {
     device_name: String,
-    digits: u8,
+    secret: Secret,
     done: Rc<RefCell<Option<oneshot::Sender<PairingResponse>>>>,
 }
 
-impl PinDialog {
+impl PairingDialog {
     fn reply(done: &Rc<RefCell<Option<oneshot::Sender<PairingResponse>>>>, r: PairingResponse) {
         if let Some(tx) = done.borrow_mut().take() {
             let _ = tx.send(r);
@@ -83,27 +126,31 @@ impl PinDialog {
     }
 }
 
-impl App for PinDialog {
+impl App for PairingDialog {
     fn render(&self) -> impl IntoElement {
-        let pin = use_state(String::new);
-        let digits = usize::from(self.digits);
-        let ready = pin.read().len() == digits;
+        let text = use_state(String::new);
+        let secret = self.secret;
+        let ready = secret.is_complete(&text.read());
 
         let on_submit = {
             let done = self.done.clone();
-            move |text: String| {
-                if text.len() == digits {
-                    Self::reply(&done, PairingResponse::Pin(text));
+            move |value: String| {
+                if secret.is_complete(&value) {
+                    Self::reply(&done, secret.response(value));
                 }
             }
         };
         let on_pair = {
             let done = self.done.clone();
-            move |_| Self::reply(&done, PairingResponse::Pin(pin.read().clone()))
+            move |_| Self::reply(&done, secret.response(text.read().clone()))
         };
         let on_cancel = {
             let done = self.done.clone();
             move |_| Self::reply(&done, PairingResponse::Cancelled)
+        };
+        let (placeholder, mode, width) = match secret {
+            Secret::Pin { .. } => ("PIN", InputMode::Shown, 160.),
+            Secret::Password => ("Password", InputMode::new_password(), 240.),
         };
 
         rect()
@@ -114,20 +161,18 @@ impl App for PinDialog {
             .spacing(14.)
             .child(
                 label()
-                    .text(format!(
-                        "Enter the {digits}-digit PIN shown on {}",
-                        self.device_name
-                    ))
+                    .text(secret.prompt(&self.device_name))
                     .font_size(14.)
                     .color((230, 230, 240)),
             )
             .child(
-                Input::new(pin)
-                    .placeholder("PIN")
+                Input::new(text)
+                    .placeholder(placeholder)
+                    .mode(mode)
                     .auto_focus(true)
-                    .width(Size::px(160.))
+                    .width(Size::px(width))
                     .on_validate(move |v: InputValidator| {
-                        let valid = is_partial_pin(&v.text(), digits);
+                        let valid = secret.accepts_partial(&v.text());
                         v.set_valid(valid);
                     })
                     .on_submit(on_submit),
@@ -159,6 +204,25 @@ mod tests {
         assert!(is_partial_pin("1234", 4));
         assert!(!is_partial_pin("12345", 4));
         assert!(!is_partial_pin("12a", 4));
+    }
+
+    #[test]
+    fn secrets_validate_and_answer_by_kind() {
+        let pin = Secret::Pin { digits: 4 };
+        assert!(pin.accepts_partial("12"));
+        assert!(!pin.accepts_partial("12a"));
+        assert!(!pin.is_complete("123"));
+        assert!(pin.is_complete("1234"));
+        assert!(matches!(pin.response("1234".into()), PairingResponse::Pin(p) if p == "1234"));
+
+        let password = Secret::Password;
+        assert!(password.accepts_partial("any text 12!"));
+        assert!(!password.is_complete(""));
+        assert!(password.is_complete("s"));
+        assert!(matches!(
+            password.response("secret".into()),
+            PairingResponse::Password(p) if p == "secret"
+        ));
     }
 
     #[tokio::test]
