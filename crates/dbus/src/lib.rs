@@ -358,6 +358,11 @@ pub trait Manager {
     #[zbus(signal)]
     fn stream_error(&self, device_id: String, message: String) -> zbus::Result<()>;
 
+    /// Non-fatal problem on a running stream (e.g. audio could not be
+    /// captured); video keeps going.
+    #[zbus(signal)]
+    fn stream_warning(&self, device_id: String, message: String) -> zbus::Result<()>;
+
     #[zbus(signal)]
     fn discovery_error(&self, protocol: String, message: String) -> zbus::Result<()>;
 

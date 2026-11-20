@@ -590,6 +590,15 @@ impl ManagerService {
         message: String,
     ) -> zbus::Result<()>;
 
+    /// Non-fatal problem on a running stream (e.g. no audio); video
+    /// keeps going.
+    #[zbus(signal)]
+    async fn stream_warning(
+        emitter: &SignalEmitter<'_>,
+        device_id: String,
+        message: String,
+    ) -> zbus::Result<()>;
+
     #[zbus(signal)]
     async fn discovery_error(
         emitter: &SignalEmitter<'_>,
@@ -741,7 +750,7 @@ async fn signal_loop(
                 device_id,
                 device_name,
             } => ManagerService::stream_started(emitter, device_id.to_string(), device_name).await,
-            ManagerEvent::StreamStopped { device_id } => {
+            ManagerEvent::StreamStopped { device_id, .. } => {
                 ManagerService::stream_stopped(emitter, device_id.to_string()).await
             }
             ManagerEvent::StreamReconnecting {
@@ -771,6 +780,12 @@ async fn signal_loop(
             // (the oneshot sender is forwarded via forward_tx).
             // No D-Bus signal yet — add one when external clients need it.
             ManagerEvent::PairingRequired { .. } => Ok(()),
+            // No D-Bus signal for start progress; clients see
+            // StreamStarted or StreamError.
+            ManagerEvent::StreamStarting { .. } => Ok(()),
+            ManagerEvent::StreamWarning { device_id, message } => {
+                ManagerService::stream_warning(emitter, device_id.to_string(), message).await
+            }
         };
         if let Err(e) = r {
             tracing::warn!(%e, "failed to emit D-Bus signal");

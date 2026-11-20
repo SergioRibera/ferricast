@@ -1978,6 +1978,7 @@ dependencies = [
 name = "ferricast"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "ferricast-airplay",
  "ferricast-capture",
  "ferricast-chromecast",

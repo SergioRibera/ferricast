@@ -301,7 +301,7 @@ fn run_window(
                                     state.streaming.push(device_id);
                                 }
                             }
-                            Some(ManagerEvent::StreamStopped { device_id }) => {
+                            Some(ManagerEvent::StreamStopped { device_id, .. }) => {
                                 radio_events
                                     .write_channel(AppChannel::Streaming)
                                     .streaming
