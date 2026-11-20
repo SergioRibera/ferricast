@@ -27,7 +27,8 @@
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use ferricast::{
@@ -52,6 +53,15 @@ pub struct ReceiverCounters {
     /// sender changes volume or mute and applied by the window's
     /// audio task.
     audio_gain: AtomicU32,
+    /// Interleaved samples the sink handed to the window.
+    audio_queued: AtomicU64,
+    /// Interleaved samples the output device consumed (or the window
+    /// dropped); `audio_queued - audio_played` is the backlog.
+    audio_played: AtomicU64,
+    /// Interleaved samples per second of the latest buffer.
+    audio_rate: AtomicU32,
+    /// Whether an output device is playing what is queued.
+    audio_output: AtomicBool,
 }
 
 impl Default for ReceiverCounters {
@@ -60,6 +70,10 @@ impl Default for ReceiverCounters {
             video_frames: AtomicU64::new(0),
             audio_frames: AtomicU64::new(0),
             audio_gain: AtomicU32::new(1.0f32.to_bits()),
+            audio_queued: AtomicU64::new(0),
+            audio_played: AtomicU64::new(0),
+            audio_rate: AtomicU32::new(0),
+            audio_output: AtomicBool::new(false),
         }
     }
 }
@@ -72,6 +86,25 @@ impl ReceiverCounters {
     pub fn set_audio_gain(&self, gain: f32) {
         self.audio_gain
             .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Audio queued for the device but not played yet, once a device is
+    /// open and the format is known.
+    fn audio_backlog(&self) -> Option<Duration> {
+        let rate = self.audio_rate.load(Ordering::Relaxed);
+        if rate == 0 || !self.audio_output.load(Ordering::Relaxed) {
+            return None;
+        }
+        let queued = self.audio_queued.load(Ordering::Relaxed);
+        let played = self.audio_played.load(Ordering::Relaxed);
+        Some(Duration::from_secs_f64(
+            queued.saturating_sub(played) as f64 / f64::from(rate),
+        ))
+    }
+
+    fn add_played(&self, samples: usize) {
+        self.audio_played
+            .fetch_add(samples as u64, Ordering::Relaxed);
     }
 }
 
@@ -185,6 +218,8 @@ impl FrameSink for WindowSink {
                 "WindowSink: audio"
             );
         }
+        let samples = audio.pcm.len() as u64;
+        let rate = audio.sample_rate * u32::from(audio.channels);
         let buf = AudioBuf {
             samples: audio.pcm,
             sample_rate: audio.sample_rate,
@@ -200,8 +235,17 @@ impl FrameSink for WindowSink {
         // eviction on the sender. Capacity 256 (~5 s @ 21 ms/buffer)
         // absorbs the startup spike; under steady-state overload
         // we'd rather glitch audio than stall the whole pipeline.
-        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = self.audio_tx.try_send(buf) {
-            tracing::warn!(receiver = %self.label, "audio buffer dropped — channel full");
+        match self.audio_tx.try_send(buf) {
+            Ok(()) => {
+                self.counters.audio_rate.store(rate, Ordering::Relaxed);
+                self.counters
+                    .audio_queued
+                    .fetch_add(samples, Ordering::Relaxed);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(receiver = %self.label, "audio buffer dropped — channel full");
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
         }
         Ok(())
     }
@@ -209,6 +253,10 @@ impl FrameSink for WindowSink {
     async fn set_volume(&mut self, gain: f32) -> Result<()> {
         self.counters.set_audio_gain(gain);
         Ok(())
+    }
+
+    fn audio_backlog(&self) -> Option<Duration> {
+        self.counters.audio_backlog()
     }
 }
 
@@ -324,6 +372,7 @@ impl App for ReceiverWindowApp {
                     };
                     // Keep `stream` alive: drop = device closed.
                     let _stream_keepalive = stream;
+                    audio_counters.audio_output.store(true, Ordering::Relaxed);
                     while let Some(buf) = rx.recv().await {
                         // Drop frames when the sink queue is too deep
                         // (~2 s worth). Rodio's internal queue is
@@ -333,6 +382,7 @@ impl App for ReceiverWindowApp {
                         // is enough to absorb startup latency without
                         // accumulating an ever-growing backlog.
                         if sink.len() > 100 {
+                            audio_counters.add_played(buf.samples.len());
                             continue;
                         }
                         sink.set_volume(audio_counters.audio_gain());
@@ -341,8 +391,12 @@ impl App for ReceiverWindowApp {
                             buf.sample_rate,
                             buf.samples,
                         );
-                        sink.append(source);
+                        sink.append(Counted {
+                            inner: source,
+                            counters: audio_counters.clone(),
+                        });
                     }
+                    audio_counters.audio_output.store(false, Ordering::Relaxed);
                     *ended_for_audio.write() = true;
                 });
             }
@@ -552,5 +606,40 @@ fn codec_label_audio(c: AudioCodec) -> &'static str {
         AudioCodec::Opus => "Opus",
         AudioCodec::Pcm => "PCM",
         AudioCodec::Alac => "ALAC",
+    }
+}
+
+/// A rodio source that counts the samples the output device pulls, so
+/// the sink can tell how much queued audio is still unplayed.
+struct Counted<S> {
+    inner: S,
+    counters: Arc<ReceiverCounters>,
+}
+
+impl<S: Iterator<Item = i16>> Iterator for Counted<S> {
+    type Item = i16;
+
+    fn next(&mut self) -> Option<i16> {
+        let sample = self.inner.next()?;
+        self.counters.add_played(1);
+        Some(sample)
+    }
+}
+
+impl<S: rodio::Source<Item = i16>> rodio::Source for Counted<S> {
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner.current_frame_len()
+    }
+
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
     }
 }
