@@ -1,4 +1,4 @@
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -31,9 +31,9 @@ pub struct RawFrame {
 /// * Read it back to CPU memory on demand via [`importer`], for
 ///   encoders that only consume `RawFrame` (x264).
 ///
-/// Cloning a `GpuFrame` is cheap — the fd is borrowed (Vulkan keeps
-/// the cached `VkImage` alive via the importer's internal cache) and
-/// the importer handle is `Arc`-shared.
+/// Cloning a `GpuFrame` is cheap — the plane's fd is an
+/// `Arc`-shared owned duplicate (see [`DmaBufFd`]) and the importer
+/// handle is `Arc`-shared too.
 #[derive(Clone)]
 pub struct GpuFrame {
     pub width: u32,
@@ -66,13 +66,96 @@ impl std::fmt::Debug for GpuFrame {
 /// One DMA-BUF plane. Single-plane formats (BGRA / BGRx / RGBA /
 /// RGBx) are the common case; multi-plane (NV12, I420) would carry
 /// a `Vec<DmaBufPlane>` once those formats are wired through.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DmaBufPlane {
-    pub fd: RawFd,
+    pub fd: DmaBufFd,
     pub offset: u32,
     pub stride: u32,
     pub modifier: u64,
     pub size: u32,
+}
+
+/// Owned, shareable handle to a DMA-BUF file descriptor.
+///
+/// Producers hand frames to consumers on other threads, often after
+/// the producer has already returned the buffer to its pool (PipeWire
+/// re-queues it as soon as the `process` callback returns). Carrying
+/// the producer's *borrowed* fd number would let the consumer import
+/// a closed or recycled descriptor — i.e. a different object. Each
+/// frame therefore owns a `dup` of the descriptor, which keeps the
+/// underlying DMA-BUF object alive until the last clone drops.
+///
+/// Note: owning the fd guarantees *object* lifetime, not *content*
+/// stability — a producer that re-queues the buffer may let the
+/// compositor render into it while a consumer still reads it.
+#[derive(Debug, Clone)]
+pub struct DmaBufFd(Arc<OwnedFd>);
+
+impl DmaBufFd {
+    /// Duplicate a borrowed descriptor (`F_DUPFD_CLOEXEC`) into an
+    /// owned, shareable handle.
+    ///
+    /// # Errors
+    /// Returns the OS error when the descriptor can't be duplicated
+    /// (invalid fd, `EMFILE`).
+    pub fn dup(fd: BorrowedFd<'_>) -> std::io::Result<Self> {
+        fd.try_clone_to_owned().map(Self::from)
+    }
+
+    /// Raw descriptor number, valid for as long as `self` (or any
+    /// clone of it) is alive. Callers must not close it.
+    #[must_use]
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+
+    /// Stable identity of the underlying DMA-BUF object. Every `dup`
+    /// of the same buffer shares it, unlike the fd number, so it is
+    /// the right key for per-buffer import caches.
+    ///
+    /// # Errors
+    /// Returns the OS error from `fstat`.
+    pub fn buffer_id(&self) -> std::io::Result<DmaBufId> {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `self.0` is a live owned descriptor and `st` points
+        // to writable storage of the right size; `fstat` fully
+        // initialises it on success, and we only read it then.
+        let rc = unsafe { libc::fstat(self.0.as_raw_fd(), st.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fstat` returned 0, so `st` is initialised.
+        let st = unsafe { st.assume_init() };
+        #[allow(
+            clippy::useless_conversion,
+            reason = "dev_t / ino_t widths differ across targets"
+        )]
+        let id = DmaBufId {
+            dev: u64::from(st.st_dev),
+            ino: u64::from(st.st_ino),
+        };
+        Ok(id)
+    }
+}
+
+impl From<OwnedFd> for DmaBufFd {
+    fn from(fd: OwnedFd) -> Self {
+        Self(Arc::new(fd))
+    }
+}
+
+impl AsFd for DmaBufFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+/// `(st_dev, st_ino)` of a DMA-BUF: identical for every `dup` of the
+/// same buffer object. See [`DmaBufFd::buffer_id`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DmaBufId {
+    pub dev: u64,
+    pub ino: u64,
 }
 
 /// Object-safe trait that lets a `GpuFrame` be read back to CPU
@@ -191,4 +274,32 @@ pub enum AudioCodec {
     Opus,
     Pcm,
     Alac,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memfd(name: &std::ffi::CStr) -> OwnedFd {
+        // SAFETY: `name` is a valid NUL-terminated string.
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+        // SAFETY: `fd` was just returned by `memfd_create` and nothing else owns it.
+        unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) }
+    }
+
+    #[test]
+    fn dmabuf_fd_dup_outlives_source_and_keeps_identity() {
+        let source = memfd(c"ferricast-dmabuf-fd-a");
+        let owned = DmaBufFd::dup(source.as_fd()).expect("dup");
+        assert_ne!(owned.as_raw_fd(), source.as_raw_fd());
+        let source_id = DmaBufFd::dup(source.as_fd())
+            .and_then(|d| d.buffer_id())
+            .expect("dup + fstat");
+        drop(source);
+        // The duplicate stays valid after the producer closes its fd.
+        assert_eq!(owned.buffer_id().expect("fstat after close"), source_id);
+        let other = DmaBufFd::from(memfd(c"ferricast-dmabuf-fd-b"));
+        assert_ne!(other.buffer_id().expect("fstat"), source_id);
+    }
 }

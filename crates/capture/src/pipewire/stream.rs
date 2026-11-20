@@ -20,14 +20,14 @@
 //! manually. Tiled / compressed modifiers need GPU-import and are
 //! dropped with a warning until that path is wired up.
 
-use std::os::fd::RawFd;
+use std::os::fd::{BorrowedFd, RawFd};
 use std::ptr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ferricast_core::{
-    CaptureConfig, CapturedFrame, DmaBufPlane, FerricastError, GpuFrame, RawFrame, Result,
+    CaptureConfig, CapturedFrame, DmaBufFd, DmaBufPlane, FerricastError, GpuFrame, RawFrame, Result,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -537,10 +537,42 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
             };
             let modifier = neg.modifier.unwrap_or(0);
             let raw = plane.as_raw();
-            if raw.fd < 0 {
+            let Ok(raw_fd) = RawFd::try_from(raw.fd) else {
+                warn!(fd = raw.fd, "DmaBuf plane has out-of-range fd");
+                return;
+            };
+            if raw_fd < 0 {
                 warn!("DmaBuf plane has invalid fd");
                 return;
             }
+            // PipeWire re-queues this buffer as soon as `process`
+            // returns, and closes its fd on renegotiation / stop. The
+            // frame must therefore own its own duplicate so a
+            // consumer on another thread never imports a closed or
+            // recycled descriptor (= a different object).
+            //
+            // Known limitation: owning the fd pins the DMA-BUF
+            // *object*, not its *contents*. Once re-queued, the
+            // compositor may render the next frame into the same
+            // buffer while the encoder is still reading it, which can
+            // show up as tearing under load. Keeping the pw_buffer
+            // dequeued until the consumer drops the frame would fix
+            // that, but needs raw `pw_stream_{de,}queue_buffer`
+            // handling with buffer-generation tracking across
+            // renegotiation and risks starving the compositor's small
+            // buffer pool, so it is deliberately not done here.
+            // SAFETY: `raw_fd` is the live descriptor PipeWire owns
+            // for this dequeued buffer; it stays open for the whole
+            // `process` callback, and we only borrow it long enough to
+            // `dup` it.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+            let fd = match DmaBufFd::dup(borrowed) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    warn!(error = %e, "dup(DmaBuf fd) failed — frame dropped");
+                    return;
+                }
+            };
             // DMA-BUF object size: use maxsize directly (the total
             // buffer including tiling padding). Do NOT subtract
             // chunk_offset — VA-API's objects[0].size expects the
@@ -565,7 +597,7 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
                 format: neg.pixel_format,
                 timestamp_us,
                 plane: DmaBufPlane {
-                    fd: raw.fd as RawFd,
+                    fd,
                     offset: chunk_offset,
                     stride,
                     modifier,

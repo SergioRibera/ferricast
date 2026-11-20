@@ -388,7 +388,7 @@ impl DmaBufImporter for VulkanImporter {
         format: PixelFormat,
     ) -> Result<Bytes> {
         self.import_and_readback(
-            plane.fd,
+            plane.fd.as_raw_fd(),
             plane.offset,
             plane.stride,
             plane.modifier,
