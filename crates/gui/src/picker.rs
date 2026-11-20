@@ -31,7 +31,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use bytes::Bytes;
 use ferricast::WindowIdentifier;
@@ -224,12 +223,12 @@ impl App for PickerWindowApp {
         let sender_select = self.sender.clone();
         let sender_cancel = self.sender.clone();
 
-        let on_select: Arc<dyn Fn(SourceDto)> = Arc::new(move |dto: SourceDto| {
+        let on_select: Rc<dyn Fn(SourceDto)> = Rc::new(move |dto: SourceDto| {
             if let Some(tx) = sender_select.borrow_mut().take() {
                 let _ = tx.send(Some(dto));
             }
         });
-        let on_cancel: Arc<dyn Fn()> = Arc::new(move || {
+        let on_cancel: Rc<dyn Fn()> = Rc::new(move || {
             if let Some(tx) = sender_cancel.borrow_mut().take() {
                 let _ = tx.send(None);
             }
@@ -250,14 +249,14 @@ impl App for PickerWindowApp {
 /// appropriate callbacks).
 #[derive(Clone)]
 pub struct SourcePicker {
-    pub on_select: Arc<dyn Fn(SourceDto)>,
-    pub on_cancel: Arc<dyn Fn()>,
+    pub on_select: Rc<dyn Fn(SourceDto)>,
+    pub on_cancel: Rc<dyn Fn()>,
 }
 
 impl PartialEq for SourcePicker {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.on_select, &other.on_select)
-            && Arc::ptr_eq(&self.on_cancel, &other.on_cancel)
+        Rc::ptr_eq(&self.on_select, &other.on_select)
+            && Rc::ptr_eq(&self.on_cancel, &other.on_cancel)
     }
 }
 
@@ -299,7 +298,6 @@ impl Component for SourcePicker {
 
         // One-shot fetch when the picker mounts.
         use_side_effect_with_deps(&(), {
-            let entries = entries;
             move |_: &()| {
                 let mut entries = entries;
                 spawn(async move {
@@ -314,10 +312,9 @@ impl Component for SourcePicker {
 
         // Wrap `on_select` so every emission carries the current
         // audio choice — the grid cards stay oblivious to it.
-        let on_select_with_audio: Arc<dyn Fn(SourceDto)> = {
+        let on_select_with_audio: Rc<dyn Fn(SourceDto)> = {
             let on_select = on_select.clone();
-            let audio = audio;
-            Arc::new(move |dto: SourceDto| {
+            Rc::new(move |dto: SourceDto| {
                 let dto = dto.with_audio(*audio.peek_state());
                 (on_select)(dto);
             })
@@ -341,18 +338,18 @@ impl Component for SourcePicker {
             .spacing(12.)
             .content(Content::Flex)
             .child(header(on_cancel.clone()))
-            .child(tabs_row(current_tab, tab.clone()))
+            .child(tabs_row(current_tab, tab))
             .child(grid(
                 current_tab,
                 snapshot,
                 on_select_with_audio,
                 compact_windows,
             ))
-            .child(footer(on_cancel, audio.clone()))
+            .child(footer(on_cancel, audio))
     }
 }
 
-fn header(on_cancel: Arc<dyn Fn()>) -> Rect {
+fn header(on_cancel: Rc<dyn Fn()>) -> Rect {
     rect()
         .width(Size::fill())
         .horizontal()
@@ -375,7 +372,7 @@ fn header(on_cancel: Arc<dyn Fn()>) -> Rect {
         )
 }
 
-fn footer(on_cancel: Arc<dyn Fn()>, audio_state: State<bool>) -> Rect {
+fn footer(on_cancel: Rc<dyn Fn()>, audio_state: State<bool>) -> Rect {
     let audio_on = *audio_state.read();
     // Click target: the whole row toggles. Box-shaped indicator on
     // the left mirrors the state so the affordance reads "checkbox".
@@ -484,7 +481,7 @@ fn tab_button(
 fn grid(
     current: Tab,
     entries: Entries,
-    on_select: Arc<dyn Fn(SourceDto)>,
+    on_select: Rc<dyn Fn(SourceDto)>,
     compact_windows: bool,
 ) -> Rect {
     let body = rect()
@@ -617,7 +614,7 @@ const THUMB_H: f32 = 124.;
 #[derive(Clone)]
 struct MonitorCard {
     info: MonitorInfoDto,
-    on_select: Arc<dyn Fn(SourceDto)>,
+    on_select: Rc<dyn Fn(SourceDto)>,
 }
 
 impl PartialEq for MonitorCard {
@@ -655,7 +652,7 @@ impl Component for MonitorCard {
 #[derive(Clone)]
 struct WindowCard {
     info: WindowInfoDto,
-    on_select: Arc<dyn Fn(SourceDto)>,
+    on_select: Rc<dyn Fn(SourceDto)>,
 }
 
 impl PartialEq for WindowCard {
@@ -700,7 +697,7 @@ impl Component for WindowCard {
 #[derive(Clone)]
 struct WindowRow {
     info: WindowInfoDto,
-    on_select: Arc<dyn Fn(SourceDto)>,
+    on_select: Rc<dyn Fn(SourceDto)>,
 }
 
 impl PartialEq for WindowRow {

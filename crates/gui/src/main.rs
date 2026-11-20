@@ -261,7 +261,7 @@ fn run_window(
     hidden: bool,
 ) {
     let radio_station = RadioStation::create_global(AppState::default());
-    let mut radio_events = radio_station.clone();
+    let mut radio_events = radio_station;
     // Pump → window listener: pairing prompts and receiver lifecycle.
     let (ui_cmd_tx, ui_cmd_rx) = mpsc::channel::<UiCommand>(16);
 

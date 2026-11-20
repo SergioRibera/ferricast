@@ -355,7 +355,7 @@ impl App for FerricastApp {
                                         device,
                                         status,
                                         lost,
-                                        on_request_picker: Arc::new({
+                                        on_request_picker: Rc::new({
                                             let sm = sm.clone();
                                             let platform = platform.clone();
                                             move || {
@@ -371,7 +371,7 @@ impl App for FerricastApp {
                                                 );
                                             }
                                         }),
-                                        on_stop: Arc::new(move || {
+                                        on_stop: Rc::new(move || {
                                             let sm = sm.clone();
                                             spawn(async move {
                                                 let sm = sm.read().await;
@@ -489,9 +489,9 @@ struct DeviceCard {
     /// stream runs.
     lost: bool,
     /// Open the picker in a separate top-level window.
-    on_request_picker: Arc<dyn Fn()>,
+    on_request_picker: Rc<dyn Fn()>,
     /// Stop (or cancel the start of) the device's stream.
-    on_stop: Arc<dyn Fn()>,
+    on_stop: Rc<dyn Fn()>,
     key: DiffKey,
 }
 

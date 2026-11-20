@@ -33,10 +33,10 @@ fn device_to_dto(d: &Device) -> DeviceDto {
     if let Some(v) = d.capabilities.max_bitrate_kbps {
         caps.insert("max_bitrate_kbps".into(), OwnedValue::from(v));
     }
-    if let Some(p) = d.capabilities.max_h264_profile {
-        if let Ok(v) = Value::Str(format!("{p:?}").into()).try_to_owned() {
-            caps.insert("max_h264_profile".into(), v);
-        }
+    if let Some(p) = d.capabilities.max_h264_profile
+        && let Ok(v) = Value::Str(format!("{p:?}").into()).try_to_owned()
+    {
+        caps.insert("max_h264_profile".into(), v);
     }
     caps.insert(
         "requires_audio".into(),
@@ -198,7 +198,7 @@ fn monitor_to_dto(m: ferricast::MonitorInfo) -> MonitorInfoDto {
 /// allocate a 200 MB buffer.
 fn clamp_thumbnail_box(max_w: u32, max_h: u32) -> (u32, u32) {
     const HARD_CAP: u32 = 4096;
-    (max_w.min(HARD_CAP).max(1), max_h.min(HARD_CAP).max(1))
+    (max_w.clamp(1, HARD_CAP), max_h.clamp(1, HARD_CAP))
 }
 
 fn window_to_dto(w: ferricast::WindowInfo) -> WindowInfoDto {
