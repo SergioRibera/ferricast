@@ -422,6 +422,10 @@ pub struct WaylandDirectCapture {
     worker: Option<WorkerHandle>,
     fps: u32,
     size: (usize, usize),
+    // Format of the last delivered frame: the worker picks Bgra or Rgba
+    // from whatever the compositor offers, so it is only known once a
+    // frame arrives.
+    pixel_format: Option<PixelFormat>,
 }
 
 impl WaylandDirectCapture {
@@ -527,11 +531,13 @@ impl ScreenCapture for WaylandDirectCapture {
             .worker
             .as_mut()
             .ok_or_else(|| FerricastError::Capture("wayland-direct: not started".into()))?;
-        worker
+        let frame = worker
             .frames
             .recv()
             .await
-            .ok_or_else(|| FerricastError::Capture("wayland-direct: worker hung up".into()))
+            .ok_or_else(|| FerricastError::Capture("wayland-direct: worker hung up".into()))?;
+        self.pixel_format = Some(frame.pixel_format());
+        Ok(frame)
     }
 
     async fn stop(&mut self) -> Result<()> {
@@ -551,7 +557,7 @@ impl ScreenCapture for WaylandDirectCapture {
     }
 
     fn get_pixel_format(&self) -> PixelFormat {
-        PixelFormat::Bgra
+        self.pixel_format.unwrap_or(PixelFormat::Bgra)
     }
 
     fn get_screen_size(&self) -> (usize, usize) {
