@@ -129,7 +129,7 @@ impl Mp4Demuxer {
         };
         let mut data = vec![0; sample.size as usize];
         self.file.read_exact_at(&mut data, sample.offset)?;
-        let (data, idr) = self.framing.annex_b(&data)?;
+        let (data, idr) = self.framing.annex_b(&data, sample.sync || self.next == 0)?;
         let dts = micros(sample.dts as i64 - self.shift, self.timescale);
         let pts = micros(
             sample.dts as i64 + i64::from(sample.cts_offset) - self.shift,

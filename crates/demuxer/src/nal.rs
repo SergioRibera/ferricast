@@ -15,10 +15,17 @@ pub(crate) struct LengthPrefixed {
 }
 
 impl Framing {
-    pub(crate) fn annex_b(&self, sample: &[u8]) -> Result<(Bytes, bool)> {
+    /// Converts one container sample to Annex B.
+    ///
+    /// `sync` is the container's random-access flag (or "first sample after
+    /// open/rewind"): parameter sets are injected on those samples as well as
+    /// on IDR/IRAP NAL units, so open-GOP streams whose sync samples are plain
+    /// I-frames with a recovery point still get SPS/PPS before decoding starts.
+    /// The returned flag reports whether the sample carried an IDR/IRAP NAL.
+    pub(crate) fn annex_b(&self, sample: &[u8], sync: bool) -> Result<(Bytes, bool)> {
         match self {
             Framing::Raw => Ok((Bytes::copy_from_slice(sample), false)),
-            Framing::LengthPrefixed(prefixed) => prefixed.annex_b(sample),
+            Framing::LengthPrefixed(prefixed) => prefixed.annex_b(sample, sync),
         }
     }
 }
@@ -32,14 +39,24 @@ impl LengthPrefixed {
         parse_hvcc(config).ok_or_else(|| FerricastError::Demux("malformed hvcC".into()))
     }
 
-    fn annex_b(&self, sample: &[u8]) -> Result<(Bytes, bool)> {
+    fn annex_b(&self, sample: &[u8], sync: bool) -> Result<(Bytes, bool)> {
         let nals = self.split(sample)?;
         let idr = nals.iter().any(|nal| self.is_idr(nal));
         let mut out = BytesMut::with_capacity(sample.len() + self.parameter_sets.len() + 8);
-        if idr {
+        let mut rest = nals.as_slice();
+        // An access unit delimiter must stay the first NAL of the access
+        // unit, so the parameter sets go right after it.
+        if let Some((aud, tail)) = rest.split_first()
+            && self.is_aud(aud)
+        {
+            out.put_slice(&START_CODE);
+            out.put_slice(aud);
+            rest = tail;
+        }
+        if idr || sync {
             out.put_slice(&self.parameter_sets);
         }
-        for nal in nals {
+        for nal in rest {
             out.put_slice(&START_CODE);
             out.put_slice(nal);
         }
@@ -71,6 +88,17 @@ impl LengthPrefixed {
         match self.codec {
             Codec::H264 => header & 0x1f == 5,
             Codec::H265 => (16..=21).contains(&((header >> 1) & 0x3f)),
+            _ => false,
+        }
+    }
+
+    fn is_aud(&self, nal: &[u8]) -> bool {
+        let Some(header) = nal.first() else {
+            return false;
+        };
+        match self.codec {
+            Codec::H264 => header & 0x1f == 9,
+            Codec::H265 => (header >> 1) & 0x3f == 35,
             _ => false,
         }
     }
@@ -162,20 +190,51 @@ mod tests {
         let prefixed = LengthPrefixed::from_avcc(&avcc(3)).unwrap();
         let slice = [0x41, 9, 9];
         let sample = [&[0, 0, 0, 3][..], &slice].concat();
-        let (data, idr) = prefixed.annex_b(&sample).unwrap();
+        let (data, idr) = prefixed.annex_b(&sample, false).unwrap();
         assert!(!idr);
         assert_eq!(data, annex_b(&[&slice]));
     }
 
     #[test]
+    fn container_sync_sample_gets_parameter_sets_without_an_idr() {
+        let prefixed = LengthPrefixed::from_avcc(&avcc(3)).unwrap();
+        let i_slice = [0x41, 9, 9];
+        let sample = [&[0, 0, 0, 3][..], &i_slice].concat();
+        let (data, idr) = prefixed.annex_b(&sample, true).unwrap();
+        assert!(!idr);
+        assert_eq!(data, annex_b(&[&SPS, &PPS, &i_slice]));
+    }
+
+    #[test]
     fn idr_sample_is_preceded_by_parameter_sets() {
+        let prefixed = LengthPrefixed::from_avcc(&avcc(3)).unwrap();
+        let idr_slice = [0x65, 1, 2, 3];
+        let sample = [&[0, 0, 0, 4][..], &idr_slice].concat();
+        let (data, idr) = prefixed.annex_b(&sample, false).unwrap();
+        assert!(idr);
+        assert_eq!(data, annex_b(&[&SPS, &PPS, &idr_slice]));
+    }
+
+    #[test]
+    fn parameter_sets_follow_a_leading_aud() {
         let prefixed = LengthPrefixed::from_avcc(&avcc(3)).unwrap();
         let aud = [0x09, 0xF0];
         let idr_slice = [0x65, 1, 2, 3];
         let sample = [&[0, 0, 0, 2][..], &aud, &[0, 0, 0, 4], &idr_slice].concat();
-        let (data, idr) = prefixed.annex_b(&sample).unwrap();
+        let (data, idr) = prefixed.annex_b(&sample, false).unwrap();
         assert!(idr);
-        assert_eq!(data, annex_b(&[&SPS, &PPS, &aud, &idr_slice]));
+        assert_eq!(data, annex_b(&[&aud, &SPS, &PPS, &idr_slice]));
+    }
+
+    #[test]
+    fn hevc_aud_is_recognised() {
+        let prefixed = LengthPrefixed {
+            codec: Codec::H265,
+            length_size: 4,
+            parameter_sets: Vec::new(),
+        };
+        assert!(prefixed.is_aud(&[35 << 1, 1, 0x50]));
+        assert!(!prefixed.is_aud(&[19 << 1, 1]));
     }
 
     #[test]
@@ -183,14 +242,14 @@ mod tests {
         let prefixed = LengthPrefixed::from_avcc(&avcc(1)).unwrap();
         let slice = [0x41, 7];
         let sample = [&[0, 2][..], &slice].concat();
-        let (data, _) = prefixed.annex_b(&sample).unwrap();
+        let (data, _) = prefixed.annex_b(&sample, false).unwrap();
         assert_eq!(data, annex_b(&[&slice]));
     }
 
     #[test]
     fn nal_longer_than_the_sample_is_rejected() {
         let prefixed = LengthPrefixed::from_avcc(&avcc(3)).unwrap();
-        assert!(prefixed.annex_b(&[0, 0, 0, 9, 0x41]).is_err());
+        assert!(prefixed.annex_b(&[0, 0, 0, 9, 0x41], false).is_err());
     }
 
     #[test]

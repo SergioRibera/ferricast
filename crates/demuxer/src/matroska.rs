@@ -17,6 +17,9 @@ pub struct MatroskaDemuxer {
     track: u64,
     scale_ns: u64,
     frame: Frame,
+    /// The next frame is the first one after open/rewind and must carry the
+    /// parameter sets whatever its NAL types.
+    at_start: bool,
 }
 
 impl MatroskaDemuxer {
@@ -56,6 +59,7 @@ impl MatroskaDemuxer {
             track,
             scale_ns,
             frame: Frame::default(),
+            at_start: true,
         })
     }
 
@@ -71,13 +75,17 @@ impl MatroskaDemuxer {
             if self.frame.track != self.track {
                 continue;
             }
-            let (data, idr) = self.framing.annex_b(&self.frame.data)?;
+            let sync = self.frame.is_keyframe.unwrap_or(false);
+            let (data, idr) = self
+                .framing
+                .annex_b(&self.frame.data, sync || self.at_start)?;
+            self.at_start = false;
             let pts = self.frame.timestamp * self.scale_ns / 1000;
             return Ok(Some(EncodedFrame {
                 codec: self.stream.codec,
                 data,
                 timestamp_us: pts,
-                is_keyframe: self.frame.is_keyframe.unwrap_or(false) || idr,
+                is_keyframe: sync || idr,
                 duration_us: self.frame.duration.map(|d| d * self.scale_ns / 1000),
                 pts_dts: (pts, pts),
             }));
@@ -85,7 +93,9 @@ impl MatroskaDemuxer {
     }
 
     pub fn rewind(&mut self) -> Result<()> {
-        self.file.seek(0).map_err(demux)
+        self.file.seek(0).map_err(demux)?;
+        self.at_start = true;
+        Ok(())
     }
 }
 
