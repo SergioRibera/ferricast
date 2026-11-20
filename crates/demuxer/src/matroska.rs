@@ -1,31 +1,52 @@
-use std::fs::File;
 use std::io::BufReader;
-use std::path::Path;
 
-use ferricast_core::{Codec, EncodedFrame, FerricastError, Result};
+use ferricast_core::{AudioCodec, AudioFrame, Codec, EncodedFrame, FerricastError, Result};
 use matroska_demuxer::{
     ContentCompAlgo, ContentEncAlgo, ContentEncodingValue, Frame, MatrixCoefficients, MatroskaFile,
     Range, TrackEntry, TrackType,
 };
 
+mod cues;
+
+use crate::audio::{AacConfig, AudioFormat, AudioStream, OPUS_RATE, opus_channels};
 use crate::nal::{Framing, LengthPrefixed};
-use crate::{Color, VideoStream};
+use crate::{BoxedSource, Color, Packet, TrackSelection, VideoStream};
 
 const EBML_MAGIC: [u8; 4] = [0x1A, 0x45, 0xDF, 0xA3];
+/// How far before a seek target the keyframe search starts, tried in
+/// turn until a keyframe at or before the target turns up.
+const SEEK_LOOKBACK_US: [u64; 5] = [1_000_000, 4_000_000, 10_000_000, 30_000_000, 120_000_000];
 
 pub struct MatroskaDemuxer {
-    file: MatroskaFile<BufReader<File>>,
+    file: MatroskaFile<BufReader<cues::CueMask>>,
+    scale_ns: u64,
+    video: Option<VideoTrack>,
+    audio: Option<AudioTrack>,
+    duration_us: Option<u64>,
+    frame: Frame,
+}
+
+struct VideoTrack {
     stream: VideoStream,
     framing: Framing,
     track: u64,
-    scale_ns: u64,
-    frame: Frame,
-    /// The next frame is the first one after open/rewind and must carry the
-    /// parameter sets whatever its NAL types.
+    /// The next frame is the first one after open, rewind or a seek and
+    /// must carry the parameter sets whatever its NAL types.
     at_start: bool,
     /// Bytes removed from the front of every frame by header-stripping
     /// content compression; restored before the frame is handed out.
     stripped_header: Vec<u8>,
+}
+
+struct AudioTrack {
+    stream: AudioStream,
+    format: AudioFormat,
+    track: u64,
+    stripped_header: Vec<u8>,
+    /// Timestamp and duration of the previous frame. Laced frames share
+    /// their block's timestamp, so each one after the first is placed
+    /// right after its predecessor.
+    previous: Option<(u64, u64)>,
 }
 
 /// One `ContentEncoding` of a track, reduced to what this demuxer can undo.
@@ -88,7 +109,7 @@ fn stripped_header<'a>(
             }
             Encoding::Unsupported(what) => {
                 return Err(FerricastError::Demux(format!(
-                    "video track uses {what}, which is not supported"
+                    "track uses {what}, which is not supported"
                 )));
             }
         }
@@ -96,17 +117,13 @@ fn stripped_header<'a>(
     Ok(header)
 }
 
-impl MatroskaDemuxer {
-    pub fn open(path: &Path) -> Result<Self> {
-        let file = MatroskaFile::open(BufReader::new(File::open(path)?)).map_err(demux)?;
-        let scale_ns = file.info().timestamp_scale().get();
-        let (entry, codec, framing) = file
-            .tracks()
-            .iter()
-            .find_map(|entry| {
-                Some((entry, codec(entry)?)).and_then(|(e, c)| Some((e, c, framing(e, c)?)))
-            })
-            .ok_or_else(|| FerricastError::Demux("no supported video track".into()))?;
+impl VideoTrack {
+    fn open(entry: &TrackEntry) -> Result<Option<Self>> {
+        let Some((codec, framing)) =
+            codec(entry).and_then(|codec| Some((codec, framing(entry, codec)?)))
+        else {
+            return Ok(None);
+        };
         let video = entry
             .video()
             .ok_or_else(|| FerricastError::Demux("video track without video settings".into()))?;
@@ -120,78 +137,303 @@ impl MatroskaDemuxer {
                     full_range: colour.range() == Some(Range::Full),
                 })
             }),
-            duration_us: file
-                .info()
-                .duration()
-                .map(|ticks| (ticks * scale_ns as f64 / 1000.0) as u64),
+            duration_us: None,
             presentation_start_us: 0,
         };
-        let track = entry.track_number().get();
-        let stripped_header = stripped_header(
-            entry
-                .content_encodings()
-                .unwrap_or_default()
-                .iter()
-                .map(|e| (e.order(), e.scope(), Encoding::from(e.encoding()))),
-        )?;
-        Ok(Self {
-            file,
+        Ok(Some(Self {
             stream,
             framing,
-            track,
-            scale_ns,
-            frame: Frame::default(),
+            track: entry.track_number().get(),
             at_start: true,
-            stripped_header,
+            stripped_header: track_stripped_header(entry)?,
+        }))
+    }
+
+    fn restore(&self, frame: &mut Frame) {
+        if !self.stripped_header.is_empty() {
+            frame
+                .data
+                .splice(0..0, self.stripped_header.iter().copied());
+        }
+    }
+
+    /// Whether `frame` (with its stripped header restored) starts a GOP.
+    fn is_sync(&self, frame: &Frame) -> bool {
+        // BlockGroups carry no keyframe flag (and the library does not
+        // expose their ReferenceBlocks), so fall back to the payload.
+        frame.is_keyframe.unwrap_or_else(|| {
+            payload_is_keyframe(self.stream.codec, &frame.data)
+                || self
+                    .framing
+                    .annex_b(&frame.data, false)
+                    .is_ok_and(|(_, idr)| idr)
         })
     }
 
-    pub fn video(&self) -> &VideoStream {
-        &self.stream
+    fn encoded(&mut self, frame: &Frame, scale_ns: u64) -> Result<EncodedFrame> {
+        let sync = frame
+            .is_keyframe
+            .unwrap_or_else(|| payload_is_keyframe(self.stream.codec, &frame.data));
+        let (data, idr) = self.framing.annex_b(&frame.data, sync || self.at_start)?;
+        self.at_start = false;
+        let pts = scaled_micros(frame.timestamp, scale_ns)?;
+        Ok(EncodedFrame {
+            codec: self.stream.codec,
+            data,
+            timestamp_us: pts,
+            is_keyframe: sync || idr,
+            duration_us: frame
+                .duration
+                .map(|d| scaled_micros(d, scale_ns))
+                .transpose()?,
+            pts_dts: (pts, pts),
+        })
+    }
+}
+
+impl AudioTrack {
+    /// An AAC or Opus track; other codecs and encodings this demuxer
+    /// cannot undo are skipped.
+    fn open(entry: &TrackEntry) -> Option<Self> {
+        if entry.track_type() != TrackType::Audio {
+            return None;
+        }
+        let settings = entry.audio()?;
+        let channels = u16::try_from(settings.channels().get()).ok()?;
+        let (format, stream) = match entry.codec_id() {
+            "A_OPUS" => {
+                let channels = entry
+                    .codec_private()
+                    .and_then(opus_channels)
+                    .unwrap_or(channels);
+                (
+                    AudioFormat::Opus,
+                    AudioStream {
+                        codec: AudioCodec::Opus,
+                        sample_rate: OPUS_RATE,
+                        channels,
+                        duration_us: None,
+                    },
+                )
+            }
+            id if id.starts_with("A_AAC") => {
+                let config = match entry.codec_private() {
+                    Some(asc) => AacConfig::from_asc(asc),
+                    // Legacy `A_AAC/MPEG4/LC`-style ids carry no config.
+                    None => {
+                        AacConfig::low_complexity(settings.sampling_frequency() as u32, channels)
+                    }
+                }
+                .ok()?;
+                (AudioFormat::Aac(config), config.stream(None))
+            }
+            _ => return None,
+        };
+        Some(Self {
+            stream,
+            format,
+            track: entry.track_number().get(),
+            stripped_header: track_stripped_header(entry).ok()?,
+            previous: None,
+        })
     }
 
-    pub fn next_frame(&mut self) -> Result<Option<EncodedFrame>> {
+    fn audio_frame(&mut self, frame: &Frame, scale_ns: u64) -> Result<AudioFrame> {
+        let mut data = frame.data.as_slice();
+        let restored;
+        if !self.stripped_header.is_empty() {
+            restored = [self.stripped_header.as_slice(), data].concat();
+            data = &restored;
+        }
+        let mut timestamp_us = scaled_micros(frame.timestamp, scale_ns)?;
+        if let Some((previous, duration)) = self.previous
+            && timestamp_us == previous
+        {
+            timestamp_us = previous + duration;
+        }
+        let duration = self.format.packet_duration_us(data).unwrap_or(0);
+        self.previous = Some((timestamp_us, duration));
+        Ok(AudioFrame {
+            codec: self.stream.codec,
+            data: self.format.packet(data)?,
+            timestamp_us,
+            sample_rate: self.stream.sample_rate,
+            channels: self.stream.channels,
+        })
+    }
+}
+
+fn track_stripped_header(entry: &TrackEntry) -> Result<Vec<u8>> {
+    stripped_header(
+        entry
+            .content_encodings()
+            .unwrap_or_default()
+            .iter()
+            .map(|e| (e.order(), e.scope(), Encoding::from(e.encoding()))),
+    )
+}
+
+impl MatroskaDemuxer {
+    pub(crate) fn open(source: BoxedSource, selection: TrackSelection) -> Result<Self> {
+        let file =
+            MatroskaFile::open(BufReader::new(cues::CueMask::new(source)?)).map_err(demux)?;
+        let scale_ns = file.info().timestamp_scale().get();
+        let duration_us = file
+            .info()
+            .duration()
+            .map(|ticks| (ticks * scale_ns as f64 / 1000.0) as u64);
+        let mut video = None;
+        for entry in file.tracks() {
+            if let Some(track) = VideoTrack::open(entry)? {
+                video = Some(track);
+                break;
+            }
+        }
+        if let Some(video) = video.as_mut() {
+            video.stream.duration_us = duration_us;
+        }
+        let audio = match selection {
+            TrackSelection::All => file
+                .tracks()
+                .iter()
+                .find_map(AudioTrack::open)
+                .map(|mut a| {
+                    a.stream.duration_us = duration_us;
+                    a
+                }),
+            TrackSelection::VideoOnly => None,
+        };
+        match (&video, &audio, selection) {
+            (None, _, TrackSelection::VideoOnly) => {
+                return Err(FerricastError::Demux("no supported video track".into()));
+            }
+            (None, None, TrackSelection::All) => {
+                return Err(FerricastError::Demux(
+                    "no supported video or audio track".into(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(Self {
+            file,
+            scale_ns,
+            video,
+            audio,
+            duration_us,
+            frame: Frame::default(),
+        })
+    }
+
+    pub(crate) fn video(&self) -> Option<&VideoStream> {
+        self.video.as_ref().map(|v| &v.stream)
+    }
+
+    pub(crate) fn audio(&self) -> Option<&AudioStream> {
+        self.audio.as_ref().map(|a| &a.stream)
+    }
+
+    pub(crate) fn duration_us(&self) -> Option<u64> {
+        self.duration_us
+    }
+
+    /// The next packet of the selected tracks, in file order.
+    pub(crate) fn next_packet(&mut self) -> Result<Option<Packet>> {
         loop {
             if !self.file.next_frame(&mut self.frame).map_err(demux)? {
                 return Ok(None);
             }
-            if self.frame.track != self.track {
-                continue;
+            if let Some(video) = self.video.as_mut()
+                && self.frame.track == video.track
+            {
+                video.restore(&mut self.frame);
+                return video
+                    .encoded(&self.frame, self.scale_ns)
+                    .map(|f| Some(Packet::Video(f)));
             }
-            if !self.stripped_header.is_empty() {
-                self.frame
-                    .data
-                    .splice(0..0, self.stripped_header.iter().copied());
+            if let Some(audio) = self.audio.as_mut()
+                && self.frame.track == audio.track
+            {
+                return audio
+                    .audio_frame(&self.frame, self.scale_ns)
+                    .map(|f| Some(Packet::Audio(f)));
             }
-            // BlockGroups carry no keyframe flag (and the library does not
-            // expose their ReferenceBlocks), so fall back to the payload.
-            let sync = self
-                .frame
-                .is_keyframe
-                .unwrap_or_else(|| payload_is_keyframe(self.stream.codec, &self.frame.data));
-            let (data, idr) = self
-                .framing
-                .annex_b(&self.frame.data, sync || self.at_start)?;
-            self.at_start = false;
-            let pts = scaled_micros(self.frame.timestamp, self.scale_ns)?;
-            return Ok(Some(EncodedFrame {
-                codec: self.stream.codec,
-                data,
-                timestamp_us: pts,
-                is_keyframe: sync || idr,
-                duration_us: self
-                    .frame
-                    .duration
-                    .map(|d| scaled_micros(d, self.scale_ns))
-                    .transpose()?,
-                pts_dts: (pts, pts),
-            }));
         }
     }
 
-    pub fn rewind(&mut self) -> Result<()> {
+    /// Positions the demuxer on the last video keyframe at or before
+    /// `timestamp_us` (audio-only files: on `timestamp_us` itself) and
+    /// returns where it landed. Without Cues the library walks the
+    /// clusters linearly, so the keyframe search reads forward from a
+    /// little before the target, widening the window until it finds one.
+    pub(crate) fn seek(&mut self, timestamp_us: u64) -> Result<u64> {
+        let past_end = self.duration_us.is_some_and(|d| timestamp_us >= d);
+        let landed = if self.video.is_none() || past_end {
+            timestamp_us
+        } else {
+            self.find_keyframe(timestamp_us)?
+        };
+        self.file.seek(self.ticks(landed)).map_err(demux)?;
+        if let Some(video) = self.video.as_mut() {
+            video.at_start = true;
+        }
+        if let Some(audio) = self.audio.as_mut() {
+            audio.previous = None;
+        }
+        Ok(landed)
+    }
+
+    fn find_keyframe(&mut self, timestamp_us: u64) -> Result<u64> {
+        let mut from = timestamp_us;
+        for lookback in SEEK_LOOKBACK_US {
+            from = timestamp_us.saturating_sub(lookback);
+            self.file.seek(self.ticks(from)).map_err(demux)?;
+            if let Some(keyframe) = self.last_keyframe_until(timestamp_us)? {
+                return Ok(keyframe);
+            }
+            if from == 0 {
+                break;
+            }
+        }
+        // No keyframe within reach: start from the widest window and let
+        // the decoder wait for the next one.
+        Ok(from)
+    }
+
+    /// Reads forward and returns the timestamp of the last video keyframe
+    /// not after `timestamp_us`.
+    fn last_keyframe_until(&mut self, timestamp_us: u64) -> Result<Option<u64>> {
+        let Some(video) = self.video.as_ref() else {
+            return Ok(None);
+        };
+        let mut found = None;
+        while self.file.next_frame(&mut self.frame).map_err(demux)? {
+            let at = scaled_micros(self.frame.timestamp, self.scale_ns)?;
+            if at > timestamp_us {
+                break;
+            }
+            if self.frame.track == video.track {
+                video.restore(&mut self.frame);
+                if video.is_sync(&self.frame) {
+                    found = Some(at);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn ticks(&self, timestamp_us: u64) -> u64 {
+        u64::try_from(u128::from(timestamp_us) * 1000 / u128::from(self.scale_ns.max(1)))
+            .unwrap_or(u64::MAX)
+    }
+
+    pub(crate) fn rewind(&mut self) -> Result<()> {
         self.file.seek(0).map_err(demux)?;
-        self.at_start = true;
+        if let Some(video) = self.video.as_mut() {
+            video.at_start = true;
+        }
+        if let Some(audio) = self.audio.as_mut() {
+            audio.previous = None;
+        }
         Ok(())
     }
 }
@@ -528,10 +770,11 @@ mod tests {
     /// only by the container flag; so is the second keyframe it carries.
     #[test]
     fn av1_fixture_keyframes_are_found_in_the_bitstream() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/av1.webm");
-        let mut demuxer = MatroskaDemuxer::open(&path).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/av1.webm");
+        let file = std::fs::File::open(&path).unwrap();
+        let mut demuxer = MatroskaDemuxer::open(Box::new(file), TrackSelection::VideoOnly).unwrap();
         let mut keyframes = Vec::new();
-        while let Some(frame) = demuxer.next_frame().unwrap() {
+        while let Some(Packet::Video(frame)) = demuxer.next_packet().unwrap() {
             keyframes.push(payload_is_keyframe(Codec::Av1, &frame.data));
         }
         assert_eq!(keyframes.first(), Some(&true));

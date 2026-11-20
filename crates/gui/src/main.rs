@@ -75,6 +75,21 @@ async fn main() -> anyhow::Result<()> {
     let manager_builder = manager_builder.with_h264_decoder();
     #[cfg(feature = "aac")]
     let manager_builder = manager_builder.with_aac_decoder();
+    #[cfg(feature = "hevc-decode")]
+    let manager_builder =
+        manager_builder.register_video_decoder::<ferricast::decoder::H265Decoder>();
+    #[cfg(feature = "vp8-decode")]
+    let manager_builder =
+        manager_builder.register_video_decoder::<ferricast::decoder::Vp8Decoder>();
+    #[cfg(feature = "vp9-decode")]
+    let manager_builder =
+        manager_builder.register_video_decoder::<ferricast::decoder::Vp9Decoder>();
+    #[cfg(feature = "av1-decode")]
+    let manager_builder =
+        manager_builder.register_video_decoder::<ferricast::decoder::Av1Decoder>();
+    #[cfg(feature = "opus-decode")]
+    let manager_builder =
+        manager_builder.register_audio_decoder::<ferricast::decoder::OpusDecoder>();
     let mut manager_builder = manager_builder;
 
     if let (Some(min), Some(max)) = (args.port_min, args.port_max) {

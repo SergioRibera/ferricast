@@ -24,6 +24,11 @@ default = [
     "airplay",
     "fdk-aac",
     "opus-rs",
+    "hevc-decode",
+    "vp8-decode",
+    "vp9-decode",
+    "av1-decode",
+    "opus-decode",
 ]
 chromecast = ["ferricast/chromecast"]
 airplay = [ "ferricast/airplay" ]
@@ -37,6 +42,12 @@ openh264 = ["ferricast/openh264"]
 vaapi = ["ferricast/vaapi"]
 nvenc = ["ferricast/nvenc"]
 aac = ["ferricast/aac"]
+# Software decoders for progressive media in receiver windows.
+hevc-decode = ["ferricast/hevc-decode"]
+vp8-decode = ["ferricast/vp8-decode"]
+vp9-decode = ["ferricast/vp9-decode"]
+av1-decode = ["ferricast/av1-decode"]
+opus-decode = ["ferricast/opus-decode"]
 # AAC-LC sender-side encoder via libfdk-aac. Required for the
 # chromecast HLS audio pipeline. Without this the audio task in
 # `StreamManager` panics on first PCM with `AacEncoder: no backend

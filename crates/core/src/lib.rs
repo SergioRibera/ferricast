@@ -29,8 +29,8 @@ pub use capture::{
 };
 pub use codec::Codec;
 pub use control::{
-    ControlSession, MediaCommand, PlaybackState, QueueItem, RemoteSender, RepeatMode,
-    TrackSelection,
+    ControlSession, MediaCommand, PlaybackState, PlaybackStatus, QueueItem, RemoteSender,
+    RepeatMode, TrackSelection,
 };
 pub use decoder::{AudioDecoder, AudioDecoderConfig, DecodedAudio, DecoderConfig, VideoDecoder};
 pub use device::{

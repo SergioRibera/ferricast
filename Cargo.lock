@@ -1890,6 +1890,7 @@ dependencies = [
  "ferricast-chromecast",
  "ferricast-core",
  "ferricast-decoder",
+ "ferricast-demuxer",
  "ferricast-encoder",
  "ferricast-hls",
  "rustls",
@@ -2021,6 +2022,7 @@ dependencies = [
  "libc",
  "openh264",
  "openh264-sys2",
+ "opus-rs",
  "rav1d",
  "rust_h265",
  "rusty_vp9",
@@ -2037,6 +2039,10 @@ dependencies = [
  "bytes",
  "ferricast-core",
  "matroska-demuxer",
+ "reqwest",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

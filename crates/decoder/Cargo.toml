@@ -21,6 +21,8 @@ vp8-decode = ["dep:vp8-decoder"]
 vp9-decode = ["dep:rusty_vp9"]
 hevc-decode = ["dep:rust_h265", "dep:h264-reader"]
 av1-decode = ["dep:rav1d", "dep:libc"]
+# Pure-Rust Opus decode (WebM / Matroska / MP4 Opus audio in the receiver).
+opus-decode = ["dep:opus-rs"]
 # Hardware H.264 decode via VA-API. Opt-in (not in defaults) until
 # the slice-submission path is fully verified against a real
 # bitstream test rig — until then `FERRICAST_H264_DECODE_BACKEND=vaapi`
@@ -57,6 +59,7 @@ rusty_vp9 = { version = "0.3", optional = true, default-features = false }
 rust_h265 = { version = "0.4.1", optional = true, default-features = false }
 rav1d = { version = "1.1", optional = true, default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 libc = { version = "0.2", optional = true }
+opus-rs = { version = "0.1.23", optional = true }
 
 # VA-API decode (opt-in). Same fork pin as the encoder so a single
 # libva ABI version is in play across the workspace.
