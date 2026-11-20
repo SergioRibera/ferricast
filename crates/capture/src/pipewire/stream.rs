@@ -229,7 +229,9 @@ fn run(
         Some(imp) => format::SUPPORTED_FORMATS
             .iter()
             .filter_map(|f| {
-                let mods = imp.supported_modifiers(*f);
+                let mods = format::pixel_format(*f)
+                    .map(|p| imp.supported_modifiers(p))
+                    .unwrap_or_default();
                 if mods.is_empty() {
                     None
                 } else {

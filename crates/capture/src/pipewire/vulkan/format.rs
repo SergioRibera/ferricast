@@ -3,7 +3,6 @@
 
 use ash::vk;
 use ferricast_core::PixelFormat;
-use pipewire::spa::param::video::VideoFormat;
 
 /// Map a public [`PixelFormat`] to the Vulkan format used to import
 /// the corresponding dmabuf.
@@ -19,16 +18,6 @@ pub(super) fn pixel_format_to_vk(p: PixelFormat) -> Option<vk::Format> {
         // NV12 / I420 are multi-plane and currently routed through
         // the SHM path; we don't import those via Vulkan.
         PixelFormat::Nv12 | PixelFormat::I420 => return None,
-    })
-}
-
-/// SPA `VideoFormat` → Vulkan format. Used to query GPU-supported
-/// modifiers for the formats we'd actually import.
-pub(super) fn video_format_to_vk(spa: VideoFormat) -> Option<vk::Format> {
-    Some(match spa {
-        VideoFormat::BGRA | VideoFormat::BGRx => vk::Format::B8G8R8A8_UNORM,
-        VideoFormat::RGBA | VideoFormat::RGBx => vk::Format::R8G8B8A8_UNORM,
-        _ => return None,
     })
 }
 

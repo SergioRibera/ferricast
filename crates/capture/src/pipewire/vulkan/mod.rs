@@ -43,7 +43,6 @@ use std::sync::Mutex;
 use ash::vk;
 use bytes::Bytes;
 use ferricast_core::{DmaBufImporter, DmaBufPlane, FerricastError, PixelFormat, Result};
-use pipewire::spa::param::video::VideoFormat;
 use tracing::{debug, warn};
 
 /// Public handle. The mutable per-frame state lives behind a
@@ -206,11 +205,11 @@ impl VulkanImporter {
         })
     }
 
-    /// DRM modifiers the GPU can import/export for the given video
-    /// format. Pass these to PipeWire's `VideoModifier` choice in the
-    /// EnumFormat pod.
-    pub(crate) fn supported_modifiers(&self, format: VideoFormat) -> Vec<u64> {
-        let Some(vk_format) = format::video_format_to_vk(format) else {
+    /// DRM modifiers the GPU can import and read back for the given
+    /// pixel format. PipeWire passes these to its `VideoModifier`
+    /// choice in the EnumFormat pod.
+    pub(crate) fn supported_modifiers(&self, format: PixelFormat) -> Vec<u64> {
+        let Some(vk_format) = format::pixel_format_to_vk(format) else {
             debug!(?format, "no VkFormat mapping, treating as unsupported");
             return Vec::new();
         };
