@@ -727,6 +727,12 @@ fn run_worker(
                 .blocking_dispatch(&mut state)
                 .map_err(|e| FerricastError::Capture(format!("frame wait: {e}")))?;
         }
+        // The frame object is single-use: once `ready` / `failed`
+        // arrived (or we gave up waiting) nothing else will happen on
+        // it. Destroy it on every path, otherwise each capture leaks a
+        // protocol object on both sides of the connection (~108k/hour
+        // at 30 fps).
+        frame.destroy();
         if state.status != FrameStatus::Ready {
             // Record per-transport consecutive failures so the
             // sticky-disable above only fires when the *dmabuf*
