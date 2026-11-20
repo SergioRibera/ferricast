@@ -34,7 +34,7 @@ fn frames(demuxer: &mut Demuxer) -> Vec<EncodedFrame> {
 fn every_fixture_reports_its_codec_and_size() {
     for &(name, codec) in FIXTURES {
         let demuxer = open(name);
-        let stream = demuxer.video();
+        let stream = demuxer.video().unwrap();
         assert_eq!(stream.codec, codec, "{name}");
         assert_eq!((stream.width, stream.height), (128, 72), "{name}");
     }

@@ -19,6 +19,7 @@ use pts::Presentation;
 
 pub struct Player {
     demuxer: Demuxer,
+    video: VideoStream,
     decoder: Decoder,
     presentation: Presentation,
     ready: VecDeque<CapturedFrame>,
@@ -36,10 +37,15 @@ pub struct Player {
 impl Player {
     pub fn open(path: &Path) -> Result<Self> {
         let demuxer = Demuxer::open(path)?;
-        let decoder = open_decoder(&demuxer, false)?;
-        let presentation = Presentation::new(demuxer.video().presentation_start_us);
+        let video = demuxer
+            .video()
+            .cloned()
+            .ok_or_else(|| FerricastError::Demux("no supported video track".into()))?;
+        let decoder = open_decoder(&video, false)?;
+        let presentation = Presentation::new(video.presentation_start_us);
         Ok(Self {
             demuxer,
+            video,
             decoder,
             presentation,
             ready: VecDeque::new(),
@@ -52,7 +58,7 @@ impl Player {
     }
 
     pub fn video(&self) -> &VideoStream {
-        self.demuxer.video()
+        &self.video
     }
 
     pub fn next_frame(&mut self) -> Result<Option<CapturedFrame>> {
@@ -102,7 +108,7 @@ impl Player {
     /// presentation state so the caller decides what may be shown again.
     fn restart(&mut self) -> Result<()> {
         self.demuxer.rewind()?;
-        self.decoder = open_decoder(&self.demuxer, self.software_only)?;
+        self.decoder = open_decoder(&self.video, self.software_only)?;
         self.ready.clear();
         self.drained = false;
         self.packets = 0;
@@ -141,7 +147,6 @@ impl Player {
     }
 }
 
-fn open_decoder(demuxer: &Demuxer, software_only: bool) -> Result<Decoder> {
-    let stream = demuxer.video();
+fn open_decoder(stream: &VideoStream, software_only: bool) -> Result<Decoder> {
     Decoder::open(stream.codec, stream.width, stream.height, software_only)
 }
