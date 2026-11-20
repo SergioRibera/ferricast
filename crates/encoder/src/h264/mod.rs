@@ -255,6 +255,19 @@ impl VideoEncoder for H264Encoder {
             H264Encoder::X264(e) => e.request_keyframe(),
         }
     }
+
+    fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
+        match self {
+            // Nothing to retarget yet; `configure()` takes the bitrate.
+            H264Encoder::Pending => Ok(()),
+            #[cfg(feature = "vaapi")]
+            H264Encoder::Vaapi(e) => e.set_bitrate_kbps(kbps),
+            #[cfg(feature = "nvenc")]
+            H264Encoder::Nvenc(e) => e.set_bitrate_kbps(kbps),
+            #[cfg(feature = "x264")]
+            H264Encoder::X264(e) => e.set_bitrate_kbps(kbps),
+        }
+    }
 }
 
 /// Reconfiguration-failure helper: switch the encoder to openh264 when
