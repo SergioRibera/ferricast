@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use ferricast::{
@@ -35,7 +35,7 @@ use ferricast::{
     PixelFormat, RemoteSender, Result,
 };
 use freya::engine::prelude::{
-    AlphaType, ColorType, Data, ISize, Image as SkImage, ImageInfo, Paint, SamplingOptions,
+    AlphaType, ColorType, Data, ISize, ImageInfo, Paint, SamplingOptions, raster_from_data,
 };
 use freya::prelude::*;
 use freya::winit::window::WindowLevel;
@@ -44,10 +44,35 @@ use tokio::sync::mpsc;
 /// Frame counters surfaced to the receiver-side telemetry — kept
 /// public because `main.rs` collects them across active sessions
 /// for a debugging overlay we may add later.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct ReceiverCounters {
     pub video_frames: AtomicU64,
     pub audio_frames: AtomicU64,
+    /// Audio output gain as `f32` bits, written by the sink when the
+    /// sender changes volume or mute and applied by the window's
+    /// audio task.
+    audio_gain: AtomicU32,
+}
+
+impl Default for ReceiverCounters {
+    fn default() -> Self {
+        Self {
+            video_frames: AtomicU64::new(0),
+            audio_frames: AtomicU64::new(0),
+            audio_gain: AtomicU32::new(1.0f32.to_bits()),
+        }
+    }
+}
+
+impl ReceiverCounters {
+    pub fn audio_gain(&self) -> f32 {
+        f32::from_bits(self.audio_gain.load(Ordering::Relaxed))
+    }
+
+    pub fn set_audio_gain(&self, gain: f32) {
+        self.audio_gain
+            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
 }
 
 /// Cross-thread payload for one decoded video frame. Skia images
@@ -65,6 +90,10 @@ pub struct VideoFrame {
     /// the CPU shape.
     pub bgra: Bytes,
     pub stride: u32,
+    /// Presentation timestamp. The pipeline already delivers each
+    /// frame at its presentation time, so the window shows frames as
+    /// they arrive; the PTS is kept for diagnostics.
+    pub pts_us: u64,
 }
 
 /// Cross-thread payload for one decoded audio buffer. Already s16
@@ -133,6 +162,7 @@ impl FrameSink for WindowSink {
             width: raw.width,
             height: raw.height,
             stride: raw.stride,
+            pts_us: raw.timestamp_us,
             bgra: raw.data,
         };
         // try_send drops on backpressure: a frame older than the
@@ -170,14 +200,14 @@ impl FrameSink for WindowSink {
         // eviction on the sender. Capacity 256 (~5 s @ 21 ms/buffer)
         // absorbs the startup spike; under steady-state overload
         // we'd rather glitch audio than stall the whole pipeline.
-        if let Err(e) = self.audio_tx.try_send(buf) {
-            if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
-                tracing::warn!(
-                    receiver = %self.label,
-                    "audio buffer dropped — channel full"
-                );
-            }
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = self.audio_tx.try_send(buf) {
+            tracing::warn!(receiver = %self.label, "audio buffer dropped — channel full");
         }
+        Ok(())
+    }
+
+    async fn set_volume(&mut self, gain: f32) -> Result<()> {
+        self.counters.set_audio_gain(gain);
         Ok(())
     }
 }
@@ -256,6 +286,7 @@ impl App for ReceiverWindowApp {
                 let slot = video_slot_for_task;
                 spawn(async move {
                     while let Some(frame) = rx.recv().await {
+                        tracing::trace!(pts_us = frame.pts_us, "receiver window: frame");
                         if let Ok(mut g) = slot.lock() {
                             *g = Some(frame);
                         }
@@ -272,6 +303,7 @@ impl App for ReceiverWindowApp {
         // tears the stream down mid-playback. Stash it in a hook
         // closure so it's owned by the task.
         let audio_rx_take = self.audio_rx.clone();
+        let audio_counters = counters.clone();
         let mut ended_for_audio = ended;
         use_hook(move || {
             if let Some(mut rx) = audio_rx_take.borrow_mut().take() {
@@ -303,6 +335,7 @@ impl App for ReceiverWindowApp {
                         if sink.len() > 100 {
                             continue;
                         }
+                        sink.set_volume(audio_counters.audio_gain());
                         let source = rodio::buffer::SamplesBuffer::new(
                             buf.channels,
                             buf.sample_rate,
@@ -372,7 +405,7 @@ impl App for ReceiverWindowApp {
                 None,
             );
             let data = Data::new_copy(&frame.bgra);
-            let Some(image) = SkImage::from_raster_data(&info, data, frame.stride as usize) else {
+            let Some(image) = raster_from_data(&info, data, frame.stride as usize) else {
                 return;
             };
             // Use the visible-area dimensions Freya gave us; the

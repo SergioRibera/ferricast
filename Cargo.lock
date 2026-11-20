@@ -1883,6 +1883,7 @@ dependencies = [
 name = "ferricast"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "ferricast-airplay",
  "ferricast-capture",
@@ -1891,7 +1892,11 @@ dependencies = [
  "ferricast-decoder",
  "ferricast-encoder",
  "ferricast-hls",
+ "rustls",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "uuid",
 ]
@@ -2080,6 +2085,7 @@ dependencies = [
 name = "ferricast-hls"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "bytes",
  "ferricast-core",
  "ferricast-m3u8",
@@ -2092,6 +2098,7 @@ dependencies = [
  "ring",
  "rustls",
  "socket2 0.6.4",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tracing",

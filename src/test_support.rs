@@ -239,7 +239,9 @@ impl CastSession for FakeSession {
         if CastSession::is_alive(self) || !self.remote_end {
             return None;
         }
-        Some(FerricastError::RemoteStopped("another app took over".into()))
+        Some(FerricastError::RemoteStopped(
+            "another app took over".into(),
+        ))
     }
 
     fn preferred_audio_codec(&self) -> AudioCodec {

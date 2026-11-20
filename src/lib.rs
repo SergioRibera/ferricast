@@ -38,6 +38,7 @@
 //! - [`prelude`] — the everyday types most callers want in scope.
 
 mod manager;
+mod receiver;
 mod stream;
 #[cfg(test)]
 mod test_support;

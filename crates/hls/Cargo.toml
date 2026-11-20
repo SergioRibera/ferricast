@@ -8,7 +8,7 @@ edition = "2024"
 # receiver path depends on it; turn off only when building a sender-
 # only binary that doesn't need to pull foreign streams.
 default = ["pull"]
-pull = ["dep:reqwest", "dep:m3u8-rs", "dep:url"]
+pull = ["dep:reqwest", "dep:m3u8-rs", "dep:url", "dep:aes"]
 
 [dependencies]
 ferricast-core.workspace = true
@@ -41,6 +41,9 @@ reqwest = { version = "0.12", optional = true, default-features = false, feature
 m3u8-rs = { version = "6", optional = true }
 mpeg2ts-reader = { version = "0.16", optional = true }
 url = { version = "2", optional = true }
+# - `aes` — AES-128 block cipher for `EXT-X-KEY:METHOD=AES-128`
+#   segments (CBC chaining is done by hand; it is a few lines).
+aes = { version = "0.8", optional = true }
 
 # TLS for the HLS server. Off by default in `HlsConfig` (loopback /
 # trusted-LAN setups don't need it), opt-in via `HlsConfig::tls`. The
@@ -58,3 +61,4 @@ socket2 = "0.6"
 [dev-dependencies]
 # `test-util` enables paused-clock tests for the timeout paths.
 tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
