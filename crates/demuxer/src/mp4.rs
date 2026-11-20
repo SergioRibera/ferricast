@@ -69,6 +69,15 @@ struct Track {
     shift: i64,
 }
 
+impl Tables {
+    /// Sum of every `stts` sample delta, in media ticks.
+    fn decode_duration(&self) -> u64 {
+        self.stts.iter().fold(0u64, |total, &(count, delta)| {
+            total.saturating_add(u64::from(count) * u64::from(delta))
+        })
+    }
+}
+
 struct Boxes<'a>(&'a [u8]);
 
 impl<'a> Iterator for Boxes<'a> {
@@ -118,7 +127,10 @@ impl Mp4Demuxer {
                 width: track.entry.width,
                 height: track.entry.height,
                 color: track.entry.color,
-                duration_us: Some(micros(track.duration as i64, track.timescale)),
+                duration_us: Some(micros(
+                    i64::try_from(track.duration).unwrap_or(i64::MAX),
+                    track.timescale,
+                )),
             },
             framing: track.entry.framing,
             timescale: track.timescale,
@@ -217,11 +229,12 @@ fn parse_track(trak: &[u8]) -> Option<Track> {
     let stbl = child(child(mdia, b"minf")?, b"stbl")?;
     let stsd = child(stbl, b"stsd")?;
     let (kind, entry) = Boxes(stsd.get(8..)?).next()?;
+    let tables = parse_tables(stbl)?;
     Some(Track {
         entry: parse_entry(kind, entry)?,
         timescale,
-        duration,
-        tables: parse_tables(stbl)?,
+        duration: duration.unwrap_or_else(|| tables.decode_duration()),
+        tables,
         shift: child(trak, b"edts")
             .and_then(|edts| child(edts, b"elst"))
             .and_then(parse_elst)
@@ -229,10 +242,21 @@ fn parse_track(trak: &[u8]) -> Option<Track> {
     })
 }
 
-fn parse_mdhd(mdhd: &[u8]) -> Option<(u32, u64)> {
+/// Returns the media timescale and duration; an all-ones duration means
+/// "unknown" (ISO/IEC 14496-12 §8.4.2.3) and comes back as `None`.
+fn parse_mdhd(mdhd: &[u8]) -> Option<(u32, Option<u64>)> {
     match *mdhd.first()? {
-        1 => Some((be32(mdhd, 20)?, be64(mdhd, 24)?)),
-        _ => Some((be32(mdhd, 12)?, u64::from(be32(mdhd, 16)?))),
+        1 => {
+            let duration = be64(mdhd, 24)?;
+            Some((be32(mdhd, 20)?, (duration != u64::MAX).then_some(duration)))
+        }
+        _ => {
+            let duration = be32(mdhd, 16)?;
+            Some((
+                be32(mdhd, 12)?,
+                (duration != u32::MAX).then_some(u64::from(duration)),
+            ))
+        }
     }
 }
 
@@ -581,6 +605,30 @@ mod tests {
             ..Tables::default()
         };
         assert_eq!(build_samples(&tables).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn all_ones_mdhd_duration_is_unknown() {
+        let mut v0 = vec![0; 12];
+        v0.extend_from_slice(&1000u32.to_be_bytes());
+        v0.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse_mdhd(&v0), Some((1000, None)));
+        let mut v1 = vec![1, 0, 0, 0];
+        v1.extend_from_slice(&[0; 16]);
+        v1.extend_from_slice(&90_000u32.to_be_bytes());
+        v1.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(parse_mdhd(&v1), Some((90_000, None)));
+        v0[16..20].copy_from_slice(&5000u32.to_be_bytes());
+        assert_eq!(parse_mdhd(&v0), Some((1000, Some(5000))));
+    }
+
+    #[test]
+    fn decode_duration_sums_the_stts_runs() {
+        let tables = Tables {
+            stts: vec![(2, 100), (3, 50)],
+            ..Tables::default()
+        };
+        assert_eq!(tables.decode_duration(), 350);
     }
 
     #[test]
