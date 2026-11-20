@@ -542,8 +542,7 @@ pub async fn run_from_frames(
                     // single drain at close.
                     if let Some(pt_us) = part_target_us {
                         let part_span_us = video_pts_us.saturating_sub(part_start_pts_us);
-                        if part_span_us > 0
-                            && part_span_us.saturating_add(frame_period_us) > pt_us
+                        if part_span_us > 0 && part_span_us.saturating_add(frame_period_us) > pt_us
                         {
                             let part_bytes = Bytes::from(muxer.drain());
                             if !part_bytes.is_empty() {
@@ -588,8 +587,7 @@ pub async fn run_from_frames(
                         loop {
                             match rx.try_recv() {
                                 Ok(extra) => {
-                                    if let Err(e) =
-                                        push_audio_frame(&mut muxer, &extra, &timeline)
+                                    if let Err(e) = push_audio_frame(&mut muxer, &extra, &timeline)
                                     {
                                         warn!(error = %e, "audio PES push failed (drain)");
                                     } else {
@@ -675,10 +673,10 @@ pub async fn run_from_frames(
         } else {
             // Classic HLS — single drain → one push.
             let size = final_drain.len();
-            let seq = ring
-                .write()
-                .await
-                .push(elapsed.as_secs_f32(), segment_discontinuity, final_drain);
+            let seq =
+                ring.write()
+                    .await
+                    .push(elapsed.as_secs_f32(), segment_discontinuity, final_drain);
             (size, seq)
         };
 
@@ -983,7 +981,10 @@ mod part_tests {
         };
         let ring = segment(frames, config).await;
         let playlist = ring.build_playlist().unwrap();
-        assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.500"), "{playlist}");
+        assert!(
+            playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.500"),
+            "{playlist}"
+        );
         let parts: Vec<f32> = playlist
             .lines()
             .filter_map(|l| l.strip_prefix("#EXT-X-PART:DURATION="))

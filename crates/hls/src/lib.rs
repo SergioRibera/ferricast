@@ -238,7 +238,10 @@ impl HlsServer {
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "?".into());
 
-        let ring = Arc::new(RwLock::new(SegmentRing::new(config.keep_segments, config.target_duration())));
+        let ring = Arc::new(RwLock::new(SegmentRing::new(
+            config.keep_segments,
+            config.target_duration(),
+        )));
         let writer = ring.clone();
         let cfg = config.clone();
         let segmenter = tokio::spawn(async move {
@@ -417,7 +420,10 @@ impl HlsFrameSink {
 
         let local = listener.local_addr().map_err(FerricastError::from)?;
 
-        let ring = Arc::new(RwLock::new(SegmentRing::new(config.keep_segments, config.target_duration())));
+        let ring = Arc::new(RwLock::new(SegmentRing::new(
+            config.keep_segments,
+            config.target_duration(),
+        )));
         let segmenter_ring = ring.clone();
         let adaptive_for_segmenter = config.adaptive.clone();
         let cfg_for_segmenter = config.clone();

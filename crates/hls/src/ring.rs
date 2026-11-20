@@ -419,7 +419,10 @@ mod tests {
         let body = seg.data.as_ptr_range();
         for part in &seg.parts {
             let p = part.data.as_ptr_range();
-            assert!(body.start <= p.start && p.end <= body.end, "part not a body slice");
+            assert!(
+                body.start <= p.start && p.end <= body.end,
+                "part not a body slice"
+            );
         }
         assert_eq!(&seg.parts[1].data[..], &[2; 376][..]);
     }
@@ -444,7 +447,12 @@ mod discontinuity_tests {
         // Evict the untagged segment 0: still nothing removed.
         ring.push(2.0, false, seg());
         ring.push(2.0, false, seg());
-        assert!(!ring.build_playlist().unwrap().contains("DISCONTINUITY-SEQUENCE"));
+        assert!(
+            !ring
+                .build_playlist()
+                .unwrap()
+                .contains("DISCONTINUITY-SEQUENCE")
+        );
         // Evict the tagged segment 1.
         ring.push(2.0, false, seg());
         let p = ring.build_playlist().unwrap();
