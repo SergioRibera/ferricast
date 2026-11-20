@@ -45,8 +45,8 @@ pub struct RawFrame {
 ///   encoders that only consume `RawFrame` (x264).
 ///
 /// Cloning a `GpuFrame` is cheap — the plane's fd is an
-/// `Arc`-shared owned duplicate (see [`DmaBufFd`]) and the importer
-/// handle is `Arc`-shared too.
+/// `Arc`-shared owned duplicate (see [`DmaBufFd`]), and the importer
+/// handle and the [`BufferLease`] are `Arc`-shared too.
 #[derive(Clone)]
 pub struct GpuFrame {
     pub width: u32,
@@ -60,6 +60,10 @@ pub struct GpuFrame {
     /// always populated when the PipeWire DmaBuf path produces a
     /// `GpuFrame`.
     pub importer: Option<Arc<dyn DmaBufImporter>>,
+    /// Keeps the producer from rendering into this DMA-BUF while any
+    /// clone of the frame is alive. `None` when the producer gives no
+    /// such guarantee (the contents may then change under readers).
+    pub lease: Option<BufferLease>,
 }
 
 impl std::fmt::Debug for GpuFrame {
@@ -72,6 +76,35 @@ impl std::fmt::Debug for GpuFrame {
             .field("timestamp_us", &self.timestamp_us)
             .field("plane", &self.plane)
             .field("has_importer", &self.importer.is_some())
+            .field("lease", &self.lease)
+            .finish()
+    }
+}
+
+/// Holds a producer's buffer out of its pool while a consumer may
+/// still read it.
+///
+/// The producer wraps a guard whose `Drop` hands the buffer back (for
+/// PipeWire: re-queues it to the compositor). Every clone of a frame
+/// shares one lease, so the buffer goes back exactly once, when the
+/// last clone is gone. A consumer whose GPU work keeps reading the
+/// DMA-BUF after it is done with the frame (asynchronous encode) must
+/// keep a clone alive until that work has completed.
+#[derive(Clone)]
+pub struct BufferLease(Arc<dyn Send + Sync>);
+
+impl BufferLease {
+    /// Wrap `guard`; its `Drop` runs when the last clone is dropped.
+    #[must_use]
+    pub fn new<G: Send + Sync + 'static>(guard: G) -> Self {
+        Self(Arc::new(guard))
+    }
+}
+
+impl std::fmt::Debug for BufferLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BufferLease")
+            .field("holders", &Arc::strong_count(&self.0))
             .finish()
     }
 }
@@ -98,9 +131,10 @@ pub struct DmaBufPlane {
 /// frame therefore owns a `dup` of the descriptor, which keeps the
 /// underlying DMA-BUF object alive until the last clone drops.
 ///
-/// Note: owning the fd guarantees *object* lifetime, not *content*
-/// stability — a producer that re-queues the buffer may let the
-/// compositor render into it while a consumer still reads it.
+/// Owning the fd guarantees *object* lifetime, not *content*
+/// stability; that comes from [`GpuFrame::lease`]. Import caches may
+/// keep a `DmaBufFd` indefinitely, which is why the lease lives on
+/// the frame and not here.
 #[derive(Debug, Clone)]
 pub struct DmaBufFd(Arc<OwnedFd>);
 
@@ -238,6 +272,9 @@ impl CapturedFrame {
     /// Force the frame into a CPU-resident `RawFrame`. No-op for
     /// `Cpu`; performs a readback through the carried importer for
     /// `Gpu`. Errors out if the GPU frame has no importer attached.
+    ///
+    /// The frame, and with it its [`BufferLease`], is dropped only
+    /// once `readback` has returned, i.e. after the copy completed.
     pub fn into_cpu(self) -> Result<RawFrame> {
         match self {
             CapturedFrame::Cpu(r) => Ok(r),
@@ -362,11 +399,83 @@ mod tests {
                 size: pitch * height,
             },
             importer: Some(Arc::new(PackedImporter)),
+            lease: None,
         });
         let raw = frame.into_cpu().expect("readback");
         assert_eq!(raw.stride, width * 4);
         assert_eq!(raw.data.len(), (raw.stride * raw.height) as usize);
         assert_eq!(raw.timestamp_us, 7);
+    }
+
+    /// Counts how often the producer got its buffer back.
+    struct CountReturns(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for CountReturns {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Asserts the lease is still outstanding while it reads.
+    struct LeaseCheckingImporter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl DmaBufImporter for LeaseCheckingImporter {
+        fn readback(
+            &self,
+            plane: &DmaBufPlane,
+            width: u32,
+            height: u32,
+            format: PixelFormat,
+        ) -> Result<Bytes> {
+            assert_eq!(
+                self.0.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "buffer returned to the producer before readback finished"
+            );
+            PackedImporter.readback(plane, width, height, format)
+        }
+    }
+
+    fn leased_frame(returns: &Arc<std::sync::atomic::AtomicUsize>) -> GpuFrame {
+        GpuFrame {
+            width: 2,
+            height: 2,
+            stride: 8,
+            format: PixelFormat::Bgra,
+            timestamp_us: 0,
+            plane: DmaBufPlane {
+                fd: DmaBufFd::from(memfd(c"ferricast-lease")),
+                offset: 0,
+                stride: 8,
+                modifier: 0,
+                size: 16,
+            },
+            importer: Some(Arc::new(LeaseCheckingImporter(Arc::clone(returns)))),
+            lease: Some(BufferLease::new(CountReturns(Arc::clone(returns)))),
+        }
+    }
+
+    #[test]
+    fn lease_returns_buffer_once_after_last_clone() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let returns = Arc::new(AtomicUsize::new(0));
+        let frame = leased_frame(&returns);
+        let clone = CapturedFrame::Gpu(frame.clone());
+        drop(frame);
+        assert_eq!(returns.load(Ordering::SeqCst), 0);
+        drop(clone);
+        assert_eq!(returns.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn into_cpu_holds_lease_until_readback_done() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let returns = Arc::new(AtomicUsize::new(0));
+        let raw = CapturedFrame::Gpu(leased_frame(&returns))
+            .into_cpu()
+            .expect("readback");
+        assert_eq!(raw.data.len(), 16);
+        assert_eq!(returns.load(Ordering::SeqCst), 1);
     }
 
     #[test]

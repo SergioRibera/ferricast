@@ -395,6 +395,11 @@ impl<C: NvencCodec> NvencEncoder<C> {
         };
 
         let timestamp_us = frame.timestamp_us();
+        // NVENC may still read a DMA-BUF input after `encode_external`
+        // returns; this clone keeps the capture buffer's lease (and so
+        // the compositor out of it) until `next_frame` below has waited
+        // for the encode to complete.
+        let input_hold = frame.clone();
         #[cfg(feature = "nvenc-zero-copy")]
         {
             match frame {
@@ -424,6 +429,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
         let nv_frame = self.encoder.next_frame().ok_or_else(|| {
             FerricastError::Encoder(format!("NVENC ({}): encoder produced no output", C::NAME))
         })?;
+        drop(input_hold);
 
         let pts = self.frame_count;
         self.frame_count += 1;

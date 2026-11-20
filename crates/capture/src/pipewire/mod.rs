@@ -9,8 +9,10 @@
 //! * [`portal`]    — D-Bus portal handshake.
 //! * [`stream`]    — PipeWire main-loop worker.
 //! * [`format`]    — SPA pod construction & format conversion.
+//! * [`lease`]     — keeps DMA-BUF buffers dequeued while consumers read them.
 
 mod format;
+mod lease;
 mod portal;
 mod stream;
 mod vulkan;
