@@ -1,7 +1,6 @@
 //! Every decoder stamps a picture with the timestamp of the packet it was
 //! decoded from: reordered pictures come out in presentation order, and
 //! packets a decoder drops or rejects never shift the pictures after them.
-#![cfg(feature = "hevc-decode")]
 
 use std::path::PathBuf;
 
@@ -69,6 +68,32 @@ fn parameter_sets(packet: &EncodedFrame, is_slice: impl Fn(u8) -> bool) -> Encod
     }
 }
 
+#[test]
+fn openh264_puts_b_frames_out_in_presentation_order() {
+    let packets = packets("h264.mp4");
+    let mut decoder: ferricast_decoder::h264::OpenH264Decoder = configured(false);
+    assert_eq!(
+        decode_all(&mut decoder, &packets),
+        presentation_order(&packets)
+    );
+}
+
+#[test]
+fn openh264_packets_rejected_before_the_first_idr_do_not_shift_later_pictures() {
+    let packets = packets("h264.mp4");
+    let mut decoder: ferricast_decoder::h264::OpenH264Decoder = configured(false);
+    let sets = parameter_sets(&packets[0], |header| header & 0x1f == 5);
+    assert!(decoder.decode(sets).unwrap().is_none());
+    // Joining mid-GOP: these pictures reference pictures never seen.
+    for packet in &packets[1..4] {
+        assert!(decoder.decode(packet.clone()).is_err());
+    }
+    assert_eq!(
+        decode_all(&mut decoder, &packets),
+        presentation_order(&packets)
+    );
+}
+
 #[cfg(feature = "hevc-decode")]
 mod hevc {
     use super::*;
@@ -114,6 +139,45 @@ mod hevc {
         assert_eq!(
             decode_all(&mut decoder, &joined),
             presentation_order(&packets[4..])
+        );
+    }
+}
+
+#[cfg(feature = "vp8-decode")]
+#[test]
+fn vp8_pictures_keep_their_packet_times() {
+    let packets = packets("vp8.webm");
+    let mut decoder: ferricast_decoder::Vp8Decoder = configured(false);
+    assert_eq!(
+        decode_all(&mut decoder, &packets),
+        presentation_order(&packets)
+    );
+}
+
+#[cfg(feature = "vp9-decode")]
+#[test]
+fn vp9_pictures_keep_their_packet_times() {
+    for name in ["vp9.webm", "vp9.mp4"] {
+        let packets = packets(name);
+        let mut decoder: ferricast_decoder::Vp9Decoder = configured(false);
+        assert_eq!(
+            decode_all(&mut decoder, &packets),
+            presentation_order(&packets),
+            "{name}"
+        );
+    }
+}
+
+#[cfg(feature = "av1-decode")]
+#[test]
+fn av1_pictures_keep_their_packet_times() {
+    for name in ["av1.mp4", "av1.webm"] {
+        let packets = packets(name);
+        let mut decoder: ferricast_decoder::Av1Decoder = configured(false);
+        assert_eq!(
+            decode_all(&mut decoder, &packets),
+            presentation_order(&packets),
+            "{name}"
         );
     }
 }
