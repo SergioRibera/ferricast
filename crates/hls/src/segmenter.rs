@@ -365,7 +365,11 @@ pub async fn run_from_frames(
     // sub-second granularity, which on flaky-firmware receivers
     // (1st/2nd-gen Chromecast) reduces the chance the receiver's
     // own prefetch state machine wedges on stale TCP connections.
-    let part_target: Option<Duration> = config.part_target_secs.map(Duration::from_secs_f32);
+    let part_target_us: Option<u64> = config
+        .part_target_secs
+        .filter(|pt| pt.is_finite() && *pt > 0.0)
+        // Saturating float→int cast; part targets are sub-second.
+        .map(|pt| (f64::from(pt) * 1_000_000.0) as u64);
     if let Some(pt) = config.part_target_secs {
         ring.write().await.enable_low_latency(pt);
     }
@@ -487,7 +491,7 @@ pub async fn run_from_frames(
         // a parallel copy here so reconstructing the segment doesn't
         // require holding the ring write lock for a long time.
         let mut local_parts: Vec<Bytes> = Vec::new();
-        let mut part_start = Instant::now();
+        let mut part_start_pts_us = segment_start_pts_us;
         let mut first_part_of_segment = true;
 
         let mut sender_hung_up = false;
@@ -519,6 +523,31 @@ pub async fn run_from_frames(
                         closing_span_us = Some(span_us);
                         pending = Some(encoded);
                         break;
+                    }
+                    // LL-HLS: close the running part *before* the
+                    // frame that would carry it past PART-TARGET, so
+                    // every part lasts at most the advertised target
+                    // (RFC 8216bis §4.4.4.9). The muxer's continuity
+                    // counters carry across drains, so the parts of a
+                    // segment concatenate into the same TS stream as a
+                    // single drain at close.
+                    if let Some(pt_us) = part_target_us {
+                        let part_span_us = video_pts_us.saturating_sub(part_start_pts_us);
+                        if part_span_us > 0
+                            && part_span_us.saturating_add(frame_period_us) > pt_us
+                        {
+                            let part_bytes = Bytes::from(muxer.drain());
+                            if !part_bytes.is_empty() {
+                                local_parts.push(part_bytes.clone());
+                                ring.write().await.push_pending_part(
+                                    micros_to_secs(part_span_us),
+                                    first_part_of_segment,
+                                    part_bytes,
+                                );
+                                first_part_of_segment = false;
+                                part_start_pts_us = video_pts_us;
+                            }
+                        }
                     }
                     last_video_pts_us = video_pts_us;
                     push_frame(&mut muxer, &encoded, video_pts_us)?;
@@ -586,28 +615,6 @@ pub async fn run_from_frames(
                 audio_pushed_window = 0;
                 video_pushed_window = 0;
             }
-
-            // LL-HLS: if we've held bytes long enough, flush them as
-            // a part. The muxer's continuity counters carry across
-            // the drain (they live in `self`, not in `out`), so the
-            // concatenation of all parts within this segment is a
-            // valid TS stream identical to a single drain at close.
-            if let Some(pt) = part_target {
-                if part_start.elapsed() >= pt {
-                    let part_bytes = Bytes::from(muxer.drain());
-                    if !part_bytes.is_empty() {
-                        let part_dur = part_start.elapsed().as_secs_f32();
-                        local_parts.push(part_bytes.clone());
-                        ring.write().await.push_pending_part(
-                            part_dur,
-                            first_part_of_segment,
-                            part_bytes,
-                        );
-                        first_part_of_segment = false;
-                        part_start = Instant::now();
-                    }
-                }
-            }
         }
 
         // EXTINF is the PTS span the segment covers: from its first
@@ -638,10 +645,15 @@ pub async fn run_from_frames(
         // in classic mode it's the entire segment body.
         let final_drain = Bytes::from(muxer.drain());
 
-        let (full_segment_bytes, seq) = if part_target.is_some() {
-            // Push the trailing part if we have leftover bytes.
+        let (full_segment_bytes, seq) = if part_target_us.is_some() {
+            // Push the trailing part if we have leftover bytes. It
+            // runs from its first frame to the end of the segment.
             if !final_drain.is_empty() {
-                let part_dur = part_start.elapsed().as_secs_f32();
+                let part_dur = micros_to_secs(
+                    segment_start_pts_us
+                        .saturating_add(span_us)
+                        .saturating_sub(part_start_pts_us),
+                );
                 local_parts.push(final_drain.clone());
                 ring.write()
                     .await
@@ -931,6 +943,46 @@ mod pipeline_tests {
         // Every closed segment (all but the trailing one) is ~2 s.
         for d in &durations[..durations.len() - 1] {
             assert!((d - 2.0).abs() < 0.05, "segment {d} s in:\n{playlist}");
+        }
+    }
+}
+
+/// Microseconds on the PTS timeline → seconds for playlist durations.
+fn micros_to_secs(us: u64) -> f32 {
+    // Precision loss is irrelevant: playlists print milliseconds.
+    (us as f64 / 1_000_000.0) as f32
+}
+
+#[cfg(test)]
+mod part_tests {
+    use super::pipeline_tests::{frame, segment};
+    use super::*;
+
+    #[tokio::test]
+    async fn parts_never_exceed_the_fixed_part_target() {
+        let period = 33_333u64;
+        let base = 1_700_000_000_000_000u64;
+        let frames: Vec<_> = (0..(30 * 7))
+            .map(|i| frame(base + i * period, i % 60 == 0))
+            .collect();
+        let config = HlsConfig {
+            segment_target_secs: 2.0,
+            playlist_target_duration: 4,
+            target_fps: 30,
+            part_target_secs: Some(0.5),
+            ..HlsConfig::default()
+        };
+        let ring = segment(frames, config).await;
+        let playlist = ring.build_playlist().unwrap();
+        assert!(playlist.contains("#EXT-X-PART-INF:PART-TARGET=0.500"), "{playlist}");
+        let parts: Vec<f32> = playlist
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXT-X-PART:DURATION="))
+            .map(|l| l.split(',').next().unwrap().parse().unwrap())
+            .collect();
+        assert!(parts.len() >= 8, "{playlist}");
+        for d in &parts {
+            assert!(*d <= 0.5 && *d > 0.4, "part {d} s in:\n{playlist}");
         }
     }
 }

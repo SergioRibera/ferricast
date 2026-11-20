@@ -280,36 +280,43 @@ impl M3u8Writer {
 
     /// The `PART-TARGET` to advertise, or `None` without LL-HLS.
     ///
-    /// Every part must last at most `PART-TARGET` (RFC 8216bis
-    /// §4.4.3.7), so the advertised value is the requested target or
-    /// the longest listed part, whichever is larger (rounded up to the
-    /// millisecond the playlist is written with).
+    /// The `PART-TARGET` to advertise, or `None` without LL-HLS.
+    ///
+    /// The advertised value is always the configured target: it must
+    /// stay identical across reloads, so it is never stretched to fit
+    /// a long part. Instead every part must last at most `PART-TARGET`
+    /// (RFC 8216bis §4.4.3.7), as written with millisecond precision.
     ///
     /// # Errors
     ///
     /// Parts listed without [`Self::with_part_target`] (they would be
-    /// emitted without `EXT-X-PART-INF`), or parts whose duration is
-    /// negative or not finite.
+    /// emitted without `EXT-X-PART-INF`), parts whose duration is
+    /// negative or not finite, or parts longer than the target.
     fn effective_part_target(&self) -> Result<Option<f32>, FerricastError> {
-        let mut longest = None::<f32>;
+        let mut any_part = false;
         for part in self.parts() {
+            any_part = true;
             if !part.duration.is_finite() || part.duration < 0.0 {
                 return Err(FerricastError::M3u8(format!(
                     "invalid part duration {:.3} for {}",
                     part.duration, part.uri
                 )));
             }
-            longest = Some(longest.map_or(part.duration, |l| l.max(part.duration)));
+            if let Some(target) = self.part_target_secs
+                && millis(part.duration) > millis(target)
+            {
+                return Err(FerricastError::M3u8(format!(
+                    "part {} lasts {:.3}s, exceeds PART-TARGET {:.3}s",
+                    part.uri, part.duration, target
+                )));
+            }
         }
-        match (self.part_target_secs, longest) {
-            (None, None) => Ok(None),
-            (None, Some(_)) => Err(FerricastError::M3u8(
+        match (self.part_target_secs, any_part) {
+            (None, false) => Ok(None),
+            (None, true) => Err(FerricastError::M3u8(
                 "parts listed without a part target (EXT-X-PART-INF)".into(),
             )),
-            (Some(target), None) => Ok(Some(target)),
-            (Some(target), Some(longest)) => {
-                Ok(Some(target.max((longest * 1000.0).ceil() / 1000.0)))
-            }
+            (Some(target), _) => Ok(Some(target)),
         }
     }
 
@@ -429,6 +436,13 @@ fn check_uri(uri: &str) -> Result<(), FerricastError> {
     Ok(())
 }
 
+/// Seconds rounded to the millisecond precision durations are
+/// written with, so comparisons match what the client reads.
+fn millis(secs: f32) -> i64 {
+    // Saturating float→int cast; durations are a few seconds.
+    (f64::from(secs) * 1000.0).round() as i64
+}
+
 fn fmt_err(_: std::fmt::Error) -> FerricastError {
     FerricastError::M3u8("playlist formatting failed".into())
 }
@@ -525,16 +539,18 @@ mod tests {
     }
 
     #[test]
-    fn part_target_covers_the_longest_part() {
+    fn part_target_stays_fixed_and_rejects_longer_parts() {
         let mut w = M3u8Writer::live(M3u8Version::V6)
             .with_target_duration(4)
             .with_part_target(0.5);
         w.add_segment(Segment::new(2.0, "a.ts")).unwrap();
-        w.attach_parts(vec![Part::new(0.5, "a.0.ts"), Part::new(0.5333, "a.1.ts")])
+        w.attach_parts(vec![Part::new(0.5, "a.0.ts"), Part::new(0.4667, "a.1.ts")])
             .unwrap();
         let s = w.to_string().unwrap();
-        assert!(s.contains("PART-TARGET=0.534"), "{s}");
-        assert!(s.contains("PART-HOLD-BACK=1.602"), "{s}");
+        assert!(s.contains("PART-TARGET=0.500"), "{s}");
+        assert!(s.contains("PART-HOLD-BACK=1.500"), "{s}");
+        w.set_pending_parts(vec![Part::new(0.5333, "b.0.ts")]);
+        assert!(w.to_string().is_err(), "a part past PART-TARGET is invalid");
         w.set_pending_parts(vec![Part::new(f32::NAN, "b.0.ts")]);
         assert!(w.to_string().is_err());
     }

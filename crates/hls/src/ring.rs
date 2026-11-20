@@ -158,7 +158,22 @@ impl SegmentRing {
         independent: bool,
         data: Bytes,
     ) -> (u64, u32) {
-        let idx = self.pending_parts.len() as u32;
+        // The segmenter closes parts before they cross PART-TARGET;
+        // this guard only fires on a capture gap. PART-TARGET itself
+        // never changes between reloads, so report the part as
+        // target-long rather than invalidating the playlist.
+        let duration_secs = match self.part_target_secs {
+            Some(pt) if duration_secs.is_nan() || duration_secs > pt => {
+                tracing::warn!(
+                    duration_secs,
+                    part_target_secs = pt,
+                    "LL-HLS part longer than PART-TARGET; clamping its duration"
+                );
+                pt
+            }
+            _ => duration_secs.max(0.0),
+        };
+        let idx = u32::try_from(self.pending_parts.len()).unwrap_or(u32::MAX);
         let seq = self.next_seq;
         self.pending_parts.push(Part {
             idx,
