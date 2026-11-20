@@ -1,12 +1,12 @@
-//! Minimal MPEG-TS muxer for a single H.264 video stream.
+//! Minimal MPEG-TS muxer for a single H.264 or HEVC video stream.
 //!
 //! Self-contained — no third-party muxer dependency. Implements the
 //! parts of ISO/IEC 13818-1 that an HLS segment actually needs:
 //!
 //! * 188-byte transport packets with sync byte, PUSI, AFC, continuity
 //!   counters.
-//! * One program with one elementary stream (H.264, stream_type
-//!   `0x1B`). PAT and PMT are emitted at the start of each segment so
+//! * One program with one video elementary stream (H.264 `0x1B` or HEVC
+//!   `0x24`). PAT and PMT are emitted at the start of each segment so
 //!   every segment is independently decodable per RFC 8216 §3.
 //! * PES packets per access unit, carrying PTS+DTS in the standard
 //!   33-bit 90 kHz form.
@@ -15,7 +15,7 @@
 //!   `PCR <= first_PTS_in_packet` (ISO/IEC 13818-1 §2.7.1).
 //!
 //! Each access unit is prefixed with a synthetic Access Unit Delimiter
-//! (NAL type 9) so decoders that strictly enforce
+//! (H.264 NAL type 9, HEVC NAL type 35) so decoders that strictly enforce
 //! `access_unit_delimiter_rbsp` (e.g. some hardware DTV chips) accept
 //! the stream. Random-access points additionally re-emit the SPS+PPS
 //! supplied via [`MpegTs::config`], so seeking into a segment never
@@ -25,7 +25,7 @@
 //! drain, drop. The HLS segmenter creates a fresh one for every
 //! segment.
 
-use ferricast_core::{EncodedFrame, FerricastError};
+use ferricast_core::{Codec, EncodedFrame, FerricastError};
 
 use crate::Muxer;
 
@@ -38,6 +38,7 @@ const PID_VIDEO: u16 = 0x0100;
 const PID_AUDIO: u16 = 0x0101;
 
 const STREAM_TYPE_H264: u8 = 0x1B;
+const STREAM_TYPE_HEVC: u8 = 0x24;
 const STREAM_TYPE_AAC_ADTS: u8 = 0x0F;
 const PES_STREAM_ID_VIDEO: u8 = 0xE0;
 const PES_STREAM_ID_AUDIO: u8 = 0xC0;
@@ -135,6 +136,9 @@ const PCR_PTS_OFFSET: u64 = 200;
 #[derive(Default)]
 pub struct MpegTs {
     parameter_sets: Vec<u8>,
+    /// Video elementary stream codec; H.264 unless set through
+    /// [`MpegTs::with_video_codec`].
+    video_codec: VideoCodec,
     /// PAT+PMT must be the very first bytes of a segment. We emit
     /// them lazily on the first frame so `drain()` after no frames
     /// returns an empty buffer rather than a partial header.
@@ -178,6 +182,16 @@ pub struct MpegTs {
 }
 
 impl MpegTs {
+    /// Select the video codec carried on the video PID (default H.264).
+    ///
+    /// # Errors
+    ///
+    /// Only H.264 and HEVC can be carried; any other codec is rejected.
+    pub fn with_video_codec(mut self, codec: Codec) -> Result<Self, FerricastError> {
+        self.video_codec = VideoCodec::try_from(codec)?;
+        Ok(self)
+    }
+
     /// Toggle silent-audio injection. Set by the chromecast HLS
     /// pipeline when the target device is an older Chromecast
     /// (`md == "Chromecast"`) whose firmware rejects video-only
@@ -290,7 +304,7 @@ impl Muxer for MpegTs {
     fn config(&mut self, parameter_sets: Vec<u8>) -> Result<(), FerricastError> {
         if parameter_sets.is_empty() {
             return Err(FerricastError::Encoder(
-                "muxer.config received empty H.264 parameter sets (SPS/PPS missing)".into(),
+                "muxer.config received empty video parameter sets (SPS/PPS missing)".into(),
             ));
         }
         self.parameter_sets = parameter_sets;
@@ -311,13 +325,25 @@ impl Muxer for MpegTs {
             tracing::warn!("Empty frame, skipping");
             return Ok(());
         }
+        let codec = VideoCodec::try_from(frame.codec)?;
+        if codec != self.video_codec {
+            return Err(FerricastError::Encoder(format!(
+                "muxer configured for {:?} received a {} frame",
+                self.video_codec, frame.codec
+            )));
+        }
         if !self.psi_emitted {
             self.emit_pat();
             self.emit_pmt();
             self.psi_emitted = true;
         }
 
-        let au = build_access_unit(&self.parameter_sets, frame.is_keyframe, &frame.data);
+        let au = build_access_unit(
+            self.video_codec,
+            &self.parameter_sets,
+            frame.is_keyframe,
+            &frame.data,
+        );
         let pes = build_pes(&au, pts_90k, dts_90k);
 
         let pcr = dts_90k.saturating_sub(PCR_PTS_OFFSET);
@@ -424,7 +450,7 @@ impl MpegTs {
         // both produce AAC ADTS bytes, so the receiver doesn't need
         // to distinguish.
         let with_audio = self.inject_silent_audio || self.has_external_audio;
-        let section = build_pmt_section(with_audio);
+        let section = build_pmt_section(self.video_codec, with_audio);
         write_psi_packet(&mut self.out, PID_PMT, &mut self.cc_pmt, &section);
     }
 }
@@ -452,7 +478,7 @@ fn build_pat_section() -> Vec<u8> {
     s
 }
 
-fn build_pmt_section(with_audio: bool) -> Vec<u8> {
+fn build_pmt_section(codec: VideoCodec, with_audio: bool) -> Vec<u8> {
     // section_length covers prog_num(2) + flags(1) + sec_num(1) +
     // last_sec_num(1) + PCR_PID(2) + program_info_len(2) +
     // stream_loop + CRC(4).
@@ -468,10 +494,10 @@ fn build_pmt_section(with_audio: bool) -> Vec<u8> {
     s.push(0x00); // last_section_number
     s.extend_from_slice(&(0xE000u16 | PID_VIDEO).to_be_bytes()); // PCR_PID
     s.extend_from_slice(&0xF000u16.to_be_bytes()); // program_info_length=0
-    // Stream loop: H.264 always; AAC only when the caller asked
+    // Stream loop: video always; AAC only when the caller asked
     // for silent-audio injection (older Chromecasts that reject
     // video-only HLS — see `MpegTs::with_silent_audio`).
-    s.push(STREAM_TYPE_H264);
+    s.push(codec.stream_type());
     s.extend_from_slice(&(0xE000u16 | PID_VIDEO).to_be_bytes()); // elementary_PID
     s.extend_from_slice(&0xF000u16.to_be_bytes()); // ES_info_length=0
     if with_audio {
@@ -578,16 +604,64 @@ fn encode_ts(prefix4: u8, ts: u64) -> [u8; 5] {
 // Access unit construction
 // ---------------------------------------------------------------------
 
-const AUD_NAL: [u8; 6] = [0x00, 0x00, 0x00, 0x01, 0x09, 0xF0];
+/// H.264 AUD: nal_unit_type 9, primary_pic_type 7 (any slice type).
+const AUD_NAL_H264: [u8; 6] = [0x00, 0x00, 0x00, 0x01, 0x09, 0xF0];
+/// HEVC AUD: nal_unit_type 35, layer 0, temporal_id_plus1 1,
+/// pic_type 2 (any slice type) plus the stop bit.
+const AUD_NAL_HEVC: [u8; 7] = [0x00, 0x00, 0x00, 0x01, 0x46, 0x01, 0x50];
 
-fn build_access_unit(parameter_sets: &[u8], keyframe: bool, frame_data: &[u8]) -> Vec<u8> {
-    // Strict order: AUD → (SPS+PPS, only on RAP) → slice NALs. Some
-    // decoders refuse a stream that doesn't start an access unit with
-    // an AUD; always prepending one is cheap and harmless.
+/// Video codecs the muxer can carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum VideoCodec {
+    #[default]
+    H264,
+    Hevc,
+}
+
+impl TryFrom<Codec> for VideoCodec {
+    type Error = FerricastError;
+
+    fn try_from(codec: Codec) -> Result<Self, Self::Error> {
+        match codec {
+            Codec::H264 => Ok(Self::H264),
+            Codec::H265 => Ok(Self::Hevc),
+            Codec::Vp8 | Codec::Vp9 | Codec::Av1 => Err(FerricastError::Encoder(format!(
+                "the MPEG-TS muxer cannot carry {codec}"
+            ))),
+        }
+    }
+}
+
+impl VideoCodec {
+    fn stream_type(self) -> u8 {
+        match self {
+            Self::H264 => STREAM_TYPE_H264,
+            Self::Hevc => STREAM_TYPE_HEVC,
+        }
+    }
+
+    fn access_unit_delimiter(self) -> &'static [u8] {
+        match self {
+            Self::H264 => &AUD_NAL_H264,
+            Self::Hevc => &AUD_NAL_HEVC,
+        }
+    }
+}
+
+fn build_access_unit(
+    codec: VideoCodec,
+    parameter_sets: &[u8],
+    keyframe: bool,
+    frame_data: &[u8],
+) -> Vec<u8> {
+    // Strict order: AUD → (parameter sets, only on RAP) → slice NALs.
+    // Some decoders refuse a stream that doesn't start an access unit
+    // with an AUD; always prepending one is cheap and harmless.
+    let aud = codec.access_unit_delimiter();
     let mut au = Vec::with_capacity(
-        AUD_NAL.len() + if keyframe { parameter_sets.len() } else { 0 } + frame_data.len(),
+        aud.len() + if keyframe { parameter_sets.len() } else { 0 } + frame_data.len(),
     );
-    au.extend_from_slice(&AUD_NAL);
+    au.extend_from_slice(aud);
     if keyframe {
         au.extend_from_slice(parameter_sets);
     }
@@ -807,7 +881,7 @@ mod tests {
     #[test]
     fn pmt_crc_round_trip() {
         for with_audio in [false, true] {
-            let s = build_pmt_section(with_audio);
+            let s = build_pmt_section(VideoCodec::H264, with_audio);
             let body = &s[..s.len() - 4];
             let appended = u32::from_be_bytes(s[s.len() - 4..].try_into().unwrap());
             assert_eq!(crc32_mpeg2(body), appended, "with_audio={with_audio}");
@@ -879,6 +953,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn frame(codec: Codec) -> EncodedFrame {
+        EncodedFrame {
+            codec,
+            data: vec![0, 0, 0, 1, 0x26, 0x01, 0xAF].into(),
+            timestamp_us: 0,
+            is_keyframe: true,
+            duration_us: None,
+            pts_dts: (0, 0),
+        }
+    }
+
+    #[test]
+    fn hevc_streams_get_their_stream_type_and_aud() {
+        let pmt = build_pmt_section(VideoCodec::Hevc, false);
+        assert_eq!(pmt[12], STREAM_TYPE_HEVC);
+        let au = build_access_unit(VideoCodec::Hevc, &[0, 0, 0, 1, 0x40], true, &[0xAA]);
+        assert_eq!(au, [0, 0, 0, 1, 0x46, 0x01, 0x50, 0, 0, 0, 1, 0x40, 0xAA]);
+
+        let mut muxer = MpegTs::default().with_video_codec(Codec::H265).unwrap();
+        muxer.config(vec![0, 0, 0, 1, 0x40]).unwrap();
+        muxer.add_frame(&frame(Codec::H265), 0, 0).unwrap();
+        assert!(!muxer.drain().is_empty());
+    }
+
+    #[test]
+    fn unsupported_or_mismatched_codecs_are_rejected() {
+        assert!(MpegTs::default().with_video_codec(Codec::Vp9).is_err());
+        let mut muxer = MpegTs::default();
+        muxer.config(vec![0, 0, 0, 1, 0x67]).unwrap();
+        assert!(muxer.add_frame(&frame(Codec::Av1), 0, 0).is_err());
+        assert!(muxer.add_frame(&frame(Codec::H265), 0, 0).is_err());
+        assert!(muxer.drain().is_empty());
+        muxer.add_frame(&frame(Codec::H264), 0, 0).unwrap();
+        assert!(!muxer.drain().is_empty());
     }
 
     #[test]
