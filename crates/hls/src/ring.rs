@@ -61,9 +61,8 @@ pub struct SegmentRing {
     capacity: usize,
     segments: VecDeque<Segment>,
     next_seq: u64,
-    /// Increments every time the segmenter has to start over (encoder
-    /// restart, capture re-opened, …). Players advertise the latest
-    /// value via `#EXT-X-DISCONTINUITY-SEQUENCE`.
+    /// Number of `#EXT-X-DISCONTINUITY` tags evicted from the window,
+    /// advertised as `#EXT-X-DISCONTINUITY-SEQUENCE`.
     discontinuity_seq: u32,
     /// LL-HLS: parts that have been published for the segment
     /// currently under construction (no `data` yet because the
@@ -203,9 +202,6 @@ impl SegmentRing {
         data: Bytes,
         parts: Vec<Part>,
     ) -> u64 {
-        if discontinuity && !self.segments.is_empty() {
-            self.discontinuity_seq = self.discontinuity_seq.saturating_add(1);
-        }
         let duration_secs = self.clamp_to_target(duration_secs);
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -217,8 +213,16 @@ impl SegmentRing {
             data,
             parts,
         });
+        // RFC 8216 §6.2.2: EXT-X-DISCONTINUITY-SEQUENCE counts the
+        // discontinuity tags that have slid out of the playlist, so
+        // it advances when a tagged segment is evicted, not when one
+        // is added.
         while self.segments.len() > self.capacity {
-            self.segments.pop_front();
+            if let Some(evicted) = self.segments.pop_front()
+                && evicted.discontinuity
+            {
+                self.discontinuity_seq = self.discontinuity_seq.saturating_add(1);
+            }
         }
         // Pending parts are now part of the just-finished segment.
         // Clear so the next one can accumulate.
@@ -418,5 +422,33 @@ mod tests {
             assert!(body.start <= p.start && p.end <= body.end, "part not a body slice");
         }
         assert_eq!(&seg.parts[1].data[..], &[2; 376][..]);
+    }
+}
+
+#[cfg(test)]
+mod discontinuity_tests {
+    use super::*;
+
+    fn seg() -> Bytes {
+        Bytes::from_static(&[0x47; 188])
+    }
+
+    #[test]
+    fn discontinuity_sequence_advances_when_tagged_segment_is_evicted() {
+        let mut ring = SegmentRing::new(3, 4);
+        ring.push(2.0, false, seg());
+        ring.push(2.0, true, seg());
+        let p = ring.build_playlist().unwrap();
+        assert!(!p.contains("#EXT-X-DISCONTINUITY-SEQUENCE"), "{p}");
+        assert!(p.contains("#EXT-X-DISCONTINUITY\n"), "{p}");
+        // Evict the untagged segment 0: still nothing removed.
+        ring.push(2.0, false, seg());
+        ring.push(2.0, false, seg());
+        assert!(!ring.build_playlist().unwrap().contains("DISCONTINUITY-SEQUENCE"));
+        // Evict the tagged segment 1.
+        ring.push(2.0, false, seg());
+        let p = ring.build_playlist().unwrap();
+        assert!(p.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1"), "{p}");
+        assert!(!p.contains("#EXT-X-DISCONTINUITY\n"), "{p}");
     }
 }
