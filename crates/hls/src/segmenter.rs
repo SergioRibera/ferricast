@@ -391,8 +391,9 @@ pub async fn run_from_frames(
     // faster than synth_pts on any host where real fps fell short
     // of `target_fps`, which is common when the encoder's per-frame
     // latency adds onto the capture cadence).
-    let mut video_wall_anchor: Option<u64> = None;
-    let mut pending: Option<EncodedFrame> = None;
+    let mut timeline = Timeline::new(frame_period_us);
+    // Keyframe that closed the previous segment, with its PTS.
+    let mut pending: Option<(EncodedFrame, u64)> = None;
 
     // When real audio is wired in, take over the audio PID from the
     // silent-injection path. Silent injection used to be necessary
@@ -430,8 +431,8 @@ pub async fn run_from_frames(
     loop {
         muxer.start_segment();
 
-        let first = match pending.take() {
-            Some(f) => f,
+        let (first, segment_start_pts_us) = match pending.take() {
+            Some(carried) => carried,
             None => loop {
                 // Drain audio while we're waiting for the first
                 // keyframe so its channel doesn't backlog. Pre-IDR
@@ -443,7 +444,12 @@ pub async fn run_from_frames(
                 tokio::select! {
                     biased;
                     f = frames.recv() => match f {
-                        Some(f) if f.is_keyframe => break f,
+                        Some(f) if f.is_keyframe => {
+                            // The first video frame the segmenter ever
+                            // sees latches the shared A/V wall anchor.
+                            let pts = timeline.video_pts(f.timestamp_us);
+                            break (f, pts);
+                        }
                         Some(_) => continue,
                         None => return Ok(()),
                     },
@@ -476,21 +482,6 @@ pub async fn run_from_frames(
         };
 
         let mut frames_in_segment: u64 = 0;
-        let first_wall_ts = first.timestamp_us;
-        // Latch the global wall-time origin on the very first video
-        // frame the segmenter ever sees. All subsequent video and
-        // audio PTS values are computed as `wall - video_wall_anchor`,
-        // so the receiver's reference clock starts at 0 and advances
-        // exactly with capture wall time.
-        if video_wall_anchor.is_none() {
-            video_wall_anchor = Some(first_wall_ts);
-            debug!(
-                wall_ts_us = first_wall_ts,
-                "A/V timeline wall anchor latched"
-            );
-        }
-        let origin = video_wall_anchor.unwrap_or(first_wall_ts);
-        let segment_start_pts_us = first_wall_ts.saturating_sub(origin);
         let mut last_video_pts_us = segment_start_pts_us;
         push_frame(&mut muxer, &first, segment_start_pts_us)?;
         frames_in_segment += 1;
@@ -529,7 +520,7 @@ pub async fn run_from_frames(
                     break;
                 }
                 SegEvent::Video(Some(encoded)) => {
-                    let video_pts_us = encoded.timestamp_us.saturating_sub(origin);
+                    let video_pts_us = timeline.video_pts(encoded.timestamp_us);
                     let span_us = video_pts_us.saturating_sub(segment_start_pts_us);
                     // A keyframe that changes the stream format (new
                     // SPS/PPS after an encoder reconfigure, other
@@ -539,7 +530,7 @@ pub async fn run_from_frames(
                         && (cut.accepts(span_us) || stream_format.differs(&encoded))
                     {
                         closing_span_us = Some(span_us);
-                        pending = Some(encoded);
+                        pending = Some((encoded, video_pts_us));
                         break;
                     }
                     // LL-HLS: close the running part *before* the
@@ -585,7 +576,7 @@ pub async fn run_from_frames(
                     continue;
                 }
                 SegEvent::Audio(Some(audio)) => {
-                    if let Err(e) = push_audio_frame(&mut muxer, &audio, video_wall_anchor) {
+                    if let Err(e) = push_audio_frame(&mut muxer, &audio, &timeline) {
                         warn!(error = %e, "audio PES push failed");
                     } else {
                         audio_frames_pushed = audio_frames_pushed.saturating_add(1);
@@ -598,7 +589,7 @@ pub async fn run_from_frames(
                             match rx.try_recv() {
                                 Ok(extra) => {
                                     if let Err(e) =
-                                        push_audio_frame(&mut muxer, &extra, video_wall_anchor)
+                                        push_audio_frame(&mut muxer, &extra, &timeline)
                                     {
                                         warn!(error = %e, "audio PES push failed (drain)");
                                     } else {
@@ -783,12 +774,17 @@ async fn recv_audio(chan: &mut Option<mpsc::Receiver<AudioFrame>>) -> Option<Aud
 /// one and clutter the log with `dropping real AAC frame` lines
 /// for the rest of the session. Better to catch them here, log the
 /// staleness once per gap, and keep the trace useful.
+///
+/// After a wall-clock step the timeline folds the jump into a shared
+/// offset (see [`Timeline`]); audio captured on the other side of the
+/// step than the video timeline currently is gets dropped instead of
+/// landing a whole step away from the video.
 fn push_audio_frame(
     muxer: &mut MpegTs,
     audio: &AudioFrame,
-    video_wall_anchor: Option<u64>,
+    timeline: &Timeline,
 ) -> Result<(), FerricastError> {
-    let Some(anchor) = video_wall_anchor else {
+    let Some(anchor) = timeline.anchor() else {
         // First video frame hasn't been seen yet — drop quietly.
         return Ok(());
     };
@@ -806,7 +802,13 @@ fn push_audio_frame(
         );
         return Ok(());
     }
-    let pts_us = audio.timestamp_us.saturating_sub(anchor);
+    let Some(pts_us) = timeline.audio_pts(audio.timestamp_us) else {
+        debug!(
+            audio_wall = audio.timestamp_us,
+            "segmenter: dropping AAC frame from across a wall-clock step"
+        );
+        return Ok(());
+    };
     let pts_90k = pts_us.saturating_mul(9) / 100;
     trace!(
         audio_wall = audio.timestamp_us,
@@ -1119,5 +1121,134 @@ mod format_tests {
         // video ES sits at offset 4 (header) + 1 (pointer) + 12.
         let pmt = &seg.data[188..376];
         assert_eq!(pmt[4 + 1 + 12], 0x24, "HEVC stream_type expected");
+    }
+}
+
+/// Largest deviation between a frame's wall timestamp and where the
+/// timeline expects it before it is treated as a wall-clock step (NTP
+/// step, suspend/resume) rather than capture jitter.
+const CLOCK_STEP_THRESHOLD_US: u64 = 1_000_000;
+
+/// Maps capture wall-clock timestamps (µs since `UNIX_EPOCH`, shared by
+/// audio and video) onto the stream's PTS timeline.
+///
+/// In steady state `pts = wall - anchor`, the anchor being the first
+/// video frame's timestamp, for both audio and video. When the video
+/// timestamps jump by more than [`CLOCK_STEP_THRESHOLD_US`] from the
+/// expected next frame, the jump is folded into `step_us` so PTS keeps
+/// advancing by one frame period instead of leaping forward or going
+/// backwards; audio shares the same offset.
+#[derive(Debug)]
+struct Timeline {
+    frame_period_us: u64,
+    anchor: Option<u64>,
+    /// Sum of the wall-clock steps folded out so far.
+    step_us: i128,
+    /// Wall timestamp of the latest video frame and when it was mapped.
+    last_video: Option<(u64, Instant)>,
+}
+
+impl Timeline {
+    fn new(frame_period_us: u64) -> Self {
+        Self {
+            frame_period_us,
+            anchor: None,
+            step_us: 0,
+            last_video: None,
+        }
+    }
+
+    fn anchor(&self) -> Option<u64> {
+        self.anchor
+    }
+
+    fn pts(&self, anchor: u64, wall_us: u64) -> u64 {
+        let pts = i128::from(wall_us) - i128::from(anchor) - self.step_us;
+        u64::try_from(pts.max(0)).unwrap_or(u64::MAX)
+    }
+
+    /// PTS of a video frame; latches the anchor on the first call and
+    /// folds wall-clock steps.
+    fn video_pts(&mut self, wall_us: u64) -> u64 {
+        let anchor = *self.anchor.get_or_insert_with(|| {
+            debug!(wall_ts_us = wall_us, "A/V timeline wall anchor latched");
+            wall_us
+        });
+        if let Some((last, _)) = self.last_video {
+            let expected = last.saturating_add(self.frame_period_us);
+            let deviation = i128::from(wall_us) - i128::from(expected);
+            if deviation.unsigned_abs() > u128::from(CLOCK_STEP_THRESHOLD_US) {
+                warn!(
+                    step_ms = i64::try_from(deviation / 1000).unwrap_or(i64::MAX),
+                    "wall clock stepped; folding the jump out of the A/V timeline"
+                );
+                self.step_us += deviation;
+            }
+        }
+        self.last_video = Some((wall_us, Instant::now()));
+        self.pts(anchor, wall_us)
+    }
+
+    /// PTS of an audio frame, or `None` when its timestamp is more than
+    /// [`CLOCK_STEP_THRESHOLD_US`] away from where the video timeline
+    /// currently is (it was captured on the other side of a clock step
+    /// than the video frames last mapped).
+    fn audio_pts(&self, wall_us: u64) -> Option<u64> {
+        let anchor = self.anchor?;
+        if let Some((last_video, mapped_at)) = self.last_video {
+            // Video may legitimately stall while audio keeps flowing,
+            // so compare with where the video clock would be now.
+            let elapsed = u64::try_from(mapped_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let expected = last_video.saturating_add(elapsed);
+            let deviation = i128::from(wall_us) - i128::from(expected);
+            if deviation.unsigned_abs() > u128::from(CLOCK_STEP_THRESHOLD_US) {
+                return None;
+            }
+        }
+        Some(self.pts(anchor, wall_us))
+    }
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+
+    const BASE: u64 = 1_700_000_000_000_000;
+    const PERIOD: u64 = 33_333;
+
+    #[test]
+    fn steady_state_is_wall_minus_anchor() {
+        let mut t = Timeline::new(PERIOD);
+        assert_eq!(t.video_pts(BASE), 0);
+        assert_eq!(t.video_pts(BASE + PERIOD + 4_000), PERIOD + 4_000);
+        assert_eq!(t.audio_pts(BASE + 20_000), Some(20_000));
+    }
+
+    #[test]
+    fn forward_and_backward_steps_are_folded() {
+        let mut t = Timeline::new(PERIOD);
+        t.video_pts(BASE);
+        t.video_pts(BASE + PERIOD);
+        // NTP steps the clock forward by an hour.
+        let fwd = BASE + 3_600_000_000;
+        assert_eq!(t.video_pts(fwd), 2 * PERIOD);
+        assert_eq!(t.video_pts(fwd + PERIOD), 3 * PERIOD);
+        // Audio on the new clock follows; audio still on the old one
+        // is dropped.
+        assert_eq!(t.audio_pts(fwd + PERIOD), Some(3 * PERIOD));
+        assert_eq!(t.audio_pts(BASE + PERIOD), None);
+        // Now a backwards step of 10 s.
+        let back = fwd + PERIOD - 10_000_000;
+        assert_eq!(t.video_pts(back), 4 * PERIOD);
+        assert_eq!(t.audio_pts(back), Some(4 * PERIOD));
+        assert_eq!(t.audio_pts(fwd + PERIOD), None);
+    }
+
+    #[test]
+    fn small_jitter_is_not_a_step() {
+        let mut t = Timeline::new(PERIOD);
+        t.video_pts(BASE);
+        // A 400 ms capture stall is real media time, not a step.
+        assert_eq!(t.video_pts(BASE + 400_000), 400_000);
     }
 }
