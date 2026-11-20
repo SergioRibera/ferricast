@@ -4,7 +4,9 @@ use crate::device::{AirPlayPairing, AirplayConfig};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingChallenge {
     /// Display a numeric PIN input. `digits` is always 4 for AirPlay.
-    Pin { digits: u8 },
+    Pin {
+        digits: u8,
+    },
     None,
     Credential,
 }
