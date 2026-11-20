@@ -828,7 +828,7 @@ mod tests {
     }
 
     fn frame(i: u64) -> EncodedFrame {
-        let key = i % 60 == 0;
+        let key = i.is_multiple_of(60);
         EncodedFrame {
             codec: ferricast_core::Codec::H264,
             data: bytes::Bytes::from(vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }, 0xAA]),

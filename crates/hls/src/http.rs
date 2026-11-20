@@ -253,7 +253,7 @@ where
                 // serving. Without this, LL-HLS clients fall back
                 // to the spec's busy-poll behaviour, which works
                 // but loses the latency benefit.
-                if let Some((code, reason)) = blocking_reload(&ring, query, &peer).await {
+                if let Some((code, reason)) = blocking_reload(ring, query, &peer).await {
                     write_status(&mut write_half, code, reason, b"", !client_wants_close).await?;
                     tracing::info!(%peer, path = %request.path, status = code, "HLS");
                     if client_wants_close {
@@ -261,7 +261,7 @@ where
                     }
                     continue;
                 }
-                let body = build_playlist(&ring).await?;
+                let body = build_playlist(ring).await?;
                 let send_body = request.method == "GET";
                 let len = body.len();
                 write_ok(
@@ -384,7 +384,6 @@ where
                         } else if let RangeReply::Partial { .. } = reply {
                             write_partial_content(
                                 &mut write_half,
-                                "video/mp2t",
                                 slice,
                                 send_body,
                                 start,
@@ -447,7 +446,7 @@ where
                             );
 
                             if let (Some(avg_mbps), Some(state)) =
-                                (tele.probe_avg_mbps, adaptive_for_peer.as_deref())
+                                (tele.probe_avg_mbps, adaptive_for_peer.map(Arc::as_ref))
                             {
                                 let avg_kbps = (avg_mbps * 1000.0) as u32;
                                 match state.observe_link_capacity_kbps(avg_kbps) {
@@ -467,15 +466,15 @@ where
                                 }
                             }
 
-                            if let Some(state) = adaptive_for_peer.as_deref() {
-                                if let Some(new_kbps) = state.record_pressure(pct) {
-                                    tracing::info!(
-                                        new_target_kbps = new_kbps,
-                                        ema_pct = state.pressure_pct(),
-                                        sample_pct = pct,
-                                        "adaptive bitrate adjustment requested"
-                                    );
-                                }
+                            if let Some(controller) = adaptive_for_peer
+                                && let Some(new_kbps) = controller.record_pressure(pct)
+                            {
+                                tracing::info!(
+                                    new_target_kbps = new_kbps,
+                                    ema_pct = controller.pressure_pct(),
+                                    sample_pct = pct,
+                                    "adaptive bitrate adjustment requested"
+                                );
                             }
 
                             if budget_ratio >= 0.7 {
@@ -647,7 +646,7 @@ where
         // before responding).
         if let Some((name, value)) = hdr.split_once(':') {
             let name = name.trim();
-            let value = value.trim().trim_end_matches(|c| c == '\r' || c == '\n');
+            let value = value.trim().trim_end_matches(['\r', '\n']);
             if name.eq_ignore_ascii_case("Connection") {
                 if value.eq_ignore_ascii_case("close") {
                     connection_close = true;
@@ -894,9 +893,10 @@ where
     Ok(())
 }
 
+/// 206 response carrying `body`, the `[start, end)` slice of a
+/// `total`-byte MPEG-TS segment.
 async fn write_partial_content<W>(
     w: &mut W,
-    content_type: &str,
     body: &[u8],
     send_body: bool,
     start: usize,
@@ -909,7 +909,7 @@ where
 {
     let mut head = String::with_capacity(384);
     head.push_str("HTTP/1.1 206 Partial Content\r\n");
-    write_common(&mut head, content_type, body.len(), true, true, keep_alive);
+    write_common(&mut head, "video/mp2t", body.len(), true, true, keep_alive);
     head.push_str(&format!(
         "Content-Range: bytes {}-{}/{}\r\n",
         start,
