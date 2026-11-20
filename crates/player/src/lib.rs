@@ -15,12 +15,11 @@ pub use ferricast_demuxer::{Color, VideoStream};
 pub use limiter::FrameLimiter;
 
 use decoder::Decoder;
-use pts::{Presentation, PtsQueue};
+use pts::Presentation;
 
 pub struct Player {
     demuxer: Demuxer,
     decoder: Decoder,
-    pending: PtsQueue,
     presentation: Presentation,
     ready: VecDeque<CapturedFrame>,
     drained: bool,
@@ -42,7 +41,6 @@ impl Player {
         Ok(Self {
             demuxer,
             decoder,
-            pending: PtsQueue::default(),
             presentation,
             ready: VecDeque::new(),
             drained: false,
@@ -85,21 +83,10 @@ impl Player {
             if index < self.skip_until {
                 continue;
             }
-            self.presentation.observe_duration(packet.duration_us);
-            let pts = packet.timestamp_us;
-            let reorders = self.decoder.reorders();
-            if reorders {
-                self.pending.push(pts);
-            }
             match self.decoder.decode(packet) {
                 Ok(Some(frame)) => self.deliver(frame),
                 Ok(None) => {}
-                Err(error) => {
-                    if reorders {
-                        self.pending.remove(pts);
-                    }
-                    self.recover(error)?;
-                }
+                Err(error) => self.recover(error)?,
             }
         }
     }
@@ -116,7 +103,6 @@ impl Player {
     fn restart(&mut self) -> Result<()> {
         self.demuxer.rewind()?;
         self.decoder = open_decoder(&self.demuxer, self.software_only)?;
-        self.pending.clear();
         self.ready.clear();
         self.drained = false;
         self.packets = 0;
@@ -141,15 +127,10 @@ impl Player {
         Ok(())
     }
 
+    /// Every decoder stamps a picture with the timestamp of the packet it was
+    /// decoded from, through reordering and dropped packets alike.
     fn deliver(&mut self, mut frame: CapturedFrame) {
-        let pts = if self.decoder.reorders() {
-            self.pending
-                .pop_earliest()
-                .unwrap_or_else(|| self.presentation.extrapolated())
-        } else {
-            frame.timestamp_us()
-        };
-        let Some(shown_at) = self.presentation.admit(pts) else {
+        let Some(shown_at) = self.presentation.admit(frame.timestamp_us()) else {
             return;
         };
         match &mut frame {

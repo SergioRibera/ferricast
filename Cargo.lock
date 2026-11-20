@@ -2086,6 +2086,7 @@ dependencies = [
  "h264-reader",
  "libc",
  "openh264",
+ "openh264-sys2",
  "rav1d",
  "rust_h265",
  "rusty_vp9",

@@ -15,11 +15,11 @@ description = "Receiver-side decoders for ferricast (CPU H.264 + AAC; GPU paths 
 #   CPU-bound across the board (no consumer driver exposes hardware
 #   AAC decode), so one backend covers the receiver pipeline.
 default = ["openh264-decode", "aac"]
-openh264-decode = ["dep:openh264"]
+openh264-decode = ["dep:openh264", "dep:openh264-sys2", "dep:h264-reader"]
 aac = ["dep:symphonia"]
 vp8-decode = ["dep:vp8-decoder"]
 vp9-decode = ["dep:rusty_vp9"]
-hevc-decode = ["dep:rust_h265"]
+hevc-decode = ["dep:rust_h265", "dep:h264-reader"]
 av1-decode = ["dep:rav1d", "dep:libc"]
 # Hardware H.264 decode via VA-API. Opt-in (not in defaults) until
 # the slice-submission path is fully verified against a real
@@ -46,6 +46,9 @@ bytes.workspace = true
 tracing.workspace = true
 
 openh264 = { version = "0.9.3", optional = true }
+# The raw openh264 types: the safe wrapper drops the timestamp openh264
+# carries from each input packet to the picture it decodes into.
+openh264-sys2 = { version = "0.9", optional = true, default-features = false }
 symphonia = { version = "0.5", optional = true, default-features = false, features = ["aac"] }
 vp8-decoder = { version = "0.1.2", optional = true, default-features = false }
 rusty_vp9 = { version = "0.3", optional = true, default-features = false }
@@ -59,7 +62,9 @@ cros-libva = { git = "https://github.com/SergioRibera/cros-libva", branch = "fix
 
 # H.264 bitstream parser. Pure-Rust, no system deps. Used by the
 # VA-API backend to decode SPS / PPS so the VA buffer construction
-# has the bitstream-derived parameters it needs.
+# has the bitstream-derived parameters it needs; openh264 reads whether
+# a stream can reorder pictures from it, and the software HEVC backend
+# borrows its Exp-Golomb bit reader to read picture order counts.
 h264-reader = { version = "0.7", optional = true }
 
 # NVDEC binding (same crate the encoder uses — the workspace is

@@ -63,10 +63,6 @@ impl Decoder {
         }
     }
 
-    pub(crate) fn reorders(&self) -> bool {
-        matches!(self, Decoder::H264(_) | Decoder::H265(_))
-    }
-
     pub(crate) fn decode(&mut self, packet: EncodedFrame) -> Result<Option<CapturedFrame>> {
         match self {
             Decoder::H264(d) => d.decode(packet),

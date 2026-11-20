@@ -28,6 +28,8 @@ compile_error!(
 
 #[cfg(feature = "hevc-decode")]
 mod software_impl;
+#[cfg(feature = "hevc-decode")]
+mod timestamps;
 #[cfg(feature = "vaapi-hevc-decode")]
 mod vaapi_impl;
 
