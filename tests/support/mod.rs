@@ -351,3 +351,25 @@ pub const VP9_OPUS: &[&str] = &[
     "-b:a",
     "64k",
 ];
+
+/// Encodes `seconds` of a 440 Hz stereo tone at 44.1 kHz into `dir/name`
+/// with the ffmpeg arguments `args`. Returns `false` when ffmpeg is
+/// unavailable.
+pub fn generate_audio(dir: &Path, name: &str, seconds: u32, args: &[&str]) -> bool {
+    let Some(ffmpeg) = ffmpeg() else {
+        eprintln!("ffmpeg not found (set FERRICAST_FFMPEG) — skipping");
+        return false;
+    };
+    let status = Command::new(ffmpeg)
+        .env_remove("LD_LIBRARY_PATH")
+        .current_dir(dir)
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100"])
+        .args(["-t", &seconds.to_string(), "-ac", "2"])
+        .args(args)
+        .arg(name)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed: {status}");
+    true
+}

@@ -17,6 +17,11 @@ description = "Receiver-side decoders for ferricast (CPU H.264 + AAC; GPU paths 
 default = ["openh264-decode", "aac"]
 openh264-decode = ["dep:openh264", "dep:openh264-sys2", "dep:h264-reader"]
 aac = ["dep:symphonia"]
+# AAC decode through libfdk-aac (bundled C++ source, built by
+# fdk-aac-sys): adds HE-AAC (SBR) and HE-AAC v2 (PS) at full rate and
+# channel count. Preferred over symphonia when on; symphonia stays the
+# fallback (`FERRICAST_AAC_DECODER=symphonia`).
+fdk-aac-decode = ["aac", "dep:fdk-aac"]
 vp8-decode = ["dep:vp8-decoder"]
 vp9-decode = ["dep:rusty_vp9"]
 hevc-decode = ["dep:rust_h265", "dep:h264-reader"]
@@ -53,6 +58,7 @@ openh264 = { version = "0.9.3", optional = true }
 # The raw openh264 types: the safe wrapper drops the timestamp openh264
 # carries from each input packet to the picture it decodes into.
 openh264-sys2 = { version = "0.9", optional = true, default-features = false }
+fdk-aac = { version = "0.8", optional = true }
 symphonia = { version = "0.5", optional = true, default-features = false, features = ["aac"] }
 vp8-decoder = { version = "0.1.2", optional = true, default-features = false }
 rusty_vp9 = { version = "0.3", optional = true, default-features = false }
@@ -80,3 +86,5 @@ shiguredo_nvcodec = { version = "2026.1.0", optional = true }
 
 [dev-dependencies]
 ferricast-demuxer = { path = "../demuxer" }
+# HE-AAC test streams: libfdk-aac is the only HE-AAC encoder available.
+fdk-aac = "0.8"

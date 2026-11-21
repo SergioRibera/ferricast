@@ -73,6 +73,16 @@ pub enum MediaPacket {
     /// a live source that restarted). Consumers re-anchor their
     /// presentation clock on the next packet.
     Discontinuity,
+    /// Packets after this one timestamped before `timestamp_us` are
+    /// decode-only. A seek lands on the keyframe (or HLS segment start)
+    /// before its target: what lies between is needed to decode the
+    /// target but must not be shown or heard. Consumers decode those
+    /// packets, drop video frames before `timestamp_us` and trim audio
+    /// that starts before it. Holds until the next seek or
+    /// [`MediaPacket::Discontinuity`].
+    PresentFrom {
+        timestamp_us: u64,
+    },
     /// Stream ended cleanly. After this `next` should not be called;
     /// doing so returns [`crate::error::FerricastError::Pull`].
     Eos,

@@ -111,10 +111,41 @@ const CASES: &[Case] = &[
         extra: &[],
         codecs: (Codec::H264, AudioCodec::Opus),
     },
+    // Fragmented MP4, located by the trailing `mfra`, by a `sidx`, and
+    // with no index at all (fragments found by scanning).
+    Case {
+        name: "fragmented_mfra.mp4",
+        video: H264,
+        audio: AAC,
+        extra: &["-movflags", "frag_keyframe+empty_moov+default_base_moof"],
+        codecs: (Codec::H264, AudioCodec::Aac),
+    },
+    Case {
+        name: "fragmented_sidx.mp4",
+        video: H264,
+        audio: AAC,
+        extra: &[
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof+global_sidx+skip_trailer",
+        ],
+        codecs: (Codec::H264, AudioCodec::Aac),
+    },
+    Case {
+        name: "fragmented_unindexed.mp4",
+        video: H264,
+        audio: AAC,
+        extra: &["-movflags", "frag_keyframe+empty_moov+skip_trailer"],
+        codecs: (Codec::H264, AudioCodec::Aac),
+    },
 ];
 
-fn packets(demuxer: &mut Demuxer) -> Vec<Packet> {
-    std::iter::from_fn(|| demuxer.next_packet().unwrap()).collect()
+fn packets(demuxer: &mut Demuxer, name: &str) -> Vec<Packet> {
+    std::iter::from_fn(|| {
+        demuxer
+            .next_packet()
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+    })
+    .collect()
 }
 
 fn timestamp(packet: &Packet) -> u64 {
@@ -151,7 +182,7 @@ fn audio_and_video_come_interleaved_from_any_reader() {
             case.name
         );
 
-        let all = packets(&mut demuxer);
+        let all = packets(&mut demuxer, case.name);
         let video_frames = all.iter().filter(|p| matches!(p, Packet::Video(_))).count();
         let audio_packets: Vec<_> = all
             .iter()
@@ -208,19 +239,22 @@ fn seek_lands_on_the_keyframe_before_the_target_and_audio_follows() {
             return;
         };
         let mut demuxer = Demuxer::from_reader(Cursor::new(bytes)).unwrap();
+        // Without an edit list the first frame of a stream with B-frames
+        // is presented after zero; nothing lands before it.
+        let start = demuxer.seek(0).unwrap();
         for target in [2_500_000u64, 1_000_000, 3_900_000, 0] {
             let landed = demuxer.seek(target).unwrap();
             assert!(
-                landed <= target,
+                landed <= target.max(start),
                 "{}: landed {landed} after {target}",
                 case.name
             );
             assert!(
-                target - landed <= 1_050_000,
+                target.saturating_sub(landed) <= 1_050_000,
                 "{}: landed {landed} far before {target}",
                 case.name
             );
-            let after = packets(&mut demuxer);
+            let after = packets(&mut demuxer, case.name);
             let first_video = after
                 .iter()
                 .find_map(|p| match p {
@@ -274,24 +308,6 @@ fn audio_only_files_open() {
 }
 
 #[test]
-fn fragmented_mp4_is_rejected_clearly() {
-    let dir = tempfile::tempdir().unwrap();
-    let Some(bytes) = generate(
-        dir.path(),
-        "fragmented.mp4",
-        H264,
-        AAC,
-        &["-movflags", "frag_keyframe+empty_moov"],
-    ) else {
-        return;
-    };
-    let error = Demuxer::from_reader(Cursor::new(bytes))
-        .err()
-        .expect("must fail");
-    assert!(error.to_string().contains("fragmented"), "{error}");
-}
-
-#[test]
 fn opening_a_file_by_path_ignores_its_audio() {
     let dir = tempfile::tempdir().unwrap();
     let Some(_) = generate(dir.path(), "clip.mkv", H264, AAC, &[]) else {
@@ -299,5 +315,5 @@ fn opening_a_file_by_path_ignores_its_audio() {
     };
     let mut demuxer = Demuxer::open(&dir.path().join("clip.mkv")).unwrap();
     assert!(demuxer.audio().is_none());
-    assert_eq!(packets(&mut demuxer).len(), 120);
+    assert_eq!(packets(&mut demuxer, "clip.mkv").len(), 120);
 }

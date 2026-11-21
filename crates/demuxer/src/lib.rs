@@ -1,12 +1,18 @@
-//! MP4/MOV and Matroska/WebM demuxers.
+//! MP4/MOV (plain and fragmented), Matroska/WebM and audio-file demuxers.
 //!
 //! [`Demuxer`] reads from any [`MediaSource`] (a file, an in-memory
 //! buffer, an HTTP range reader) and hands out the packets of the first
 //! supported video track and, optionally, the first supported audio
 //! track (AAC or Opus), interleaved in decode order, with seeking to the
-//! keyframe at or before a target time.
+//! keyframe at or before a target time. Audio-only files are read too:
+//! raw ADTS AAC natively, MP3, FLAC, Ogg (Vorbis, Opus) and WAV through
+//! symphonia. [`demux_segment`] reads fragmented MP4 media segments (HLS
+//! `EXT-X-MAP`, CMAF).
 
+mod adts;
 mod audio;
+#[cfg(feature = "audio-files")]
+mod audio_file;
 mod mp4;
 mod nal;
 
@@ -21,7 +27,10 @@ use std::path::Path;
 
 use ferricast_core::{AudioFrame, Codec, EncodedFrame, FerricastError, Result};
 
+pub use adts::AdtsDemuxer;
 pub use audio::AudioStream;
+#[cfg(feature = "audio-files")]
+pub use audio_file::AudioFileDemuxer;
 pub use mp4::Mp4Demuxer;
 #[cfg(feature = "http")]
 pub use puller::ProgressivePuller;
@@ -77,6 +86,11 @@ pub enum Demuxer {
     Mp4(Box<Mp4Demuxer>),
     #[cfg(feature = "matroska")]
     Matroska(Box<MatroskaDemuxer>),
+    /// A raw ADTS AAC file.
+    Adts(Box<AdtsDemuxer>),
+    /// An MP3, FLAC, Ogg or WAV file.
+    #[cfg(feature = "audio-files")]
+    AudioFile(Box<AudioFileDemuxer>),
 }
 
 impl Demuxer {
@@ -101,16 +115,22 @@ impl Demuxer {
     /// # Errors
     ///
     /// Fails when the source cannot be read, its container is not
-    /// recognised (or is fragmented MP4), or it has neither a supported
+    /// recognised, or it has neither a supported
     /// video nor a supported audio track.
     pub fn from_reader(source: impl MediaSource + 'static) -> Result<Self> {
         Self::open_source(Box::new(source), TrackSelection::All)
     }
 
     fn open_source(mut source: BoxedSource, selection: TrackSelection) -> Result<Self> {
-        let mut head = [0; 8];
+        let mut head = [0; 10];
         source.seek(SeekFrom::Start(0))?;
-        source.read_exact(&mut head)?;
+        let mut filled = 0;
+        while filled < head.len() {
+            match source.read(&mut head[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
         source.seek(SeekFrom::Start(0))?;
         if mp4::is_mp4(&head) {
             return Ok(Self::Mp4(Box::new(Mp4Demuxer::open(source, selection)?)));
@@ -121,6 +141,28 @@ impl Demuxer {
                 source, selection,
             )?)));
         }
+        if selection == TrackSelection::All {
+            return Self::open_audio_file(source, &head);
+        }
+        Err(FerricastError::Demux(UNRECOGNISED.into()))
+    }
+
+    /// Opens audio-only files: ADTS AAC natively, the rest through
+    /// symphonia.
+    fn open_audio_file(mut source: BoxedSource, head: &[u8; 10]) -> Result<Self> {
+        let start = adts::id3v2_len(head).unwrap_or(0);
+        let mut sync = [0; 2];
+        source.seek(SeekFrom::Start(start))?;
+        let adts = source.read_exact(&mut sync).is_ok() && adts::is_adts(&sync);
+        source.seek(SeekFrom::Start(0))?;
+        if adts {
+            return Ok(Self::Adts(Box::new(AdtsDemuxer::open(source, start)?)));
+        }
+        #[cfg(feature = "audio-files")]
+        return AudioFileDemuxer::open(source)
+            .map(|d| Self::AudioFile(Box::new(d)))
+            .map_err(|_| FerricastError::Demux(UNRECOGNISED.into()));
+        #[cfg(not(feature = "audio-files"))]
         Err(FerricastError::Demux(UNRECOGNISED.into()))
     }
 
@@ -130,6 +172,9 @@ impl Demuxer {
             Demuxer::Mp4(d) => d.video(),
             #[cfg(feature = "matroska")]
             Demuxer::Matroska(d) => d.video(),
+            Demuxer::Adts(_) => None,
+            #[cfg(feature = "audio-files")]
+            Demuxer::AudioFile(_) => None,
         }
     }
 
@@ -139,6 +184,9 @@ impl Demuxer {
             Demuxer::Mp4(d) => d.audio(),
             #[cfg(feature = "matroska")]
             Demuxer::Matroska(d) => d.audio(),
+            Demuxer::Adts(d) => Some(d.audio()),
+            #[cfg(feature = "audio-files")]
+            Demuxer::AudioFile(d) => Some(d.audio()),
         }
     }
 
@@ -149,6 +197,9 @@ impl Demuxer {
             Demuxer::Mp4(d) => d.duration_us(),
             #[cfg(feature = "matroska")]
             Demuxer::Matroska(d) => d.duration_us(),
+            Demuxer::Adts(d) => d.duration_us(),
+            #[cfg(feature = "audio-files")]
+            Demuxer::AudioFile(d) => d.duration_us(),
         }
     }
 
@@ -162,6 +213,9 @@ impl Demuxer {
             Demuxer::Mp4(d) => d.next_packet(),
             #[cfg(feature = "matroska")]
             Demuxer::Matroska(d) => d.next_packet(),
+            Demuxer::Adts(d) => d.next_packet(),
+            #[cfg(feature = "audio-files")]
+            Demuxer::AudioFile(d) => d.next_packet(),
         }
     }
 
@@ -190,9 +244,12 @@ impl Demuxer {
     /// Fails on read errors while searching for the keyframe.
     pub fn seek(&mut self, timestamp_us: u64) -> Result<u64> {
         match self {
-            Demuxer::Mp4(d) => Ok(d.seek(timestamp_us)),
+            Demuxer::Mp4(d) => d.seek(timestamp_us),
             #[cfg(feature = "matroska")]
             Demuxer::Matroska(d) => d.seek(timestamp_us),
+            Demuxer::Adts(d) => d.seek(timestamp_us),
+            #[cfg(feature = "audio-files")]
+            Demuxer::AudioFile(d) => d.seek(timestamp_us),
         }
     }
 
@@ -203,14 +260,55 @@ impl Demuxer {
     /// Fails when the source cannot seek back.
     pub fn rewind(&mut self) -> Result<()> {
         match self {
-            Demuxer::Mp4(d) => {
+            Demuxer::Mp4(d) => d.rewind(),
+            #[cfg(feature = "matroska")]
+            Demuxer::Matroska(d) => d.rewind(),
+            Demuxer::Adts(d) => {
                 d.rewind();
                 Ok(())
             }
-            #[cfg(feature = "matroska")]
-            Demuxer::Matroska(d) => d.rewind(),
+            #[cfg(feature = "audio-files")]
+            Demuxer::AudioFile(d) => d.rewind(),
         }
     }
+}
+
+/// The tracks and packets of one fragmented MP4 media segment.
+#[derive(Debug, Clone)]
+pub struct Segment {
+    pub video: Option<VideoStream>,
+    pub audio: Option<AudioStream>,
+    /// In decode order. Timestamps share one timeline across the
+    /// segments of a stream: the decode times the segments carry, from
+    /// the edit list start.
+    pub packets: Vec<Packet>,
+}
+
+/// Demuxes one fragmented MP4 media segment (an HLS `EXT-X-MAP` or CMAF
+/// segment) against the initialization segment holding its `moov`.
+///
+/// # Errors
+///
+/// Fails when the initialization segment has no supported track or the
+/// media segment is malformed.
+pub fn demux_segment(init: &[u8], segment: &[u8]) -> Result<Segment> {
+    let mut file = Vec::with_capacity(init.len() + segment.len());
+    file.extend_from_slice(init);
+    file.extend_from_slice(segment);
+    let mut demuxer = Mp4Demuxer::open_with(
+        Box::new(std::io::Cursor::new(file)),
+        TrackSelection::All,
+        mp4::Origin::EditList,
+    )?;
+    let mut packets = Vec::new();
+    while let Some(packet) = demuxer.next_packet()? {
+        packets.push(packet);
+    }
+    Ok(Segment {
+        video: demuxer.video().cloned(),
+        audio: demuxer.audio().cloned(),
+        packets,
+    })
 }
 
 const UNRECOGNISED: &str = "unrecognised container";

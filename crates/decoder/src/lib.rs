@@ -4,7 +4,9 @@
 //! * [`h264`] — backend-agnostic H.264 facade. Auto-selects NVDEC →
 //!   VA-API → openh264 at first `configure()`. Mirror of the
 //!   encoder's `H264Encoder` facade.
-//! * [`aac`] — pure-Rust AAC-LC decoder over symphonia.
+//! * [`aac`] — AAC decoder: libfdk-aac (HE-AAC v1/v2 too) when built in,
+//!   else pure-Rust AAC-LC over symphonia.
+//! * [`PcmDecoder`] — pass-through for 16-bit PCM packets.
 //!
 //! Each module re-exports its facade type; the typical receiver
 //! pipeline registers both with the manager:
@@ -22,6 +24,7 @@
 pub mod h264;
 
 mod nv12;
+mod pcm;
 
 #[cfg(any(
     feature = "nvdec-hevc-decode",
@@ -61,6 +64,7 @@ pub use h264::H264Decoder;
 pub use h265::H265Decoder;
 #[cfg(feature = "opus-decode")]
 pub use opus::OpusDecoder;
+pub use pcm::PcmDecoder;
 #[cfg(feature = "vp8-decode")]
 pub use vp8::Vp8Decoder;
 #[cfg(feature = "vp9-decode")]

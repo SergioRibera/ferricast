@@ -18,8 +18,9 @@
 //! `METHOD=AES-128`, `EXT-X-DISCONTINUITY`, live sources that restart
 //! (media sequence going backwards), transient HTTP failures (retried
 //! with backoff) and expired live segments (skip to the live edge).
-//! Rejected with an explicit error: fMP4 segments (`EXT-X-MAP`),
-//! `SAMPLE-AES` and DRM key formats. Alternate audio renditions in a
+//! Fragmented MP4 segments (`EXT-X-MAP` initialization segment plus
+//! CMAF media segments) go through the MP4 demuxer. Rejected with an
+//! explicit error: `SAMPLE-AES` and DRM key formats. Alternate audio renditions in a
 //! separate playlist are not fetched; such variants play video only.
 //!
 //! Demux happens segment-by-segment on the worker task; packets
@@ -41,8 +42,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use url::Url;
 
-use fetch::{ByteRange, FetchError, Fetched, Fetcher, KEY_LIMIT, PLAYLIST_LIMIT, SEGMENT_LIMIT};
-use playlist::{SegmentKey, SegmentRef};
+use bytes::Bytes;
+use fetch::{
+    ByteRange, FetchError, Fetched, Fetcher, INIT_LIMIT, KEY_LIMIT, PLAYLIST_LIMIT, SEGMENT_LIMIT,
+};
+use playlist::{InitSegment, SegmentKey, SegmentRef};
 use ts::{DemuxedPacket, TsDemuxer};
 
 /// Puller → worker control messages.
@@ -280,6 +284,14 @@ struct Worker {
     /// Something was emitted already; a timeline reset must then be
     /// signalled downstream.
     timeline_started: bool,
+    /// After a seek: how far into the next segment the target lies.
+    /// That much of the segment is decode-only.
+    seek_offset_us: Option<u64>,
+    /// Last `EXT-X-MAP` initialization segment fetched.
+    init_cache: Option<(InitSegment, Bytes)>,
+    /// Streams of the last fragmented MP4 segment (MPEG-TS streams are
+    /// tracked by the TS demuxer).
+    fmp4_streams: Option<(Option<VideoStreamInfo>, Option<AudioStreamInfo>)>,
 }
 
 /// Top-level worker entry: resolves the playlist, probes the first
@@ -389,6 +401,9 @@ impl Worker {
             last_reload_changed: false,
             reset_pending: false,
             timeline_started: false,
+            seek_offset_us: None,
+            init_cache: None,
+            fmp4_streams: None,
         };
 
         // Probe the first segment: codecs and audio parameters are
@@ -398,27 +413,35 @@ impl Worker {
             Stop::Ended => Stop::Failed(FerricastError::Pull("HLS playlist has no media".into())),
             other => other,
         })?;
-        let ts_info = worker.demuxer.info();
-        if ts_info.video_codec.is_none() && ts_info.audio_codec.is_none() {
+        let (video, audio) = match worker.fmp4_streams.clone() {
+            Some(streams) => streams,
+            None => {
+                let ts_info = worker.demuxer.info();
+                (
+                    ts_info.video_codec.map(|codec| VideoStreamInfo {
+                        codec,
+                        // Not carried in the PMT; decoders read the real
+                        // dimensions from the SPS.
+                        width: 0,
+                        height: 0,
+                        fps: 0,
+                    }),
+                    ts_info.audio_codec.map(|codec| AudioStreamInfo {
+                        codec,
+                        sample_rate: ts_info.audio_sample_rate,
+                        channels: ts_info.audio_channels,
+                    }),
+                )
+            }
+        };
+        if video.is_none() && audio.is_none() {
             return Err(Stop::Failed(FerricastError::Pull(
-                "no supported elementary stream (H.264, H.265, AAC) in the first HLS segment"
-                    .into(),
+                "no supported elementary stream in the first HLS segment".into(),
             )));
         }
         let info = MediaInfo {
-            video: ts_info.video_codec.map(|codec| VideoStreamInfo {
-                codec,
-                // Not carried in the PMT; decoders read the real
-                // dimensions from the SPS.
-                width: 0,
-                height: 0,
-                fps: 0,
-            }),
-            audio: ts_info.audio_codec.map(|codec| AudioStreamInfo {
-                codec,
-                sample_rate: ts_info.audio_sample_rate,
-                channels: ts_info.audio_channels,
-            }),
+            video,
+            audio,
             duration_us: playlist::total_duration_us(&worker.playlist),
             is_live: !worker.playlist.end_list,
         };
@@ -477,6 +500,7 @@ impl Worker {
             Some((idx, segment_start_us)) => {
                 tracing::info!(position_us, segment_start_us, "HLS seek");
                 self.next_seq = self.playlist.media_sequence + idx as u64;
+                self.seek_offset_us = Some(position_us.saturating_sub(segment_start_us));
             }
             // Past the end: play nothing more.
             None => {
@@ -588,14 +612,67 @@ impl Worker {
                 out.push(MediaPacket::Discontinuity);
             }
         }
-        let demuxed = std::mem::take(self.demuxer.push(body))
-            .into_iter()
-            .chain(std::mem::take(self.demuxer.flush()));
-        out.extend(demuxed.map(|p| match p {
-            DemuxedPacket::Video(v) => MediaPacket::Video(v),
-            DemuxedPacket::Audio(a) => MediaPacket::Audio(a),
-        }));
+        if let Some(map) = &seg.map {
+            let init = self.init_segment(map).await?;
+            out.extend(self.demux_fragmented(&init, body).map_err(Stop::Failed)?);
+        } else {
+            let demuxed = std::mem::take(self.demuxer.push(body))
+                .into_iter()
+                .chain(std::mem::take(self.demuxer.flush()));
+            out.extend(demuxed.map(|p| match p {
+                DemuxedPacket::Video(v) => MediaPacket::Video(v),
+                DemuxedPacket::Audio(a) => MediaPacket::Audio(a),
+            }));
+        }
+        if let Some(offset_us) = self.seek_offset_us.take() {
+            mark_seek_target(&mut out, offset_us);
+        }
         Ok(out)
+    }
+
+    /// The `EXT-X-MAP` initialization segment `map`, fetched once.
+    async fn init_segment(&mut self, map: &InitSegment) -> Step<Bytes> {
+        if let Some((cached, bytes)) = &self.init_cache
+            && cached == map
+        {
+            return Ok(bytes.clone());
+        }
+        let budget = self.retry_budget();
+        let fetched = self
+            .io
+            .fetch(&map.url, map.range, INIT_LIMIT, budget)
+            .await?
+            .map_err(|e| Stop::Failed(e.into_pull_error(&map.url)))?;
+        self.init_cache = Some((map.clone(), fetched.body.clone()));
+        Ok(fetched.body)
+    }
+
+    /// Demuxes a fragmented MP4 media segment against its
+    /// initialization segment.
+    fn demux_fragmented(&mut self, init: &[u8], body: &[u8]) -> Result<Vec<MediaPacket>> {
+        let segment = ferricast_demuxer::demux_segment(init, body)
+            .map_err(|e| FerricastError::Pull(format!("fragmented MP4 segment: {e}")))?;
+        self.fmp4_streams = Some((
+            segment.video.as_ref().map(|v| VideoStreamInfo {
+                codec: v.codec,
+                width: v.width,
+                height: v.height,
+                fps: 0,
+            }),
+            segment.audio.as_ref().map(|a| AudioStreamInfo {
+                codec: a.codec,
+                sample_rate: a.sample_rate,
+                channels: a.channels,
+            }),
+        ));
+        Ok(segment
+            .packets
+            .into_iter()
+            .map(|p| match p {
+                ferricast_demuxer::Packet::Video(v) => MediaPacket::Video(v),
+                ferricast_demuxer::Packet::Audio(a) => MediaPacket::Audio(a),
+            })
+            .collect())
     }
 
     async fn key_bytes(&mut self, key: &SegmentKey) -> Step<[u8; 16]> {
@@ -663,4 +740,29 @@ impl Worker {
         }
         Ok(())
     }
+}
+
+/// Marks the first `offset_us` of a segment's packets as decode-only:
+/// a seek target that falls inside a segment is reached by decoding from
+/// the segment start. The segment start is its first video frame (HLS
+/// segments open on a keyframe), or its first audio packet without video.
+fn mark_seek_target(packets: &mut Vec<MediaPacket>, offset_us: u64) {
+    let first_video = packets.iter().find_map(|p| match p {
+        MediaPacket::Video(v) => Some(v.timestamp_us),
+        _ => None,
+    });
+    let first_audio = packets.iter().find_map(|p| match p {
+        MediaPacket::Audio(a) => Some(a.timestamp_us),
+        _ => None,
+    });
+    let Some(start_us) = first_video.or(first_audio) else {
+        return;
+    };
+    let at = usize::from(matches!(packets.first(), Some(MediaPacket::Discontinuity)));
+    packets.insert(
+        at,
+        MediaPacket::PresentFrom {
+            timestamp_us: start_us.saturating_add(offset_us),
+        },
+    );
 }

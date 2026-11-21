@@ -48,13 +48,6 @@ pub(super) fn choose_variant(master: &MasterPlaylist) -> Option<(&VariantStream,
 /// message naming the feature.
 pub(super) fn check_supported(pl: &MediaPlaylist) -> Result<()> {
     for seg in &pl.segments {
-        if seg.map.is_some() {
-            return Err(FerricastError::Pull(
-                "unsupported HLS stream: fragmented MP4 segments (EXT-X-MAP) are not supported, \
-                 only MPEG-TS"
-                    .into(),
-            ));
-        }
         if let Some(key) = &seg.key {
             match &key.method {
                 KeyMethod::None => {}
@@ -143,6 +136,16 @@ pub(super) struct SegmentRef {
     pub(super) range: Option<ByteRange>,
     pub(super) key: Option<SegmentKey>,
     pub(super) discontinuity: bool,
+    /// Initialization segment (`EXT-X-MAP`) of fragmented MP4 media;
+    /// `None` for MPEG-TS.
+    pub(super) map: Option<InitSegment>,
+}
+
+/// Where an `EXT-X-MAP` initialization segment is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct InitSegment {
+    pub(super) url: Url,
+    pub(super) range: Option<ByteRange>,
 }
 
 /// Resolves segment `idx` of `pl` against the playlist's (final) URL.
@@ -160,9 +163,14 @@ pub(super) fn resolve_segment(pl: &MediaPlaylist, base: &Url, idx: usize) -> Res
     let mut next_offset = 0u64;
     let mut range = None;
     let mut key = None;
+    let mut map = None;
     for s in &pl.segments[..=idx] {
         if let Some(k) = &s.key {
             key = Some(k);
+        }
+        // An EXT-X-MAP applies to every segment after it until the next.
+        if let Some(m) = &s.map {
+            map = Some(m);
         }
         range = s.byte_range.as_ref().map(|br| {
             let offset = br.offset.unwrap_or(next_offset);
@@ -194,11 +202,25 @@ pub(super) fn resolve_segment(pl: &MediaPlaylist, base: &Url, idx: usize) -> Res
         _ => None,
     };
 
+    let map = map
+        .map(|m| -> Result<InitSegment> {
+            let url = base
+                .join(&m.uri)
+                .map_err(|e| FerricastError::Pull(format!("EXT-X-MAP URL join {}: {e}", m.uri)))?;
+            let range = m.byte_range.as_ref().map(|br| ByteRange {
+                offset: br.offset.unwrap_or(0),
+                length: br.length,
+            });
+            Ok(InitSegment { url, range })
+        })
+        .transpose()?;
+
     Ok(SegmentRef {
         url,
         range,
         key,
         discontinuity: seg.discontinuity,
+        map,
     })
 }
 
@@ -294,11 +316,18 @@ mod tests {
     }
 
     #[test]
-    fn fmp4_and_sample_aes_are_rejected() {
+    fn fmp4_maps_carry_over_and_sample_aes_is_rejected() {
         let fmp4 = media(
-            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4.0,\na.m4s\n",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4.0,\na.m4s\n\
+             #EXTINF:4.0,\nb.m4s\n",
         );
-        assert!(check_supported(&fmp4).is_err());
+        assert!(check_supported(&fmp4).is_ok());
+        let base = Url::parse("http://host/dir/index.m3u8").unwrap();
+        let second = resolve_segment(&fmp4, &base, 1).unwrap();
+        assert_eq!(
+            second.map.map(|m| m.url.to_string()).as_deref(),
+            Some("http://host/dir/init.mp4")
+        );
         let sample_aes = media(
             "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"k\"\n\
              #EXTINF:4.0,\na.ts\n",

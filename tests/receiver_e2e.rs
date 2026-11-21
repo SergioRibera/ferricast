@@ -77,6 +77,12 @@ struct SinkLog {
     audio_chunks: usize,
     /// (arrival, PTS, duration) per audio chunk.
     audio: Vec<(Instant, u64, Duration)>,
+    /// Whether each audio chunk is pure silence (the pipeline's lead-in).
+    audio_silent: Vec<bool>,
+    /// Audio chunks received when each `flush_audio` arrived.
+    flushes: Vec<usize>,
+    /// (sample rate, channels) per audio chunk.
+    audio_shapes: Vec<(u32, u16)>,
     gains: Vec<f32>,
     sinks_created: usize,
     sinks_dropped: usize,
@@ -104,6 +110,14 @@ impl FrameSink for HeadlessSink {
         log.audio_chunks += 1;
         log.audio
             .push((Instant::now(), audio.timestamp_us, duration));
+        log.audio_silent.push(audio.pcm.iter().all(|&s| s == 0));
+        log.audio_shapes.push((audio.sample_rate, audio.channels));
+        Ok(())
+    }
+    async fn flush_audio(&mut self) -> Result<()> {
+        let mut log = self.0.lock().unwrap();
+        let at = log.audio.len();
+        log.flushes.push(at);
         Ok(())
     }
     async fn set_volume(&mut self, gain: f32) -> Result<()> {
@@ -136,6 +150,7 @@ impl Receiver {
         let builder = builder.register_video_decoder::<ferricast::decoder::Vp9Decoder>();
         #[cfg(feature = "opus-decode")]
         let builder = builder.register_audio_decoder::<ferricast::decoder::OpusDecoder>();
+        let builder = builder.register_audio_decoder::<ferricast::decoder::PcmDecoder>();
         let (mut manager, events) = builder
             .set_sink_factory(move |_remote, _info| {
                 log_factory.lock().unwrap().sinks_created += 1;
@@ -787,6 +802,12 @@ async fn progressive_files_play_paced_with_audio_and_report_duration() {
             &[][..],
             "video/x-matroska",
         ),
+        (
+            "fragmented.mp4",
+            support::H264_AAC,
+            &["-movflags", "frag_keyframe+empty_moov+default_base_moof"][..],
+            "video/mp4",
+        ),
     ];
     if cfg!(all(feature = "vp9-decode", feature = "opus-decode")) {
         cases.push(("vp9_opus.webm", support::VP9_OPUS, &[][..], "video/webm"));
@@ -847,19 +868,74 @@ async fn progressive_files_play_paced_with_audio_and_report_duration() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seek_in_a_progressive_file_lands_near_the_target() {
     let dir = tempfile::tempdir().unwrap();
-    if !support::generate_progressive(dir.path(), "long.mp4", 12, support::H264_AAC, &[]) {
-        return;
+    if support::generate_progressive(dir.path(), "long.mp4", 12, support::H264_AAC, &[]) {
+        seek_lands_on_the_target(dir.path(), "long.mp4", "video/mp4", Origin::Zero).await;
     }
-    let server = TestServer::start(support::dir_handler(dir.path())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seek_in_a_fragmented_mp4_lands_on_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let extra = ["-movflags", "frag_keyframe+empty_moov+default_base_moof"];
+    let name = "long_fragmented.mp4";
+    if support::generate_progressive(dir.path(), name, 12, support::H264_AAC, &extra) {
+        seek_lands_on_the_target(dir.path(), name, "video/mp4", Origin::Zero).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seek_in_hls_lands_on_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    if support::generate_hls(dir.path(), 12, 2, &[]) {
+        let mime = "application/vnd.apple.mpegurl";
+        seek_lands_on_the_target(dir.path(), "index.m3u8", mime, Origin::FirstFrame).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seek_in_fmp4_hls_lands_on_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    if support::generate_hls(dir.path(), 12, 2, &["-hls_segment_type", "fmp4"]) {
+        let mime = "application/vnd.apple.mpegurl";
+        seek_lands_on_the_target(dir.path(), "index.m3u8", mime, Origin::FirstFrame).await;
+    }
+}
+
+/// Where media time zero is in the timestamps a sink sees.
+#[derive(Clone, Copy)]
+enum Origin {
+    /// Timestamps are media time (progressive files).
+    Zero,
+    /// At the first frame shown (MPEG-TS and HLS start anywhere).
+    FirstFrame,
+}
+
+/// Seeks to 7.5 s into a 12 s clip with a keyframe every second: the
+/// first frame and audio shown are at the target, no stale audio is
+/// pushed after the flush, and the status reports the right position.
+async fn seek_lands_on_the_target(dir: &std::path::Path, name: &str, mime: &str, origin: Origin) {
+    let server = TestServer::start(support::dir_handler(dir)).await;
     let mut rx = Receiver::start().await;
     let mut sender = Sender::connect(rx.port, "sender-seek").await;
     sender.launch().await;
-    let reply = sender.load(&server.url("/long.mp4"), "video/mp4").await;
+    let reply = sender.load(&server.url(&format!("/{name}")), mime).await;
     assert_eq!(reply["status"][0]["playerState"], "PLAYING", "{reply}");
     let session_id = reply["status"][0]["mediaSessionId"].clone();
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let shown_before = rx.log.lock().unwrap().video.len();
+    let (shown_before, heard_before, base) = {
+        let log = rx.log.lock().unwrap();
+        let base = match origin {
+            Origin::Zero => 0,
+            Origin::FirstFrame => log
+                .video
+                .iter()
+                .map(|v| v.1)
+                .min()
+                .expect("frames before the seek"),
+        };
+        (log.video.len(), log.audio.len(), base)
+    };
     let seek_sent = Instant::now();
     let id = sender
         .request(
@@ -878,10 +954,30 @@ async fn seek_in_a_progressive_file_lands_near_the_target() {
         let after = &log.video[shown_before..];
         let first = after
             .iter()
-            .find(|(_, pts)| *pts >= 5_000_000)
+            .find(|(_, pts)| *pts >= base + 5_000_000)
             .copied()
             .expect("frames after the seek");
-        (first.1, after.last().unwrap().1, first.0)
+        (first.1 - base, after.last().unwrap().1 - base, first.0)
+    };
+    let (first_audio, flushed_at, stale) = {
+        let log = rx.log.lock().unwrap();
+        let flushed_at = log
+            .flushes
+            .iter()
+            .copied()
+            .find(|&at| at >= heard_before)
+            .expect("the seek flushes the sink audio");
+        let after = flushed_at..log.audio.len();
+        let first = after
+            .clone()
+            .find(|&i| !log.audio_silent[i])
+            .map(|i| log.audio[i].1.saturating_sub(base))
+            .expect("audio after the seek");
+        // Anything pushed after the flush from before the target is stale.
+        let stale = after
+            .filter(|&i| !log.audio_silent[i] && log.audio[i].1 < base + 7_400_000)
+            .count();
+        (first, flushed_at, stale)
     };
     let id = sender
         .request(
@@ -901,17 +997,27 @@ async fn seek_in_a_progressive_file_lands_near_the_target() {
         .await;
     let reported = paused["status"][0]["currentTime"].as_f64().unwrap();
     eprintln!(
-        "E2E seek: target 7.500s, first frame after seek at {:.3}s ({:.0} ms after SEEK), \
+        "E2E seek {name}: target 7.500s, first frame after seek at {:.3}s ({:.0} ms after SEEK), \
          last shown {:.3}s, PAUSED currentTime {reported:.3}s",
         first_after as f64 / 1e6,
         (at_first - seek_sent).as_secs_f64() * 1000.0,
         last_after as f64 / 1e6,
     );
-    // Keyframes every second: playback resumes from the one at 7.0 s.
-    assert!(
-        (6_900_000..=7_500_000).contains(&first_after),
-        "resumed at {first_after}"
+    eprintln!(
+        "E2E seek {name}: first audio after seek at {:.3}s, flush after {flushed_at} chunks, {stale} stale chunks",
+        first_audio as f64 / 1e6
     );
+    // Keyframes every second: decoding restarts at 7.0 s, but nothing
+    // before the target is shown or heard.
+    assert!(
+        first_after.abs_diff(7_500_000) <= 34_000,
+        "first frame after the seek at {first_after}"
+    );
+    assert!(
+        first_audio.abs_diff(7_500_000) <= 25_000,
+        "first audio after the seek at {first_audio}"
+    );
+    assert_eq!(stale, 0, "stale audio after the flush");
     assert!(
         (reported - last_after as f64 / 1e6).abs() < 0.3,
         "status says {reported}, last frame {last_after}"
@@ -956,5 +1062,167 @@ async fn progressive_file_plays_from_a_server_without_range_support() {
         .load(&server.url("/missing.webm"), "video/webm")
         .await;
     assert_eq!(reply["type"], "LOAD_FAILED", "{reply}");
+    rx.manager.stop_receivers().await.unwrap();
+}
+
+/// Pacing of the audible (non-silent) audio chunks of an audio-only
+/// playback: `(PTS span, wall span, seconds of audio)`.
+fn audio_pacing(log: &SinkLog) -> (f64, f64, f64) {
+    let heard: Vec<_> = log
+        .audio
+        .iter()
+        .zip(&log.audio_silent)
+        .filter(|(_, silent)| !**silent)
+        .map(|(a, _)| *a)
+        .collect();
+    let (first, last) = (heard[0], heard[heard.len() - 1]);
+    let pts_span = Duration::from_micros(last.1 - first.1).as_secs_f64();
+    let wall_span = (last.0 - first.0).as_secs_f64();
+    let secs = heard.iter().map(|a| a.2).sum::<Duration>().as_secs_f64();
+    (pts_span, wall_span, secs)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audio_files_play_paced_and_report_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cases: Vec<(&str, &[&str], &str)> = vec![
+        (
+            "tone.mp3",
+            &["-c:a", "libmp3lame", "-q:a", "4"],
+            "audio/mpeg",
+        ),
+        ("tone.flac", &["-c:a", "flac"], "audio/flac"),
+        ("vorbis.ogg", &["-c:a", "libvorbis"], "audio/ogg"),
+        ("tone.wav", &["-c:a", "pcm_s24le"], "audio/wav"),
+        ("tone.aac", &["-c:a", "aac", "-f", "adts"], "audio/aac"),
+    ];
+    if cfg!(feature = "opus-decode") {
+        cases.push(("opus.ogg", &["-c:a", "libopus"], "audio/ogg"));
+    }
+    for (name, args, _) in &cases {
+        if !support::generate_audio(dir.path(), name, 4, args) {
+            return;
+        }
+    }
+    let mut expected_shape = vec![None; cases.len()];
+    if cfg!(feature = "fdk-aac") {
+        std::fs::write(dir.path().join("he1.aac"), he_aac_adts(4, false)).unwrap();
+        std::fs::write(dir.path().join("he2.aac"), he_aac_adts(4, true)).unwrap();
+        cases.push(("he1.aac", &[], "audio/aac"));
+        cases.push(("he2.aac", &[], "audio/aac"));
+        expected_shape.extend([Some((48_000, 2)), Some((48_000, 2))]);
+    }
+    let server = TestServer::start(support::dir_handler(dir.path())).await;
+    let mut rx = Receiver::start().await;
+    let mut sender = Sender::connect(rx.port, "sender-audio").await;
+    sender.launch().await;
+    for ((name, _, content_type), shape) in cases.iter().zip(expected_shape) {
+        let reply = play_to_end(
+            &rx,
+            &mut sender,
+            &server.url(&format!("/{name}")),
+            content_type,
+        )
+        .await;
+        let log = rx.log.lock().unwrap();
+        let duration = reply["status"][0]["media"]["duration"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{name}: no duration"));
+        let (pts_span, wall_span, secs) = audio_pacing(&log);
+        let heard_shape = log.audio_shapes.last().copied().unwrap();
+        eprintln!(
+            "E2E audio {name}: duration {duration:.3}s, {} chunks, {secs:.3}s of audio, \
+             PTS span {pts_span:.3}s over {wall_span:.3}s wall, {} Hz / {} ch, no video: {}",
+            log.audio.len(),
+            heard_shape.0,
+            heard_shape.1,
+            log.video.is_empty()
+        );
+        assert!(log.video.is_empty(), "{name}: video frames");
+        assert!((duration - 4.0).abs() < 0.15, "{name}: duration {duration}");
+        assert!((secs - 4.0).abs() < 0.2, "{name}: {secs:.3}s of audio");
+        assert!(
+            (wall_span - pts_span).abs() < 0.25,
+            "{name}: PTS span {pts_span:.3}s over {wall_span:.3}s"
+        );
+        if let Some(shape) = shape {
+            assert_eq!(heard_shape, shape, "{name}: decoded shape");
+        }
+    }
+    rx.manager.stop_receivers().await.unwrap();
+}
+
+/// `seconds` of stereo tones at 48 kHz encoded with libfdk-aac as ADTS
+/// HE-AAC (`v2`: with parametric stereo), the only HE-AAC encoder at
+/// hand (ffmpeg builds rarely include it).
+fn he_aac_adts(seconds: u32, v2: bool) -> Vec<u8> {
+    use fdk_aac::enc::{AudioObjectType, BitRate, ChannelMode, Encoder, EncoderParams, Transport};
+    let rate = 48_000u32;
+    let encoder = Encoder::new(EncoderParams {
+        bit_rate: BitRate::Cbr(48_000),
+        sample_rate: rate,
+        transport: Transport::Adts,
+        channels: ChannelMode::Stereo,
+        audio_object_type: if v2 {
+            AudioObjectType::Mpeg4HeAacV2
+        } else {
+            AudioObjectType::Mpeg4HeAac
+        },
+    })
+    .unwrap();
+    let chunk = encoder.info().unwrap().frameLength as usize * 2;
+    let pcm: Vec<i16> = (0..(rate * seconds) as usize)
+        .flat_map(|n| {
+            let t = n as f32 / rate as f32;
+            let l = (t * 1_000.0 * std::f32::consts::TAU).sin();
+            let r = (t * 3_000.0 * std::f32::consts::TAU).sin();
+            [(l * 12_000.0) as i16, (r * 12_000.0) as i16]
+        })
+        .collect();
+    let mut adts = Vec::new();
+    let mut out = vec![0u8; 8192];
+    for mut input in pcm.chunks(chunk) {
+        while !input.is_empty() {
+            let info = encoder.encode(input, &mut out).unwrap();
+            adts.extend_from_slice(&out[..info.output_size]);
+            if info.input_consumed == 0 {
+                break;
+            }
+            input = &input[info.input_consumed..];
+        }
+    }
+    adts
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fmp4_hls_plays_paced_with_audio() {
+    let dir = tempfile::tempdir().unwrap();
+    if !support::generate_hls(dir.path(), 6, 2, &["-hls_segment_type", "fmp4"]) {
+        return;
+    }
+    let server = TestServer::start(support::dir_handler(dir.path())).await;
+    let mut rx = Receiver::start().await;
+    let mut sender = Sender::connect(rx.port, "sender-fmp4-hls").await;
+    sender.launch().await;
+    let reply = play_to_end(
+        &rx,
+        &mut sender,
+        &server.url("/index.m3u8"),
+        "application/vnd.apple.mpegurl",
+    )
+    .await;
+    let p = Playback::of(&rx.log.lock().unwrap());
+    eprintln!(
+        "E2E fMP4 HLS: duration {}, {} frames, PTS span {:.3}s, drift {:+.3}s, {:.3}s of audio",
+        reply["status"][0]["media"]["duration"], p.frames, p.pts_span, p.drift, p.audio_secs
+    );
+    assert!(p.frames >= 170, "only {} frames shown", p.frames);
+    assert!(p.pts_span > 5.8, "PTS span {:.3}s", p.pts_span);
+    assert!(p.drift.abs() < 0.25, "paced {:+.3}s off real time", p.drift);
+    assert!(
+        (p.audio_secs - 6.0).abs() < 0.25,
+        "{:.3}s of audio",
+        p.audio_secs
+    );
     rx.manager.stop_receivers().await.unwrap();
 }
