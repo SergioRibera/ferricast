@@ -35,6 +35,7 @@
 
 #![forbid(unsafe_code)]
 
+mod playfair;
 mod setup;
 
 /// Length of the first `fp-setup` message.
@@ -69,9 +70,6 @@ pub enum FairPlayError {
     /// The mode byte is outside `0..=3`; no reply or key table exists for it.
     #[error("unsupported fp-setup mode {0}, expected 0..=3")]
     Mode(u8),
-    /// ekey decryption is not built in yet.
-    #[error("ekey decryption is not available")]
-    Unavailable,
 }
 
 /// Builds the receiver's reply to the first `fp-setup` message.
@@ -111,10 +109,10 @@ pub fn setup2_reply(message2: &[u8]) -> Result<[u8; FP_SETUP2_REPLY_LEN], FairPl
 /// [`FairPlayError::Mode`] when the mode byte of `keymsg` (offset 12) is
 /// above 3.
 pub fn decrypt_ekey(
-    _keymsg: &[u8; FP_SETUP2_LEN],
-    _ekey: &[u8; EKEY_LEN],
+    keymsg: &[u8; FP_SETUP2_LEN],
+    ekey: &[u8; EKEY_LEN],
 ) -> Result<[u8; 16], FairPlayError> {
-    Err(FairPlayError::Unavailable)
+    playfair::decrypt(keymsg, ekey)
 }
 
 /// FairPlay protocol version byte carried at offset 4 of every message.
@@ -201,6 +199,18 @@ mod tests {
         assert_eq!(setup_message1(2)[14], 2);
         assert_eq!(setup_message1(2)[4], FAIRPLAY_VERSION);
         assert_eq!(&expected_reply2()[12..], &KEY_MESSAGE[144..]);
+    }
+
+    #[test]
+    fn decrypt_ekey_recovers_the_recorded_key() {
+        assert_eq!(decrypt_ekey(&KEY_MESSAGE, &EKEY), Ok(AES_KEY));
+    }
+
+    #[test]
+    fn decrypt_ekey_rejects_unknown_modes() {
+        let mut keymsg = KEY_MESSAGE;
+        keymsg[12] = 4;
+        assert_eq!(decrypt_ekey(&keymsg, &EKEY), Err(FairPlayError::Mode(4)));
     }
 
     #[test]
