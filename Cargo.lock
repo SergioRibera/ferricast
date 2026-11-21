@@ -2073,6 +2073,7 @@ dependencies = [
  "rusty_vp9",
  "shiguredo_nvcodec",
  "symphonia",
+ "tempfile",
  "tracing",
  "vp8-decoder",
 ]

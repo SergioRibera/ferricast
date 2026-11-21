@@ -23,6 +23,7 @@
 //! AES-128 is decrypted by the caller before the bytes get here),
 //! multi-program transport streams, PSI versioning, non-AAC audio.
 
+use ferricast_core::frame::AacChannelConfig;
 use ferricast_core::{AudioCodec, AudioFrame, Codec, EncodedFrame};
 
 /// Result of feeding bytes through [`TsDemuxer::push`]. The demuxer
@@ -448,10 +449,7 @@ fn parse_adts_header(buf: &[u8]) -> Option<(u32, u16)> {
         .copied()
         .filter(|&r| r != 0)?;
     // Channel config — 3 bits straddling bytes 2/3.
-    let ch = u16::from(((buf[2] & 0x01) << 2) | ((buf[3] & 0xC0) >> 6));
-    if ch == 0 {
-        return None;
-    }
+    let ch = AacChannelConfig::new(((buf[2] & 0x01) << 2) | ((buf[3] & 0xC0) >> 6))?.channels();
     Some((rate, ch))
 }
 

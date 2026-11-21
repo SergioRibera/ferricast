@@ -9,6 +9,7 @@
 use std::io::SeekFrom;
 
 use bytes::Bytes;
+use ferricast_core::frame::AacChannelConfig;
 use ferricast_core::{AudioCodec, AudioFrame, FerricastError, Result};
 
 use crate::{AudioStream, BoxedSource, Packet};
@@ -47,7 +48,7 @@ pub(crate) fn id3v2_len(head: &[u8; 10]) -> Option<u64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Header {
     sample_rate: u32,
-    channels: u8,
+    channels: u16,
     frame_len: usize,
     /// Samples per channel in the frame.
     samples: u64,
@@ -59,12 +60,13 @@ impl Header {
             return None;
         }
         let rate = *RATES.get(usize::from((data[2] >> 2) & 0xF))?;
-        let channels = ((data[2] & 1) << 2) | (data[3] >> 6);
+        let code = ((data[2] & 1) << 2) | (data[3] >> 6);
+        let channels = AacChannelConfig::new(code)?.channels();
         let frame_len = (usize::from(data[3] & 3) << 11)
             | (usize::from(data[4]) << 3)
             | usize::from(data[5] >> 5);
         let blocks = u64::from(data[6] & 3) + 1;
-        (frame_len > HEADER_LEN && channels > 0).then_some(Self {
+        (frame_len > HEADER_LEN).then_some(Self {
             sample_rate: rate,
             channels,
             frame_len,
@@ -120,7 +122,7 @@ impl AdtsDemuxer {
             stream: AudioStream {
                 codec: AudioCodec::Aac,
                 sample_rate: first.sample_rate,
-                channels: u16::from(first.channels),
+                channels: first.channels,
                 duration_us,
             },
             offset: start,
@@ -195,7 +197,7 @@ impl AdtsDemuxer {
             data: Bytes::from(data),
             timestamp_us: self.micros(self.position),
             sample_rate: header.sample_rate,
-            channels: u16::from(header.channels),
+            channels: header.channels,
         };
         self.offset += header.frame_len as u64;
         self.position += header.samples;

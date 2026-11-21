@@ -3,6 +3,7 @@
 //! decoder reads, and Opus identification headers.
 
 use bytes::{BufMut, Bytes, BytesMut};
+use ferricast_core::frame::AacChannelConfig;
 use ferricast_core::{AudioCodec, FerricastError, Result};
 
 /// Sampling frequencies indexed by `samplingFrequencyIndex`
@@ -94,11 +95,11 @@ pub(crate) struct AacConfig {
     object_type: u8,
     rate_index: u8,
     pub(crate) sample_rate: u32,
-    pub(crate) channels: u8,
+    pub(crate) channel_config: AacChannelConfig,
     /// What a decoder that handles SBR and PS outputs: twice the core
     /// rate for HE-AAC, stereo for HE-AAC v2 (whose core is mono).
     output_rate: u32,
-    output_channels: u8,
+    output_channels: u16,
 }
 
 impl AacConfig {
@@ -110,9 +111,12 @@ impl AacConfig {
         let mut bits = Bits::new(asc);
         let mut object_type = bits.object_type().ok_or_else(malformed)?;
         let (mut rate_index, mut sample_rate) = bits.rate().ok_or_else(malformed)?;
-        let channels = bits.read(4).ok_or_else(malformed)? as u8;
+        let code = bits.read(4).ok_or_else(malformed)? as u8;
+        let channel_config = AacChannelConfig::new(code).ok_or_else(|| {
+            FerricastError::Demux(format!("AAC channel configuration {code} is not supported"))
+        })?;
         let mut output_rate = None;
-        let mut output_channels = channels;
+        let mut output_channels = channel_config.channels();
         if object_type == AOT_SBR || object_type == AOT_PS {
             // The extension rate belongs to the SBR layer; the core
             // keeps the rate read above.
@@ -127,11 +131,6 @@ impl AacConfig {
                 "AAC object type {object_type} is not supported"
             )));
         }
-        if channels == 0 || channels > 7 {
-            return Err(FerricastError::Demux(format!(
-                "AAC channel configuration {channels} is not supported"
-            )));
-        }
         if rate_index == AAC_EXPLICIT_RATE {
             rate_index = nearest_rate_index(sample_rate);
             sample_rate = AAC_RATES[usize::from(rate_index)];
@@ -140,7 +139,7 @@ impl AacConfig {
             object_type,
             rate_index,
             sample_rate,
-            channels,
+            channel_config,
             output_rate: output_rate.unwrap_or(sample_rate),
             output_channels,
         })
@@ -156,19 +155,16 @@ impl AacConfig {
         )
     )]
     pub(crate) fn low_complexity(sample_rate: u32, channels: u16) -> Result<Self> {
-        let channels = u8::try_from(channels)
-            .ok()
-            .filter(|c| (1..=7).contains(c))
-            .ok_or_else(|| {
-                FerricastError::Demux(format!("AAC with {channels} channels is not supported"))
-            })?;
+        let channel_config = AacChannelConfig::from_channels(channels).ok_or_else(|| {
+            FerricastError::Demux(format!("AAC with {channels} channels is not supported"))
+        })?;
         let rate_index = nearest_rate_index(sample_rate);
         let sample_rate = AAC_RATES[usize::from(rate_index)];
         Ok(Self {
             object_type: 2,
             rate_index,
             sample_rate,
-            channels,
+            channel_config,
             output_rate: sample_rate,
             output_channels: channels,
         })
@@ -178,7 +174,7 @@ impl AacConfig {
         AudioStream {
             codec: AudioCodec::Aac,
             sample_rate: self.output_rate,
-            channels: u16::from(self.output_channels),
+            channels: self.output_channels,
             duration_us,
         }
     }
@@ -193,12 +189,13 @@ impl AacConfig {
             )));
         }
         let profile = self.object_type - 1;
+        let channels = self.channel_config.code();
         let mut out = BytesMut::with_capacity(len);
         out.put_u8(0xFF);
         // MPEG-4, layer 0, no CRC.
         out.put_u8(0xF1);
-        out.put_u8((profile << 6) | (self.rate_index << 2) | (self.channels >> 2));
-        out.put_u8(((self.channels & 3) << 6) | ((len >> 11) & 3) as u8);
+        out.put_u8((profile << 6) | (self.rate_index << 2) | (channels >> 2));
+        out.put_u8(((channels & 3) << 6) | ((len >> 11) & 3) as u8);
         out.put_u8((len >> 3) as u8);
         // Low length bits, then a buffer fullness of 0x7FF (variable rate).
         out.put_u8((((len & 7) as u8) << 5) | 0x1F);
@@ -296,7 +293,7 @@ mod tests {
         let config = AacConfig::from_asc(&[0x11, 0x90]).unwrap();
         assert_eq!(config.object_type, 2);
         assert_eq!(config.sample_rate, 48_000);
-        assert_eq!(config.channels, 2);
+        assert_eq!(config.channel_config.channels(), 2);
     }
 
     #[test]
@@ -307,7 +304,7 @@ mod tests {
         let config = AacConfig::from_asc(&asc).unwrap();
         assert_eq!(config.object_type, 2);
         assert_eq!(config.sample_rate, 24_000);
-        assert_eq!(config.channels, 2);
+        assert_eq!(config.channel_config.channels(), 2);
         let stream = config.stream(None);
         assert_eq!((stream.sample_rate, stream.channels), (48_000, 2));
     }
@@ -318,9 +315,26 @@ mod tests {
         // (index 3), core object type 2.
         let asc = [0xEB, 0x09, 0x88, 0x00];
         let config = AacConfig::from_asc(&asc).unwrap();
-        assert_eq!((config.sample_rate, config.channels), (24_000, 1));
+        assert_eq!(
+            (config.sample_rate, config.channel_config.channels()),
+            (24_000, 1)
+        );
         let stream = config.stream(None);
         assert_eq!((stream.sample_rate, stream.channels), (48_000, 2));
+    }
+
+    #[test]
+    fn surround_configurations_report_their_channel_count() {
+        // AAC-LC, 48 kHz, channel configuration 6 (5.1), then 7 (7.1).
+        let surround = AacConfig::from_asc(&[0x11, 0xB0]).unwrap();
+        assert_eq!(surround.stream(None).channels, 6);
+        let wide = AacConfig::from_asc(&[0x11, 0xB8]).unwrap();
+        assert_eq!(wide.stream(None).channels, 8);
+        let frame = wide.adts(&[0]).unwrap();
+        assert_eq!(((frame[2] & 1) << 2) | (frame[3] >> 6), 7);
+        let named = AacConfig::low_complexity(48_000, 8).unwrap();
+        assert_eq!(named.channel_config.code(), 7);
+        assert!(AacConfig::low_complexity(48_000, 7).is_err());
     }
 
     #[test]
