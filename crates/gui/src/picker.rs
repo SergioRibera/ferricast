@@ -117,18 +117,32 @@ pub fn open_picker(
     let (tx, rx) = oneshot::channel::<Option<SourceDto>>();
     open_picker_for_dto(platform, tx);
     spawn(async move {
-        if let Ok(Some(dto)) = rx.await
-            && let Err(e) = start_stream_with_dto(stream_manager, device_id, dto).await
-        {
-            tracing::error!(%e, ?device_id, "start_stream");
-            // Failures after the start was accepted arrive as
-            // StreamError events; only rejections need a notice here.
-            if matches!(
-                e,
-                FerricastError::SessionAlreadyActive(_) | FerricastError::DeviceNotFound(_)
-            ) {
-                on_error(format!("Could not start: {e}"));
+        let Ok(Some(dto)) = rx.await else {
+            return;
+        };
+        // The start runs on the Tokio runtime, not on this UI task: it
+        // captures, initialises the encoder and negotiates with the
+        // receiver for seconds, partly with blocking calls, and every
+        // window shares the UI thread. The picker is already closed;
+        // progress shows on the device card through the stream events.
+        let start = tokio::spawn(start_stream_with_dto(stream_manager, device_id, dto));
+        let e = match start.await {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => e,
+            Err(join) => {
+                tracing::error!(%join, ?device_id, "start_stream task failed");
+                on_error(format!("Could not start: {join}"));
+                return;
             }
+        };
+        tracing::error!(%e, ?device_id, "start_stream");
+        // Failures after the start was accepted arrive as
+        // StreamError events; only rejections need a notice here.
+        if matches!(
+            e,
+            FerricastError::SessionAlreadyActive(_) | FerricastError::DeviceNotFound(_)
+        ) {
+            on_error(format!("Could not start: {e}"));
         }
     });
 }

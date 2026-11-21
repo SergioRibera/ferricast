@@ -371,7 +371,9 @@ impl App for FerricastApp {
                                         }),
                                         on_stop: Rc::new(move || {
                                             let sm = sm.clone();
-                                            spawn(async move {
+                                            // Off the UI thread: stopping waits
+                                            // for the stream task to wind down.
+                                            tokio::spawn(async move {
                                                 let sm = sm.read().await;
                                                 if let Err(e) = sm.stop_stream(device_id).await {
                                                     tracing::error!(%e, ?device_id, "stop_stream");
