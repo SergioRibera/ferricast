@@ -488,6 +488,7 @@ impl App for ReceiverWindowApp {
             })
             .unwrap_or_else(|| "no audio".to_string());
 
+        let audio_only = info.video.is_none();
         let render_slot = video_slot.clone();
         let on_render = RenderCallback::new(move |ctx| {
             let Ok(g) = render_slot.lock() else { return };
@@ -537,7 +538,15 @@ impl App for ReceiverWindowApp {
                     .height(Size::flex(1.))
                     .background((0, 0, 0))
                     .center()
-                    .child(canvas(on_render).expanded()),
+                    // Audio-only media: no picture will come, say so
+                    // instead of leaving the region blank.
+                    .maybe_child(audio_only.then(|| {
+                        label()
+                            .text("Audio only")
+                            .font_size(20.)
+                            .color((150, 150, 170))
+                    }))
+                    .maybe_child((!audio_only).then(|| canvas(on_render).expanded())),
             )
             .child(
                 // Metadata strip across the bottom.

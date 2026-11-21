@@ -103,7 +103,19 @@ impl MediaKind {
             || matches!(
                 ext,
                 Some(
-                    "mp4" | "m4v" | "m4a" | "mov" | "mkv" | "webm" | "mp3" | "ogg" | "flac" | "wav"
+                    "mp4"
+                        | "m4v"
+                        | "m4a"
+                        | "mov"
+                        | "mkv"
+                        | "webm"
+                        | "mp3"
+                        | "ogg"
+                        | "oga"
+                        | "opus"
+                        | "flac"
+                        | "wav"
+                        | "aac"
                 )
             )
         {
@@ -683,6 +695,13 @@ mod tests {
             c("http://h/stream", Some("video/webm")),
             MediaKind::Progressive
         );
+        for audio in ["a.mp3", "a.flac", "a.ogg", "a.opus", "a.wav", "a.aac"] {
+            assert_eq!(
+                c(&format!("http://h/{audio}"), None),
+                MediaKind::Progressive
+            );
+        }
+        assert_eq!(c("http://h/s", Some("audio/aac")), MediaKind::Progressive);
         assert_eq!(c("http://h/stream", None), MediaKind::Unknown);
     }
 }

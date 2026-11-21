@@ -90,6 +90,10 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "opus-decode")]
     let manager_builder =
         manager_builder.register_audio_decoder::<ferricast::decoder::OpusDecoder>();
+    // Audio files the demuxer decodes itself (MP3, FLAC, Vorbis, WAV)
+    // arrive as 16-bit PCM.
+    let manager_builder =
+        manager_builder.register_audio_decoder::<ferricast::decoder::PcmDecoder>();
     let mut manager_builder = manager_builder;
 
     if let (Some(min), Some(max)) = (args.port_min, args.port_max) {

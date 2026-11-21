@@ -6,7 +6,10 @@
 //! track (AAC or Opus), interleaved in decode order, with seeking to the
 //! keyframe at or before a target time.
 
+mod adts;
 mod audio;
+#[cfg(feature = "audio-files")]
+mod audio_file;
 mod mp4;
 mod nal;
 
@@ -21,7 +24,10 @@ use std::path::Path;
 
 use ferricast_core::{AudioFrame, Codec, EncodedFrame, FerricastError, Result};
 
+pub use adts::AdtsDemuxer;
 pub use audio::AudioStream;
+#[cfg(feature = "audio-files")]
+pub use audio_file::AudioFileDemuxer;
 pub use mp4::Mp4Demuxer;
 #[cfg(feature = "http")]
 pub use puller::ProgressivePuller;
@@ -77,6 +83,11 @@ pub enum Demuxer {
     Mp4(Box<Mp4Demuxer>),
     #[cfg(feature = "matroska")]
     Matroska(Box<MatroskaDemuxer>),
+    /// A raw ADTS AAC file.
+    Adts(Box<AdtsDemuxer>),
+    /// An MP3, FLAC, Ogg or WAV file.
+    #[cfg(feature = "audio-files")]
+    AudioFile(Box<AudioFileDemuxer>),
 }
 
 impl Demuxer {
@@ -108,9 +119,15 @@ impl Demuxer {
     }
 
     fn open_source(mut source: BoxedSource, selection: TrackSelection) -> Result<Self> {
-        let mut head = [0; 8];
+        let mut head = [0; 10];
         source.seek(SeekFrom::Start(0))?;
-        source.read_exact(&mut head)?;
+        let mut filled = 0;
+        while filled < head.len() {
+            match source.read(&mut head[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
         source.seek(SeekFrom::Start(0))?;
         if mp4::is_mp4(&head) {
             return Ok(Self::Mp4(Box::new(Mp4Demuxer::open(source, selection)?)));
@@ -121,6 +138,28 @@ impl Demuxer {
                 source, selection,
             )?)));
         }
+        if selection == TrackSelection::All {
+            return Self::open_audio_file(source, &head);
+        }
+        Err(FerricastError::Demux(UNRECOGNISED.into()))
+    }
+
+    /// Opens audio-only files: ADTS AAC natively, the rest through
+    /// symphonia.
+    fn open_audio_file(mut source: BoxedSource, head: &[u8; 10]) -> Result<Self> {
+        let start = adts::id3v2_len(head).unwrap_or(0);
+        let mut sync = [0; 2];
+        source.seek(SeekFrom::Start(start))?;
+        let adts = source.read_exact(&mut sync).is_ok() && adts::is_adts(&sync);
+        source.seek(SeekFrom::Start(0))?;
+        if adts {
+            return Ok(Self::Adts(Box::new(AdtsDemuxer::open(source, start)?)));
+        }
+        #[cfg(feature = "audio-files")]
+        return AudioFileDemuxer::open(source)
+            .map(|d| Self::AudioFile(Box::new(d)))
+            .map_err(|_| FerricastError::Demux(UNRECOGNISED.into()));
+        #[cfg(not(feature = "audio-files"))]
         Err(FerricastError::Demux(UNRECOGNISED.into()))
     }
 
@@ -130,6 +169,9 @@ impl Demuxer {
             Demuxer::Mp4(d) => d.video(),
             #[cfg(feature = "matroska")]
             Demuxer::Matroska(d) => d.video(),
+            Demuxer::Adts(_) => None,
+            #[cfg(feature = "audio-files")]
+            Demuxer::AudioFile(_) => None,
         }
     }
 
@@ -139,6 +181,9 @@ impl Demuxer {
             Demuxer::Mp4(d) => d.audio(),
             #[cfg(feature = "matroska")]
             Demuxer::Matroska(d) => d.audio(),
+            Demuxer::Adts(d) => Some(d.audio()),
+            #[cfg(feature = "audio-files")]
+            Demuxer::AudioFile(d) => Some(d.audio()),
         }
     }
 
@@ -149,6 +194,9 @@ impl Demuxer {
             Demuxer::Mp4(d) => d.duration_us(),
             #[cfg(feature = "matroska")]
             Demuxer::Matroska(d) => d.duration_us(),
+            Demuxer::Adts(d) => d.duration_us(),
+            #[cfg(feature = "audio-files")]
+            Demuxer::AudioFile(d) => d.duration_us(),
         }
     }
 
@@ -162,6 +210,9 @@ impl Demuxer {
             Demuxer::Mp4(d) => d.next_packet(),
             #[cfg(feature = "matroska")]
             Demuxer::Matroska(d) => d.next_packet(),
+            Demuxer::Adts(d) => d.next_packet(),
+            #[cfg(feature = "audio-files")]
+            Demuxer::AudioFile(d) => d.next_packet(),
         }
     }
 
@@ -193,6 +244,9 @@ impl Demuxer {
             Demuxer::Mp4(d) => Ok(d.seek(timestamp_us)),
             #[cfg(feature = "matroska")]
             Demuxer::Matroska(d) => d.seek(timestamp_us),
+            Demuxer::Adts(d) => d.seek(timestamp_us),
+            #[cfg(feature = "audio-files")]
+            Demuxer::AudioFile(d) => d.seek(timestamp_us),
         }
     }
 
@@ -209,6 +263,12 @@ impl Demuxer {
             }
             #[cfg(feature = "matroska")]
             Demuxer::Matroska(d) => d.rewind(),
+            Demuxer::Adts(d) => {
+                d.rewind();
+                Ok(())
+            }
+            #[cfg(feature = "audio-files")]
+            Demuxer::AudioFile(d) => d.rewind(),
         }
     }
 }

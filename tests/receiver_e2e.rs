@@ -81,6 +81,8 @@ struct SinkLog {
     audio_silent: Vec<bool>,
     /// Audio chunks received when each `flush_audio` arrived.
     flushes: Vec<usize>,
+    /// (sample rate, channels) per audio chunk.
+    audio_shapes: Vec<(u32, u16)>,
     gains: Vec<f32>,
     sinks_created: usize,
     sinks_dropped: usize,
@@ -109,6 +111,7 @@ impl FrameSink for HeadlessSink {
         log.audio
             .push((Instant::now(), audio.timestamp_us, duration));
         log.audio_silent.push(audio.pcm.iter().all(|&s| s == 0));
+        log.audio_shapes.push((audio.sample_rate, audio.channels));
         Ok(())
     }
     async fn flush_audio(&mut self) -> Result<()> {
@@ -147,6 +150,7 @@ impl Receiver {
         let builder = builder.register_video_decoder::<ferricast::decoder::Vp9Decoder>();
         #[cfg(feature = "opus-decode")]
         let builder = builder.register_audio_decoder::<ferricast::decoder::OpusDecoder>();
+        let builder = builder.register_audio_decoder::<ferricast::decoder::PcmDecoder>();
         let (mut manager, events) = builder
             .set_sink_factory(move |_remote, _info| {
                 log_factory.lock().unwrap().sinks_created += 1;
@@ -1001,4 +1005,133 @@ async fn progressive_file_plays_from_a_server_without_range_support() {
         .await;
     assert_eq!(reply["type"], "LOAD_FAILED", "{reply}");
     rx.manager.stop_receivers().await.unwrap();
+}
+
+/// Pacing of the audible (non-silent) audio chunks of an audio-only
+/// playback: `(PTS span, wall span, seconds of audio)`.
+fn audio_pacing(log: &SinkLog) -> (f64, f64, f64) {
+    let heard: Vec<_> = log
+        .audio
+        .iter()
+        .zip(&log.audio_silent)
+        .filter(|(_, silent)| !**silent)
+        .map(|(a, _)| *a)
+        .collect();
+    let (first, last) = (heard[0], heard[heard.len() - 1]);
+    let pts_span = Duration::from_micros(last.1 - first.1).as_secs_f64();
+    let wall_span = (last.0 - first.0).as_secs_f64();
+    let secs = heard.iter().map(|a| a.2).sum::<Duration>().as_secs_f64();
+    (pts_span, wall_span, secs)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audio_files_play_paced_and_report_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cases: Vec<(&str, &[&str], &str)> = vec![
+        (
+            "tone.mp3",
+            &["-c:a", "libmp3lame", "-q:a", "4"],
+            "audio/mpeg",
+        ),
+        ("tone.flac", &["-c:a", "flac"], "audio/flac"),
+        ("vorbis.ogg", &["-c:a", "libvorbis"], "audio/ogg"),
+        ("tone.wav", &["-c:a", "pcm_s24le"], "audio/wav"),
+        ("tone.aac", &["-c:a", "aac", "-f", "adts"], "audio/aac"),
+    ];
+    if cfg!(feature = "opus-decode") {
+        cases.push(("opus.ogg", &["-c:a", "libopus"], "audio/ogg"));
+    }
+    for (name, args, _) in &cases {
+        if !support::generate_audio(dir.path(), name, 4, args) {
+            return;
+        }
+    }
+    let mut expected_shape = vec![None; cases.len()];
+    if cfg!(feature = "fdk-aac") {
+        std::fs::write(dir.path().join("he1.aac"), he_aac_adts(4, false)).unwrap();
+        std::fs::write(dir.path().join("he2.aac"), he_aac_adts(4, true)).unwrap();
+        cases.push(("he1.aac", &[], "audio/aac"));
+        cases.push(("he2.aac", &[], "audio/aac"));
+        expected_shape.extend([Some((48_000, 2)), Some((48_000, 2))]);
+    }
+    let server = TestServer::start(support::dir_handler(dir.path())).await;
+    let mut rx = Receiver::start().await;
+    let mut sender = Sender::connect(rx.port, "sender-audio").await;
+    sender.launch().await;
+    for ((name, _, content_type), shape) in cases.iter().zip(expected_shape) {
+        let reply = play_to_end(
+            &rx,
+            &mut sender,
+            &server.url(&format!("/{name}")),
+            content_type,
+        )
+        .await;
+        let log = rx.log.lock().unwrap();
+        let duration = reply["status"][0]["media"]["duration"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{name}: no duration"));
+        let (pts_span, wall_span, secs) = audio_pacing(&log);
+        let heard_shape = log.audio_shapes.last().copied().unwrap();
+        eprintln!(
+            "E2E audio {name}: duration {duration:.3}s, {} chunks, {secs:.3}s of audio, \
+             PTS span {pts_span:.3}s over {wall_span:.3}s wall, {} Hz / {} ch, no video: {}",
+            log.audio.len(),
+            heard_shape.0,
+            heard_shape.1,
+            log.video.is_empty()
+        );
+        assert!(log.video.is_empty(), "{name}: video frames");
+        assert!((duration - 4.0).abs() < 0.15, "{name}: duration {duration}");
+        assert!((secs - 4.0).abs() < 0.2, "{name}: {secs:.3}s of audio");
+        assert!(
+            (wall_span - pts_span).abs() < 0.25,
+            "{name}: PTS span {pts_span:.3}s over {wall_span:.3}s"
+        );
+        if let Some(shape) = shape {
+            assert_eq!(heard_shape, shape, "{name}: decoded shape");
+        }
+    }
+    rx.manager.stop_receivers().await.unwrap();
+}
+
+/// `seconds` of stereo tones at 48 kHz encoded with libfdk-aac as ADTS
+/// HE-AAC (`v2`: with parametric stereo), the only HE-AAC encoder at
+/// hand (ffmpeg builds rarely include it).
+fn he_aac_adts(seconds: u32, v2: bool) -> Vec<u8> {
+    use fdk_aac::enc::{AudioObjectType, BitRate, ChannelMode, Encoder, EncoderParams, Transport};
+    let rate = 48_000u32;
+    let encoder = Encoder::new(EncoderParams {
+        bit_rate: BitRate::Cbr(48_000),
+        sample_rate: rate,
+        transport: Transport::Adts,
+        channels: ChannelMode::Stereo,
+        audio_object_type: if v2 {
+            AudioObjectType::Mpeg4HeAacV2
+        } else {
+            AudioObjectType::Mpeg4HeAac
+        },
+    })
+    .unwrap();
+    let chunk = encoder.info().unwrap().frameLength as usize * 2;
+    let pcm: Vec<i16> = (0..(rate * seconds) as usize)
+        .flat_map(|n| {
+            let t = n as f32 / rate as f32;
+            let l = (t * 1_000.0 * std::f32::consts::TAU).sin();
+            let r = (t * 3_000.0 * std::f32::consts::TAU).sin();
+            [(l * 12_000.0) as i16, (r * 12_000.0) as i16]
+        })
+        .collect();
+    let mut adts = Vec::new();
+    let mut out = vec![0u8; 8192];
+    for mut input in pcm.chunks(chunk) {
+        while !input.is_empty() {
+            let info = encoder.encode(input, &mut out).unwrap();
+            adts.extend_from_slice(&out[..info.output_size]);
+            if info.input_consumed == 0 {
+                break;
+            }
+            input = &input[info.input_consumed..];
+        }
+    }
+    adts
 }
