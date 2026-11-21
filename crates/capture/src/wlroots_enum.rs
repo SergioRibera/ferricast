@@ -26,6 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ferricast_core::{
@@ -77,6 +78,19 @@ struct OutputData {
     /// "ready". Compositors batch initial state behind a `done`
     /// event; we wait for it before publishing.
     ready: bool,
+    /// Whether xdg-output reported the logical size. It arrives one
+    /// round-trip after the wl_output events because the xdg-output
+    /// object is only created once the output is known.
+    logical_size_known: bool,
+}
+
+impl OutputData {
+    /// Whether the output can be shown to pickers: its wl_output state
+    /// is complete and, when xdg-output is bound, so is its geometry.
+    /// Publishing earlier would list the monitor as 0×0.
+    fn is_publishable(&self, needs_logical_size: bool) -> bool {
+        self.ready && (self.logical_size_known || !needs_logical_size)
+    }
 }
 
 #[derive(Default)]
@@ -172,13 +186,31 @@ impl State {
         self.windows_dirty = true;
     }
 
+    /// Whether every output and toplevel known so far has delivered
+    /// its initial state.
+    fn initial_state_complete(&self) -> bool {
+        let needs_logical_size = self.xdg_output_manager.is_some();
+        self.outputs
+            .values()
+            .all(|(_, o)| o.is_publishable(needs_logical_size))
+            && self
+                .wlr_toplevels
+                .values()
+                .all(|(_, t)| t.ready || t.closed)
+            && self
+                .ext_toplevels
+                .values()
+                .all(|(_, t)| t.ready || t.closed)
+    }
+
     fn recompute(&mut self) {
         if !self.monitors_dirty && !self.windows_dirty {
             return;
         }
+        let needs_logical_size = self.xdg_output_manager.is_some();
         let mut snap = Snapshot::default();
         for (_, o) in self.outputs.values() {
-            if !o.ready {
+            if !o.is_publishable(needs_logical_size) {
                 continue;
             }
             let name = o.name.clone().unwrap_or_else(|| "wl_output".to_string());
@@ -236,6 +268,11 @@ impl State {
         for (id, (_, t)) in &self.ext_toplevels {
             publish(&mut snap, *id, t, &self.outputs);
         }
+        // Stable order for pickers: monitors left to right, top to
+        // bottom; the maps above iterate in arbitrary order.
+        snap.monitors.sort_by(|a, b| {
+            (a.geometry.x, a.geometry.y, &a.id).cmp(&(b.geometry.x, b.geometry.y, &b.id))
+        });
         *self.snapshot.lock().unwrap() = snap;
 
         if self.monitors_dirty {
@@ -249,10 +286,62 @@ impl State {
     }
 }
 
+/// Round-trips `try_new` spends at most on the initial state: wl_output
+/// and toplevel state arrive on the first, xdg-output geometry on the
+/// second (its objects are created while handling the first).
+const INITIAL_STATE_ROUNDTRIPS: usize = 4;
+
+/// Upper bound a caller waits for one thumbnail. A capture is a few
+/// compositor round-trips; this only matters when the compositor
+/// stops answering.
+const THUMBNAIL_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Runs blocking thumbnail captures on their own thread and bounds how
+/// long the async caller waits for them.
+#[derive(Clone, Copy, Debug)]
+struct ThumbnailRunner {
+    deadline: Duration,
+}
+
+impl Default for ThumbnailRunner {
+    fn default() -> Self {
+        Self {
+            deadline: THUMBNAIL_DEADLINE,
+        }
+    }
+}
+
+impl ThumbnailRunner {
+    /// Runs `capture` on a dedicated thread. On timeout the thread is
+    /// left to finish on its own and the caller gets an error, so a
+    /// stuck compositor shows up as a missing preview, not a hang.
+    async fn run<F>(self, capture: F) -> Result<Vec<u8>, SourceError>
+    where
+        F: FnOnce() -> Result<Vec<u8>, SourceError> + Send + 'static,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("ferricast-wl-thumb".into())
+            .spawn(move || {
+                let _ = tx.send(capture());
+            })
+            .map_err(|e| SourceError::Backend(format!("spawn: {e}")))?;
+        match tokio::time::timeout(self.deadline, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(SourceError::Backend("thumbnail thread hung up".into())),
+            Err(_) => Err(SourceError::Backend(format!(
+                "thumbnail not captured within {:?}",
+                self.deadline
+            ))),
+        }
+    }
+}
+
 pub struct WaylandSourceEnumerator {
     snapshot: Arc<Mutex<Snapshot>>,
     change_tx: broadcast::Sender<SourceChange>,
     has_windows: bool,
+    thumbnails: ThumbnailRunner,
 }
 
 impl WaylandSourceEnumerator {
@@ -346,11 +435,20 @@ impl WaylandSourceEnumerator {
             windows_dirty: false,
         };
 
-        // Pump once so the manager's `toplevel` events for the
-        // pre-existing windows actually arrive before we return.
-        event_queue
-            .roundtrip(&mut state)
-            .map_err(|e| SourceError::Backend(format!("initial roundtrip: {e}")))?;
+        // Pump until the pre-existing outputs and windows are fully
+        // described, so the first listing is complete instead of
+        // missing (or zero-sizing) monitors until a later event.
+        for _ in 0..INITIAL_STATE_ROUNDTRIPS {
+            event_queue
+                .roundtrip(&mut state)
+                .map_err(|e| SourceError::Backend(format!("initial roundtrip: {e}")))?;
+            if state.initial_state_complete() {
+                break;
+            }
+        }
+        if !state.initial_state_complete() {
+            warn!("wayland enumerator: initial state still incomplete; listing what is known");
+        }
         state.recompute();
 
         std::thread::Builder::new()
@@ -362,6 +460,7 @@ impl WaylandSourceEnumerator {
             snapshot,
             change_tx,
             has_windows,
+            thumbnails: ThumbnailRunner::default(),
         })
     }
 }
@@ -432,17 +531,9 @@ impl SourceEnumerator for WaylandSourceEnumerator {
         max_height: u32,
     ) -> Result<Vec<u8>, SourceError> {
         let id = id.to_owned();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
-            .name("ferricast-wl-thumb".into())
-            .spawn(move || {
-                let _ = tx.send(crate::wayland_thumb::monitor_png(
-                    &id, max_width, max_height,
-                ));
-            })
-            .map_err(|e| SourceError::Backend(format!("spawn: {e}")))?;
-        rx.await
-            .map_err(|_| SourceError::Backend("thumbnail thread hung up".into()))?
+        self.thumbnails
+            .run(move || crate::wayland_thumb::monitor_png(&id, max_width, max_height))
+            .await
     }
 
     async fn window_thumbnail(
@@ -452,15 +543,9 @@ impl SourceEnumerator for WaylandSourceEnumerator {
         max_height: u32,
     ) -> Result<Vec<u8>, SourceError> {
         let id = id.to_owned();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
-            .name("ferricast-wl-thumb".into())
-            .spawn(move || {
-                let _ = tx.send(crate::wayland_thumb::window_png(&id, max_width, max_height));
-            })
-            .map_err(|e| SourceError::Backend(format!("spawn: {e}")))?;
-        rx.await
-            .map_err(|_| SourceError::Backend("thumbnail thread hung up".into()))?
+        self.thumbnails
+            .run(move || crate::wayland_thumb::window_png(&id, max_width, max_height))
+            .await
     }
 
     fn subscribe(&self) -> broadcast::Receiver<SourceChange> {
@@ -597,6 +682,8 @@ impl Dispatch<ZxdgOutputV1, u32> for State {
             zxdg_output_v1::Event::LogicalSize { width, height } => {
                 entry.1.logical_w = width;
                 entry.1.logical_h = height;
+                entry.1.logical_size_known = true;
+                state.monitors_dirty = true;
             }
             zxdg_output_v1::Event::Name { name } if entry.1.name.is_none() => {
                 entry.1.name = Some(name);
@@ -779,5 +866,63 @@ impl Dispatch<ExtForeignToplevelHandleV1, ()> for State {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    #[test]
+    fn output_waits_for_xdg_geometry_when_xdg_output_is_bound() {
+        let mut output = OutputData {
+            ready: true,
+            ..OutputData::default()
+        };
+        assert!(!output.is_publishable(true));
+        assert!(output.is_publishable(false));
+        output.logical_size_known = true;
+        assert!(output.is_publishable(true));
+    }
+
+    #[test]
+    fn output_waits_for_wl_output_done() {
+        let output = OutputData {
+            logical_size_known: true,
+            ..OutputData::default()
+        };
+        assert!(!output.is_publishable(true));
+        assert!(!output.is_publishable(false));
+    }
+
+    #[tokio::test]
+    async fn thumbnail_that_never_finishes_times_out() {
+        let runner = ThumbnailRunner {
+            deadline: Duration::from_millis(50),
+        };
+        let started = Instant::now();
+        let result = runner
+            .run(|| {
+                std::thread::sleep(Duration::from_secs(2));
+                Ok(vec![1])
+            })
+            .await;
+        assert!(matches!(result, Err(SourceError::Backend(_))), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn thumbnail_result_is_passed_through() {
+        let runner = ThumbnailRunner::default();
+        assert_eq!(
+            runner.run(|| Ok(vec![1, 2, 3])).await.unwrap(),
+            vec![1, 2, 3]
+        );
+        let missing = runner
+            .run(|| Err(SourceError::NotFound("DP-9".into())))
+            .await;
+        assert!(matches!(missing, Err(SourceError::NotFound(_))));
     }
 }
