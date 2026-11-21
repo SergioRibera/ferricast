@@ -97,7 +97,7 @@ fn hevc_record(payload: &[u8]) -> Option<&[u8]> {
 
 fn header_f32(header: &[u8; HEADER_LEN], at: usize) -> u32 {
     let v = f32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]);
-    if v.is_finite() && v >= 1.0 && v < 65_536.0 {
+    if (1.0..65_536.0).contains(&v) {
         // Picture sizes are small integers stored as floats.
         #[expect(
             clippy::cast_possible_truncation,

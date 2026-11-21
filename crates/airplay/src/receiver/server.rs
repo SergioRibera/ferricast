@@ -5,7 +5,8 @@
 //! so probes (`GET /info` while the sender's AirPlay menu is open) are
 //! answered without involving the pipeline. A connection becomes a
 //! pipeline session (is handed out by [`AirPlayReceiverControl::accept`])
-//! once the sender starts pairing or setting up a stream.
+//! once the sender asks for a PIN or sets up a session (pairing alone
+//! does not count: senders pair on every connection).
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

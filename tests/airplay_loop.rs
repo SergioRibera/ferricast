@@ -114,7 +114,7 @@ fn pattern(frame: u32) -> Bytes {
         let y = (i as u32) / WIDTH;
         px[0] = ((x + frame * 4) % 256) as u8;
         px[1] = ((y + frame * 2) % 256) as u8;
-        px[2] = if (x / 80 + y / 80 + frame / 15) % 2 == 0 {
+        px[2] = if (x / 80 + y / 80 + frame / 15).is_multiple_of(2) {
             220
         } else {
             30

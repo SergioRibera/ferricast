@@ -453,7 +453,6 @@ impl Connection {
                 "pair-setup: expected 32 bytes".into(),
             ));
         }
-        self.promote().await;
         let key = self.shared.settings.identity.key.verifying_key();
         Ok(Response::ok().body(OCTET, key.as_bytes().to_vec()))
     }
@@ -480,7 +479,6 @@ impl Connection {
                         return Ok(Response::ok());
                     }
                 }
-                self.promote().await;
                 Ok(Response::ok().body(OCTET, reply))
             }
             Some(0) => match self.pairing.verify_finish(&request.body) {
@@ -538,7 +536,6 @@ impl Connection {
     async fn fp_setup(&mut self, request: &Request) -> Result<Response> {
         use ferricast_fairplay as fp;
         let fp_error = |e: fp::FairPlayError| FerricastError::Protocol(format!("fp-setup: {e}"));
-        self.promote().await;
         match request.body.len() {
             fp::FP_SETUP1_LEN => {
                 let reply = fp::setup1_reply(&request.body).map_err(fp_error)?;
