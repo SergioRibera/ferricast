@@ -221,6 +221,81 @@ async fn fmp4_vod_plays_with_continuous_timestamps_and_seeks() {
     puller.close().await.unwrap();
 }
 
+/// AES-128-CBC with PKCS#7 padding, as an HLS packager writes it.
+fn encrypt_aes128(key: &[u8; 16], iv: &[u8; 16], plain: &[u8]) -> Vec<u8> {
+    use aes::Aes128;
+    use aes::cipher::generic_array::GenericArray;
+    use aes::cipher::{BlockEncrypt, KeyInit};
+
+    let pad = 16 - plain.len() % 16;
+    let mut padded = plain.to_vec();
+    padded.extend(std::iter::repeat_n(pad as u8, pad));
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    let mut prev = *iv;
+    let mut out = Vec::with_capacity(padded.len());
+    for block in padded.chunks_exact(16) {
+        let mut buf = GenericArray::clone_from_slice(block);
+        buf.iter_mut().zip(prev).for_each(|(b, p)| *b ^= p);
+        cipher.encrypt_block(&mut buf);
+        prev.copy_from_slice(&buf);
+        out.extend_from_slice(&buf);
+    }
+    out
+}
+
+#[tokio::test]
+async fn aes128_fmp4_decrypts_the_initialization_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    if !support::generate_hls(dir.path(), 4, 2, &["-hls_segment_type", "fmp4"]) {
+        return;
+    }
+    // Encrypt the init segment and every media segment, then put the
+    // key tag ahead of the map so it covers both.
+    let key = [0x5au8; 16];
+    let iv = [0x0fu8; 16];
+    std::fs::write(dir.path().join("enc.key"), key).unwrap();
+    let playlist = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
+    let mut rewritten = String::new();
+    let mut encrypted = 0;
+    for line in playlist.lines() {
+        let file = if let Some(attrs) = line.strip_prefix("#EXT-X-MAP:") {
+            rewritten.push_str(
+                "#EXT-X-KEY:METHOD=AES-128,URI=\"enc.key\",IV=0x0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f\n",
+            );
+            attrs
+                .split('"')
+                .nth(1)
+                .map(str::to_owned)
+                .expect("EXT-X-MAP URI")
+        } else if !line.starts_with('#') && !line.is_empty() {
+            line.to_owned()
+        } else {
+            String::new()
+        };
+        if !file.is_empty() {
+            let path = dir.path().join(&file);
+            let plain = std::fs::read(&path).unwrap();
+            std::fs::write(&path, encrypt_aes128(&key, &iv, &plain)).unwrap();
+            encrypted += 1;
+        }
+        rewritten.push_str(line);
+        rewritten.push('\n');
+    }
+    assert_eq!(encrypted, 3, "{playlist}");
+    std::fs::write(dir.path().join("index.m3u8"), rewritten).unwrap();
+
+    let server = TestServer::start(support::dir_handler(dir.path())).await;
+    let mut puller = HlsPuller::new();
+    let info = puller.open(spec(server.url("/index.m3u8"))).await.unwrap();
+    let video = info.video.as_ref().unwrap();
+    assert_eq!((video.width, video.height), (320, 240));
+    assert_eq!(info.audio.as_ref().map(|a| a.codec), Some(AudioCodec::Aac));
+    let c = collect(&mut puller, Duration::from_secs(20)).await;
+    assert_eq!(c.video_pts.len(), 120);
+    assert_eq!(c.keyframes, 2);
+    puller.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn close_does_not_hang_when_the_consumer_stopped_reading() {
     let dir = tempfile::tempdir().unwrap();

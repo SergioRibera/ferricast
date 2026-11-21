@@ -64,3 +64,6 @@ socket2 = "0.6"
 # `test-util` enables paused-clock tests for the timeout paths.
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
+# Encrypts ffmpeg's fMP4 output in tests: ffmpeg cannot write
+# AES-128 fragmented MP4 HLS itself.
+aes = "0.8"

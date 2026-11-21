@@ -6,7 +6,10 @@ use aes::Aes128;
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, KeyInit};
 use ferricast_core::{FerricastError, Result};
-use m3u8_rs::{AlternativeMediaType, KeyMethod, MasterPlaylist, MediaPlaylist, VariantStream};
+use m3u8_rs::{
+    AlternativeMediaType, Key, KeyMethod, MasterPlaylist, MediaPlaylist, MediaSegment,
+    VariantStream,
+};
 use url::Url;
 
 use super::fetch::ByteRange;
@@ -141,17 +144,61 @@ pub(super) struct SegmentRef {
     pub(super) map: Option<InitSegment>,
 }
 
-/// Where an `EXT-X-MAP` initialization segment is.
+/// Where an `EXT-X-MAP` initialization segment is, and the key that
+/// encrypts it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct InitSegment {
     pub(super) url: Url,
     pub(super) range: Option<ByteRange>,
+    pub(super) key: Option<SegmentKey>,
+}
+
+/// For each `EXT-X-MAP` tag, in playlist order: whether an
+/// `EXT-X-KEY` tag sits between the previous media segment URI and
+/// the map.
+///
+/// m3u8-rs attaches both tags to the segment that follows them and
+/// drops their relative order, yet that order decides which key
+/// encrypts the initialization segment: the one in effect where the
+/// `EXT-X-MAP` tag appears (RFC 8216 §4.3.2.5).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct MapKeyOrder(Vec<bool>);
+
+impl MapKeyOrder {
+    /// Reads the tag order out of the raw playlist text.
+    pub(super) fn scan(body: &[u8]) -> Self {
+        let text = String::from_utf8_lossy(body);
+        let mut key_in_block = false;
+        let mut order = Vec::new();
+        for line in text.lines().map(str::trim) {
+            if line.starts_with("#EXT-X-KEY:") {
+                key_in_block = true;
+            } else if line.starts_with("#EXT-X-MAP:") {
+                order.push(key_in_block);
+            } else if !line.is_empty() && !line.starts_with('#') {
+                key_in_block = false;
+            }
+        }
+        Self(order)
+    }
+
+    /// Whether map number `n` follows the key tag of its own segment.
+    /// Without a scan, assumes the usual `EXT-X-KEY`-then-`EXT-X-MAP`
+    /// order.
+    fn key_precedes(&self, n: usize) -> bool {
+        self.0.get(n).copied().unwrap_or(true)
+    }
 }
 
 /// Resolves segment `idx` of `pl` against the playlist's (final) URL.
 /// The key and byte-range offset carry over from earlier segments,
 /// so they are found by scanning from the start.
-pub(super) fn resolve_segment(pl: &MediaPlaylist, base: &Url, idx: usize) -> Result<SegmentRef> {
+pub(super) fn resolve_segment(
+    pl: &MediaPlaylist,
+    order: &MapKeyOrder,
+    base: &Url,
+    idx: usize,
+) -> Result<SegmentRef> {
     let seg = pl
         .segments
         .get(idx)
@@ -163,14 +210,27 @@ pub(super) fn resolve_segment(pl: &MediaPlaylist, base: &Url, idx: usize) -> Res
     let mut next_offset = 0u64;
     let mut range = None;
     let mut key = None;
+    // The map in effect, the key that encrypts it and the index of the
+    // segment it heads.
     let mut map = None;
-    for s in &pl.segments[..=idx] {
-        if let Some(k) = &s.key {
-            key = Some(k);
-        }
+    let mut maps_seen = 0;
+    for (i, s) in pl.segments[..=idx].iter().enumerate() {
+        // The key tag of this segment, if any: `Some(None)` clears the key.
+        let own_key = match &s.key {
+            Some(k) => Some(Some(k)),
+            None => clears_key(s).then_some(None),
+        };
         // An EXT-X-MAP applies to every segment after it until the next.
         if let Some(m) = &s.map {
-            map = Some(m);
+            let map_key = match own_key {
+                Some(own) if order.key_precedes(maps_seen) => own,
+                _ => key,
+            };
+            map = Some((m, map_key, i));
+            maps_seen += 1;
+        }
+        if let Some(own) = own_key {
+            key = own;
         }
         range = s.byte_range.as_ref().map(|br| {
             let offset = br.offset.unwrap_or(next_offset);
@@ -182,28 +242,14 @@ pub(super) fn resolve_segment(pl: &MediaPlaylist, base: &Url, idx: usize) -> Res
         });
     }
 
-    let key = match key {
-        Some(k) if k.method == KeyMethod::AES128 => {
-            let uri = k
-                .uri
-                .as_deref()
-                .ok_or_else(|| FerricastError::Pull("EXT-X-KEY without URI".into()))?;
-            let uri = base
-                .join(uri)
-                .map_err(|e| FerricastError::Pull(format!("key URL join {uri}: {e}")))?;
-            let iv = match k.iv.as_deref() {
-                Some(hex) => parse_iv(hex)?,
-                // No IV attribute: the media sequence number,
-                // big-endian, is the IV (RFC 8216 §5.2).
-                None => u128::from(pl.media_sequence + idx as u64).to_be_bytes(),
-            };
-            Some(SegmentKey { uri, iv })
-        }
-        _ => None,
-    };
+    let sequence = |i: usize| pl.media_sequence + i as u64;
+    let key = key
+        .map(|k| segment_key(k, base, sequence(idx)))
+        .transpose()?
+        .flatten();
 
     let map = map
-        .map(|m| -> Result<InitSegment> {
+        .map(|(m, map_key, i)| -> Result<InitSegment> {
             let url = base
                 .join(&m.uri)
                 .map_err(|e| FerricastError::Pull(format!("EXT-X-MAP URL join {}: {e}", m.uri)))?;
@@ -211,7 +257,14 @@ pub(super) fn resolve_segment(pl: &MediaPlaylist, base: &Url, idx: usize) -> Res
                 offset: br.offset.unwrap_or(0),
                 length: br.length,
             });
-            Ok(InitSegment { url, range })
+            // RFC 8216 §4.3.2.5 requires an IV attribute on the key of
+            // an encrypted map. Without one, the sequence number of the
+            // segment the map heads stands in, as for media segments.
+            let key = map_key
+                .map(|k| segment_key(k, base, sequence(i)))
+                .transpose()?
+                .flatten();
+            Ok(InitSegment { url, range, key })
         })
         .transpose()?;
 
@@ -222,6 +275,40 @@ pub(super) fn resolve_segment(pl: &MediaPlaylist, base: &Url, idx: usize) -> Res
         discontinuity: seg.discontinuity,
         map,
     })
+}
+
+/// Whether `seg` carries `EXT-X-KEY:METHOD=NONE`. m3u8-rs rejects that
+/// tag when it has no IV (which is how it is always written) and
+/// keeps it as an unknown tag instead.
+fn clears_key(seg: &MediaSegment) -> bool {
+    seg.unknown_tags.iter().any(|t| {
+        t.tag == "X-KEY"
+            && t.rest
+                .as_deref()
+                .is_some_and(|rest| rest.trim_start().starts_with("METHOD=NONE"))
+    })
+}
+
+/// The AES-128 parameters of `key`, `None` for `METHOD=NONE`.
+/// `sequence` is the IV when the tag has no IV attribute.
+fn segment_key(key: &Key, base: &Url, sequence: u64) -> Result<Option<SegmentKey>> {
+    if key.method != KeyMethod::AES128 {
+        return Ok(None);
+    }
+    let uri = key
+        .uri
+        .as_deref()
+        .ok_or_else(|| FerricastError::Pull("EXT-X-KEY without URI".into()))?;
+    let uri = base
+        .join(uri)
+        .map_err(|e| FerricastError::Pull(format!("key URL join {uri}: {e}")))?;
+    let iv = match key.iv.as_deref() {
+        Some(hex) => parse_iv(hex)?,
+        // No IV attribute: the media sequence number, big-endian, is
+        // the IV (RFC 8216 §5.2).
+        None => u128::from(sequence).to_be_bytes(),
+    };
+    Ok(Some(SegmentKey { uri, iv }))
 }
 
 fn parse_iv(hex: &str) -> Result<[u8; 16]> {
@@ -301,7 +388,7 @@ mod tests {
              #EXT-X-BYTERANGE:50\n#EXTINF:4.0,\nall.ts\n",
         );
         let base = Url::parse("http://host/dir/pl.m3u8").unwrap();
-        let second = resolve_segment(&pl, &base, 1).unwrap();
+        let second = resolve_segment(&pl, &MapKeyOrder::default(), &base, 1).unwrap();
         assert_eq!(second.url.as_str(), "http://host/dir/all.ts");
         assert_eq!(
             second.range,
@@ -323,7 +410,7 @@ mod tests {
         );
         assert!(check_supported(&fmp4).is_ok());
         let base = Url::parse("http://host/dir/index.m3u8").unwrap();
-        let second = resolve_segment(&fmp4, &base, 1).unwrap();
+        let second = resolve_segment(&fmp4, &MapKeyOrder::default(), &base, 1).unwrap();
         assert_eq!(
             second.map.map(|m| m.url.to_string()).as_deref(),
             Some("http://host/dir/init.mp4")
@@ -333,6 +420,53 @@ mod tests {
              #EXTINF:4.0,\na.ts\n",
         );
         assert!(check_supported(&sample_aes).is_err());
+    }
+
+    fn resolve(text: &str, idx: usize) -> SegmentRef {
+        let base = Url::parse("http://host/dir/index.m3u8").unwrap();
+        let order = MapKeyOrder::scan(text.as_bytes());
+        resolve_segment(&media(text), &order, &base, idx).unwrap()
+    }
+
+    #[test]
+    fn map_after_a_key_tag_is_encrypted_with_that_key() {
+        let text = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:5\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"k1\",IV=0x10\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4.0,\na.m4s\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"k2\"\n#EXTINF:4.0,\nb.m4s\n";
+        let second = resolve(text, 1);
+        let map_key = second.map.unwrap().key.unwrap();
+        assert_eq!(map_key.uri.as_str(), "http://host/dir/k1");
+        assert_eq!(map_key.iv, 0x10u128.to_be_bytes());
+        let key = second.key.unwrap();
+        assert_eq!(key.uri.as_str(), "http://host/dir/k2");
+        assert_eq!(key.iv, 6u128.to_be_bytes());
+    }
+
+    #[test]
+    fn map_before_the_first_key_tag_is_clear() {
+        let text = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:4.0,\na.m4s\n";
+        let first = resolve(text, 0);
+        assert!(first.key.is_some());
+        assert_eq!(first.map.unwrap().key, None);
+    }
+
+    #[test]
+    fn map_inherits_the_key_of_earlier_segments() {
+        let text = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:3\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXT-X-MAP:URI=\"a.mp4\"\n#EXTINF:4.0,\na.m4s\n\
+             #EXT-X-MAP:URI=\"b.mp4\"\n#EXTINF:4.0,\nb.m4s\n\
+             #EXT-X-MAP:URI=\"c.mp4\"\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:4.0,\nc.m4s\n";
+        let second = resolve(text, 1);
+        let map = second.map.unwrap();
+        assert_eq!(map.url.as_str(), "http://host/dir/b.mp4");
+        // No IV attribute: the sequence number of the segment the map heads.
+        assert_eq!(map.key.unwrap().iv, 4u128.to_be_bytes());
+        // The map comes before the METHOD=NONE tag, so the old key holds.
+        let third = resolve(text, 2);
+        assert!(third.key.is_none());
+        assert!(third.map.unwrap().key.is_some());
     }
 
     #[test]
