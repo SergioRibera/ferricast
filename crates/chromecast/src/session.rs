@@ -32,15 +32,15 @@ mod playlist;
 #[cfg(test)]
 mod tests;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::BytesMut;
 use ferricast_core::{
-    AudioCodec, AudioFrame, CastSession, Codec, ConnectOutcome, Device, EncodedFrame,
-    FerricastError, Result, StreamConfig, bind_tcp,
+    AudioCodec, AudioFrame, CastSession, Codec, ConnectOutcome, Device, DeviceAddresses,
+    EncodedFrame, FerricastError, Result, StreamConfig, bind_tcp,
 };
 use ferricast_hls::{HlsConfig, HlsFrameSink};
 use tokio::sync::{mpsc, oneshot};
@@ -163,6 +163,38 @@ impl Default for ChromecastSession {
     }
 }
 
+/// Host for the HLS URL handed to the receiver.
+///
+/// Normally our end of the control connection (`local`). A link-local
+/// IPv6 address makes a poor URL host, though: browsers reject zone ids
+/// in URLs, so the receiver gets the address without one and must
+/// resolve it on its own link. When the receiver also has a routable
+/// address, the local address `route` picks towards it is used instead.
+/// Only a receiver reachable over link-local IPv6 alone gets the bare
+/// link-local host, which works on receivers with a single link.
+fn hls_host(
+    local: SocketAddr,
+    device: &DeviceAddresses,
+    route: impl Fn(SocketAddr) -> Option<IpAddr>,
+) -> IpAddr {
+    let is_link_local_v6 = |ip: IpAddr| matches!(ip, IpAddr::V6(v6) if v6.is_unicast_link_local());
+    if !is_link_local_v6(local.ip()) {
+        return local.ip();
+    }
+    let routable = device
+        .iter()
+        .filter(|addr| !is_link_local_v6(addr.ip()))
+        .filter_map(&route)
+        .find(|ip| !is_link_local_v6(*ip) && !ip.is_unspecified());
+    routable.unwrap_or_else(|| {
+        warn!(
+            %local,
+            "receiver is only reachable over link-local IPv6; its HLS URL carries no zone"
+        );
+        local.ip()
+    })
+}
+
 struct ConnectedState {
     writer: SharedWriter,
     /// Application transport ID, used as the destination for all
@@ -171,12 +203,12 @@ struct ConnectedState {
     /// Session ID returned by LAUNCH. Required by STOP; otherwise
     /// the receiver refuses to tear the app down.
     session_id: String,
-    /// Local IP from the receiver's perspective (the LAN side of the
-    /// TCP socket). Used to build the HLS URL we hand back.
-    local_ip: IpAddr,
+    /// Our end of the control connection, as the receiver sees it.
+    /// Picks the host of the HLS URL we hand back.
+    local: SocketAddr,
     /// The receiver itself: the only remote peer allowed to fetch the
-    /// stream.
-    device_ip: IpAddr,
+    /// stream, from any of its addresses.
+    device_addresses: DeviceAddresses,
     /// Mirror of `device.capabilities.requires_audio` so the HLS
     /// bootstrap path knows whether to ask the MPEG-TS muxer to
     /// inject a silent AAC track. Old generic Chromecasts need
@@ -276,11 +308,16 @@ impl CastSession for ChromecastSession {
 
         info!(
             name = %device.name,
-            addr = %device.addr,
-            port = device.port,
+            addresses = ?device.addresses.as_slice(),
             "connecting to chromecast"
         );
-        let (reader, writer, local_ip) = wire::connect(device.addr, device.port).await?;
+        let wire::CastConnection {
+            reader,
+            writer,
+            peer,
+            local,
+        } = wire::connect(device.addresses.as_slice()).await?;
+        debug!(%peer, %local, "chromecast control connection open");
 
         // Spawn the read loop *before* sending anything. Some firmwares
         // answer CONNECT with status / heartbeat traffic that must be
@@ -384,8 +421,8 @@ impl CastSession for ChromecastSession {
             writer,
             transport_id,
             session_id,
-            local_ip,
-            device_ip: device.addr,
+            local,
+            device_addresses: device.addresses.clone(),
             requires_audio: device.capabilities.requires_audio,
             supports_low_latency_hls: device.capabilities.supports_low_latency_hls,
             request_id,
@@ -610,7 +647,12 @@ impl ChromecastSession {
             playlist_target_duration: PLAYLIST_TARGET_DURATION,
             ..Default::default()
         };
-        let listener = bind_tcp(state.device_ip, cfg.port_range).await?;
+        let host = hls_host(state.local, &state.device_addresses, |target| {
+            ferricast_core::local_socket_addr_for(target)
+                .ok()
+                .map(|local| local.ip())
+        });
+        let listener = bind_tcp(host, cfg.port_range).await?;
         let sink = HlsFrameSink::start_on_listener(
             listener,
             frame_rx,
@@ -620,21 +662,13 @@ impl ChromecastSession {
         )
         .await?;
         // Bound on every interface, so only the receiver (and loopback)
-        // may fetch; advertise the LAN-side IP observed on the control
-        // socket (`0.0.0.0` is unroutable).
-        sink.allow_peer(state.device_ip);
-        // A link-local IPv6 host goes into the URL without its zone:
-        // URLs can't carry a usable one, and the receiver resolves it
-        // on its single link anyway. Discovery prefers IPv4, so this
-        // only happens for receivers reachable over IPv6 alone.
-        if let IpAddr::V6(v6) = state.local_ip
-            && v6.is_unicast_link_local()
-        {
-            warn!(local_ip = %v6, "HLS URL uses a link-local IPv6 address");
+        // may fetch, from whichever of its addresses it picks.
+        for addr in state.device_addresses.iter() {
+            sink.allow_peer(addr.ip());
         }
         let location = PlaylistLocation::new(
             sink.scheme(),
-            state.local_ip,
+            host,
             sink.local_addr().port(),
             &sink.playlist_path(),
         );

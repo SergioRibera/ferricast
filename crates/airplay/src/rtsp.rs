@@ -207,39 +207,31 @@ pub(crate) struct RtspClient {
 }
 
 impl RtspClient {
-    /// Connect to the first reachable address.
+    /// Connect to the first reachable address, in order.
     pub async fn connect(
         addrs: &[SocketAddr],
         identity: ClientIdentity,
         hkp: Option<&'static str>,
     ) -> Result<Self> {
-        let mut last_err = None;
-        for addr in addrs {
-            match timeout(REQUEST_TIMEOUT, TcpStream::connect(addr)).await {
-                Ok(Ok(stream)) => {
-                    // Small request/response exchanges; don't let Nagle add
-                    // latency. Failure only costs latency.
-                    let _ = stream.set_nodelay(true);
-                    let local_addr = stream.local_addr()?;
-                    return Ok(Self {
-                        stream,
-                        rx: Vec::new(),
-                        cseq: 0,
-                        identity,
-                        hkp,
-                        secure: None,
-                        local_addr,
-                        peer_addr: *addr,
-                    });
-                }
-                Ok(Err(e)) => last_err = Some(format!("{addr}: {e}")),
-                Err(_) => last_err = Some(format!("{addr}: connect timed out")),
-            }
-        }
-        Err(FerricastError::Connection(format!(
-            "cannot connect to AirPlay receiver ({})",
-            last_err.unwrap_or_else(|| "no address".into())
-        )))
+        let (stream, peer_addr) = ferricast_core::connect_tcp_any(addrs, REQUEST_TIMEOUT)
+            .await
+            .map_err(|e| {
+                FerricastError::Connection(format!("cannot connect to AirPlay receiver: {e}"))
+            })?;
+        // Small request/response exchanges; don't let Nagle add
+        // latency. Failure only costs latency.
+        let _ = stream.set_nodelay(true);
+        let local_addr = stream.local_addr()?;
+        Ok(Self {
+            stream,
+            rx: Vec::new(),
+            cseq: 0,
+            identity,
+            hkp,
+            secure: None,
+            local_addr,
+            peer_addr,
+        })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -248,6 +240,14 @@ impl RtspClient {
 
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
+    }
+
+    /// The receiver's address on another port, keeping the scope id of
+    /// a link-local IPv6 peer.
+    pub fn peer_at(&self, port: u16) -> SocketAddr {
+        let mut addr = self.peer_addr;
+        addr.set_port(port);
+        addr
     }
 
     /// Switch to the encrypted control framing. Keys come from the HomeKit

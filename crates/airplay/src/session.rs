@@ -8,7 +8,7 @@
 //! mirroring data connection; `send_frame` pushes encrypted H.264 access
 //! units and a background task posts `/feedback` every two seconds.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -125,22 +125,6 @@ impl Default for AirPlaySession {
             alive: Arc::new(AtomicBool::new(false)),
         }
     }
-}
-
-/// Addresses to try for `device`: the resolved address first, then any
-/// extra addresses discovery recorded.
-fn candidate_addrs(device: &Device) -> Vec<SocketAddr> {
-    let mut addrs = vec![SocketAddr::new(device.addr, device.port)];
-    if let Some(extra) = device.metadata.get(crate::discovery::META_ADDRESSES) {
-        addrs.extend(
-            extra
-                .split(',')
-                .filter_map(|a| a.trim().parse::<IpAddr>().ok())
-                .map(|ip| SocketAddr::new(ip, device.port))
-                .filter(|a| a.ip() != device.addr),
-        );
-    }
-    addrs
 }
 
 fn bplist(dict: Dictionary) -> Result<Vec<u8>> {
@@ -438,7 +422,7 @@ impl AirPlaySession {
                 FerricastError::Protocol("SETUP reply has no mirroring dataPort".into())
             })?;
 
-        let data_addr = SocketAddr::new(guard.peer_addr().ip(), data_port);
+        let data_addr = guard.peer_at(data_port);
         let tcp = tokio::time::timeout(DATA_CONNECT_TIMEOUT, TcpStream::connect(data_addr))
             .await
             .map_err(|_| {
@@ -596,9 +580,8 @@ async fn setup_audio(
             FerricastError::Protocol(format!("SETUP audio stream reply has no {key}"))
         })
     };
-    let ip = rtsp.peer_addr().ip();
-    let data_addr = SocketAddr::new(ip, port("dataPort")?);
-    let control_addr = SocketAddr::new(ip, port("controlPort")?);
+    let data_addr = rtsp.peer_at(port("dataPort")?);
+    let control_addr = rtsp.peer_at(port("controlPort")?);
     info!(%data_addr, %control_addr, "AirPlay audio stream established");
     AudioStream::start(
         data,
@@ -662,11 +645,11 @@ impl CastSession for AirPlaySession {
         let device_id = config
             .device_id
             .clone()
-            .unwrap_or_else(|| device.addr.to_string());
-        info!(addr = %device.addr, port = device.port, ?mode, "connecting to AirPlay receiver");
+            .unwrap_or_else(|| device.addresses.primary().ip().to_string());
+        info!(addresses = ?device.addresses.as_slice(), ?mode, "connecting to AirPlay receiver");
 
         let mut rtsp = RtspClient::connect(
-            &candidate_addrs(device),
+            device.addresses.as_slice(),
             ClientIdentity::default(),
             mode.hkp_header(),
         )
@@ -708,11 +691,13 @@ impl CastSession for AirPlaySession {
                 return Err(e);
             }
         };
-        let session_uri = format!(
-            "rtsp://{}/{}",
-            rtsp.local_addr().ip(),
-            rand::random::<u32>()
-        );
+        // An IPv6 host is bracketed and carries no zone: a URI has no
+        // usable syntax for one, and receivers only echo it back.
+        let host = match rtsp.local_addr().ip() {
+            IpAddr::V6(v6) => format!("[{v6}]"),
+            ip @ IpAddr::V4(_) => ip.to_string(),
+        };
+        let session_uri = format!("rtsp://{host}/{}", rand::random::<u32>());
         self.link = Some(Link {
             rtsp: Arc::new(Mutex::new(rtsp)),
             device_id,

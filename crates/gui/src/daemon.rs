@@ -48,7 +48,7 @@ fn device_to_dto(d: &Device) -> DeviceDto {
         name: d.name.clone(),
         protocol: d.protocol.to_string(),
         model: d.model.clone().unwrap_or_default(),
-        host: format!("{}:{}", d.addr, d.port),
+        addresses: d.addresses.iter().map(|a| a.to_string()).collect(),
         capabilities: caps,
     }
 }

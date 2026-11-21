@@ -2,7 +2,7 @@
 //! a self-signed certificate speaking just enough CASTv2.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,8 +62,7 @@ impl FakeCast {
             name: "fake".into(),
             protocol: "chromecast",
             protocol_icon: Bytes::new(),
-            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: self.listener.local_addr().unwrap().port(),
+            addresses: self.listener.local_addr().unwrap().into(),
             model: None,
             capabilities: ferricast_core::DeviceCapabilities::default(),
             metadata: HashMap::new(),
@@ -306,4 +305,41 @@ async fn launch_error_fails_connect_and_releases_the_connection() {
     let err = outcome.unwrap_err();
     assert!(err.to_string().contains("NOT_ALLOWED"), "{err}");
     assert!(!session.is_alive());
+}
+
+#[test]
+fn hls_host_prefers_a_routable_address_over_link_local() {
+    use super::hls_host;
+    use ferricast_core::DeviceAddresses;
+    use std::net::{IpAddr, SocketAddr};
+
+    let parse = |s: &str| s.parse::<SocketAddr>().unwrap();
+    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+    let both =
+        DeviceAddresses::ranked([parse("[fe80::2%3]:8009"), parse("10.0.0.5:8009")], &[]).unwrap();
+    let route_v4 = |target: SocketAddr| target.is_ipv4().then(|| ip("10.0.0.9"));
+
+    // Connected over IPv4: the local end is the host.
+    assert_eq!(
+        hls_host(parse("10.0.0.9:50000"), &both, route_v4),
+        ip("10.0.0.9")
+    );
+    // Connected over link-local IPv6 although the receiver has IPv4:
+    // the IPv4 route wins.
+    assert_eq!(
+        hls_host(parse("[fe80::9%3]:50000"), &both, route_v4),
+        ip("10.0.0.9")
+    );
+    // No route to the IPv4 address: fall back to the link-local host,
+    // without its zone.
+    assert_eq!(
+        hls_host(parse("[fe80::9%3]:50000"), &both, |_| None),
+        ip("fe80::9")
+    );
+    // Only link-local addresses: nothing else to try.
+    let only_ll = DeviceAddresses::from(parse("[fe80::2%3]:8009"));
+    assert_eq!(
+        hls_host(parse("[fe80::9%3]:50000"), &only_ll, route_v4),
+        ip("fe80::9")
+    );
 }

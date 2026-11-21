@@ -160,7 +160,7 @@ async fn _daemon_shape() -> zbus::Result<()> {
         name: "n".into(),
         protocol: "p".into(),
         model: String::new(),
-        host: String::new(),
+        addresses: vec!["[fe80::1%2]:8009".into()],
         capabilities: HashMap::<String, OwnedValue>::new(),
     };
     Stub::device_added(emitter, dto).await?;

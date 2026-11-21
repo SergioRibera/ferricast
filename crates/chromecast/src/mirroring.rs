@@ -20,7 +20,7 @@ mod rtp;
 mod sender;
 mod transport;
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -121,7 +121,8 @@ struct ConnectedState {
     writer: SharedWriter,
     transport_id: String,
     session_id: String,
-    peer_ip: IpAddr,
+    /// The receiver address the control connection reached.
+    peer: SocketAddr,
     request_id: Arc<AtomicI64>,
     shared: Arc<ControlShared>,
     answers: mpsc::Receiver<String>,
@@ -227,8 +228,17 @@ impl CastSession for ChromecastMirrorSession {
             return Err(FerricastError::SessionAlreadyActive(device.name.clone()));
         }
 
-        info!(name = %device.name, addr = %device.addr, "connecting (mirror) to chromecast");
-        let (reader, writer, _local_ip) = wire::connect(device.addr, device.port).await?;
+        info!(
+            name = %device.name,
+            addresses = ?device.addresses.as_slice(),
+            "connecting (mirror) to chromecast"
+        );
+        let wire::CastConnection {
+            reader,
+            writer,
+            peer,
+            ..
+        } = wire::connect(device.addresses.as_slice()).await?;
 
         let shared = Arc::new(ControlShared::default());
         shared.alive.store(true, Ordering::Relaxed);
@@ -289,7 +299,7 @@ impl CastSession for ChromecastMirrorSession {
             writer,
             transport_id,
             session_id,
-            peer_ip: device.addr,
+            peer,
             request_id,
             shared,
             answers,
@@ -401,8 +411,11 @@ impl CastSession for ChromecastMirrorSession {
                 "Cast Streaming ANSWER did not accept the video stream".into(),
             ));
         };
-        let peer_udp = SocketAddr::new(control.peer_ip, answer.udp_port);
-        let socket = bind_udp(control.peer_ip, config.port_range)
+        // Same address as the control connection, so a link-local
+        // receiver keeps its scope id.
+        let mut peer_udp = control.peer;
+        peer_udp.set_port(answer.udp_port);
+        let socket = bind_udp(peer_udp.ip(), config.port_range)
             .await
             .map_err(|e| FerricastError::Connection(format!("bind cast streaming UDP: {e}")))?;
         socket

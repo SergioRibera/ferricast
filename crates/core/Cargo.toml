@@ -6,12 +6,16 @@ description = "Core traits and types for ferricast streaming protocols"
 
 [features]
 default = ["net"]
-net = ["dep:tokio", "dep:socket2"]
+net = ["dep:tokio", "dep:socket2", "dep:if-addrs", "dep:mdns-sd"]
 
 [dependencies]
-tokio = { workspace = true, features = ["sync", "macros", "net"], optional = true }
+tokio = { workspace = true, features = ["sync", "macros", "net", "rt", "time"], optional = true }
 # Dual-stack (`IPV6_V6ONLY` off) listeners in `net.rs`.
 socket2 = { version = "0.6", optional = true }
+# Interface subnets for ranking receiver addresses (`net::local_ipv4_subnets`).
+if-addrs = { version = "0.13", optional = true }
+# Scoped addresses of resolved services (`DeviceAddresses::from_mdns`).
+mdns-sd = { workspace = true, optional = true }
 tracing.workspace = true
 thiserror.workspace = true
 bytes.workspace = true

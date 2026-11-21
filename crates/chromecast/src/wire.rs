@@ -7,6 +7,7 @@
 //! [`CastWriter`] that's `Arc`-shareable so concurrent senders
 //! (heartbeat, control, media) never interleave bytes.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -127,54 +128,42 @@ impl CastWriter {
     }
 }
 
-/// Connect to a Chromecast at `addr:port`, doing the rustls handshake
-/// with a verifier that accepts self-signed certs. Returns split
-/// read/write halves and the local TCP address — the latter is the IP
-/// the chromecast can route back to, which we use to advertise our
-/// embedded HLS URL.
+/// An open CASTv2 control connection.
+pub struct CastConnection {
+    pub reader: ReadHalf<TlsStream<TcpStream>>,
+    pub writer: SharedWriter,
+    /// The receiver address that answered.
+    pub peer: SocketAddr,
+    /// Our end of the connection: the address the receiver routes back
+    /// to, in the peer's family. Link-local IPv6 keeps its scope id.
+    pub local: SocketAddr,
+}
+
+/// Per-address TCP connect ceiling. A healthy LAN connect is sub-
+/// millisecond; 10 s leaves margin for slow Wi-Fi while still surfacing
+/// a wedged target as an error instead of hanging forever.
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connect to a Chromecast at the first of `addrs` that answers (in
+/// order, see [`ferricast_core::connect_tcp_any`]) and do the rustls
+/// handshake with a verifier that accepts self-signed certs.
 ///
 /// # Errors
 ///
-/// `Connection` / `Timeout` when the TCP connect or TLS handshake fails.
-pub async fn connect(
-    addr: std::net::IpAddr,
-    port: u16,
-) -> Result<(
-    ReadHalf<TlsStream<TcpStream>>,
-    SharedWriter,
-    std::net::IpAddr,
-)> {
-    // TCP connect with a 10 s ceiling. Healthy LAN connect is sub-
-    // millisecond; 10 s gives us margin for slow Wi-Fi while still
-    // surfacing a wedged target as an error rather than hanging
-    // forever.
-    let tcp = match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect((addr, port)))
-        .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            return Err(FerricastError::Connection(format!(
-                "tcp connect to {addr}:{port}: {e}"
-            )));
-        }
-        Err(_) => {
-            return Err(FerricastError::Timeout(format!(
-                "tcp connect to {addr}:{port} did not complete in 10s"
-            )));
-        }
-    };
+/// `Connection` when no address accepts TCP or the TLS handshake
+/// fails, `Timeout` when the handshake stalls.
+pub async fn connect(addrs: &[SocketAddr]) -> Result<CastConnection> {
+    let (tcp, peer) = ferricast_core::connect_tcp_any(addrs, TCP_CONNECT_TIMEOUT).await?;
     configure_dead_peer_detection(&tcp);
 
-    // The local end of the TLS socket is the address the chromecast
-    // can route back to — kernel already picked the right
-    // interface to reach `addr`, so this is authoritative. Fall
-    // back to the shared `local_addr_for` UDP probe in the
-    // (unlikely) case `local_addr()` returns something unroutable
-    // (0.0.0.0 / ::).
-    let local_ip = {
-        let from_socket = tcp.local_addr().map_err(FerricastError::from)?.ip();
-        if from_socket.is_unspecified() {
-            ferricast_core::local_addr_for(addr)?
+    // The local end of the socket is the address the chromecast can
+    // route back to: the kernel already picked the interface to reach
+    // `peer`. Fall back to the routing probe in the unlikely case it
+    // reports something unroutable (0.0.0.0 / ::).
+    let local = {
+        let from_socket = tcp.local_addr().map_err(FerricastError::from)?;
+        if from_socket.ip().is_unspecified() {
+            ferricast_core::local_socket_addr_for(peer)?
         } else {
             from_socket
         }
@@ -197,7 +186,7 @@ pub async fn connect(
             .with_no_client_auth();
 
     let connector = TlsConnector::from(Arc::new(config));
-    let server_name = ServerName::IpAddress(addr.into());
+    let server_name = ServerName::IpAddress(peer.ip().into());
 
     // 5 s ceiling on the TLS handshake. A healthy chromecast acks
     // the ClientHello in <50 ms; if we've waited 5 s the receiver
@@ -213,15 +202,20 @@ pub async fn connect(
             }
             Err(_) => {
                 return Err(FerricastError::Timeout(format!(
-                    "TLS handshake to {addr}:{port} did not complete in 5s — \
+                    "TLS handshake to {peer} did not complete in 5s — \
                  receiver is wedged; physically power-cycle the chromecast"
                 )));
             }
         };
-    tracing::info!(%addr, port, %local_ip, "TLS handshake to chromecast complete");
+    tracing::info!(%peer, %local, "TLS handshake to chromecast complete");
 
-    let (read_half, write_half) = tokio::io::split(tls);
-    Ok((read_half, CastWriter::shared(write_half), local_ip))
+    let (reader, write_half) = tokio::io::split(tls);
+    Ok(CastConnection {
+        reader,
+        writer: CastWriter::shared(write_half),
+        peer,
+        local,
+    })
 }
 
 /// Enable TCP keepalive and `TCP_USER_TIMEOUT` so a receiver that

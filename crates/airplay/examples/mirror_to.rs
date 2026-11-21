@@ -114,8 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "receiver".into(),
         protocol: "airplay",
         protocol_icon: Bytes::new(),
-        addr: addr.ip(),
-        port: addr.port(),
+        addresses: addr.into(),
         model: None,
         metadata: HashMap::new(),
         capabilities: DeviceCapabilities {

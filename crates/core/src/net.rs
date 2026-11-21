@@ -18,6 +18,7 @@ use std::time::Duration;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::device::Ipv4Subnet;
 use crate::error::{FerricastError, Result};
 
 /// Backlog for listeners bound through [`bind_tcp`]; matches what
@@ -153,8 +154,9 @@ pub async fn bind_udp(
     )))
 }
 
-/// Check that `target` accepts TCP connections, giving up after
-/// `timeout`. The connection is closed straight away; nothing is sent.
+/// Check that one of `targets` accepts TCP connections, giving up after
+/// `timeout` overall. The connection is closed straight away; nothing
+/// is sent. Returns the address that answered.
 ///
 /// Used before a stream starts so an offline or firewalled receiver is
 /// reported in about a second instead of after the full handshake
@@ -162,18 +164,141 @@ pub async fn bind_udp(
 ///
 /// # Errors
 ///
-/// [`FerricastError::Connection`] (`device unreachable: <addr>:<port>`)
-/// when the connection is refused, has no route or does not complete
-/// within `timeout`.
-pub async fn probe_tcp(target: SocketAddr, timeout: Duration) -> Result<()> {
-    let reason = match tokio::time::timeout(timeout, TcpStream::connect(target)).await {
-        Ok(Ok(_stream)) => return Ok(()),
-        Ok(Err(e)) => e.to_string(),
+/// [`FerricastError::Connection`] (`device unreachable: …`) when every
+/// address refuses, has no route or does not complete within `timeout`.
+pub async fn probe_tcp(targets: &[SocketAddr], timeout: Duration) -> Result<SocketAddr> {
+    let reason = match tokio::time::timeout(timeout, race_connect(targets, timeout)).await {
+        Ok(Ok((_stream, addr))) => return Ok(addr),
+        Ok(Err(failures)) => failures,
         Err(_) => format!("no answer within {} ms", timeout.as_millis()),
     };
     Err(FerricastError::Connection(format!(
-        "device unreachable: {target} ({reason})"
+        "device unreachable: {reason}"
     )))
+}
+
+/// Delay before racing the next address while earlier attempts are
+/// still pending (RFC 8305 "Connection Attempt Delay").
+const CONNECT_STAGGER: Duration = Duration::from_millis(250);
+
+/// Connect to the first of `addrs` that accepts, trying them in order.
+///
+/// A light Happy Eyeballs (RFC 8305): the next address starts as soon
+/// as the previous attempt fails, or after [`CONNECT_STAGGER`] while
+/// it is still pending, so a silently dropped address doesn't hold up
+/// the rest. The first successful connection wins and the attempts
+/// still in flight are dropped. Each attempt gives up after
+/// `attempt_timeout`.
+///
+/// Returns the stream and the address it connected to. The stream's
+/// `local_addr` is the address the peer can route back to, in the
+/// peer's family (and, for link-local IPv6, with its scope id).
+///
+/// # Errors
+///
+/// [`FerricastError::Connection`] listing every address with its
+/// failure when none connects, or when `addrs` is empty.
+pub async fn connect_tcp_any(
+    addrs: &[SocketAddr],
+    attempt_timeout: Duration,
+) -> Result<(TcpStream, SocketAddr)> {
+    race_connect(addrs, attempt_timeout)
+        .await
+        .map_err(|failures| FerricastError::Connection(format!("no address answered: {failures}")))
+}
+
+/// [`connect_tcp_any`] with the failures of every address, joined by
+/// `; `, as the error.
+async fn race_connect(
+    addrs: &[SocketAddr],
+    attempt_timeout: Duration,
+) -> std::result::Result<(TcpStream, SocketAddr), String> {
+    if addrs.is_empty() {
+        return Err("no address to connect to".into());
+    }
+    let mut queue = addrs.iter().copied();
+    let mut next = queue.next();
+    let mut pending = tokio::task::JoinSet::new();
+    let mut failures = Vec::with_capacity(addrs.len());
+    loop {
+        if let Some(addr) = next.take() {
+            pending.spawn(connect_attempt(addr, attempt_timeout));
+        }
+        next = queue.next();
+        if next.is_none() {
+            // Nothing left to start: wait for what is in flight.
+            while let Some(joined) = pending.join_next().await {
+                if let Some(won) = attempt_outcome(joined, &mut failures) {
+                    return Ok(won);
+                }
+            }
+            break;
+        }
+        tokio::select! {
+            Some(joined) = pending.join_next() => {
+                if let Some(won) = attempt_outcome(joined, &mut failures) {
+                    return Ok(won);
+                }
+            }
+            () = tokio::time::sleep(CONNECT_STAGGER) => {}
+        }
+    }
+    Err(failures.join("; "))
+}
+
+type AttemptResult = (SocketAddr, std::result::Result<TcpStream, String>);
+
+async fn connect_attempt(addr: SocketAddr, timeout: Duration) -> AttemptResult {
+    let result = match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("no answer within {} ms", timeout.as_millis())),
+    };
+    (addr, result)
+}
+
+/// The winning connection, or `None` after recording the failure.
+fn attempt_outcome(
+    joined: std::result::Result<AttemptResult, tokio::task::JoinError>,
+    failures: &mut Vec<String>,
+) -> Option<(TcpStream, SocketAddr)> {
+    match joined {
+        Ok((addr, Ok(stream))) => Some((stream, addr)),
+        Ok((addr, Err(reason))) => {
+            failures.push(format!("{addr}: {reason}"));
+            None
+        }
+        Err(e) => {
+            failures.push(format!("connect attempt aborted: {e}"));
+            None
+        }
+    }
+}
+
+/// IPv4 subnets of the non-loopback local interfaces, for ranking a
+/// receiver's addresses with [`DeviceAddresses::ranked`]. Empty when
+/// the interfaces can't be listed.
+///
+/// [`DeviceAddresses::ranked`]: crate::device::DeviceAddresses::ranked
+#[must_use]
+pub fn local_ipv4_subnets() -> Vec<Ipv4Subnet> {
+    match if_addrs::get_if_addrs() {
+        Ok(ifaces) => ifaces
+            .into_iter()
+            .filter(|i| !i.is_loopback())
+            .filter_map(|i| match i.addr {
+                if_addrs::IfAddr::V4(v4) => Some(Ipv4Subnet {
+                    addr: v4.ip,
+                    netmask: v4.netmask,
+                }),
+                if_addrs::IfAddr::V6(_) => None,
+            })
+            .collect(),
+        Err(e) => {
+            tracing::debug!(%e, "cannot list local interfaces");
+            Vec::new()
+        }
+    }
 }
 
 /// A non-blocking socket of `addr`'s family, dual-stack for IPv6.
@@ -317,21 +442,23 @@ mod tests {
     async fn probe_passes_for_an_open_listener() {
         let l = bind_tcp(V4_LOOPBACK, None).await.unwrap();
         let target = SocketAddr::new(V4_LOOPBACK, l.local_addr().unwrap().port());
-        probe_tcp(target, Duration::from_secs(3)).await.unwrap();
+        assert_eq!(
+            probe_tcp(&[target], Duration::from_secs(3)).await.unwrap(),
+            target
+        );
+    }
+
+    /// A port on `ip` that nothing listens on.
+    async fn closed_port(ip: IpAddr) -> SocketAddr {
+        let l = bind_tcp(ip, None).await.unwrap();
+        SocketAddr::new(ip, l.local_addr().unwrap().port())
     }
 
     #[tokio::test]
     async fn probe_fails_fast_for_a_closed_port() {
-        // Bind then drop to get a port nothing listens on.
-        let port = bind_tcp(V4_LOOPBACK, None)
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let target = SocketAddr::new(V4_LOOPBACK, port);
+        let target = closed_port(V4_LOOPBACK).await;
         let started = std::time::Instant::now();
-        let err = probe_tcp(target, Duration::from_secs(3))
+        let err = probe_tcp(&[target], Duration::from_secs(3))
             .await
             .unwrap_err()
             .to_string();
@@ -340,9 +467,88 @@ mod tests {
             "refusal took {:?}",
             started.elapsed()
         );
+        assert!(err.contains("device unreachable"), "{err}");
+        assert!(err.contains(&target.to_string()), "{err}");
+    }
+
+    #[tokio::test]
+    async fn connect_falls_back_to_the_next_address() {
+        let refused = closed_port(V4_LOOPBACK).await;
+        let l = bind_tcp(V4_LOOPBACK, None).await.unwrap();
+        let open = SocketAddr::new(V4_LOOPBACK, l.local_addr().unwrap().port());
+        let started = std::time::Instant::now();
+        let (stream, addr) = connect_tcp_any(&[refused, open], Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(addr, open);
+        assert_eq!(stream.peer_addr().unwrap(), open);
+        // A refusal starts the next attempt at once, without the stagger.
         assert!(
-            err.contains(&format!("device unreachable: 127.0.0.1:{port}")),
+            started.elapsed() < CONNECT_STAGGER,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_crosses_address_families() {
+        if !ipv6_available() {
+            return;
+        }
+        let l = bind_tcp(V6_LOOPBACK, None).await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        // ::1 refuses on a fresh port; the dual-stack listener answers
+        // on 127.0.0.1, and the local end follows the peer's family.
+        let refused = closed_port(V6_LOOPBACK).await;
+        let v4 = SocketAddr::new(V4_LOOPBACK, port);
+        let (stream, addr) = connect_tcp_any(&[refused, v4], Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(addr, v4);
+        assert!(stream.local_addr().unwrap().is_ipv4());
+        let v6 = SocketAddr::new(V6_LOOPBACK, port);
+        let (stream, addr) = connect_tcp_any(&[v6, v4], Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(addr, v6);
+        assert!(stream.local_addr().unwrap().is_ipv6());
+    }
+
+    #[tokio::test]
+    async fn connect_does_not_wait_on_a_silent_address() {
+        // TEST-NET-1 is never routed; the attempt either hangs or fails
+        // with no route, and the next address must win either way.
+        let silent: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        let l = bind_tcp(V4_LOOPBACK, None).await.unwrap();
+        let open = SocketAddr::new(V4_LOOPBACK, l.local_addr().unwrap().port());
+        let started = std::time::Instant::now();
+        let (_stream, addr) = connect_tcp_any(&[silent, open], Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(addr, open);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_reports_every_failure() {
+        let a = closed_port(V4_LOOPBACK).await;
+        let b = closed_port(V4_LOOPBACK).await;
+        let err = connect_tcp_any(&[a, b], Duration::from_secs(3))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&a.to_string()) && err.contains(&b.to_string()),
             "{err}"
         );
+        let err = connect_tcp_any(&[], Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no address"), "{err}");
     }
 }

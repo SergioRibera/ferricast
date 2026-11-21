@@ -34,7 +34,8 @@ pub use control::{
 };
 pub use decoder::{AudioDecoder, AudioDecoderConfig, DecodedAudio, DecoderConfig, VideoDecoder};
 pub use device::{
-    AirPlayPairing, Device, DeviceCapabilities, DiscoveryEvent, H264Profile, H265Profile,
+    AirPlayPairing, Device, DeviceAddresses, DeviceCapabilities, DiscoveryEvent, H264Profile,
+    H265Profile, Ipv4Subnet,
 };
 #[cfg(feature = "net")]
 pub use discovery::{Discovery, MdnsDiscovery};
@@ -46,7 +47,8 @@ pub use frame::{
 };
 #[cfg(feature = "net")]
 pub use net::{
-    bind_tcp, bind_udp, local_addr_for, local_socket_addr_for, probe_tcp, unspecified_for,
+    bind_tcp, bind_udp, connect_tcp_any, local_addr_for, local_ipv4_subnets, local_socket_addr_for,
+    probe_tcp, unspecified_for,
 };
 pub use pairing::{PairingChallenge, PairingResponse};
 #[cfg(feature = "net")]

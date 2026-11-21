@@ -276,8 +276,7 @@ mod tests {
             name: "tv".into(),
             protocol: "chromecast",
             protocol_icon: bytes::Bytes::new(),
-            addr: [192, 168, 1, 2].into(),
-            port: 8009,
+            addresses: std::net::SocketAddr::from(([192, 168, 1, 2], 8009)).into(),
             model: None,
             capabilities: DeviceCapabilities {
                 supports_cast_streaming: cast_streaming,

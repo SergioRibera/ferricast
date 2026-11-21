@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -10,11 +10,175 @@ pub struct Device {
     pub name: String,
     pub protocol: &'static str,
     pub protocol_icon: Bytes,
-    pub addr: IpAddr,
-    pub port: u16,
+    /// Every address the receiver answers on, most preferred first.
+    pub addresses: DeviceAddresses,
     pub model: Option<String>,
     pub capabilities: DeviceCapabilities,
     pub metadata: HashMap<String, String>,
+}
+
+/// The socket addresses a receiver answers on, ordered by preference.
+///
+/// Receivers advertise several addresses over mDNS (IPv4 on more than
+/// one interface, global and link-local IPv6). Connecting walks them
+/// in this order, so the first is the one most likely to work from
+/// this host:
+///
+/// 1. IPv4 on a subnet of a local interface,
+/// 2. other private IPv4,
+/// 3. other routable IPv4,
+/// 4. IPv4 link-local (`169.254.0.0/16`),
+/// 5. global or unique-local IPv6,
+/// 6. link-local IPv6, carrying the scope id of the interface it was
+///    seen on,
+/// 7. loopback.
+///
+/// Unspecified and multicast addresses, and link-local IPv6 without a
+/// scope id (no interface to send it on), are dropped. Never empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceAddresses(Vec<SocketAddr>);
+
+impl DeviceAddresses {
+    /// Rank `addrs` by preference, dropping duplicates and addresses
+    /// nothing can connect to. `local_subnets` are the IPv4 subnets of
+    /// this host's interfaces (`ferricast_core::net::local_ipv4_subnets`).
+    ///
+    /// Returns `None` when no usable address remains.
+    #[must_use]
+    pub fn ranked(
+        addrs: impl IntoIterator<Item = SocketAddr>,
+        local_subnets: &[Ipv4Subnet],
+    ) -> Option<Self> {
+        let mut ranked: Vec<(AddressRank, SocketAddr)> = addrs
+            .into_iter()
+            .filter_map(|addr| Some((AddressRank::of(addr, local_subnets)?, addr)))
+            .collect();
+        // Address then scope id as tie-breakers keep the order stable
+        // across mDNS answers that list the same set differently.
+        ranked.sort_unstable_by_key(|&(rank, addr)| (rank, addr.ip(), scope_id(addr)));
+        ranked.dedup_by_key(|&mut (_, addr)| addr);
+        let addrs: Vec<SocketAddr> = ranked.into_iter().map(|(_, addr)| addr).collect();
+        (!addrs.is_empty()).then_some(Self(addrs))
+    }
+
+    /// The address to try first.
+    #[must_use]
+    pub fn primary(&self) -> SocketAddr {
+        *self
+            .0
+            .first()
+            .expect("invariant: DeviceAddresses is never empty")
+    }
+
+    /// Every address, most preferred first.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = SocketAddr> + '_ {
+        self.0.iter().copied()
+    }
+
+    /// Every address, most preferred first.
+    #[must_use]
+    pub fn as_slice(&self) -> &[SocketAddr] {
+        &self.0
+    }
+
+    /// Whether `ip` is one of the receiver's addresses, ignoring port
+    /// and scope id. An IPv4-mapped IPv6 address matches its IPv4 form.
+    #[must_use]
+    pub fn contains_ip(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        self.0.iter().any(|a| a.ip().to_canonical() == ip)
+    }
+}
+
+impl From<SocketAddr> for DeviceAddresses {
+    /// A receiver known by a single address (manual entry, tests).
+    fn from(addr: SocketAddr) -> Self {
+        Self(vec![addr])
+    }
+}
+
+impl Display for DeviceAddresses {
+    /// The primary address; IPv6 prints as `[addr%scope]:port`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.primary().fmt(f)
+    }
+}
+
+fn scope_id(addr: SocketAddr) -> u32 {
+    match addr {
+        SocketAddr::V4(_) => 0,
+        SocketAddr::V6(v6) => v6.scope_id(),
+    }
+}
+
+/// Preference class of one address; lower is tried first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AddressRank {
+    V4LocalSubnet,
+    V4Private,
+    V4Routable,
+    V4LinkLocal,
+    V6Routable,
+    V6LinkLocal,
+    Loopback,
+}
+
+impl AddressRank {
+    /// `None` for addresses nothing can connect to.
+    fn of(addr: SocketAddr, local_subnets: &[Ipv4Subnet]) -> Option<Self> {
+        match addr {
+            SocketAddr::V4(v4) => Self::of_v4(*v4.ip(), local_subnets),
+            SocketAddr::V6(v6) => {
+                let ip = *v6.ip();
+                if let Some(mapped) = ip.to_ipv4_mapped() {
+                    Self::of_v4(mapped, local_subnets)
+                } else if ip.is_unspecified() || ip.is_multicast() {
+                    None
+                } else if ip.is_loopback() {
+                    Some(Self::Loopback)
+                } else if ip.is_unicast_link_local() {
+                    // Only usable on the interface it was seen on.
+                    (v6.scope_id() != 0).then_some(Self::V6LinkLocal)
+                } else {
+                    Some(Self::V6Routable)
+                }
+            }
+        }
+    }
+
+    fn of_v4(ip: Ipv4Addr, local_subnets: &[Ipv4Subnet]) -> Option<Self> {
+        if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() {
+            return None;
+        }
+        Some(if ip.is_loopback() {
+            Self::Loopback
+        } else if local_subnets.iter().any(|net| net.contains(ip)) {
+            Self::V4LocalSubnet
+        } else if ip.is_private() {
+            Self::V4Private
+        } else if ip.is_link_local() {
+            Self::V4LinkLocal
+        } else {
+            Self::V4Routable
+        })
+    }
+}
+
+/// An IPv4 subnet of a local interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv4Subnet {
+    pub addr: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+}
+
+impl Ipv4Subnet {
+    /// Whether `ip` lies in this subnet. A zero netmask matches
+    /// nothing, so a default route doesn't claim every address.
+    #[must_use]
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        let mask = u32::from(self.netmask);
+        mask != 0 && u32::from(self.addr) & mask == u32::from(ip) & mask
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -379,5 +543,96 @@ mod tests {
         assert_eq!(AirPlayPairing::HapTransient.hkp_header(), Some("4"));
         assert_eq!(AirPlayPairing::Legacy.hkp_header(), None);
         assert_eq!(AirPlayPairing::LegacyPin.hkp_header(), None);
+    }
+
+    fn addrs(list: &[&str], subnets: &[Ipv4Subnet]) -> Option<Vec<String>> {
+        let parsed = list.iter().map(|a| a.parse::<SocketAddr>().unwrap());
+        DeviceAddresses::ranked(parsed, subnets).map(|d| d.iter().map(|a| a.to_string()).collect())
+    }
+
+    #[test]
+    fn addresses_are_ordered_by_reachability() {
+        let lan = Ipv4Subnet {
+            addr: Ipv4Addr::new(192, 168, 1, 10),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+        };
+        let ordered = addrs(
+            &[
+                "[fe80::2%3]:7000",
+                "[2001:db8::5]:7000",
+                "169.254.3.4:7000",
+                "8.8.4.4:7000",
+                "172.17.0.1:7000",
+                "[fd00::5]:7000",
+                "192.168.1.40:7000",
+                "127.0.0.1:7000",
+            ],
+            &[lan],
+        )
+        .unwrap();
+        assert_eq!(
+            ordered,
+            [
+                "192.168.1.40:7000",
+                "172.17.0.1:7000",
+                "8.8.4.4:7000",
+                "169.254.3.4:7000",
+                "[2001:db8::5]:7000",
+                "[fd00::5]:7000",
+                "[fe80::2%3]:7000",
+                "127.0.0.1:7000",
+            ]
+        );
+        // Without a matching subnet, private IPv4 still leads.
+        assert_eq!(
+            addrs(&["[fd00::5]:7000", "10.0.0.5:7000"], &[]).unwrap(),
+            ["10.0.0.5:7000", "[fd00::5]:7000"]
+        );
+    }
+
+    #[test]
+    fn unusable_addresses_are_dropped_and_duplicates_merged() {
+        assert_eq!(
+            addrs(
+                &[
+                    "[fe80::2]:7000",
+                    "0.0.0.0:7000",
+                    "[::]:7000",
+                    "10.0.0.5:7000",
+                    "10.0.0.5:7000",
+                    "[::ffff:10.0.0.6]:7000",
+                ],
+                &[]
+            )
+            .unwrap(),
+            ["10.0.0.5:7000", "[::ffff:10.0.0.6]:7000"]
+        );
+        assert_eq!(addrs(&["[fe80::2]:7000"], &[]), None);
+        assert_eq!(addrs(&[], &[]), None);
+    }
+
+    #[test]
+    fn primary_and_membership() {
+        let d = DeviceAddresses::ranked(
+            ["[fe80::2%3]:8009", "10.0.0.5:8009"].map(|a| a.parse().unwrap()),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(d.primary(), "10.0.0.5:8009".parse().unwrap());
+        assert_eq!(d.to_string(), "10.0.0.5:8009");
+        assert!(d.contains_ip("fe80::2".parse().unwrap()));
+        assert!(d.contains_ip("::ffff:10.0.0.5".parse().unwrap()));
+        assert!(!d.contains_ip("10.0.0.6".parse().unwrap()));
+        let single = DeviceAddresses::from("[fe80::2%3]:8009".parse::<SocketAddr>().unwrap());
+        assert_eq!(single.to_string(), "[fe80::2%3]:8009");
+    }
+
+    #[test]
+    fn zero_netmask_matches_nothing() {
+        let any = Ipv4Subnet {
+            addr: Ipv4Addr::new(10, 0, 0, 1),
+            netmask: Ipv4Addr::UNSPECIFIED,
+        };
+        assert!(!any.contains(Ipv4Addr::new(10, 0, 0, 2)));
     }
 }

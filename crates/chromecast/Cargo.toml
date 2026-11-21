@@ -20,7 +20,7 @@ uuid = { workspace = true, features = ["v5"] }
 # any extra runtime cost since the workspace's default-feature
 # `openh264` already had it on for the encoder path.
 ferricast-encoder = { workspace = true, features = ["x264"] }
-mdns-sd = "0.11"
+mdns-sd.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
     "logging",
@@ -52,7 +52,6 @@ ctr = "0.9"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 socket2 = { version = "0.6", features = ["all"] }
 rand = "0.8"
-if-addrs = "0.13"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
