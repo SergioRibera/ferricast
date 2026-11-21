@@ -62,6 +62,11 @@ pub struct ReceiverCounters {
     audio_rate: AtomicU32,
     /// Whether an output device is playing what is queued.
     audio_output: AtomicBool,
+    /// Bumped by every flush: buffers and playing sources of an older
+    /// epoch are stale and neither played nor counted.
+    audio_epoch: AtomicU64,
+    /// Wakes the audio task to empty the output queue after a flush.
+    audio_flushed: tokio::sync::Notify,
 }
 
 impl Default for ReceiverCounters {
@@ -74,6 +79,8 @@ impl Default for ReceiverCounters {
             audio_played: AtomicU64::new(0),
             audio_rate: AtomicU32::new(0),
             audio_output: AtomicBool::new(false),
+            audio_epoch: AtomicU64::new(0),
+            audio_flushed: tokio::sync::Notify::new(),
         }
     }
 }
@@ -105,6 +112,19 @@ impl ReceiverCounters {
     fn add_played(&self, samples: usize) {
         self.audio_played
             .fetch_add(samples as u64, Ordering::Relaxed);
+    }
+
+    fn audio_epoch(&self) -> u64 {
+        self.audio_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Forgets every queued sample: the backlog drops to zero and the
+    /// audio task empties the output device queue.
+    fn flush_audio(&self) {
+        self.audio_epoch.fetch_add(1, Ordering::Relaxed);
+        self.audio_played
+            .store(self.audio_queued.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.audio_flushed.notify_one();
     }
 }
 
@@ -139,6 +159,8 @@ pub struct AudioBuf {
     pub samples: Vec<i16>,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Flush epoch the buffer was queued in.
+    epoch: u64,
 }
 
 /// The sink the manager pipeline writes into. Owns the tx ends of
@@ -224,6 +246,7 @@ impl FrameSink for WindowSink {
             samples: audio.pcm,
             sample_rate: audio.sample_rate,
             channels: audio.channels,
+            epoch: self.counters.audio_epoch(),
         };
         // Drop on backpressure (matches video). The window-side
         // drain task is bottlenecked by rodio's playback clock —
@@ -257,6 +280,11 @@ impl FrameSink for WindowSink {
 
     fn audio_backlog(&self) -> Option<Duration> {
         self.counters.audio_backlog()
+    }
+
+    async fn flush_audio(&mut self) -> Result<()> {
+        self.counters.flush_audio();
+        Ok(())
     }
 }
 
@@ -373,7 +401,21 @@ impl App for ReceiverWindowApp {
                     // Keep `stream` alive: drop = device closed.
                     let _stream_keepalive = stream;
                     audio_counters.audio_output.store(true, Ordering::Relaxed);
-                    while let Some(buf) = rx.recv().await {
+                    loop {
+                        let buf = tokio::select! {
+                            buf = rx.recv() => buf,
+                            () = audio_counters.audio_flushed.notified() => {
+                                // Stale audio (before a seek or a pause) must
+                                // not be heard; `clear` also pauses the sink.
+                                sink.clear();
+                                sink.play();
+                                continue;
+                            }
+                        };
+                        let Some(buf) = buf else { break };
+                        if buf.epoch != audio_counters.audio_epoch() {
+                            continue;
+                        }
                         // Drop frames when the sink queue is too deep
                         // (~2 s worth). Rodio's internal queue is
                         // unbounded; if playback stalls (PipeWire
@@ -394,6 +436,7 @@ impl App for ReceiverWindowApp {
                         sink.append(Counted {
                             inner: source,
                             counters: audio_counters.clone(),
+                            epoch: buf.epoch,
                         });
                     }
                     audio_counters.audio_output.store(false, Ordering::Relaxed);
@@ -615,6 +658,9 @@ fn codec_label_audio(c: AudioCodec) -> &'static str {
 struct Counted<S> {
     inner: S,
     counters: Arc<ReceiverCounters>,
+    /// Samples of a flushed epoch are not counted: the flush already
+    /// wrote them off.
+    epoch: u64,
 }
 
 impl<S: Iterator<Item = i16>> Iterator for Counted<S> {
@@ -622,7 +668,9 @@ impl<S: Iterator<Item = i16>> Iterator for Counted<S> {
 
     fn next(&mut self) -> Option<i16> {
         let sample = self.inner.next()?;
-        self.counters.add_played(1);
+        if self.epoch == self.counters.audio_epoch() {
+            self.counters.add_played(1);
+        }
         Some(sample)
     }
 }

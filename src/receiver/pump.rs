@@ -317,7 +317,7 @@ impl Pump {
                 match self.input {
                     Input::Eos => return PumpEnd::Finished,
                     Input::Discontinuity | Input::Open => {
-                        self.restart_timeline();
+                        self.restart_timeline().await;
                         self.input = Input::Open;
                         continue;
                     }
@@ -394,10 +394,19 @@ impl Pump {
         }
     }
 
-    fn restart_timeline(&mut self) {
+    /// Starts a new timeline: whatever audio the sink still queues
+    /// belongs to the old one and is dropped.
+    async fn restart_timeline(&mut self) {
+        self.flush_sink_audio().await;
         self.clock.reset();
         self.position.restart();
         self.audio_primed = false;
+    }
+
+    async fn flush_sink_audio(&mut self) {
+        if let Err(e) = self.sink.flush_audio().await {
+            tracing::warn!(%e, "pump: sink.flush_audio failed");
+        }
     }
 
     /// The earliest due item, anchoring the timeline if needed.
@@ -425,10 +434,13 @@ impl Pump {
             Some(PumpCmd::Play) => {
                 if !self.playing {
                     self.playing = true;
-                    self.restart_timeline();
+                    self.restart_timeline().await;
                 }
             }
-            Some(PumpCmd::Pause) => self.playing = false,
+            Some(PumpCmd::Pause) => {
+                self.playing = false;
+                self.flush_sink_audio().await;
+            }
             Some(PumpCmd::Seek(position_us)) => {
                 if let Err(e) = self.puller.seek(position_us).await {
                     tracing::warn!(%e, "pump: seek failed");
@@ -442,7 +454,7 @@ impl Pump {
                     a.clear();
                 }
                 self.input = Input::Open;
-                self.restart_timeline();
+                self.restart_timeline().await;
                 self.position.jump(position_us);
             }
             Some(PumpCmd::Volume(gain)) => {
@@ -450,7 +462,10 @@ impl Pump {
                     tracing::warn!(%e, "pump: sink.set_volume failed");
                 }
             }
-            Some(PumpCmd::Stop) | None => return Flow::Exit(PumpEnd::Stopped),
+            Some(PumpCmd::Stop) | None => {
+                self.flush_sink_audio().await;
+                return Flow::Exit(PumpEnd::Stopped);
+            }
         }
         Flow::Continue
     }
@@ -472,7 +487,7 @@ impl Pump {
                 if late > RESYNC_LATENESS {
                     tracing::debug!(?late, "pump: stalled — re-anchoring");
                     stream.ready.push_front(frame);
-                    self.restart_timeline();
+                    self.restart_timeline().await;
                     return;
                 }
                 if late > MAX_VIDEO_LATENESS {
@@ -497,7 +512,7 @@ impl Pump {
                 if late > RESYNC_LATENESS {
                     tracing::debug!(?late, "pump: audio stalled — re-anchoring");
                     stream.ready.push_front(pcm);
-                    self.restart_timeline();
+                    self.restart_timeline().await;
                     return;
                 }
                 if self.audio_primed {

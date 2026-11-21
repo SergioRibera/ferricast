@@ -49,4 +49,13 @@ pub trait FrameSink: Send {
     fn audio_backlog(&self) -> Option<std::time::Duration> {
         None
     }
+
+    /// Drops audio accepted by [`Self::push_audio`] that the output
+    /// device has not played yet. The pipeline calls it when the
+    /// timeline jumps or halts (seek, discontinuity, pause, stop), so no
+    /// stale audio is heard afterwards and the next timeline starts
+    /// from an empty device queue. Does nothing by default.
+    async fn flush_audio(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
