@@ -117,6 +117,49 @@ pub fn open_pairing_dialog(
     });
 }
 
+/// Show `pin`, the code an AirPlay sender asks its user to type, in its
+/// own always-on-top window. The caller closes it.
+pub async fn open_pin_window(platform: &Platform, pin: String) -> freya::winit::window::WindowId {
+    let config = WindowConfig::new_app(PinDisplay { pin })
+        .with_size(360., 220.)
+        .with_resizable(false)
+        .with_background((20, 20, 28))
+        .with_app_id("rs.sergioribera.ferricast.Pin")
+        .with_window_attributes(|attrs, _| {
+            attrs
+                .with_title("AirPlay PIN")
+                .with_window_level(WindowLevel::AlwaysOnTop)
+        });
+    platform.launch_window(config).await
+}
+
+struct PinDisplay {
+    pin: String,
+}
+
+impl App for PinDisplay {
+    fn render(&self) -> impl IntoElement {
+        rect()
+            .expanded()
+            .center()
+            .vertical()
+            .spacing(12.)
+            .child(
+                label()
+                    .text("Enter this PIN on your device")
+                    .font_size(15.)
+                    .color((210, 210, 225)),
+            )
+            .child(
+                label()
+                    .text(self.pin.clone())
+                    .font_size(56.)
+                    .font_weight(FontWeight::BOLD)
+                    .color((240, 240, 250)),
+            )
+    }
+}
+
 /// Whether `text` can still become a valid PIN of `digits` digits.
 fn is_partial_pin(text: &str, digits: usize) -> bool {
     text.len() <= digits && text.chars().all(|c| c.is_ascii_digit())
