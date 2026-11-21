@@ -36,6 +36,9 @@ aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 ferricast-fairplay = { workspace = true, optional = true }
 md-5 = "0.10"
+# Secret Service / Secret portal client for pairing secrets. 0.6 is the
+# newest release on zbus 5, which the rest of the workspace already uses.
+oo7 = { version = "0.6", default-features = false, features = ["tokio", "native_crypto"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

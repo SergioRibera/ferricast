@@ -7,8 +7,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use ferricast_core::{
     AudioCodec, CaptureConfig, CaptureSource, CapturedFrame, CastSession, Codec, ConnectOutcome,
-    Device, DeviceCapabilities, EncodedFrame, EncoderConfig, FerricastError, PixelFormat, RawFrame,
-    Result, ScreenCapture, StreamConfig, VideoEncoder,
+    Device, DeviceCapabilities, EncodedFrame, EncoderConfig, FerricastError, PairingResponse,
+    PixelFormat, RawFrame, Result, ScreenCapture, StreamConfig, VideoEncoder,
 };
 use uuid::Uuid;
 
@@ -168,6 +168,9 @@ pub(crate) struct SessionScript {
     /// When the session dies (`dies_after`), `end_reason` reports a
     /// receiver-side stop.
     pub dies_remotely: bool,
+    /// `setup_stream` fails with `CredentialRequired` until this password
+    /// was submitted.
+    pub password: Option<&'static str>,
 }
 
 impl Default for SessionScript {
@@ -180,6 +183,7 @@ impl Default for SessionScript {
             forced_keyframes: None,
             connect_fails: false,
             dies_remotely: false,
+            password: None,
         }
     }
 }
@@ -191,6 +195,8 @@ pub(crate) struct SessionLog {
     pub setups: Vec<StreamConfig>,
     pub frames: usize,
     pub stops: usize,
+    /// Passwords submitted through `submit_pairing`.
+    pub passwords: Vec<String>,
 }
 
 pub(crate) struct FakeSession {
@@ -198,6 +204,7 @@ pub(crate) struct FakeSession {
     log: Arc<Mutex<SessionLog>>,
     frames: usize,
     remote_end: bool,
+    submitted: Option<String>,
 }
 
 impl CastSession for FakeSession {
@@ -208,7 +215,26 @@ impl CastSession for FakeSession {
         Ok(ConnectOutcome::Ready)
     }
 
+    async fn submit_pairing(&mut self, response: PairingResponse) -> Result<()> {
+        match response {
+            PairingResponse::Password(password) => {
+                self.log.lock().unwrap().passwords.push(password.clone());
+                self.submitted = Some(password);
+                Ok(())
+            }
+            PairingResponse::Cancelled => Err(FerricastError::Protocol("cancelled".into())),
+            PairingResponse::Pin(_) | PairingResponse::Confirmed => Ok(()),
+        }
+    }
+
     async fn setup_stream(&mut self, config: &StreamConfig) -> Result<()> {
+        if let Some(want) = self.script.password
+            && self.submitted.as_deref() != Some(want)
+        {
+            return Err(FerricastError::CredentialRequired {
+                rejected: self.submitted.is_some(),
+            });
+        }
         self.log.lock().unwrap().setups.push(config.clone());
         Ok(())
     }
@@ -278,6 +304,7 @@ pub(crate) fn session_factory(
             log: log_for_factory.clone(),
             frames: 0,
             remote_end,
+            submitted: None,
         }) as Box<dyn ErasedSession>)
     });
     (factory, log)

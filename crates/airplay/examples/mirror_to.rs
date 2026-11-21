@@ -2,15 +2,15 @@
 //! receiver by address.
 //!
 //! ```text
-//! cargo run -p ferricast-airplay --features fairplay --example mirror_to -- 192.168.1.20:7000 [seconds] [--pin] [--password[=<pw>]] [--no-audio]
+//! cargo run -p ferricast-airplay --features fairplay --example mirror_to -- 192.168.1.20:7000 [seconds] [--pin] [--password[=<pw>[,<pw>...]]] [--no-audio]
 //! ```
 //!
 //! `--pin` treats the receiver as PIN-protected (UxPlay `-pin`); the PIN
 //! shown by the receiver is then read from stdin. `--password` marks it as
-//! password-protected (UxPlay `-pw`); without `=<pw>` the password is read
-//! from stdin when the receiver asks for it.
+//! password-protected (UxPlay `-pw`). Whenever the receiver asks for its
+//! password, the next `=<pw>[,<pw>...]` entry answers, then stdin.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::BufRead as _;
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,7 +20,7 @@ use ferricast_airplay::AirPlaySession;
 use ferricast_core::device::{AirplayConfig, Features, Flags};
 use ferricast_core::{
     AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame, AudioStreamConfig, CapturedFrame,
-    CastSession, Codec, ConnectOutcome, Device, DeviceCapabilities, EncoderConfig,
+    CastSession, Codec, ConnectOutcome, Device, DeviceCapabilities, EncoderConfig, FerricastError,
     PairingChallenge, PairingResponse, PixelFormat, RawFrame, StreamConfig, VideoEncoder,
 };
 use ferricast_encoder::aac::{ELD_SAMPLE_RATE, FdkEldEncoder};
@@ -30,6 +30,8 @@ const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 const FPS: u32 = 30;
 const TONE_HZ: f64 = 440.0;
+/// Password prompts answered before giving up, like the manager.
+const MAX_PASSWORDS: u32 = 3;
 
 fn pattern(frame: u32) -> Bytes {
     let mut data = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
@@ -67,6 +69,19 @@ fn now_us() -> u64 {
         .as_micros() as u64
 }
 
+fn next_password(
+    passwords: &mut VecDeque<String>,
+    rejected: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if rejected {
+        println!("receiver rejected the password");
+    }
+    match passwords.pop_front() {
+        Some(password) => Ok(password),
+        None => read_line("receiver asks for its password; type it:"),
+    }
+}
+
 fn read_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
     println!("{prompt}");
     Ok(std::io::stdin().lock().lines().next().ok_or("no input")??)
@@ -84,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let addr: SocketAddr = args
         .first()
-        .ok_or("usage: mirror_to <ip:port> [seconds] [--pin] [--password[=<pw>]] [--no-audio]")?
+        .ok_or("usage: mirror_to <ip:port> [seconds] [--pin] [--password[=<pw>[,<pw>...]]] [--no-audio]")?
         .parse()?;
     let seconds: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
     let pin = args.iter().any(|a| a == "--pin");
@@ -121,15 +136,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
+    let mut passwords: VecDeque<String> = password
+        .flatten()
+        .map(|list| list.split(',').map(str::to_owned).collect())
+        .unwrap_or_default();
+
     let mut session = AirPlaySession::default();
     if let ConnectOutcome::PairingRequired(challenge) = session.connect(&device).await? {
         let response = match challenge {
-            PairingChallenge::Credential => match password.clone().flatten() {
-                Some(pw) => PairingResponse::Password(pw),
-                None => PairingResponse::Password(read_line(
-                    "receiver asks for its password; type it:",
-                )?),
-            },
+            PairingChallenge::Credential { rejected } => {
+                PairingResponse::Password(next_password(&mut passwords, rejected)?)
+            }
             other => PairingResponse::Pin(read_line(&format!(
                 "receiver asks for {other:?}; type the PIN it shows:"
             ))?),
@@ -150,7 +167,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         ..Default::default()
     };
-    session.setup_stream(&config).await?;
+    // Like the manager: a password-protected receiver challenges `SETUP`;
+    // answer and retry on the same session.
+    let mut asked = 0;
+    loop {
+        match session.setup_stream(&config).await {
+            Ok(()) => break,
+            Err(FerricastError::CredentialRequired { rejected }) if asked < MAX_PASSWORDS => {
+                asked += 1;
+                let password = next_password(&mut passwords, rejected)?;
+                session
+                    .submit_pairing(PairingResponse::Password(password))
+                    .await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     let mut encoder = X264Encoder::default();
     encoder.configure(&EncoderConfig {

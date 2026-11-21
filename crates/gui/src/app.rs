@@ -216,9 +216,11 @@ impl AppState {
                 pairing::answer(respond, PairingResponse::Confirmed);
                 None
             }
-            PairingChallenge::Credential => Some(UiCommand::PairingPrompt {
+            PairingChallenge::Credential { rejected } => Some(UiCommand::PairingPrompt {
                 device_name: self.device_name(device_id),
-                secret: pairing::Secret::Password,
+                secret: pairing::Secret::Password {
+                    rejected: *rejected,
+                },
                 respond: respond.clone(),
             }),
         }
@@ -713,9 +715,13 @@ mod tests {
             })
         ));
         assert!(matches!(
-            s.pairing_prompt(id, &PairingChallenge::Credential, &respond),
+            s.pairing_prompt(
+                id,
+                &PairingChallenge::Credential { rejected: true },
+                &respond
+            ),
             Some(UiCommand::PairingPrompt {
-                secret: pairing::Secret::Password,
+                secret: pairing::Secret::Password { rejected: true },
                 ..
             })
         ));

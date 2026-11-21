@@ -35,7 +35,9 @@ pub enum Secret {
     /// A PIN of `digits` digits shown on the receiver.
     Pin { digits: u8 },
     /// The receiver's access password.
-    Password,
+    /// The receiver's access password; `rejected` when the previous
+    /// answer was refused.
+    Password { rejected: bool },
 }
 
 impl Secret {
@@ -43,7 +45,7 @@ impl Secret {
     fn accepts_partial(self, text: &str) -> bool {
         match self {
             Self::Pin { digits } => is_partial_pin(text, usize::from(digits)),
-            Self::Password => true,
+            Self::Password { .. } => true,
         }
     }
 
@@ -53,21 +55,26 @@ impl Secret {
             Self::Pin { digits } => {
                 text.len() == usize::from(digits) && is_partial_pin(text, usize::from(digits))
             }
-            Self::Password => !text.is_empty(),
+            Self::Password { .. } => !text.is_empty(),
         }
     }
 
     fn response(self, text: String) -> PairingResponse {
         match self {
             Self::Pin { .. } => PairingResponse::Pin(text),
-            Self::Password => PairingResponse::Password(text),
+            Self::Password { .. } => PairingResponse::Password(text),
         }
     }
 
     fn prompt(self, device_name: &str) -> String {
         match self {
             Self::Pin { digits } => format!("Enter the {digits}-digit PIN shown on {device_name}"),
-            Self::Password => format!("Enter the AirPlay password of {device_name}"),
+            Self::Password { rejected: false } => {
+                format!("Enter the AirPlay password of {device_name}")
+            }
+            Self::Password { rejected: true } => {
+                format!("Wrong password. Enter the AirPlay password of {device_name} again")
+            }
         }
     }
 }
@@ -150,7 +157,7 @@ impl App for PairingDialog {
         };
         let (placeholder, mode, width) = match secret {
             Secret::Pin { .. } => ("PIN", InputMode::Shown, 160.),
-            Secret::Password => ("Password", InputMode::new_password(), 240.),
+            Secret::Password { .. } => ("Password", InputMode::new_password(), 240.),
         };
 
         rect()
@@ -215,7 +222,7 @@ mod tests {
         assert!(pin.is_complete("1234"));
         assert!(matches!(pin.response("1234".into()), PairingResponse::Pin(p) if p == "1234"));
 
-        let password = Secret::Password;
+        let password = Secret::Password { rejected: false };
         assert!(password.accepts_partial("any text 12!"));
         assert!(!password.is_complete(""));
         assert!(password.is_complete("s"));
@@ -223,6 +230,12 @@ mod tests {
             password.response("secret".into()),
             PairingResponse::Password(p) if p == "secret"
         ));
+        assert!(!password.prompt("TV").contains("Wrong"));
+        assert!(
+            Secret::Password { rejected: true }
+                .prompt("TV")
+                .starts_with("Wrong password")
+        );
     }
 
     #[tokio::test]
