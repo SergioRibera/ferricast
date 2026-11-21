@@ -42,8 +42,8 @@ pub use discovery::{Discovery, MdnsDiscovery};
 pub use encoder::{AudioEncoder, AudioEncoderConfig, EncoderConfig, VideoEncoder};
 pub use error::{FerricastError, Result};
 pub use frame::{
-    AudioCodec, AudioFrame, BufferLease, CapturedFrame, DmaBufFd, DmaBufId, DmaBufImporter,
-    DmaBufPlane, EncodedFrame, GpuFrame, PixelFormat, RawFrame,
+    AacChannelConfig, AudioCodec, AudioFrame, BufferLease, CapturedFrame, DmaBufFd, DmaBufId,
+    DmaBufImporter, DmaBufPlane, EncodedFrame, GpuFrame, PixelFormat, RawFrame, SourceAudioFormat,
 };
 #[cfg(feature = "net")]
 pub use net::{
