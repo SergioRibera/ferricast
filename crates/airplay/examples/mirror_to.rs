@@ -2,13 +2,14 @@
 //! receiver by address.
 //!
 //! ```text
-//! cargo run -p ferricast-airplay --features fairplay --example mirror_to -- 192.168.1.20:7000 [seconds] [--pin] [--password[=<pw>[,<pw>...]]] [--no-audio]
+//! cargo run -p ferricast-airplay --features fairplay --example mirror_to -- 192.168.1.20:7000 [seconds] [--pin] [--password[=<pw>[,<pw>...]]] [--no-audio] [--ports=<first>-<last>]
 //! ```
 //!
 //! `--pin` treats the receiver as PIN-protected (UxPlay `-pin`); the PIN
 //! shown by the receiver is then read from stdin. `--password` marks it as
 //! password-protected (UxPlay `-pw`). Whenever the receiver asks for its
 //! password, the next `=<pw>[,<pw>...]` entry answers, then stdin.
+//! `--ports` binds the local UDP sockets (timing, audio) in that range.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::BufRead as _;
@@ -99,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let addr: SocketAddr = args
         .first()
-        .ok_or("usage: mirror_to <ip:port> [seconds] [--pin] [--password[=<pw>[,<pw>...]]] [--no-audio]")?
+        .ok_or("usage: mirror_to <ip:port> [seconds] [--pin] [--password[=<pw>[,<pw>...]]] [--no-audio] [--ports=<first>-<last>]")?
         .parse()?;
     let seconds: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
     let pin = args.iter().any(|a| a == "--pin");
@@ -108,6 +109,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find_map(|a| a.strip_prefix("--password"))
         .map(|rest| rest.strip_prefix('=').map(str::to_owned));
     let audio = !args.iter().any(|a| a == "--no-audio");
+    // `--ports=<first>-<last>`: bind the local UDP sockets in this range
+    // (one a host firewall lets the receiver reach).
+    let port_range = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--ports="))
+        .and_then(|r| r.split_once('-'))
+        .and_then(|(a, b)| Some((a.parse::<u16>().ok()?, b.parse::<u16>().ok()?)));
 
     let device = Device {
         id: uuid::Uuid::new_v4(),
@@ -164,6 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sample_rate: ELD_SAMPLE_RATE,
             ..Default::default()
         }),
+        port_range,
         ..Default::default()
     };
     // Like the manager: a password-protected receiver challenges `SETUP`;
