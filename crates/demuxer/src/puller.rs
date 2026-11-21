@@ -46,28 +46,45 @@ pub struct ProgressivePuller {
 impl MediaPuller for ProgressivePuller {
     async fn open(&mut self, spec: PullSpec) -> Result<MediaInfo> {
         self.close().await?;
-        let source = HttpSource::open(&spec.url, &spec.headers).await?;
-        let ranged = source.is_ranged();
-        let demuxer = tokio::task::spawn_blocking(move || Demuxer::from_reader(source))
-            .await
-            .map_err(|e| FerricastError::Pull(format!("demuxer task failed: {e}")))??;
-        let info = media_info(&demuxer);
-        tracing::info!(url = %spec.url, ranged, ?info, "progressive: opened");
-
         let (packet_tx, packet_rx) = mpsc::channel(PACKET_CHANNEL_DEPTH);
         let (cmd_tx, cmd_rx) = std_mpsc::channel();
+        let (info_tx, info_rx) = oneshot::channel();
+        // Opening reads the container header over the network; it runs
+        // on the worker thread too, so no async runtime is ever blocked.
         std::thread::Builder::new()
             .name("ferricast-progressive".into())
             .spawn(move || {
+                let opened = HttpSource::open(&spec.url, &spec.headers).and_then(|source| {
+                    let ranged = source.is_ranged();
+                    let demuxer = Demuxer::from_reader(source)?;
+                    tracing::info!(url = %spec.url, ranged, "progressive: opened");
+                    Ok(demuxer)
+                });
+                let demuxer = match opened {
+                    Ok(demuxer) => {
+                        if info_tx.send(Ok(media_info(&demuxer))).is_err() {
+                            return;
+                        }
+                        demuxer
+                    }
+                    Err(e) => {
+                        let _ = info_tx.send(Err(e));
+                        return;
+                    }
+                };
                 Worker {
                     demuxer,
                     packet_tx,
                     cmd_rx,
                     generation: 0,
                 }
-                .run()
+                .run();
             })
             .map_err(|e| FerricastError::Pull(format!("spawn demuxer thread: {e}")))?;
+        let info = info_rx
+            .await
+            .map_err(|_| FerricastError::Pull("demuxer thread ended".into()))??;
+        tracing::debug!(?info, "progressive: media info");
         self.rx = Some(packet_rx);
         self.cmd_tx = Some(cmd_tx);
         self.generation = 0;

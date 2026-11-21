@@ -8,22 +8,27 @@
 //! that ignore `Range` are downloaded front to back into an anonymous
 //! temporary file, and reads wait for the bytes they need.
 //!
-//! Reads block on the async HTTP client through a runtime [`Handle`], so
-//! the source must be used from a thread that is not running async code
-//! (a plain thread or `spawn_blocking`).
+//! Every request runs on a small runtime of its own, on a dedicated
+//! thread ([`HttpRuntime`]), so the source never borrows the caller's
+//! runtime: it behaves the same under a multi-thread runtime, a
+//! current-thread runtime or none at all. Opening and reading block the
+//! calling thread until the bytes arrive, so the source belongs on a
+//! thread that is not running async code.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
+use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::pin::Pin;
+use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc as std_mpsc};
 use std::time::Duration;
 
 use bytes::Bytes;
 use ferricast_core::{FerricastError, Result};
 use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderName, HeaderValue, RANGE};
 use reqwest::{Client, StatusCode};
-use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 
 /// Bytes fetched per range request.
 const BLOCK: u64 = 1 << 20;
@@ -41,6 +46,59 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// whole file lands on disk, so this bounds the temporary file.
 pub(super) const MAX_DOWNLOAD: u64 = 4 << 30;
 
+/// Work queued for the HTTP thread.
+type Job = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// A current-thread runtime on a dedicated thread that runs the HTTP
+/// requests of one source. The thread exits once every handle is gone.
+#[derive(Clone)]
+struct HttpRuntime {
+    jobs: mpsc::UnboundedSender<Job>,
+}
+
+impl HttpRuntime {
+    fn start() -> Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| FerricastError::Pull(format!("HTTP runtime: {e}")))?;
+        let (jobs, mut queue) = mpsc::unbounded_channel::<Job>();
+        std::thread::Builder::new()
+            .name("ferricast-http".into())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    while let Some(job) = queue.recv().await {
+                        tokio::spawn(job);
+                    }
+                });
+            })
+            .map_err(|e| FerricastError::Pull(format!("spawn HTTP thread: {e}")))?;
+        Ok(Self { jobs })
+    }
+
+    /// Runs `future` on the HTTP thread and blocks until it finishes.
+    fn block_on<T, F>(&self, future: F) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        let (done_tx, done_rx) = std_mpsc::sync_channel(1);
+        self.spawn(async move {
+            let _ = done_tx.send(future.await);
+        })?;
+        done_rx
+            .recv()
+            .map_err(|_| io::Error::other("the HTTP thread stopped"))
+    }
+
+    /// Starts `future` on the HTTP thread without waiting for it.
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) -> io::Result<()> {
+        self.jobs
+            .send(Box::pin(future))
+            .map_err(|_| io::Error::other("the HTTP thread stopped"))
+    }
+}
+
 /// A remote file, readable and seekable.
 pub(super) struct HttpSource {
     position: u64,
@@ -50,12 +108,16 @@ pub(super) struct HttpSource {
 
 enum Backend {
     Ranged(Ranged),
-    Download(Arc<Download>),
+    Download {
+        download: Arc<Download>,
+        /// Kept alive for the download task running on it.
+        _runtime: HttpRuntime,
+    },
 }
 
 /// Blocks of a file served with `Range` support.
 struct Ranged {
-    handle: Handle,
+    runtime: HttpRuntime,
     client: Client,
     url: String,
     len: u64,
@@ -64,18 +126,26 @@ struct Ranged {
     recency: VecDeque<u64>,
 }
 
-impl HttpSource {
-    /// Probes `url` with a request for its first block and picks ranged
-    /// reads or a full download depending on how the server answers.
-    pub(super) async fn open(url: &str, headers: &HashMap<String, String>) -> Result<Self> {
-        let client = client(headers)?;
+/// How the server answered the first request.
+enum Probe {
+    /// `206`, with the first block.
+    Ranged { len: u64, first: Bytes },
+    /// `200`: the whole file follows in `response`.
+    Whole {
+        len: Option<u64>,
+        response: Box<reqwest::Response>,
+    },
+}
+
+impl Probe {
+    async fn run(client: Client, url: String) -> Result<Self> {
         let response = client
-            .get(url)
+            .get(&url)
             .header(RANGE, range_header(0, BLOCK - 1))
             .timeout(BLOCK_TIMEOUT)
             .send()
             .await
-            .map_err(|e| pull_error(url, &e))?;
+            .map_err(|e| pull_error(&url, &e))?;
         match response.status() {
             StatusCode::PARTIAL_CONTENT => {
                 let (start, len) = content_range(response.headers()).ok_or_else(|| {
@@ -86,9 +156,40 @@ impl HttpSource {
                         "GET {url}: asked for byte 0, got a range starting at {start}"
                     )));
                 }
-                let first = response.bytes().await.map_err(|e| pull_error(url, &e))?;
+                let first = response.bytes().await.map_err(|e| pull_error(&url, &e))?;
+                Ok(Self::Ranged { len, first })
+            }
+            StatusCode::OK => {
+                let len = response.content_length();
+                if len.is_some_and(|len| len > MAX_DOWNLOAD) {
+                    return Err(FerricastError::Pull(format!(
+                        "GET {url}: the server does not support range requests and the file \
+                         is larger than {} MiB",
+                        MAX_DOWNLOAD >> 20
+                    )));
+                }
+                Ok(Self::Whole {
+                    len,
+                    response: Box::new(response),
+                })
+            }
+            status => Err(FerricastError::Pull(format!("GET {url}: HTTP {status}"))),
+        }
+    }
+}
+
+impl HttpSource {
+    /// Probes `url` with a request for its first block and picks ranged
+    /// reads or a full download depending on how the server answers.
+    /// Blocks the calling thread.
+    pub(super) fn open(url: &str, headers: &HashMap<String, String>) -> Result<Self> {
+        let client = client(headers)?;
+        let runtime = HttpRuntime::start()?;
+        let probe = runtime.block_on(Probe::run(client.clone(), url.to_string()))??;
+        match probe {
+            Probe::Ranged { len, first } => {
                 let mut ranged = Ranged {
-                    handle: Handle::current(),
+                    runtime,
                     client,
                     url: url.to_string(),
                     len,
@@ -102,28 +203,22 @@ impl HttpSource {
                     backend: Backend::Ranged(ranged),
                 })
             }
-            StatusCode::OK => {
-                let len = response.content_length();
-                if len.is_some_and(|len| len > MAX_DOWNLOAD) {
-                    return Err(FerricastError::Pull(format!(
-                        "GET {url}: the server does not support range requests and the file \
-                         is larger than {} MiB",
-                        MAX_DOWNLOAD >> 20
-                    )));
-                }
+            Probe::Whole { len, response } => {
                 tracing::info!(
                     %url,
                     ?len,
                     "progressive: server ignores Range; downloading the whole file"
                 );
-                let download = Download::start(url.to_string(), response)?;
+                let download = Download::start(&runtime, url.to_string(), *response)?;
                 Ok(Self {
                     position: 0,
                     len,
-                    backend: Backend::Download(download),
+                    backend: Backend::Download {
+                        download,
+                        _runtime: runtime,
+                    },
                 })
             }
-            status => Err(FerricastError::Pull(format!("GET {url}: HTTP {status}"))),
         }
     }
 
@@ -140,7 +235,7 @@ impl Read for HttpSource {
         }
         let n = match &mut self.backend {
             Backend::Ranged(ranged) => ranged.read_at(self.position, buf)?,
-            Backend::Download(download) => download.read_at(self.position, buf)?,
+            Backend::Download { download, .. } => download.read_at(self.position, buf)?,
         };
         self.position += n as u64;
         Ok(n)
@@ -156,7 +251,7 @@ impl Seek for HttpSource {
                 let len = match (&self.backend, self.len) {
                     (_, Some(len)) => len,
                     // Unknown length: only the finished download tells.
-                    (Backend::Download(download), None) => download.wait_done()?,
+                    (Backend::Download { download, .. }, None) => download.wait_done()?,
                     (Backend::Ranged(ranged), None) => ranged.len,
                 };
                 self.len = Some(len);
@@ -206,7 +301,13 @@ impl Ranged {
             if attempt > 0 {
                 std::thread::sleep(RETRY_BACKOFF * attempt);
             }
-            match self.handle.block_on(self.fetch(start, end)) {
+            let request = RangeRequest {
+                client: self.client.clone(),
+                url: self.url.clone(),
+                start,
+                end,
+            };
+            match self.runtime.block_on(request.fetch())? {
                 Ok(block) => {
                     self.insert(index, block.clone());
                     return Ok(block);
@@ -221,20 +322,44 @@ impl Ranged {
         Err(io::Error::other(last_error))
     }
 
-    async fn fetch(&self, start: u64, end: u64) -> std::result::Result<Bytes, FetchError> {
-        let response = self
-            .client
-            .get(&self.url)
+    fn insert(&mut self, index: u64, block: Bytes) {
+        if self.blocks.len() >= CACHED_BLOCKS
+            && let Some(evicted) = self.recency.pop_front()
+        {
+            self.blocks.remove(&evicted);
+        }
+        self.blocks.insert(index, block);
+        self.recency.push_back(index);
+    }
+}
+
+/// One range request, owned so it can run on the HTTP thread.
+struct RangeRequest {
+    client: Client,
+    url: String,
+    start: u64,
+    end: u64,
+}
+
+impl RangeRequest {
+    async fn fetch(self) -> std::result::Result<Bytes, FetchError> {
+        let Self {
+            client,
+            url,
+            start,
+            end,
+        } = self;
+        let response = client
+            .get(&url)
             .header(RANGE, range_header(start, end))
             .timeout(BLOCK_TIMEOUT)
             .send()
             .await
-            .map_err(|e| FetchError::Transient(format!("GET {}: {e}", self.url)))?;
+            .map_err(|e| FetchError::Transient(format!("GET {url}: {e}")))?;
         let status = response.status();
         if status != StatusCode::PARTIAL_CONTENT {
             let message = format!(
-                "GET {} bytes {start}-{end}: HTTP {status} instead of a partial response",
-                self.url
+                "GET {url} bytes {start}-{end}: HTTP {status} instead of a partial response"
             );
             return Err(if status.is_server_error() {
                 FetchError::Transient(message)
@@ -244,32 +369,20 @@ impl Ranged {
         }
         if content_range(response.headers()).map(|(s, _)| s) != Some(start) {
             return Err(FetchError::Fatal(format!(
-                "GET {} bytes {start}-{end}: the server answered a different range",
-                self.url
+                "GET {url} bytes {start}-{end}: the server answered a different range"
             )));
         }
         let body = response
             .bytes()
             .await
-            .map_err(|e| FetchError::Transient(format!("GET {}: {e}", self.url)))?;
+            .map_err(|e| FetchError::Transient(format!("GET {url}: {e}")))?;
         if (body.len() as u64) < end - start + 1 {
             return Err(FetchError::Transient(format!(
-                "GET {} bytes {start}-{end}: short body of {} bytes",
-                self.url,
+                "GET {url} bytes {start}-{end}: short body of {} bytes",
                 body.len()
             )));
         }
         Ok(body)
-    }
-
-    fn insert(&mut self, index: u64, block: Bytes) {
-        if self.blocks.len() >= CACHED_BLOCKS
-            && let Some(evicted) = self.recency.pop_front()
-        {
-            self.blocks.remove(&evicted);
-        }
-        self.blocks.insert(index, block);
-        self.recency.push_back(index);
     }
 }
 
@@ -294,7 +407,7 @@ struct DownloadState {
 }
 
 impl Download {
-    fn start(url: String, response: reqwest::Response) -> Result<Arc<Self>> {
+    fn start(runtime: &HttpRuntime, url: String, response: reqwest::Response) -> Result<Arc<Self>> {
         let file = tempfile::tempfile()?;
         let writer = file.try_clone()?;
         let download = Arc::new(Self {
@@ -303,7 +416,7 @@ impl Download {
             progress: Condvar::new(),
         });
         let task = download.clone();
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             let result = task.fill(writer, response).await;
             let mut state = task.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.done = true;
@@ -312,7 +425,7 @@ impl Download {
                 state.error = Some(message);
             }
             task.progress.notify_all();
-        });
+        })?;
         Ok(download)
     }
 
