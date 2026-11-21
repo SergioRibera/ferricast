@@ -780,8 +780,9 @@ fn parse_blocking_reload(
 
 /// Handle the LL-HLS blocking-reload part of a playlist request.
 /// `None` means "serve the playlist now"; `Some((code, reason))` is
-/// an error status to answer with instead: 400 for a malformed query
-/// or an `_HLS_msn` more than two past the last segment, 503 when the
+/// an error status to answer with instead: 400 for a malformed query,
+/// an `_HLS_msn` more than two past the last segment or an `_HLS_part`
+/// beyond the Advance Part Limit, 503 when the
 /// requested point is not reached within three target durations
 /// (rfc8216bis §6.2.5.2).
 async fn blocking_reload(
@@ -794,16 +795,17 @@ async fn blocking_reload(
         Ok(None) => return None,
         Err(BadReloadQuery) => return Some((400, "Bad Request")),
     };
-    let (last_msn, target_duration) = {
+    let (too_far, target_duration) = {
         let g = ring.read().await;
         // The segment under construction is `next_seq`; the last
         // complete one is the one before it.
-        (g.next_seq().checked_sub(1), g.target_duration())
-    };
-    let too_far = match last_msn {
-        Some(last) => msn > last.saturating_add(2),
-        // Nothing published yet: allow the first two segments.
-        None => msn > 1,
+        let msn_too_far = match g.next_seq().checked_sub(1) {
+            Some(last) => msn > last.saturating_add(2),
+            // Nothing published yet: allow the first two segments.
+            None => msn > 1,
+        };
+        let part_too_far = part.is_some_and(|p| g.exceeds_advance_part_limit(msn, p));
+        (msn_too_far || part_too_far, g.target_duration())
     };
     if too_far {
         return Some((400, "Bad Request"));
@@ -1211,6 +1213,30 @@ mod tests {
             Some((503, "Service Unavailable"))
         );
         // Target duration 1 s → gives up after 3 s.
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocking_reload_rejects_parts_beyond_the_advance_part_limit() {
+        // Last published part is (1, 1); PART-TARGET 0.5 s gives a
+        // limit of 6 parts and two parts per segment.
+        let ring = ring_with_parts();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            blocking_reload(&ring, "_HLS_msn=2&_HLS_part=6", "t").await,
+            Some((400, "Bad Request"))
+        );
+        assert_eq!(
+            blocking_reload(&ring, "_HLS_msn=3&_HLS_part=5", "t").await,
+            Some((400, "Bad Request"))
+        );
+        // Rejections are immediate, not after the blocking deadline.
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        // Exactly at the limit still blocks and then times out.
+        assert_eq!(
+            blocking_reload(&ring, "_HLS_msn=2&_HLS_part=5", "t").await,
+            Some((503, "Service Unavailable"))
+        );
         assert_eq!(started.elapsed(), Duration::from_secs(3));
     }
 

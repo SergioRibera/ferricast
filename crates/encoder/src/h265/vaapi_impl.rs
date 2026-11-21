@@ -38,8 +38,10 @@ use crate::config_ext::EncoderConfigExt;
 use crate::frame_view::FrameView;
 use crate::gop::GopState;
 use crate::h264::yuv::{
-    VPP_INPUT_STANDARD, VPP_OUTPUT_STANDARD, vpp_input_colour, vpp_output_colour,
+    VPP_BACKGROUND_BLACK, VPP_INPUT_STANDARD, VPP_OUTPUT_STANDARD, vpp_input_colour,
+    vpp_output_colour,
 };
+use crate::scale::{FrameScaler, FrameSize};
 
 const RENDER_NODES: &[&str] = &[
     "/dev/dri/renderD128",
@@ -98,6 +100,9 @@ pub struct VaapiH265Encoder {
 
     /// The configuration this session was opened for.
     requested: EncoderConfig,
+
+    /// Fits CPU frames whose size differs from the session into it.
+    scaler: FrameScaler,
 }
 
 #[derive(Clone, Copy)]
@@ -130,14 +135,19 @@ impl EncoderCfg {
         u32::from(self.height_ctus) * 32
     }
 
-    /// Top-left `width × height` rectangle: where VPP writes the picture
-    /// inside the padded surface.
-    fn visible_region(&self) -> VARectangle {
+    /// Aspect-preserving placement of a `src_width × src_height`
+    /// picture inside the top-left `width × height` (visible) part of
+    /// the padded surface: where VPP writes the picture.
+    fn letterbox_region(&self, src_width: u32, src_height: u32) -> VARectangle {
+        let p = FrameSize::new(src_width, src_height)
+            .letterbox_in(FrameSize::new(self.width, self.height));
+        let clamp = |v: u32| i16::try_from(v).unwrap_or(i16::MAX);
+        let clamp_u = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
         VARectangle {
-            x: 0,
-            y: 0,
-            width: u16::try_from(self.width).unwrap_or(u16::MAX),
-            height: u16::try_from(self.height).unwrap_or(u16::MAX),
+            x: clamp(p.x),
+            y: clamp(p.y),
+            width: clamp_u(p.size.width),
+            height: clamp_u(p.size.height),
         }
     }
 
@@ -314,6 +324,7 @@ impl VaapiH265Encoder {
             pps_nal,
             state: RefCell::new(FrameState::new(cfg.keyframe_interval)),
             requested,
+            scaler: FrameScaler::default(),
         })
     }
 }
@@ -513,7 +524,10 @@ impl VaapiH265Encoder {
                 self.upload_dmabuf_via_vpp(target_recon_idx, &g)?;
             }
             other => {
-                let raw = other.into_cpu()?;
+                let raw = self.scaler.fit(
+                    other.into_cpu()?,
+                    FrameSize::new(self.cfg.width, self.cfg.height),
+                )?;
                 let view = FrameView::new(&raw, self.cfg.width, self.cfg.height)?;
                 crate::h264::yuv::upload_to_surface(target_surface, self.cfg.coded_size(), &view)?;
             }
@@ -1067,10 +1081,11 @@ impl VaapiH265Encoder {
             imported.id(),
             None,
             VPP_INPUT_STANDARD,
-            // Visible area only; the default (whole surface) would
-            // stretch the frame into the CTU padding.
-            Some(self.cfg.visible_region()),
-            0,
+            // Inside the visible region (never the CTU padding), aspect
+            // kept: a source whose size changed mid-stream is
+            // letterboxed and the driver fills the rest black.
+            Some(self.cfg.letterbox_region(g.width, g.height)),
+            VPP_BACKGROUND_BLACK,
             VPP_OUTPUT_STANDARD,
             0,
             0,
@@ -1148,6 +1163,30 @@ mod tests {
         assert_eq!(geometry(1920, 1080), ((1920, 1088), Some((0, 4))));
         // 1366 → 1376: 10 luma columns = 5 chroma columns.
         assert_eq!(geometry(1366, 768), ((1376, 768), Some((5, 0))));
+    }
+
+    fn region(width: u32, height: u32, src: (u32, u32)) -> (i16, i16, u16, u16) {
+        let cfg = EncoderConfig {
+            width,
+            height,
+            codec: Codec::H265,
+            ..EncoderConfig::default()
+        };
+        let r = build_encoder_cfg(HEVC_PROFILE_MAIN_IDC, 0, &cfg)
+            .unwrap()
+            .letterbox_region(src.0, src.1);
+        (r.x, r.y, r.width, r.height)
+    }
+
+    #[test]
+    fn vpp_region_letterboxes_inside_the_visible_area() {
+        // Same aspect: fills the visible area, never the CTU padding.
+        assert_eq!(region(1920, 1080, (1920, 1080)), (0, 0, 1920, 1080));
+        assert_eq!(region(1920, 1080, (3840, 2160)), (0, 0, 1920, 1080));
+        // 4:3 source in 16:9: pillarboxed and centred.
+        assert_eq!(region(1920, 1080, (1440, 1080)), (240, 0, 1440, 1080));
+        // Ultra-wide source: letterboxed top and bottom.
+        assert_eq!(region(1920, 1080, (3840, 1080)), (0, 270, 1920, 540));
     }
 
     #[test]

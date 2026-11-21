@@ -1994,6 +1994,7 @@ dependencies = [
  "bitflags 2.13.1",
  "bytes",
  "libc",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

@@ -365,7 +365,7 @@ impl AirPlaySession {
             None => fp.aes_key,
         };
 
-        let timing = TimingServer::start(bind_udp(config).await?)?;
+        let timing = TimingServer::start(bind_udp(config, guard.peer_addr().ip()).await?)?;
 
         let mut setup = Dictionary::new();
         setup.insert("deviceID".into(), Value::String(identity.device_id.clone()));
@@ -525,12 +525,10 @@ async fn probe_access(rtsp: &mut RtspClient) -> Option<Access> {
     access
 }
 
-/// UDP socket in `config.port_range`, or on an ephemeral port.
-async fn bind_udp(config: &StreamConfig) -> Result<UdpSocket> {
-    match config.port_range {
-        Some((start, end)) => ferricast_core::bind_udp_in_range(start, end).await,
-        None => Ok(UdpSocket::bind(("0.0.0.0", 0)).await?),
-    }
+/// UDP socket of `peer`'s address family in `config.port_range`, or on
+/// an ephemeral port.
+async fn bind_udp(config: &StreamConfig, peer: IpAddr) -> Result<UdpSocket> {
+    ferricast_core::bind_udp(peer, config.port_range).await
 }
 
 /// Port `key` of the reply's stream entry of type `stream_type`.
@@ -559,8 +557,9 @@ async fn setup_audio(
     base_key: &[u8; 16],
     eiv: [u8; 16],
 ) -> Result<AudioStream> {
-    let data = bind_udp(config).await?;
-    let control = bind_udp(config).await?;
+    let peer = rtsp.peer_addr().ip();
+    let data = bind_udp(config, peer).await?;
+    let control = bind_udp(config, peer).await?;
     let control_port = control
         .local_addr()
         .map_err(|e| FerricastError::Connection(format!("audio control socket: {e}")))?
