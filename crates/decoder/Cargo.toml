@@ -22,6 +22,8 @@ aac = ["dep:symphonia"]
 # channel count. Preferred over symphonia when on; symphonia stays the
 # fallback (`FERRICAST_AAC_DECODER=symphonia`).
 fdk-aac-decode = ["aac", "dep:fdk-aac-sys"]
+# Apple Lossless decode for AirPlay audio streams (`ct = 2`).
+alac-decode = ["aac", "symphonia/alac"]
 vp8-decode = ["dep:vp8-decoder"]
 vp9-decode = ["dep:rusty_vp9"]
 hevc-decode = ["dep:rust_h265", "dep:h264-reader"]

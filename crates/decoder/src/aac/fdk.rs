@@ -37,7 +37,7 @@ const RATES: [u32; 13] = [
 ];
 
 /// A libfdk-aac decoder instance reading raw access units.
-struct RawDecoder {
+pub(super) struct RawDecoder {
     handle: NonNull<sys::AAC_DECODER_INSTANCE>,
 }
 
@@ -50,7 +50,7 @@ unsafe impl Send for RawDecoder {}
 impl RawDecoder {
     /// Opens a decoder configured with the `AudioSpecificConfig` `asc`,
     /// limiter off and every coded channel output.
-    fn open(asc: &[u8]) -> Result<Self> {
+    pub(super) fn open(asc: &[u8]) -> Result<Self> {
         // SAFETY: `aacDecoder_Open` has no preconditions; it returns null
         // on allocation failure, checked below.
         let raw = unsafe { sys::aacDecoder_Open(sys::TRANSPORT_TYPE_TT_MP4_RAW, 1) };
@@ -87,7 +87,7 @@ impl RawDecoder {
     }
 
     /// Hands `data` to the decoder; returns how many bytes it took.
-    fn fill(&mut self, data: &[u8]) -> Result<usize> {
+    pub(super) fn fill(&mut self, data: &[u8]) -> Result<usize> {
         let mut buffer = data.as_ptr().cast_mut();
         let size = u32::try_from(data.len())
             .map_err(|_| FerricastError::Decode("AAC access unit too long".into()))?;
@@ -108,7 +108,10 @@ impl RawDecoder {
     }
 
     /// Decodes one frame into `pcm` (interleaved).
-    fn decode_frame(&mut self, pcm: &mut [i16]) -> std::result::Result<(), sys::AAC_DECODER_ERROR> {
+    pub(super) fn decode_frame(
+        &mut self,
+        pcm: &mut [i16],
+    ) -> std::result::Result<(), sys::AAC_DECODER_ERROR> {
         let len = i32::try_from(pcm.len()).unwrap_or(i32::MAX);
         // SAFETY: the handle is live and `pcm` is writable for `len`
         // samples, the bound libfdk-aac is given (`INT_PCM` is `i16`).
@@ -122,7 +125,7 @@ impl RawDecoder {
 
     /// Shape of the last decoded frame: `(sample_rate, channels,
     /// samples per channel, output delay in samples)`.
-    fn stream_info(&self) -> Option<(i32, i32, i32, u32)> {
+    pub(super) fn stream_info(&self) -> Option<(i32, i32, i32, u32)> {
         // SAFETY: the handle is live; the returned pointer, when not
         // null, points at the instance's own `CStreamInfo`, which stays
         // valid while `&self` borrows the decoder and is only read here.
@@ -151,7 +154,7 @@ fn check(err: sys::AAC_DECODER_ERROR) -> Result<()> {
     }
 }
 
-fn fdk_error(err: sys::AAC_DECODER_ERROR) -> FerricastError {
+pub(super) fn fdk_error(err: sys::AAC_DECODER_ERROR) -> FerricastError {
     FerricastError::Decode(format!("libfdk-aac error {err:#06x}"))
 }
 
