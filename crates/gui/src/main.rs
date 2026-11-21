@@ -72,6 +72,19 @@ async fn main() -> anyhow::Result<()> {
     let manager_builder = manager_builder.with_airplay();
     #[cfg(feature = "chromecast")]
     let manager_builder = manager_builder.with_chromecast_receiver();
+    #[cfg(feature = "airplay")]
+    let manager_builder = if args.no_airplay_receiver {
+        manager_builder
+    } else {
+        let receiver =
+            ferricast::airplay::AirPlayReceiver::new(ferricast::airplay::AirPlayReceiverConfig {
+                name: args.receiver_name.clone(),
+                require_pin: args.airplay_pin,
+                ..Default::default()
+            })
+            .await;
+        manager_builder.with_airplay_receiver(receiver)
+    };
     let manager_builder = manager_builder.with_h264_decoder();
     #[cfg(feature = "aac")]
     let manager_builder = manager_builder.with_aac_decoder();
@@ -348,6 +361,12 @@ fn run_window(
                                 Some(UiCommand::ReceiverSession {
                                     receiver_id: *receiver_id,
                                     remote_id: remote.id,
+                                })
+                            }
+                            ManagerEvent::ReceiverPin { receiver_id, pin } => {
+                                Some(UiCommand::ReceiverPin {
+                                    receiver_id: *receiver_id,
+                                    pin: pin.clone(),
                                 })
                             }
                             ManagerEvent::ReceiverStarted { remote, info, .. } => {

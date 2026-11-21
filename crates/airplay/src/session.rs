@@ -130,6 +130,17 @@ impl Default for AirPlaySession {
     }
 }
 
+impl AirPlaySession {
+    /// A session that keeps no credentials: it pairs with a fresh identity
+    /// and remembers no receiver, so every connection starts from scratch.
+    #[must_use]
+    pub fn ephemeral() -> Self {
+        let mut session = Self::default();
+        session.store = CredentialStore::ephemeral();
+        session
+    }
+}
+
 fn bplist(dict: Dictionary) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     plist::to_writer_binary(&mut out, &Value::Dictionary(dict))

@@ -90,6 +90,10 @@ pub(super) enum Timeline {
     /// Timestamps have an arbitrary origin (MPEG-TS), so the position is
     /// counted from the start or seek target.
     Offset,
+    /// A live stream the sender pushes (screen mirroring): timestamps
+    /// have an arbitrary origin and the timeline starts as soon as any
+    /// stream has something to present.
+    Live,
 }
 
 pub(super) async fn run(parts: PumpParts, cmd_rx: mpsc::Receiver<PumpCmd>) -> PumpEnd {
@@ -360,8 +364,12 @@ impl Pump {
                     .is_some_and(|s| s.packets.len() >= MAX_QUEUED_PACKETS);
             let read = self.playing && self.input == Input::Open && starved && !queues_full;
             // Anchor only once every stream has something ready, so
-            // the earliest PTS of either stream starts the timeline.
-            let can_present = self.playing && !nothing_ready && (self.clock.is_anchored() || !read);
+            // the earliest PTS of either stream starts the timeline. A
+            // live stream starts with whatever arrives first: its other
+            // stream may stay silent for as long as the sender likes.
+            let live = self.position.timeline == Timeline::Live;
+            let can_present =
+                self.playing && !nothing_ready && (self.clock.is_anchored() || !read || live);
             let next = if can_present { self.next_due() } else { None };
 
             tokio::select! {

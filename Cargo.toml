@@ -78,7 +78,11 @@ chromecast = ["dep:ferricast-chromecast"]
 # AirPlay sender. Also enables FairPlay `fp-setup` support, which links the
 # GPL-3.0-or-later `ferricast-fairplay` crate; drop `ferricast-airplay/fairplay`
 # here to build without it.
-airplay = ["dep:ferricast-airplay", "ferricast-airplay/fairplay"]
+airplay = [
+    "dep:ferricast-airplay",
+    "ferricast-airplay/fairplay",
+    "ferricast-decoder/alac-decode",
+]
 
 
 # Capture backends — re-exported from `ferricast-capture`. At least
@@ -160,6 +164,9 @@ uuid.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
+# The FairPlay vector the loop test checks the receiver against.
+ferricast-fairplay.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # HE-AAC test streams: libfdk-aac is the only HE-AAC encoder at hand.
 fdk-aac = "0.8"
 async-trait.workspace = true

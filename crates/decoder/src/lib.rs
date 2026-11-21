@@ -39,6 +39,9 @@ pub mod nvdec;
 #[cfg(feature = "aac")]
 pub mod aac;
 
+#[cfg(feature = "alac-decode")]
+mod alac;
+
 #[cfg(feature = "av1-decode")]
 mod av1;
 
@@ -53,6 +56,10 @@ mod vp9;
 
 #[cfg(feature = "aac")]
 pub use aac::AacDecoder;
+#[cfg(feature = "fdk-aac-decode")]
+pub use aac::AacEldDecoder;
+#[cfg(feature = "alac-decode")]
+pub use alac::AlacDecoder;
 #[cfg(feature = "av1-decode")]
 pub use av1::Av1Decoder;
 pub use h264::H264Decoder;

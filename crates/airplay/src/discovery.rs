@@ -76,6 +76,10 @@ fn device_from_service(
         flags |= Flags::PASSWORD_REQUIRED;
     }
     let device_id = txt.get("deviceid").cloned();
+    if device_id.as_deref().is_some_and(crate::self_filter::is_own) {
+        debug!(name = fullname, "skipping our own AirPlay receiver");
+        return None;
+    }
     let id = stable_id(device_id.as_deref().unwrap_or(fullname));
     Some(Device {
         id,

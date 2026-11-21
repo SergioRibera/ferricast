@@ -186,9 +186,130 @@ impl<D: Digest> SrpClient<D> {
     }
 }
 
+/// Server side of one SRP-6a exchange: the verifier for a user / password
+/// and the server's ephemeral key pair.
+pub(crate) struct SrpServer<D> {
+    client: SrpClient<D>,
+    username: String,
+    salt: [u8; 16],
+    verifier: BigUint,
+    private_b: BigUint,
+    public_b: BigUint,
+}
+
+/// What the server learns from a valid client proof.
+pub(crate) struct SrpSession {
+    /// Server proof `M2`, to send back.
+    pub m2: Vec<u8>,
+    /// Session key `K`.
+    pub session_key: Vec<u8>,
+}
+
+impl<D: Digest> SrpServer<D> {
+    /// Start an exchange for `username` / `password` with a random salt
+    /// and private key.
+    pub fn new(group: SrpGroup, username: &str, password: &str) -> Self {
+        let mut salt = [0_u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        let mut b = [0_u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        Self::with_secrets(group, username, password, salt, &b)
+    }
+
+    fn with_secrets(
+        group: SrpGroup,
+        username: &str,
+        password: &str,
+        salt: [u8; 16],
+        b: &[u8],
+    ) -> Self {
+        let client = SrpClient::<D>::new(group);
+        let inner = SrpClient::<D>::hash(&[username.as_bytes(), b":", password.as_bytes()]);
+        let x = BigUint::from_bytes_be(&SrpClient::<D>::hash(&[&salt, &inner]));
+        let verifier = client.g.modpow(&x, &client.n);
+        let private_b = BigUint::from_bytes_be(b);
+        let k = BigUint::from_bytes_be(&SrpClient::<D>::hash(&[
+            &client.n.to_bytes_be(),
+            &client.pad(&client.g),
+        ]));
+        let public_b = (&k * &verifier + client.g.modpow(&private_b, &client.n)) % &client.n;
+        Self {
+            client,
+            username: username.to_owned(),
+            salt,
+            verifier,
+            private_b,
+            public_b,
+        }
+    }
+
+    pub fn salt(&self) -> &[u8; 16] {
+        &self.salt
+    }
+
+    /// Server public key `B`, padded to the group size.
+    pub fn public_b(&self) -> Vec<u8> {
+        self.client.pad(&self.public_b)
+    }
+
+    /// Check the client's `A` and proof `M1`; on success return `M2` and
+    /// the session key.
+    pub fn verify_client(&self, public_a: &[u8], m1: &[u8]) -> Result<SrpSession> {
+        let c = &self.client;
+        let n = &c.n;
+        let a = BigUint::from_bytes_be(public_a);
+        if (&a % n) == BigUint::default() {
+            return Err(FerricastError::Protocol(
+                "invalid SRP client public key".into(),
+            ));
+        }
+        let u =
+            BigUint::from_bytes_be(&SrpClient::<D>::hash(&[&c.pad(&a), &c.pad(&self.public_b)]));
+        let shared = (&a * self.verifier.modpow(&u, n)).modpow(&self.private_b, n);
+        let session_key = c.session_key(&shared);
+        let h_n = SrpClient::<D>::hash(&[&n.to_bytes_be()]);
+        let h_g = SrpClient::<D>::hash(&[&c.g.to_bytes_be()]);
+        let h_xor: Vec<u8> = h_n.iter().zip(&h_g).map(|(x, y)| x ^ y).collect();
+        let h_i = SrpClient::<D>::hash(&[self.username.as_bytes()]);
+        let a_bytes = a.to_bytes_be();
+        let expected = SrpClient::<D>::hash(&[
+            &h_xor,
+            &h_i,
+            &self.salt,
+            &a_bytes,
+            &self.public_b.to_bytes_be(),
+            &session_key,
+        ]);
+        if expected != m1 {
+            return Err(FerricastError::Protocol(
+                "SRP client proof mismatch: wrong PIN".into(),
+            ));
+        }
+        let m2 = SrpClient::<D>::hash(&[&a_bytes, m1, &session_key]);
+        Ok(SrpSession { m2, session_key })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_and_client_agree_on_the_pin() {
+        let user = "AA:BB:CC:DD:EE:FF";
+        let server = SrpServer::<sha1::Sha1>::new(SrpGroup::Apple2048, user, "4321");
+        let client = SrpClient::<sha1::Sha1>::new(SrpGroup::Apple2048);
+        let proof = client
+            .process(user, "4321", server.salt(), &server.public_b())
+            .unwrap();
+        let session = server.verify_client(&proof.public_a, &proof.m1).unwrap();
+        assert_eq!(session.session_key, proof.session_key);
+        proof.verify_server(&session.m2).unwrap();
+        let wrong = client
+            .process(user, "1111", server.salt(), &server.public_b())
+            .unwrap();
+        assert!(server.verify_client(&wrong.public_a, &wrong.m1).is_err());
+    }
 
     /// Server side of SRP-6a, used only to check the client end to end.
     fn server<D: Digest>(

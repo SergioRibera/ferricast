@@ -171,6 +171,25 @@ impl SecretBackend for SystemKeyring {
     }
 }
 
+/// No keyring at all: every request fails as unavailable, so nothing is
+/// kept. Backs stores that must not outlive the session.
+#[derive(Debug, Default)]
+pub(crate) struct NoKeyring;
+
+impl SecretBackend for NoKeyring {
+    fn load<'a>(&'a self, _entry: SecretEntry<'a>) -> SecretFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async { Err(SecretError::Unavailable("no keyring in use".into())) })
+    }
+
+    fn store<'a>(&'a self, _entry: SecretEntry<'a>, _secret: &'a [u8]) -> SecretFuture<'a, ()> {
+        Box::pin(async { Err(SecretError::Unavailable("no keyring in use".into())) })
+    }
+
+    fn delete<'a>(&'a self, _entry: SecretEntry<'a>) -> SecretFuture<'a, ()> {
+        Box::pin(async { Err(SecretError::Unavailable("no keyring in use".into())) })
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     //! In-memory backends for tests.
@@ -178,7 +197,7 @@ pub(crate) mod testing {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use super::{Attributes, SecretBackend, SecretEntry, SecretError, SecretFuture};
+    use super::{Attributes, SecretBackend, SecretEntry, SecretFuture};
 
     /// A keyring kept in memory.
     #[derive(Debug, Default)]
@@ -216,24 +235,6 @@ pub(crate) mod testing {
                 .expect("invariant: no test panics while holding the lock")
                 .remove(&entry.attributes());
             Box::pin(async { Ok(()) })
-        }
-    }
-
-    /// No keyring at all, as in a headless session.
-    #[derive(Debug, Default)]
-    pub(crate) struct NoKeyring;
-
-    impl SecretBackend for NoKeyring {
-        fn load<'a>(&'a self, _entry: SecretEntry<'a>) -> SecretFuture<'a, Option<Vec<u8>>> {
-            Box::pin(async { Err(SecretError::Unavailable("test".into())) })
-        }
-
-        fn store<'a>(&'a self, _entry: SecretEntry<'a>, _secret: &'a [u8]) -> SecretFuture<'a, ()> {
-            Box::pin(async { Err(SecretError::Unavailable("test".into())) })
-        }
-
-        fn delete<'a>(&'a self, _entry: SecretEntry<'a>) -> SecretFuture<'a, ()> {
-            Box::pin(async { Err(SecretError::Unavailable("test".into())) })
         }
     }
 }

@@ -19,7 +19,12 @@
 
 mod adts;
 #[cfg(feature = "fdk-aac-decode")]
+mod eld;
+#[cfg(feature = "fdk-aac-decode")]
 mod fdk;
+
+#[cfg(feature = "fdk-aac-decode")]
+pub use eld::AacEldDecoder;
 
 use std::collections::VecDeque;
 
@@ -239,7 +244,7 @@ fn use_fdk() -> bool {
 /// decoder picked internally) into interleaved i16 samples. AAC's
 /// natural output is f32; the conversion clips at ±1.0 and rounds
 /// to the nearest integer.
-fn interleave_s16(buf: AudioBufferRef<'_>) -> Vec<i16> {
+pub(crate) fn interleave_s16(buf: AudioBufferRef<'_>) -> Vec<i16> {
     let frames = buf.frames();
     let channels = buf.spec().channels.count();
     let mut out = Vec::with_capacity(frames * channels);

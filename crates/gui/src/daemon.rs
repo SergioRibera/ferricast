@@ -780,6 +780,7 @@ async fn signal_loop(
             // for these will be added when external clients need
             // them; for now the daemon just logs.
             ManagerEvent::ReceiverIncoming { .. }
+            | ManagerEvent::ReceiverPin { .. }
             | ManagerEvent::ReceiverStarted { .. }
             | ManagerEvent::ReceiverStateChanged { .. }
             | ManagerEvent::ReceiverStopped { .. }

@@ -40,6 +40,12 @@ pub enum UiCommand {
     ReceiverSession { receiver_id: Uuid, remote_id: Uuid },
     /// That receiver's session ended: close its window.
     ReceiverEnded { receiver_id: Uuid },
+    /// Show (`Some`) or withdraw (`None`) the pairing PIN a sender asked
+    /// for on that receiver session.
+    ReceiverPin {
+        receiver_id: Uuid,
+        pin: Option<String>,
+    },
 }
 
 /// Where a device's stream is. Devices without an entry are idle.
@@ -192,6 +198,7 @@ impl AppState {
             }
             ManagerEvent::PairingRequired { .. }
             | ManagerEvent::ReceiverIncoming { .. }
+            | ManagerEvent::ReceiverPin { .. }
             | ManagerEvent::ReceiverStarted { .. }
             | ManagerEvent::ReceiverStateChanged { .. }
             | ManagerEvent::ReceiverStopped { .. } => {}
@@ -411,6 +418,7 @@ async fn run_window_listener(
 ) {
     let mut windows: HashMap<Uuid, freya::winit::window::WindowId> = HashMap::new();
     let mut sessions: HashMap<Uuid, Uuid> = HashMap::new();
+    let mut pins: HashMap<Uuid, freya::winit::window::WindowId> = HashMap::new();
     loop {
         tokio::select! {
             // Window requests first: a session's end must not be
@@ -446,7 +454,19 @@ async fn run_window_listener(
                 Some(UiCommand::ReceiverSession { receiver_id, remote_id }) => {
                     sessions.insert(receiver_id, remote_id);
                 }
+                Some(UiCommand::ReceiverPin { receiver_id, pin }) => {
+                    if let Some(old) = pins.remove(&receiver_id) {
+                        platform.close_window(old);
+                    }
+                    if let Some(pin) = pin {
+                        let wid = pairing::open_pin_window(&platform, pin).await;
+                        pins.insert(receiver_id, wid);
+                    }
+                }
                 Some(UiCommand::ReceiverEnded { receiver_id }) => {
+                    if let Some(wid) = pins.remove(&receiver_id) {
+                        platform.close_window(wid);
+                    }
                     if let Some(remote_id) = sessions.remove(&receiver_id)
                         && let Some(wid) = windows.remove(&remote_id)
                     {

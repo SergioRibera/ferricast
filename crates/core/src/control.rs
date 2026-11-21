@@ -125,7 +125,10 @@ pub struct TrackSelection {
 /// (`urn:x-cast:com.google.cast.media`) + receiver namespace
 /// (`urn:x-cast:com.google.cast.receiver`) volume/launch. AirPlay
 /// and DIAL commands map onto the same set.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: [`MediaCommand::Push`] hands over the one consumer of a
+/// live stream.
+#[derive(Debug)]
 pub enum MediaCommand {
     /// Load a media URL and (optionally) start playing it.
     /// Chromecast `LOAD`; AirPlay `play` HTTP request.
@@ -206,6 +209,15 @@ pub enum MediaCommand {
     /// Stop the currently running receiver application.
     /// Chromecast receiver namespace `STOP`.
     StopApp,
+    /// The sender started pushing media over connections it opened
+    /// itself (AirPlay screen mirroring); play it as it arrives. Like
+    /// [`MediaCommand::Load`] it replaces whatever was playing.
+    #[cfg(feature = "net")]
+    Push(crate::push::PushedStream),
+    /// The sender asked to pair with a PIN: `Some(pin)` is the code to
+    /// show the user, who types it on the sender; `None` once the PIN is
+    /// no longer needed (pairing done or abandoned).
+    PairingPin(Option<String>),
 }
 
 /// Bidirectional control channel with one remote sender. Lifetime:

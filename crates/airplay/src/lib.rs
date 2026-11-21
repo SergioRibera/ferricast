@@ -12,13 +12,16 @@ mod fairplay;
 mod mirror;
 mod ntp;
 mod pair;
+pub mod receiver;
 mod rtsp;
+mod self_filter;
 pub mod session;
 mod srp;
 mod store;
 mod tlv;
 
 pub use discovery::AirPlayDiscovery;
+pub use receiver::{AirPlayReceiver, AirPlayReceiverConfig, CredentialStorage};
 pub use session::AirPlaySession;
 
 use ferricast_core::{Codec, ProtocolHandler, Result};

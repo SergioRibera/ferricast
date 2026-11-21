@@ -16,6 +16,8 @@ pub mod pairing;
 #[cfg(feature = "net")]
 pub mod protocol;
 pub mod puller;
+#[cfg(feature = "net")]
+pub mod push;
 pub mod session;
 pub mod sink;
 #[cfg(feature = "net")]
@@ -54,6 +56,8 @@ pub use pairing::{PairingChallenge, PairingResponse};
 #[cfg(feature = "net")]
 pub use protocol::{ProtocolHandler, ReceiverProtocol};
 pub use puller::{AudioStreamInfo, MediaInfo, MediaPacket, MediaPuller, PullSpec, VideoStreamInfo};
+#[cfg(feature = "net")]
+pub use push::{PushError, PushSender, PushedStream};
 pub use session::{AudioStreamConfig, CastSession, ConnectOutcome, StreamConfig};
 pub use sink::FrameSink;
 #[cfg(feature = "net")]

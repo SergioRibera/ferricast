@@ -41,6 +41,21 @@ pub struct Cli {
     #[arg(long, requires = "port_min")]
     pub port_max: Option<u16>,
 
+    /// Name this machine shows in AirPlay menus.
+    #[arg(long, default_value = "Ferricast")]
+    pub receiver_name: String,
+
+    /// AirPlay senders must type a 4-digit PIN shown on this machine the
+    /// first time they connect.
+    #[arg(long)]
+    pub airplay_pin: bool,
+
+    /// Do not act as an AirPlay receiver. Otherwise it listens on TCP 7000
+    /// (control) and 7100 (mirroring), UDP 6000-6001 (audio) and 7011
+    /// (timing), which the firewall must let in from the LAN.
+    #[arg(long)]
+    pub no_airplay_receiver: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

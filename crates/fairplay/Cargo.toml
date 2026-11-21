@@ -2,10 +2,11 @@
 name = "ferricast-fairplay"
 version = "0.1.0"
 edition = "2024"
-description = "FairPlay fp-setup key material for ferricast's AirPlay sender"
-# The AES key of the vector was derived with the GPL-3.0 `playfair` code, so this
-# crate is kept separate and opt-in (the `fairplay` feature of
-# ferricast-airplay) and licensed accordingly.
+description = "FairPlay fp-setup for ferricast's AirPlay sender and receiver"
+# Ports the GPL-3.0 `playfair` code from UxPlay, so this crate is kept
+# separate and opt-in (the `fairplay` feature of ferricast-airplay) and
+# licensed accordingly.
 license = "GPL-3.0-or-later"
 
 [dependencies]
+thiserror.workspace = true
