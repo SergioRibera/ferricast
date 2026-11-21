@@ -25,7 +25,7 @@ pub(crate) async fn setup(rtsp: &mut RtspClient) -> Result<FairPlayKey> {
             "POST",
             "/fp-setup",
             Some(CONTENT_OCTET),
-            &fp::setup_message1(0),
+            &fp::setup_message1(fp::MODE),
             &headers,
         )
         .await?
@@ -48,10 +48,12 @@ pub(crate) async fn setup(rtsp: &mut RtspClient) -> Result<FairPlayKey> {
         .await?
         .ensure_success("fp-setup (2)")?;
     if reply.body != fp::expected_reply2() {
-        // Only shairplay-derived receivers accept this key message; others
-        // will not decrypt the stream.
+        // Receivers that verify the key message answer a rejected one with
+        // something else, then cannot unwrap the `ekey` and drop the
+        // session on the mirroring `SETUP`.
         warn!(
-            "fp-setup (2) reply differs from the expected echo; receiver may not decrypt the stream"
+            reply = %hex::encode(&reply.body),
+            "fp-setup (2) reply differs from the expected echo; receiver rejected the key message"
         );
     }
     Ok(FairPlayKey {
