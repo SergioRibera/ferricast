@@ -21,7 +21,8 @@ use ferricast_core::{
     AdaptiveBitrateState, AudioCapture, AudioCaptureConfig, AudioCodec, AudioEncoder,
     AudioEncoderConfig, AudioFrame, AudioSource, AudioStreamConfig, CaptureConfig, CaptureSource,
     CapturedFrame, CastSession, ConnectOutcome, Device, EncodedFrame, EncoderConfig,
-    FerricastError, PairingResponse, Result, ScreenCapture, StreamConfig, VideoEncoder,
+    FerricastError, PairingChallenge, PairingResponse, Result, ScreenCapture, StreamConfig,
+    VideoEncoder,
 };
 use ferricast_encoder::aac::AacEncoder;
 #[cfg(feature = "fdk-aac")]
@@ -39,6 +40,9 @@ type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the user has to answer a pairing prompt.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
+/// Password prompts per connection before a receiver that keeps
+/// rejecting the answer is given up on.
+const MAX_PASSWORD_PROMPTS: u32 = 3;
 /// Reconnect attempts in a row before the stream is given up.
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 /// A session that stayed up this long resets the failure counter: one
@@ -371,7 +375,7 @@ async fn open_session(
     if let Some(audio) = config.audio.as_mut() {
         audio.codec = session.preferred_audio_codec();
     }
-    if let Err(e) = session.setup_stream(config).await {
+    if let Err(e) = setup_stream(session.as_mut(), device, config, event_tx).await {
         // Connected but not streaming: release the receiver so it
         // doesn't sit on the launched app's splash screen.
         let _ = session.stop().await;
@@ -380,10 +384,39 @@ async fn open_session(
     Ok(session)
 }
 
+/// Set up the stream, asking the user for the receiver's password and
+/// retrying on the same session when the receiver wants one, so the first
+/// connection to a password-protected receiver needs no second attempt.
+async fn setup_stream(
+    session: &mut dyn ErasedSession,
+    device: &Device,
+    config: &StreamConfig,
+    event_tx: &mpsc::Sender<ManagerEvent>,
+) -> Result<()> {
+    let mut asked = 0;
+    loop {
+        match session.setup_stream(config).await {
+            Err(FerricastError::CredentialRequired { rejected }) => {
+                if asked == MAX_PASSWORD_PROMPTS {
+                    return Err(FerricastError::Connection(format!(
+                        "{} rejected the password {MAX_PASSWORD_PROMPTS} times",
+                        device.name
+                    )));
+                }
+                asked += 1;
+                let challenge = PairingChallenge::Credential { rejected };
+                let response = ask_pairing(event_tx, device.id, challenge).await?;
+                session.submit_pairing(response).await?;
+            }
+            result => return result,
+        }
+    }
+}
+
 async fn ask_pairing(
     event_tx: &mpsc::Sender<ManagerEvent>,
     device_id: Uuid,
-    challenge: ferricast_core::PairingChallenge,
+    challenge: PairingChallenge,
 ) -> Result<PairingResponse> {
     let (respond_tx, respond_rx) = oneshot::channel::<PairingResponse>();
     event_tx
@@ -1426,5 +1459,102 @@ mod tests {
         assert_eq!(ReconnectBudget::backoff(1), Duration::from_secs(1));
         assert_eq!(ReconnectBudget::backoff(5), Duration::from_secs(16));
         assert_eq!(ReconnectBudget::backoff(9), Duration::from_secs(16));
+    }
+
+    /// Open a session against `script`, answering password prompts with
+    /// `answers` in order. Returns the outcome, the `rejected` flag of
+    /// every prompt and the session log.
+    async fn open_with_answers(
+        script: SessionScript,
+        answers: &[&str],
+    ) -> (Result<()>, Vec<bool>, crate::test_support::SessionLog) {
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (factory, sessions) = session_factory(vec![script]);
+        let answers: Vec<String> = answers.iter().map(|a| (*a).to_owned()).collect();
+        let answerer = tokio::spawn(async move {
+            let mut prompts = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                let ManagerEvent::PairingRequired {
+                    challenge, respond, ..
+                } = event
+                else {
+                    continue;
+                };
+                let PairingChallenge::Credential { rejected } = challenge else {
+                    panic!("unexpected challenge {challenge:?}");
+                };
+                let answer = answers
+                    .get(prompts.len())
+                    .cloned()
+                    .map_or(PairingResponse::Cancelled, PairingResponse::Password);
+                prompts.push(rejected);
+                if let Some(tx) = respond.lock().await.take() {
+                    let _ = tx.send(answer);
+                }
+            }
+            prompts
+        });
+        let mut config = StreamConfig::default();
+        let result = open_session(
+            &factory,
+            &device(DeviceCapabilities::default()),
+            &mut config,
+            &event_tx,
+        )
+        .await
+        .map(drop);
+        drop(event_tx);
+        let prompts = answerer.await.expect("answerer");
+        let log = std::mem::take(&mut *sessions.lock().unwrap());
+        (result, prompts, log)
+    }
+
+    fn password_protected() -> SessionScript {
+        SessionScript {
+            password: Some("secret"),
+            ..SessionScript::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn password_prompt_retries_setup_on_the_same_session() {
+        let (result, prompts, log) = open_with_answers(password_protected(), &["secret"]).await;
+        result.expect("stream set up");
+        assert_eq!(prompts, [false]);
+        assert_eq!(log.created, 1);
+        assert_eq!(log.setups.len(), 1);
+        assert_eq!(log.passwords, ["secret"]);
+    }
+
+    #[tokio::test]
+    async fn wrong_password_is_asked_again() {
+        let (result, prompts, log) =
+            open_with_answers(password_protected(), &["wrong", "secret"]).await;
+        result.expect("stream set up");
+        assert_eq!(prompts, [false, true]);
+        assert_eq!(log.created, 1);
+        assert_eq!(log.passwords, ["wrong", "secret"]);
+    }
+
+    #[tokio::test]
+    async fn three_wrong_passwords_give_up() {
+        let (result, prompts, log) =
+            open_with_answers(password_protected(), &["a", "b", "c", "secret"]).await;
+        let err = result.expect_err("gives up");
+        assert!(
+            err.to_string().contains("rejected the password 3 times"),
+            "{err}"
+        );
+        assert_eq!(prompts, [false, true, true]);
+        assert_eq!(log.stops, 1);
+        assert!(log.setups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_password_prompt_releases_the_receiver() {
+        let (result, prompts, log) = open_with_answers(password_protected(), &[]).await;
+        assert!(result.is_err());
+        assert_eq!(prompts, [false]);
+        assert_eq!(log.stops, 1);
     }
 }
