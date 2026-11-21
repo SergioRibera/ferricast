@@ -40,7 +40,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use ferricast_core::{
     AudioCodec, AudioFrame, CastSession, Codec, ConnectOutcome, Device, EncodedFrame,
-    FerricastError, Result, StreamConfig, bind_in_range,
+    FerricastError, Result, StreamConfig, bind_tcp,
 };
 use ferricast_hls::{HlsConfig, HlsFrameSink};
 use tokio::sync::{mpsc, oneshot};
@@ -610,27 +610,28 @@ impl ChromecastSession {
             playlist_target_duration: PLAYLIST_TARGET_DURATION,
             ..Default::default()
         };
-        let sink = match cfg.port_range {
-            Some((start, end)) => {
-                let listener = bind_in_range(start, end).await?;
-                HlsFrameSink::start_on_listener(
-                    listener,
-                    frame_rx,
-                    audio_rx,
-                    parameter_sets,
-                    hls_config,
-                )
-                .await?
-            }
-            None => {
-                HlsFrameSink::start("0.0.0.0:0", frame_rx, audio_rx, parameter_sets, hls_config)
-                    .await?
-            }
-        };
+        let listener = bind_tcp(state.device_ip, cfg.port_range).await?;
+        let sink = HlsFrameSink::start_on_listener(
+            listener,
+            frame_rx,
+            audio_rx,
+            parameter_sets,
+            hls_config,
+        )
+        .await?;
         // Bound on every interface, so only the receiver (and loopback)
         // may fetch; advertise the LAN-side IP observed on the control
         // socket (`0.0.0.0` is unroutable).
         sink.allow_peer(state.device_ip);
+        // A link-local IPv6 host goes into the URL without its zone:
+        // URLs can't carry a usable one, and the receiver resolves it
+        // on its single link anyway. Discovery prefers IPv4, so this
+        // only happens for receivers reachable over IPv6 alone.
+        if let IpAddr::V6(v6) = state.local_ip
+            && v6.is_unicast_link_local()
+        {
+            warn!(local_ip = %v6, "HLS URL uses a link-local IPv6 address");
+        }
         let location = PlaylistLocation::new(
             sink.scheme(),
             state.local_ip,

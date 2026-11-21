@@ -6,14 +6,39 @@
 //! to**, not just any random interface address — Docker bridges,
 //! Tailscale, libvirt, podman and friends litter the host with
 //! addresses that won't resolve from an external device.
+//!
+//! Listeners and sockets follow the address family of the device they
+//! serve: an IPv4 device gets a socket on `0.0.0.0`, an IPv6 one a
+//! dual-stack socket on `[::]` (so loopback self-tests over
+//! `127.0.0.1` keep working).
 
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 
 use crate::error::{FerricastError, Result};
 
+/// Backlog for listeners bound through [`bind_tcp`]; matches what
+/// `std`/tokio use for `TcpListener::bind`.
+const LISTEN_BACKLOG: i32 = 1024;
+
 /// The local IP address the kernel would use to reach `target`.
+///
+/// Convenience over [`local_socket_addr_for`] for callers that only
+/// have an `IpAddr`. IPv6 link-local targets need a zone, which an
+/// `IpAddr` cannot carry, so they fail here; use
+/// [`local_socket_addr_for`] with a scoped `SocketAddrV6` instead.
+///
+/// # Errors
+///
+/// See [`local_socket_addr_for`].
+pub fn local_addr_for(target: IpAddr) -> Result<IpAddr> {
+    local_socket_addr_for(SocketAddr::new(target, 0)).map(|a| a.ip())
+}
+
+/// The local address the kernel would use to reach `target`, with the
+/// IPv6 scope id preserved.
 ///
 /// Doesn't actually transmit any bytes — opens a UDP socket and
 /// "connects" it (a pure kernel routing operation that picks the
@@ -25,42 +50,74 @@ use crate::error::{FerricastError, Result};
 /// receiver's reply traffic will actually arrive on.
 ///
 /// The `target` doesn't have to be reachable — UDP `connect()` is
-/// purely local. If the routing table has a default route to the
-/// general direction of `target`, that route's source IP is what
-/// you get back.
+/// purely local. Only its IP (and, for IPv6, scope id) is used; the
+/// port is ignored and the returned port is meaningless.
 ///
-/// Used by:
-/// * `ferricast-chromecast` for the HLS playlist URL passed to
-///   the Default Media Receiver via `LOAD`.
-/// * (future) `ferricast-airplay` for the RTSP `Transport:` URL.
-pub fn local_addr_for(target: IpAddr) -> Result<IpAddr> {
-    let bind: SocketAddr = match target {
-        IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
-        IpAddr::V6(_) => SocketAddr::from(([0u16; 8], 0)),
-    };
-    let s = UdpSocket::bind(bind)
+/// For a link-local IPv6 target the returned address is link-local
+/// too and carries the target's scope id. Such an address can't go
+/// into an HTTP URL for a receiver (browsers reject zone ids), so
+/// URL builders should prefer a routable address when one exists.
+///
+/// # Errors
+///
+/// [`FerricastError::Connection`] when `target` is an IPv6 link-local
+/// address without a scope id (the kernel can't pick an interface),
+/// or [`FerricastError::Other`] when the kernel has no route to it.
+pub fn local_socket_addr_for(target: SocketAddr) -> Result<SocketAddr> {
+    if let SocketAddr::V6(v6) = target
+        && needs_zone(v6)
+    {
+        return Err(FerricastError::Connection(format!(
+            "IPv6 link-local address {} has no interface scope id",
+            v6.ip()
+        )));
+    }
+    let s = UdpSocket::bind(SocketAddr::new(unspecified_for(target.ip()), 0))
         .map_err(|e| FerricastError::Other(format!("local_addr_for: bind probe socket: {e}")))?;
     // Port doesn't matter — `connect` on UDP is purely a routing
-    // hint, no SYN goes out. Use 1 (root-only on most systems but
-    // we never actually send so we don't need to bind it).
-    s.connect(SocketAddr::new(target, 1))
+    // hint, no packet goes out.
+    let mut probe = target;
+    probe.set_port(1);
+    s.connect(probe)
         .map_err(|e| FerricastError::Other(format!("local_addr_for: connect probe socket: {e}")))?;
     s.local_addr()
-        .map(|a| a.ip())
         .map_err(|e| FerricastError::Other(format!("local_addr_for: local_addr: {e}")))
 }
 
-/// Bind a `TcpListener` to the first free port in `start..=end` on
-/// `0.0.0.0`. Returns the bound listener so the caller hands it
-/// directly to the server without a TOCTOU re-bind race.
+/// The unspecified address (`0.0.0.0` or `::`) of `peer`'s family.
+#[must_use]
+pub fn unspecified_for(peer: IpAddr) -> IpAddr {
+    match peer {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    }
+}
+
+/// Whether `addr` is an IPv6 link-local address with no scope id.
+fn needs_zone(addr: SocketAddrV6) -> bool {
+    addr.ip().is_unicast_link_local() && addr.scope_id() == 0
+}
+
+/// Bind a `TcpListener` that `peer` can reach, on the first free port
+/// in `port_range` or on an ephemeral port when it is `None`.
 ///
-/// Used by every protocol that serves a listener (HLS, future RTP
-/// control channel, …) when a `StreamConfig::port_range` is set.
-pub async fn bind_in_range(start: u16, end: u16) -> Result<TcpListener> {
+/// The listener is bound on every interface of `peer`'s family; for
+/// IPv6 it is dual-stack (`IPV6_V6ONLY` off) so IPv4 clients and
+/// loopback still reach it. Returns the bound listener so the caller
+/// hands it directly to the server without a TOCTOU re-bind race.
+///
+/// # Errors
+///
+/// [`FerricastError::Other`] when no port in the range is free, or the
+/// socket error for an ephemeral bind.
+pub async fn bind_tcp(peer: IpAddr, port_range: Option<(u16, u16)>) -> Result<TcpListener> {
+    let ip = unspecified_for(peer);
+    let Some((start, end)) = port_range else {
+        return Ok(tcp_listener(SocketAddr::new(ip, 0))?);
+    };
     for port in start..=end {
-        match TcpListener::bind(format!("0.0.0.0:{port}")).await {
-            Ok(l) => return Ok(l),
-            Err(_) => continue,
+        if let Ok(l) = tcp_listener(SocketAddr::new(ip, port)) {
+            return Ok(l);
         }
     }
     Err(FerricastError::Other(format!(
@@ -68,14 +125,26 @@ pub async fn bind_in_range(start: u16, end: u16) -> Result<TcpListener> {
     )))
 }
 
-/// Bind a tokio `UdpSocket` to the first free port in `start..=end` on
-/// `0.0.0.0`. Mirror of [`bind_in_range`] for UDP senders (Cast Streaming
-/// RTP/RTCP socket, future QUIC, …).
-pub async fn bind_udp_in_range(start: u16, end: u16) -> Result<tokio::net::UdpSocket> {
+/// Bind a tokio `UdpSocket` that can talk to `peer`, on the first free
+/// port in `port_range` or on an ephemeral port when it is `None`.
+/// UDP counterpart of [`bind_tcp`] (Cast Streaming RTP/RTCP, AirPlay
+/// timing/control, …).
+///
+/// # Errors
+///
+/// [`FerricastError::Other`] when no port in the range is free, or the
+/// socket error for an ephemeral bind.
+pub async fn bind_udp(
+    peer: IpAddr,
+    port_range: Option<(u16, u16)>,
+) -> Result<tokio::net::UdpSocket> {
+    let ip = unspecified_for(peer);
+    let Some((start, end)) = port_range else {
+        return Ok(udp_socket(SocketAddr::new(ip, 0))?);
+    };
     for port in start..=end {
-        match tokio::net::UdpSocket::bind(format!("0.0.0.0:{port}")).await {
-            Ok(s) => return Ok(s),
-            Err(_) => continue,
+        if let Ok(s) = udp_socket(SocketAddr::new(ip, port)) {
+            return Ok(s);
         }
     }
     Err(FerricastError::Other(format!(
@@ -83,10 +152,43 @@ pub async fn bind_udp_in_range(start: u16, end: u16) -> Result<tokio::net::UdpSo
     )))
 }
 
+/// A non-blocking socket of `addr`'s family, dual-stack for IPv6.
+fn socket_for(addr: SocketAddr, ty: Type, proto: Protocol) -> std::io::Result<Socket> {
+    let socket = Socket::new(Domain::for_address(addr), ty, Some(proto))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+fn tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = socket_for(addr, Type::STREAM, Protocol::TCP)?;
+    // Same as std's listener: lets a restarted session rebind a port
+    // still in TIME_WAIT from the previous one.
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(LISTEN_BACKLOG)?;
+    TcpListener::from_std(socket.into())
+}
+
+fn udp_socket(addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = socket_for(addr, Type::DGRAM, Protocol::UDP)?;
+    socket.bind(&addr.into())?;
+    tokio::net::UdpSocket::from_std(socket.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+
+    const V4_LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    const V6_LOOPBACK: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
+    /// Whether the host has IPv6 at all (sandboxes sometimes don't).
+    fn ipv6_available() -> bool {
+        std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).is_ok()
+    }
 
     #[test]
     fn returns_a_v4_for_a_v4_target() {
@@ -100,11 +202,90 @@ mod tests {
 
     #[test]
     fn rfc1918_target_returns_routable_local() {
-        // Asking for the source-IP toward 192.168.x.x should give
-        // the LAN-side address (or fall back to default route's
-        // source if no LAN). Either way: not 0.0.0.0, not loopback
-        // unless the only route is loopback.
         let ip = local_addr_for(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))).unwrap();
         assert!(!ip.is_unspecified(), "shouldn't be 0.0.0.0, got {ip}");
+    }
+
+    #[test]
+    fn loopback_targets_resolve_to_loopback_of_the_same_family() {
+        assert_eq!(local_addr_for(V4_LOOPBACK).unwrap(), V4_LOOPBACK);
+        if ipv6_available() {
+            assert_eq!(local_addr_for(V6_LOOPBACK).unwrap(), V6_LOOPBACK);
+        }
+    }
+
+    #[test]
+    fn link_local_without_scope_is_rejected_with_a_clear_error() {
+        let target: SocketAddr = "[fe80::1]:8009".parse().unwrap();
+        let err = local_socket_addr_for(target).unwrap_err().to_string();
+        assert!(err.contains("scope id"), "{err}");
+        assert!(local_addr_for(target.ip()).is_err());
+    }
+
+    #[test]
+    fn scope_id_is_preserved_for_link_local_targets() {
+        if !ipv6_available() {
+            return;
+        }
+        // Loopback is interface 1 on Linux but carries no link-local
+        // address, so the routing probe may fail there; the check is
+        // that a scoped target is accepted and the zone survives.
+        let target = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 9, 0, 1));
+        if let Ok(SocketAddr::V6(local)) = local_socket_addr_for(target) {
+            assert_eq!(local.scope_id(), 1);
+        }
+    }
+
+    #[test]
+    fn unspecified_follows_the_peer_family() {
+        assert_eq!(
+            unspecified_for(V4_LOOPBACK),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+        assert_eq!(
+            unspecified_for(V6_LOOPBACK),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_peer_gets_a_v4_listener() {
+        let l = bind_tcp(V4_LOOPBACK, None).await.unwrap();
+        assert!(l.local_addr().unwrap().is_ipv4());
+        let u = bind_udp(V4_LOOPBACK, None).await.unwrap();
+        assert!(u.local_addr().unwrap().is_ipv4());
+    }
+
+    #[tokio::test]
+    async fn v6_peer_gets_a_dual_stack_listener() {
+        if !ipv6_available() {
+            return;
+        }
+        let l = bind_tcp(V6_LOOPBACK, None).await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert!(l.local_addr().unwrap().is_ipv6());
+        // Dual-stack: both loopbacks reach the same listener.
+        for ip in [V6_LOOPBACK, V4_LOOPBACK] {
+            let connect = tokio::net::TcpStream::connect((ip, port));
+            let (client, accepted) = tokio::join!(connect, l.accept());
+            client.unwrap();
+            accepted.unwrap();
+        }
+        let u = bind_udp(V6_LOOPBACK, None).await.unwrap();
+        assert!(u.local_addr().unwrap().is_ipv6());
+    }
+
+    #[tokio::test]
+    async fn ranged_bind_skips_taken_ports() {
+        let taken = bind_tcp(V4_LOOPBACK, None).await.unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let Some(next) = port.checked_add(1) else {
+            return;
+        };
+        match bind_tcp(V4_LOOPBACK, Some((port, next))).await {
+            Ok(l) => assert_eq!(l.local_addr().unwrap().port(), next),
+            // `next` happened to be in use by something else.
+            Err(e) => assert!(e.to_string().contains("no free TCP port"), "{e}"),
+        }
     }
 }

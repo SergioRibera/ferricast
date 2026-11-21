@@ -6,10 +6,12 @@ description = "Core traits and types for ferricast streaming protocols"
 
 [features]
 default = ["net"]
-net = ["dep:tokio"]
+net = ["dep:tokio", "dep:socket2"]
 
 [dependencies]
 tokio = { workspace = true, features = ["sync", "macros", "net"], optional = true }
+# Dual-stack (`IPV6_V6ONLY` off) listeners in `net.rs`.
+socket2 = { version = "0.6", optional = true }
 tracing.workspace = true
 thiserror.workspace = true
 bytes.workspace = true

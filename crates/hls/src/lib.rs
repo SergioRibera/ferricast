@@ -572,7 +572,7 @@ impl HlsFrameSink {
 
     /// Same as [`Self::start`] but accepts an already-bound listener.
     /// Use this when the caller pre-bound the port (e.g. via
-    /// [`ferricast_core::bind_in_range`]) to keep the bind inside a
+    /// [`ferricast_core::bind_tcp`]) to keep the bind inside a
     /// known firewall-friendly range.
     ///
     /// # Errors

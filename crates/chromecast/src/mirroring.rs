@@ -28,10 +28,9 @@ use std::time::{Duration, Instant};
 use bytes::BytesMut;
 use ferricast_core::{
     AudioCodec, AudioFrame, CastSession, Codec, ConnectOutcome, Device, EncodedFrame,
-    FerricastError, Result, StreamConfig, bind_udp_in_range,
+    FerricastError, Result, StreamConfig, bind_udp,
 };
 use rand::{Rng, RngCore};
-use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -403,14 +402,9 @@ impl CastSession for ChromecastMirrorSession {
             ));
         };
         let peer_udp = SocketAddr::new(control.peer_ip, answer.udp_port);
-        let socket = match config.port_range {
-            Some((start, end)) => bind_udp_in_range(start, end).await.map_err(|e| {
-                FerricastError::Connection(format!("bind cast streaming UDP in range: {e}"))
-            })?,
-            None => UdpSocket::bind("0.0.0.0:0")
-                .await
-                .map_err(|e| FerricastError::Connection(format!("bind cast streaming UDP: {e}")))?,
-        };
+        let socket = bind_udp(control.peer_ip, config.port_range)
+            .await
+            .map_err(|e| FerricastError::Connection(format!("bind cast streaming UDP: {e}")))?;
         socket
             .connect(peer_udp)
             .await
