@@ -30,7 +30,7 @@ use crate::mirror::{MirrorStream, stream_cipher};
 use crate::ntp::TimingServer;
 use crate::pair::{PairedSession, hap, legacy, legacy_pin};
 use crate::rtsp::{CONTENT_BPLIST, ClientIdentity, RtspClient, RtspResponse};
-use crate::store::{CredentialStore, Identity, ReceiverKey};
+use crate::store::{CredentialStore, Identity, PasswordState, ReceiverKey};
 
 const FEEDBACK_INTERVAL: Duration = Duration::from_secs(2);
 const DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -153,10 +153,13 @@ fn reply_dict(response: &RtspResponse, what: &str) -> Result<Dictionary> {
 }
 
 impl AirPlaySession {
-    fn identity(&mut self) -> Identity {
-        self.identity
-            .get_or_insert_with(|| self.store.identity())
-            .clone()
+    async fn identity(&mut self) -> Identity {
+        if let Some(identity) = &self.identity {
+            return identity.clone();
+        }
+        let identity = self.store.identity().await;
+        self.identity = Some(identity.clone());
+        identity
     }
 
     fn link(&self) -> Result<&Link> {
@@ -184,7 +187,7 @@ impl AirPlaySession {
         let Some(stored) = self.store.receiver(device_id) else {
             return Ok(false);
         };
-        let identity = self.identity();
+        let identity = self.identity().await;
         let result = match mode {
             AirPlayPairing::LegacyPin => match stored.public_key_bytes() {
                 Some(pk) => legacy::pair_verify(rtsp, &identity.key, &pk)
@@ -222,7 +225,7 @@ impl AirPlaySession {
         device_id: &str,
         mode: AirPlayPairing,
     ) -> Result<ConnectOutcome> {
-        let identity = self.identity();
+        let identity = self.identity().await;
         match mode {
             AirPlayPairing::Legacy => {
                 let server_key = legacy::pair_setup(rtsp, &identity.key).await?;
@@ -250,7 +253,7 @@ impl AirPlaySession {
     }
 
     async fn finish_pin_pairing(&mut self, pin: &str) -> Result<()> {
-        let identity = self.identity();
+        let identity = self.identity().await;
         let link = self.link()?;
         let (rtsp, device_id, mode) = (link.rtsp.clone(), link.device_id.clone(), link.mode);
         let mut rtsp = rtsp.lock().await;
@@ -307,7 +310,12 @@ impl AirPlaySession {
             .request("SETUP", uri, Some(CONTENT_BPLIST), body)
             .await?;
         if reply.status != 401 {
-            return reply.ensure_success("SETUP");
+            let reply = reply.ensure_success("SETUP")?;
+            if password.is_some() {
+                info!("AirPlay receiver no longer asks for a password");
+                self.store.clear_password(device_id).await;
+            }
+            return Ok(reply);
         }
         let challenge = reply
             .header("WWW-Authenticate")
@@ -315,13 +323,8 @@ impl AirPlaySession {
             .ok_or_else(|| {
                 FerricastError::Protocol("SETUP: 401 without a Digest challenge".into())
             })?;
-        let remember_required = || {
-            if let Err(e) = self.store.save_password(device_id, None) {
-                warn!(error = %e, "cannot record that the AirPlay receiver wants a password");
-            }
-        };
         let Some(password) = password else {
-            remember_required();
+            self.store.mark_password_required(device_id);
             return Err(FerricastError::Protocol(
                 "the AirPlay receiver requires a password; connect again to enter it".into(),
             ));
@@ -337,23 +340,24 @@ impl AirPlaySession {
             )
             .await?;
         if reply.status == 401 {
-            remember_required();
+            self.store.mark_password_required(device_id);
+            if password.stored {
+                self.store.forget_password(device_id).await;
+            }
             return Err(FerricastError::Protocol(
                 "the AirPlay receiver rejected the password".into(),
             ));
         }
         let reply = reply.ensure_success("SETUP")?;
-        if !password.stored
-            && let Err(e) = self.store.save_password(device_id, Some(&password.value))
-        {
-            warn!(error = %e, "cannot store the AirPlay password; it will be asked again");
+        if !password.stored {
+            self.store.save_password(device_id, &password.value).await;
         }
         info!("AirPlay receiver accepted the password");
         Ok(reply)
     }
 
     async fn start_stream(&mut self, config: &StreamConfig) -> Result<Stream> {
-        let identity = self.identity();
+        let identity = self.identity().await;
         let link = self.link()?;
         let (rtsp, uri) = (link.rtsp.clone(), link.session_uri.clone());
         let (password, device_id) = (link.password.clone(), link.device_id.clone());
@@ -662,9 +666,9 @@ impl CastSession for AirPlaySession {
         // set (UxPlay 1.73 always reports 0x4); otherwise a receiver is known
         // to want a password once a `SETUP` was challenged. Password-protected
         // receivers pair without a PIN and check the password on `SETUP`.
-        let known_password = self.store.password(&device_id);
+        let known_password = self.store.password(&device_id).await;
         let password_protected = mode == AirPlayPairing::LegacyPin
-            && (known_password.is_some()
+            && (known_password != PasswordState::NotRequired
                 || probe_access(&mut rtsp).await == Some(Access::Password));
         let mode = if password_protected {
             AirPlayPairing::Legacy
@@ -680,14 +684,16 @@ impl CastSession for AirPlaySession {
         };
         let mut password = None;
         if password_protected {
-            match known_password.flatten() {
-                Some(value) => {
+            match known_password {
+                PasswordState::Required(Some(value)) => {
                     password = Some(Password {
                         value,
                         stored: true,
                     });
                 }
-                None => outcome = ConnectOutcome::PairingRequired(PairingChallenge::Credential),
+                PasswordState::Required(None) | PasswordState::NotRequired => {
+                    outcome = ConnectOutcome::PairingRequired(PairingChallenge::Credential);
+                }
             }
             info!(
                 stored = password.is_some(),
