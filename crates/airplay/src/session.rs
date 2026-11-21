@@ -2,7 +2,9 @@
 //!
 //! `connect` pairs with the receiver (asking for a PIN through
 //! [`ConnectOutcome::PairingRequired`] when needed), `setup_stream` runs
-//! FairPlay setup, both `SETUP` requests and `RECORD`, then opens the
+//! FairPlay setup, both `SETUP` requests and `RECORD` (failing with
+//! [`FerricastError::CredentialRequired`] when the receiver wants a
+//! password, to be retried after `submit_pairing`), then opens the
 //! mirroring data connection; `send_frame` pushes encrypted H.264 access
 //! units and a background task posts `/feedback` every two seconds.
 
@@ -42,7 +44,8 @@ enum State {
     Disconnected,
     /// Pair-setup needs the PIN the receiver is showing.
     AwaitingPin,
-    /// Paired; the receiver also wants its access password.
+    /// Paired, but `SETUP` was challenged: the receiver wants its access
+    /// password before `setup_stream` is tried again.
     AwaitingPassword,
     /// Paired and verified; ready for `setup_stream`.
     Paired,
@@ -77,6 +80,8 @@ struct Link {
     session_uri: String,
     /// Access password for `SETUP` (password-protected receivers).
     password: Option<Password>,
+    /// The credential store marks this receiver as wanting a password.
+    password_known: bool,
 }
 
 /// Access password and where it came from.
@@ -294,24 +299,31 @@ impl AirPlaySession {
         Ok(())
     }
 
-    /// Send the first `SETUP`, answering a Digest challenge with `password`.
-    /// A password the receiver accepts is remembered. A challenge without a
-    /// password, or a rejected password, is remembered as "wants a
-    /// password", so the next `connect` asks the user for it.
+    /// Send the first `SETUP`, answering a Digest challenge with the link's
+    /// password. A password the receiver accepts is remembered. A challenge
+    /// without a password, or a rejected password, fails with
+    /// [`FerricastError::CredentialRequired`] and marks the receiver as
+    /// wanting a password.
     async fn authorized_setup(
         &self,
         rtsp: &mut RtspClient,
-        uri: &str,
+        link: &Link,
         body: &[u8],
-        password: Option<&Password>,
-        device_id: &str,
     ) -> Result<RtspResponse> {
+        let Link {
+            session_uri: uri,
+            device_id,
+            mode,
+            password,
+            password_known,
+            ..
+        } = link;
         let reply = rtsp
             .request("SETUP", uri, Some(CONTENT_BPLIST), body)
             .await?;
         if reply.status != 401 {
             let reply = reply.ensure_success("SETUP")?;
-            if password.is_some() {
+            if *password_known {
                 info!("AirPlay receiver no longer asks for a password");
                 self.store.clear_password(device_id).await;
             }
@@ -323,11 +335,16 @@ impl AirPlaySession {
             .ok_or_else(|| {
                 FerricastError::Protocol("SETUP: 401 without a Digest challenge".into())
             })?;
+        self.store.mark_password_required(device_id);
+        if *mode == AirPlayPairing::LegacyPin {
+            // Password-protected receivers are paired without a PIN from now
+            // on, so the key from this connection's PIN pairing is dead
+            // weight.
+            self.store.forget_receiver(device_id);
+        }
         let Some(password) = password else {
-            self.store.mark_password_required(device_id);
-            return Err(FerricastError::Protocol(
-                "the AirPlay receiver requires a password; connect again to enter it".into(),
-            ));
+            info!("AirPlay receiver requires a password");
+            return Err(FerricastError::CredentialRequired { rejected: false });
         };
         let authorization = challenge.authorization("SETUP", uri, &password.value);
         let reply = rtsp
@@ -340,13 +357,14 @@ impl AirPlaySession {
             )
             .await?;
         if reply.status == 401 {
-            self.store.mark_password_required(device_id);
+            warn!(
+                stored = password.stored,
+                "AirPlay receiver rejected the password"
+            );
             if password.stored {
                 self.store.forget_password(device_id).await;
             }
-            return Err(FerricastError::Protocol(
-                "the AirPlay receiver rejected the password".into(),
-            ));
+            return Err(FerricastError::CredentialRequired { rejected: true });
         }
         let reply = reply.ensure_success("SETUP")?;
         if !password.stored {
@@ -360,7 +378,6 @@ impl AirPlaySession {
         let identity = self.identity().await;
         let link = self.link()?;
         let (rtsp, uri) = (link.rtsp.clone(), link.session_uri.clone());
-        let (password, device_id) = (link.password.clone(), link.device_id.clone());
         let mut guard = rtsp.lock().await;
 
         let fp = fairplay::setup(&mut guard).await?;
@@ -393,13 +410,7 @@ impl AirPlaySession {
         let eiv: [u8; 16] = rand::random();
         setup.insert("eiv".into(), Value::Data(eiv.to_vec()));
         let reply = self
-            .authorized_setup(
-                &mut guard,
-                &uri,
-                &bplist(setup)?,
-                password.as_ref(),
-                &device_id,
-            )
+            .authorized_setup(&mut guard, link, &bplist(setup)?)
             .await?;
         debug!(reply = ?reply_dict(&reply, "SETUP").ok(), "SETUP session reply");
 
@@ -663,43 +674,41 @@ impl CastSession for AirPlaySession {
         .await?;
         // Receivers advertise `pw=true` for both a PIN and a password. The
         // `sf` flags of their RAOP record tell the two apart when they are
-        // set (UxPlay 1.73 always reports 0x4); otherwise a receiver is known
-        // to want a password once a `SETUP` was challenged. Password-protected
-        // receivers pair without a PIN and check the password on `SETUP`.
+        // set (UxPlay 1.73 reports 0x4 for both); otherwise a receiver is
+        // known to want a password once a `SETUP` was challenged.
+        // Password-protected receivers pair without a PIN and check the
+        // password on `SETUP`, which asks for it through
+        // `FerricastError::CredentialRequired` when none is stored.
         let known_password = self.store.password(&device_id).await;
-        let password_protected = mode == AirPlayPairing::LegacyPin
-            && (known_password != PasswordState::NotRequired
-                || probe_access(&mut rtsp).await == Some(Access::Password));
-        let mode = if password_protected {
+        let password_known = known_password != PasswordState::NotRequired;
+        let password_protected = password_known
+            || (mode == AirPlayPairing::LegacyPin
+                && probe_access(&mut rtsp).await == Some(Access::Password));
+        let mode = if password_protected && mode == AirPlayPairing::LegacyPin {
             AirPlayPairing::Legacy
         } else {
             mode
         };
-        let mut outcome = match self.pair(&mut rtsp, &device_id, mode).await {
+        let password = match known_password {
+            PasswordState::Required(Some(value)) => Some(Password {
+                value,
+                stored: true,
+            }),
+            PasswordState::Required(None) | PasswordState::NotRequired => None,
+        };
+        if password_protected {
+            info!(
+                stored = password.is_some(),
+                "AirPlay receiver requires a password"
+            );
+        }
+        let outcome = match self.pair(&mut rtsp, &device_id, mode).await {
             Ok(o) => o,
             Err(e) => {
                 self.reset();
                 return Err(e);
             }
         };
-        let mut password = None;
-        if password_protected {
-            match known_password {
-                PasswordState::Required(Some(value)) => {
-                    password = Some(Password {
-                        value,
-                        stored: true,
-                    });
-                }
-                PasswordState::Required(None) | PasswordState::NotRequired => {
-                    outcome = ConnectOutcome::PairingRequired(PairingChallenge::Credential);
-                }
-            }
-            info!(
-                stored = password.is_some(),
-                "AirPlay receiver requires a password"
-            );
-        }
         let session_uri = format!(
             "rtsp://{}/{}",
             rtsp.local_addr().ip(),
@@ -711,12 +720,10 @@ impl CastSession for AirPlaySession {
             mode,
             session_uri,
             password,
+            password_known,
         });
         self.state = match &outcome {
             ConnectOutcome::Ready => State::Paired,
-            ConnectOutcome::PairingRequired(PairingChallenge::Credential) => {
-                State::AwaitingPassword
-            }
             ConnectOutcome::PairingRequired(_) => State::AwaitingPin,
         };
         self.alive.store(true, Ordering::Relaxed);
@@ -740,7 +747,7 @@ impl CastSession for AirPlaySession {
                         "the AirPlay password is empty".into(),
                     ));
                 }
-                // The receiver checks it on the first `SETUP`.
+                // The receiver checks it on the next `SETUP`.
                 if let Some(link) = self.link.as_mut() {
                     link.password = Some(Password {
                         value,
@@ -798,6 +805,15 @@ impl CastSession for AirPlaySession {
         }
         let stream = match self.start_stream(config).await {
             Ok(s) => s,
+            Err(e @ FerricastError::CredentialRequired { .. }) => {
+                // The connection stays up: the receiver checks a password
+                // on the next `SETUP` without pairing again.
+                if let Some(link) = self.link.as_mut() {
+                    link.password = None;
+                }
+                self.state = State::AwaitingPassword;
+                return Err(e);
+            }
             Err(e) => {
                 self.alive.store(false, Ordering::Relaxed);
                 return Err(e);

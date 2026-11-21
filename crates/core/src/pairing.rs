@@ -8,8 +8,12 @@ pub enum PairingChallenge {
         digits: u8,
     },
     None,
-    /// Ask the user for the receiver's access password.
-    Credential,
+    /// Ask the user for the receiver's access password. `rejected` is set
+    /// when the receiver refused the previous answer, so the prompt can
+    /// say so.
+    Credential {
+        rejected: bool,
+    },
 }
 
 impl PairingChallenge {

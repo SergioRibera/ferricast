@@ -62,6 +62,14 @@ pub enum FerricastError {
         protocol: &'static str,
     },
 
+    /// The receiver wants an access password before it streams.
+    /// `setup_stream` fails with this when the receiver challenged the
+    /// request (`rejected` when a password was sent and refused); the
+    /// session then waits for `submit_pairing(PairingResponse::Password)`
+    /// and `setup_stream` can be called again on the same session.
+    #[error("{}", if *rejected { "the receiver rejected the password" } else { "the receiver requires a password" })]
+    CredentialRequired { rejected: bool },
+
     #[error("Session already active for device {0}")]
     SessionAlreadyActive(String),
 
