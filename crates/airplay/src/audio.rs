@@ -90,7 +90,7 @@ impl PayloadCipher {
         }
     }
 
-    fn encrypt(&self, payload: &mut [u8]) {
+    pub(crate) fn encrypt(&self, payload: &mut [u8]) {
         let mut chain = self.iv;
         for block in payload.chunks_exact_mut(16) {
             for (b, c) in block.iter_mut().zip(chain) {

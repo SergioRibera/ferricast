@@ -41,6 +41,6 @@ md-5 = "0.10"
 oo7 = { version = "0.6", default-features = false, features = ["tokio", "native_crypto"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ferricast-encoder = { workspace = true, features = ["x264", "fdk-aac"] }

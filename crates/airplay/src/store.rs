@@ -81,6 +81,16 @@ struct IdentityFile {
     seed: Option<String>,
 }
 
+/// A sender that completed PIN pairing with our receiver; it may skip the
+/// PIN on later connections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PairedSender {
+    /// Device id the sender gave as its SRP user name.
+    pub device_id: String,
+    /// Hex Ed25519 public key it pair-verifies with.
+    pub public_key: String,
+}
+
 /// Long-term key material of a paired receiver.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ReceiverKey {
@@ -143,9 +153,57 @@ impl CredentialStore {
         }
     }
 
+    /// A store that keeps nothing: identities are generated afresh and no
+    /// pairing outlives the session. For tests and throw-away runs.
+    pub fn ephemeral() -> Self {
+        Self {
+            dir: None,
+            secrets: Arc::new(secret::NoKeyring),
+        }
+    }
+
+    /// A store under `dir` instead of the XDG data directory.
+    pub fn in_dir(dir: &Path) -> Self {
+        Self {
+            dir: Some(dir.to_path_buf()),
+            secrets: Arc::new(SystemKeyring::default()),
+        }
+    }
+
     /// Load this sender's identity, creating and saving one on first use.
     pub async fn identity(&self) -> Identity {
-        let Some(path) = self.path("identity") else {
+        self.named_identity("identity").await
+    }
+
+    /// Load the identity this process advertises as an AirPlay receiver
+    /// (its `deviceid` and `pk`), creating and saving one on first use.
+    /// Kept apart from the sender identity so pairing with ourselves
+    /// never confuses the two.
+    pub async fn receiver_identity(&self) -> Identity {
+        self.named_identity("receiver-identity").await
+    }
+
+    /// Senders that completed PIN pairing with our receiver, by Ed25519
+    /// public key (hex).
+    pub fn paired_senders(&self) -> Vec<PairedSender> {
+        self.path("receiver-paired-senders")
+            .and_then(|path| read_json::<Vec<PairedSender>>(&path))
+            .unwrap_or_default()
+    }
+
+    /// Remember a sender that completed PIN pairing.
+    pub fn save_paired_sender(&self, sender: PairedSender) -> Result<()> {
+        let Some(path) = self.path("receiver-paired-senders") else {
+            return Ok(());
+        };
+        let mut senders = read_json::<Vec<PairedSender>>(&path).unwrap_or_default();
+        senders.retain(|s| s.public_key != sender.public_key);
+        senders.push(sender);
+        write_json(&path, &senders)
+    }
+
+    async fn named_identity(&self, name: &str) -> Identity {
+        let Some(path) = self.path(name) else {
             return Identity::generate();
         };
         if let Some(file) = read_json::<IdentityFile>(&path) {
@@ -433,7 +491,8 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::secret::testing::{MemoryKeyring, NoKeyring};
+    use super::secret::NoKeyring;
+    use super::secret::testing::MemoryKeyring;
     use super::*;
 
     const RECEIVER: &str = "AA:BB:CC:DD:EE:FF";
