@@ -40,6 +40,9 @@ pub(super) struct Shared {
     /// over (and the old one is closed), as only one sender can mirror at
     /// a time and the media ports are fixed.
     active: Mutex<Option<(u64, mpsc::Sender<()>)>>,
+    /// Ed25519 keys (hex) of senders that paired with the PIN while this
+    /// receiver ran; the credential store keeps them across restarts.
+    paired: Mutex<std::collections::HashSet<String>>,
     /// Volume in the sender's dB scale (-144 mute, -30 to 0).
     volume_db: Mutex<f32>,
     next_id: AtomicU64,
@@ -77,6 +80,28 @@ impl Shared {
         if active.as_ref().is_some_and(|(owner, _)| *owner == id) {
             *active = None;
         }
+    }
+
+    /// Remember a sender paired with the PIN.
+    pub fn add_paired(&self, public_key_hex: String) {
+        self.paired
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(public_key_hex);
+    }
+
+    /// Whether a sender with this key paired with the PIN.
+    pub fn is_paired(&self, public_key_hex: &str) -> bool {
+        self.paired
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(public_key_hex)
+            || self
+                .settings
+                .store
+                .paired_senders()
+                .iter()
+                .any(|s| s.public_key == public_key_hex)
     }
 
     pub fn volume_db(&self) -> f32 {
@@ -122,6 +147,7 @@ impl Server {
         let shared = Arc::new(Shared {
             settings,
             active: Mutex::new(None),
+            paired: Mutex::new(std::collections::HashSet::new()),
             volume_db: Mutex::new(0.0),
             next_id: AtomicU64::new(1),
         });

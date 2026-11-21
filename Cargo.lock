@@ -1932,6 +1932,7 @@ dependencies = [
  "ferricast-decoder",
  "ferricast-demuxer",
  "ferricast-encoder",
+ "ferricast-fairplay",
  "ferricast-hls",
  "rustls",
  "serde_json",
@@ -1939,6 +1940,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

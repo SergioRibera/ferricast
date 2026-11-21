@@ -96,6 +96,12 @@ pub mod protocols {
     pub use ferricast_chromecast::ChromecastHandler as Chromecast;
 }
 
+/// The AirPlay receiver (screen mirroring and audio from Apple devices).
+#[cfg(feature = "airplay")]
+pub mod airplay {
+    pub use ferricast_airplay::receiver::*;
+}
+
 /// Everything you typically want in scope to talk to Ferricast.
 ///
 /// ```

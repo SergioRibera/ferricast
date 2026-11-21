@@ -460,13 +460,7 @@ impl Connection {
 
     /// Whether a sender pair-verifying with `key` may connect in PIN mode.
     fn sender_paired(&self, key: &[u8; 32]) -> bool {
-        let key = hex::encode(key);
-        self.shared
-            .settings
-            .store
-            .paired_senders()
-            .iter()
-            .any(|s| s.public_key == key)
+        self.shared.is_paired(&hex::encode(key))
     }
 
     async fn pair_verify(&mut self, request: &Request) -> Result<Response> {
@@ -520,6 +514,7 @@ impl Connection {
             Ok((reply, paired)) => {
                 if let Some(paired) = paired {
                     info!(device_id = %paired.device_id, "AirPlay sender paired with the PIN");
+                    self.shared.add_paired(hex::encode(paired.public_key));
                     let saved = self.shared.settings.store.save_paired_sender(PairedSender {
                         device_id: paired.device_id,
                         public_key: hex::encode(paired.public_key),

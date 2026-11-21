@@ -745,6 +745,20 @@ impl StreamManagerBuilder {
         self.register_receiver::<ferricast_chromecast::ChromecastReceiver>()
     }
 
+    /// Register the AirPlay *receiver* — advertise this process as an
+    /// AirPlay target and play the screen and audio Apple devices (and
+    /// ferricast's AirPlay sender) mirror to it. Also registers the audio
+    /// decoders AirPlay needs (AAC-ELD with `fdk-aac`, ALAC). Build the
+    /// receiver with [`ferricast_airplay::AirPlayReceiver::new`], which
+    /// loads its persisted identity.
+    #[cfg(feature = "airplay")]
+    pub fn with_airplay_receiver(self, receiver: ferricast_airplay::AirPlayReceiver) -> Self {
+        let builder = self.with_receiver(receiver);
+        #[cfg(feature = "fdk-aac")]
+        let builder = builder.register_audio_decoder::<ferricast_decoder::AacEldDecoder>();
+        builder.register_audio_decoder::<ferricast_decoder::AlacDecoder>()
+    }
+
     /// Register the bundled H.264 video decoder facade
     /// ([`ferricast_decoder::H264Decoder`]).
     pub fn with_h264_decoder(self) -> Self {
