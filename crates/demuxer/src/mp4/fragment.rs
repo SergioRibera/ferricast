@@ -212,12 +212,39 @@ pub(super) struct IndexEntry {
     pub moof: u64,
 }
 
-/// A `sidx` box at file offset `end` (where the box ends): its entries
-/// converted to `timescale`, and the total duration it covers in that
-/// timescale. Hierarchical indexes (references to further `sidx` boxes)
-/// are not followed: `None`.
-pub(super) fn parse_sidx(sidx: &[u8], end: u64, timescale: u32) -> Option<(Vec<IndexEntry>, u64)> {
+/// What one `sidx` reference points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SidxTarget {
+    /// Media: a fragment (`moof`, possibly after a `styp`).
+    Media,
+    /// A further `sidx` box indexing a run of fragments (a hierarchical
+    /// index).
+    Index,
+}
+
+/// One reference of a `sidx` box: where it points, and the time (in the
+/// timescale passed to [`parse_sidx`]) its media starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SidxRef {
+    pub target: SidxTarget,
+    pub time: u64,
+    pub offset: u64,
+}
+
+/// A parsed `sidx` box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Sidx {
+    pub reference_id: u32,
+    pub refs: Vec<SidxRef>,
+    /// Total duration the box covers.
+    pub duration: u64,
+}
+
+/// A `sidx` box at file offset `end` (where the box ends), with its
+/// times converted to `timescale`.
+pub(super) fn parse_sidx(sidx: &[u8], end: u64, timescale: u32) -> Option<Sidx> {
     let version = *sidx.first()?;
+    let reference_id = be32(sidx, 4)?;
     let sidx_scale = u64::from(be32(sidx, 8)?.max(1));
     let (mut time, first_offset, mut at) = if version == 0 {
         (u64::from(be32(sidx, 12)?), u64::from(be32(sidx, 16)?), 20)
@@ -230,24 +257,31 @@ pub(super) fn parse_sidx(sidx: &[u8], end: u64, timescale: u32) -> Option<(Vec<I
     at += 4;
     let convert = |t: u64| (u128::from(t) * u128::from(timescale) / u128::from(sidx_scale)) as u64;
     let mut offset = end.checked_add(first_offset)?;
-    let mut entries = Vec::with_capacity(count.min(MAX_INDEX));
+    let mut refs = Vec::with_capacity(count.min(MAX_INDEX));
     let mut total = 0u64;
     for _ in 0..count.min(MAX_INDEX) {
         let reference = be32(sidx, at)?;
         let duration = u64::from(be32(sidx, at + 4)?);
         at += 12;
-        if reference & 0x8000_0000 != 0 {
-            return None;
-        }
-        entries.push(IndexEntry {
+        let target = if reference & 0x8000_0000 == 0 {
+            SidxTarget::Media
+        } else {
+            SidxTarget::Index
+        };
+        refs.push(SidxRef {
+            target,
             time: convert(time),
-            moof: offset,
+            offset,
         });
         offset = offset.checked_add(u64::from(reference & 0x7FFF_FFFF))?;
         time = time.saturating_add(duration);
         total = total.saturating_add(duration);
     }
-    Some((entries, convert(total)))
+    Some(Sidx {
+        reference_id,
+        refs,
+        duration: convert(total),
+    })
 }
 
 /// The `tfra` entries of `track_id` in an `mfra` body.
@@ -359,21 +393,42 @@ mod tests {
         let mut body = words(&[0, 1, 1000, 0, 0]);
         body.extend_from_slice(&[0, 0, 0, 2]);
         body.extend(words(&[300, 2000, 0x9000_0000, 400, 2000, 0x9000_0000]));
-        let (entries, total) = parse_sidx(&body, 1000, 90_000).unwrap();
+        let sidx = parse_sidx(&body, 1000, 90_000).unwrap();
+        assert_eq!(sidx.reference_id, 1);
         assert_eq!(
-            entries,
+            sidx.refs,
             [
-                IndexEntry {
+                SidxRef {
+                    target: SidxTarget::Media,
                     time: 0,
-                    moof: 1000
+                    offset: 1000
                 },
-                IndexEntry {
+                SidxRef {
+                    target: SidxTarget::Media,
                     time: 180_000,
-                    moof: 1300
+                    offset: 1300
                 }
             ]
         );
-        assert_eq!(total, 360_000);
+        assert_eq!(sidx.duration, 360_000);
+    }
+
+    #[test]
+    fn sidx_references_to_further_indexes_are_marked() {
+        // version 1, EPT 500, first offset 20; one reference to a sidx.
+        let mut body = words(&[1 << 24, 1, 1000, 0, 500, 0, 20]);
+        body.extend_from_slice(&[0, 0, 0, 1]);
+        body.extend(words(&[0x8000_0000 | 900, 3000, 0x9000_0000]));
+        let sidx = parse_sidx(&body, 100, 1000).unwrap();
+        assert_eq!(
+            sidx.refs,
+            [SidxRef {
+                target: SidxTarget::Index,
+                time: 500,
+                offset: 120
+            }]
+        );
+        assert_eq!(sidx.duration, 3000);
     }
 
     #[test]

@@ -137,6 +137,59 @@ const CASES: &[Case] = &[
         extra: &["-movflags", "frag_keyframe+empty_moov+skip_trailer"],
         codecs: (Codec::H264, AudioCodec::Aac),
     },
+    // One `moof` per track (`separate_moof`): each track resumes from
+    // its own fragment after a seek. The audio-first files put the
+    // audio fragment of each interval before the video one. ffmpeg
+    // writes the `global_sidx` of such a file with sizes that skip the
+    // other track's fragments; it is rejected and the file scanned.
+    Case {
+        name: "separate_moof_mfra.mp4",
+        video: H264,
+        audio: AAC,
+        extra: &[
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof+separate_moof",
+        ],
+        codecs: (Codec::H264, AudioCodec::Aac),
+    },
+    Case {
+        name: "separate_moof_sidx.mp4",
+        video: H264,
+        audio: AAC,
+        extra: &[
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof+separate_moof+global_sidx+skip_trailer",
+        ],
+        codecs: (Codec::H264, AudioCodec::Aac),
+    },
+    Case {
+        name: "separate_moof_audio_first.mp4",
+        video: H264,
+        audio: AAC,
+        extra: &[
+            "-map",
+            "1:a",
+            "-map",
+            "0:v",
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof+separate_moof+skip_trailer",
+        ],
+        codecs: (Codec::H264, AudioCodec::Aac),
+    },
+    Case {
+        name: "separate_moof_audio_first_mfra.mp4",
+        video: H264,
+        audio: AAC,
+        extra: &[
+            "-map",
+            "1:a",
+            "-map",
+            "0:v",
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof+separate_moof",
+        ],
+        codecs: (Codec::H264, AudioCodec::Aac),
+    },
 ];
 
 fn packets(demuxer: &mut Demuxer, name: &str) -> Vec<Packet> {
@@ -276,9 +329,12 @@ fn seek_lands_on_the_keyframe_before_the_target_and_audio_follows() {
                     Packet::Audio(a) => Some(a.timestamp_us),
                     Packet::Video(_) => None,
                 })
-                .unwrap();
+                .unwrap_or_else(|| panic!("{}: no audio after seeking to {target}", case.name));
+            // Audio resumes with the packet playing at the keyframe or
+            // shortly before it, never later (but for millisecond rounding).
             assert!(
-                first_audio.abs_diff(landed) < 100_000,
+                first_audio <= landed.max(start) + 2_000
+                    && landed.saturating_sub(first_audio) < 100_000,
                 "{}: audio resumes at {first_audio}, video at {landed}",
                 case.name
             );

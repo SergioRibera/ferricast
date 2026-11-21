@@ -30,6 +30,10 @@ const MAX_INDEX_BOX: u64 = 16 << 20;
 /// Samples queued on one track before fragments stop being read ahead
 /// for another track that has none.
 const MAX_PENDING: usize = 2048;
+/// Levels of a hierarchical `sidx` index followed at most.
+const MAX_SIDX_DEPTH: usize = 4;
+/// `sidx` boxes read at most while following one index.
+const MAX_SIDX_BOXES: usize = 4096;
 
 pub struct Mp4Demuxer {
     source: BoxedSource,
@@ -243,6 +247,17 @@ impl AudioTrack {
         self.samples.get(self.next).map(|s| self.ts_us(s))
     }
 
+    /// Decode ticks of the sample timestamped `timestamp_us`: the inverse
+    /// of [`Self::ts_us`].
+    fn ticks(&self, timestamp_us: u64) -> u64 {
+        let us = timestamp_us.saturating_sub(self.offset_us);
+        let t = u128::from(us) * u128::from(self.timescale) / 1_000_000;
+        i64::try_from(t)
+            .unwrap_or(i64::MAX)
+            .saturating_add(self.shift)
+            .max(0) as u64
+    }
+
     /// Moves to the first sample still playing at `timestamp_us`.
     fn seek(&mut self, timestamp_us: u64) {
         self.next = self
@@ -313,14 +328,64 @@ struct Fragments {
     next_box: u64,
     /// No `moof` after `next_box`.
     ended: bool,
-    /// Fragments by time of the track seeks are made on (video, else
-    /// audio), ascending.
-    index: Vec<fragment::IndexEntry>,
-    /// The index covers the whole file (from `sidx` or `mfra`); otherwise
-    /// it holds the fragments read so far and grows as more are scanned.
-    index_complete: bool,
+    /// Fragments of the track seeks are made on (video, else audio).
+    index: FragmentIndex,
+    /// Fragments of the audio track when video leads seeks: files that
+    /// give each track its own `moof` place them independently.
+    audio_index: FragmentIndex,
     /// Where each track's decode time continues after the last fragment.
     next_dts: Vec<(u32, u64)>,
+}
+
+/// What one walk over every `moof` of a file finds.
+#[derive(Debug, Default)]
+struct Scan {
+    /// Fragments holding a keyframe of the track seeks are made on.
+    primary: Vec<fragment::IndexEntry>,
+    /// Fragments of the audio track when video leads seeks.
+    secondary: Vec<fragment::IndexEntry>,
+    /// Where the primary track ends, in its timescale.
+    end: Option<u64>,
+}
+
+/// Fragments of one track by time, ascending.
+#[derive(Debug, Default)]
+struct FragmentIndex {
+    entries: Vec<fragment::IndexEntry>,
+    /// The index covers the whole file (from `sidx` or `mfra`, or a full
+    /// scan); otherwise it holds the fragments read so far and grows as
+    /// more are read.
+    complete: bool,
+}
+
+impl FragmentIndex {
+    fn complete(entries: Vec<fragment::IndexEntry>) -> Self {
+        Self {
+            entries,
+            complete: true,
+        }
+    }
+
+    fn remember(&mut self, entry: fragment::IndexEntry) {
+        if self.complete || self.entries.len() >= fragment::MAX_INDEX {
+            return;
+        }
+        if self
+            .entries
+            .last()
+            .is_none_or(|last| last.moof < entry.moof)
+        {
+            self.entries.push(entry);
+        }
+    }
+
+    /// The `moof` offset of the last fragment starting at or before `time`.
+    fn at_or_before(&self, time: u64) -> Option<u64> {
+        let at = self.entries.partition_point(|e| e.time <= time);
+        at.checked_sub(1)
+            .and_then(|i| self.entries.get(i))
+            .map(|e| e.moof)
+    }
 }
 
 impl Fragments {
@@ -335,15 +400,6 @@ impl Fragments {
         match self.next_dts.iter_mut().find(|(id, _)| *id == track_id) {
             Some(entry) => entry.1 = dts,
             None => self.next_dts.push((track_id, dts)),
-        }
-    }
-
-    fn remember(&mut self, entry: fragment::IndexEntry) {
-        if self.index_complete || self.index.len() >= fragment::MAX_INDEX {
-            return;
-        }
-        if self.index.last().is_none_or(|last| last.moof < entry.moof) {
-            self.index.push(entry);
         }
     }
 
@@ -469,8 +525,8 @@ impl Mp4Demuxer {
                 file_len,
                 next_box: moov_end,
                 ended: false,
-                index: Vec::new(),
-                index_complete: false,
+                index: FragmentIndex::default(),
+                audio_index: FragmentIndex::default(),
                 next_dts: Vec::new(),
             }),
             _ => None,
@@ -532,54 +588,83 @@ impl Mp4Demuxer {
             .or_else(|| self.audio.as_ref().map(|a| (a.id, a.timescale)))
     }
 
-    /// Builds the fragment index from a `sidx` or an `mfra` box when the
-    /// file has one, and returns the duration it reveals.
+    /// Id and timescale of the audio track when video leads seeks.
+    fn secondary(&self) -> Option<(u32, u32)> {
+        self.video.as_ref()?;
+        self.audio.as_ref().map(|a| (a.id, a.timescale))
+    }
+
+    /// Builds the fragment indexes from `sidx` or `mfra` boxes when the
+    /// file has them (else from one scan of its fragments), and returns
+    /// the duration they reveal.
     fn locate_fragments(&mut self) -> Result<Option<u64>> {
         let Some((track_id, timescale)) = self.primary() else {
             return Ok(None);
         };
-        let Some(fragments) = self.fragments.as_ref() else {
+        let secondary = self.secondary();
+        let Some(file_len) = self.fragments.as_ref().map(|f| f.file_len) else {
             return Ok(None);
         };
-        let file_len = fragments.file_len;
-        // A `sidx` sits between the `moov` and the first `moof`.
+        // `sidx` boxes sit between the `moov` and the first `moof`: one
+        // for the whole file or one per track.
+        let mut primary_sidx = None;
+        let mut audio_sidx = None;
         let mut offset = 0;
-        let mut found = None;
         while let Some((kind, header_len, size)) = box_header(&mut self.source, offset, file_len)? {
             match &kind {
-                b"sidx" if size - header_len <= MAX_INDEX_BOX => {
-                    let mut body = vec![0; (size - header_len) as usize];
-                    self.source.seek(SeekFrom::Start(offset + header_len))?;
-                    self.source.read_exact(&mut body)?;
-                    if be32(&body, 4) == Some(track_id) {
-                        found = fragment::parse_sidx(&body, offset + size, timescale);
+                b"sidx" => {
+                    let reference_id = self
+                        .read_box_body(offset, header_len, size)?
+                        .and_then(|body| be32(&body, 4));
+                    if reference_id == Some(track_id) && primary_sidx.is_none() {
+                        primary_sidx = self.sidx_index(offset, timescale)?;
+                    } else if let Some((audio_id, audio_scale)) = secondary
+                        && reference_id == Some(audio_id)
+                        && audio_sidx.is_none()
+                    {
+                        audio_sidx = self.sidx_index(offset, audio_scale)?;
                     }
-                    break;
+                    offset += size;
                 }
                 b"moof" | b"mdat" => break,
                 _ => offset += size,
             }
         }
+
         let mut duration = None;
-        let entries = match found {
-            Some((entries, total)) => {
-                duration = Some(micros(i64::try_from(total).unwrap_or(i64::MAX), timescale));
-                Some(entries)
+        let mut audio_entries = audio_sidx.map(|(entries, _)| entries);
+        let mfra = match primary_sidx {
+            Some(_) => None,
+            None => self.read_mfra(file_len)?,
+        };
+        let from_mfra = |id: u32| mfra.as_deref().and_then(|m| fragment::parse_mfra(m, id));
+        let entries = if let Some((entries, total)) = primary_sidx {
+            duration = Some(micros(i64::try_from(total).unwrap_or(i64::MAX), timescale));
+            entries
+        } else if let Some(entries) = from_mfra(track_id) {
+            if audio_entries.is_none() {
+                audio_entries = secondary.and_then(|(id, _)| from_mfra(id));
             }
-            None => match self.read_mfra(track_id, file_len)? {
-                Some(entries) => Some(entries),
-                None => {
-                    // No index in the file: walk its fragments once.
-                    let (entries, end) = self.scan_fragments(track_id)?;
-                    duration = end
-                        .map(|ticks| micros(i64::try_from(ticks).unwrap_or(i64::MAX), timescale));
-                    Some(entries)
-                }
-            },
+            entries
+        } else {
+            // No index in the file: walk its fragments once.
+            let scan = self.scan_fragments(track_id, secondary.map(|(id, _)| id))?;
+            duration = scan
+                .end
+                .map(|ticks| micros(i64::try_from(ticks).unwrap_or(i64::MAX), timescale));
+            if audio_entries.is_none() {
+                audio_entries = Some(scan.secondary);
+            }
+            scan.primary
         };
-        let Some(entries) = entries.filter(|e| !e.is_empty()) else {
+        if let Some(fragments) = self.fragments.as_mut()
+            && let Some(audio_entries) = audio_entries.filter(|e| !e.is_empty())
+        {
+            fragments.audio_index = FragmentIndex::complete(audio_entries);
+        }
+        if entries.is_empty() {
             return Ok(duration);
-        };
+        }
         if duration.is_none()
             && let Some(last) = entries.last()
         {
@@ -587,21 +672,132 @@ impl Mp4Demuxer {
             duration = self.fragment_end_us(last.moof)?;
         }
         if let Some(fragments) = self.fragments.as_mut() {
-            fragments.index = entries;
-            fragments.index_complete = true;
+            fragments.index = FragmentIndex::complete(entries);
         }
         Ok(duration)
     }
 
-    /// Reads every `moof` of the file (not the media): the index entry of
-    /// each fragment holding a keyframe of `track_id`, and where that
-    /// track ends, in its timescale.
-    fn scan_fragments(
+    /// The body of the box at `offset`, unless it is over
+    /// [`MAX_INDEX_BOX`].
+    fn read_box_body(
         &mut self,
-        track_id: u32,
-    ) -> Result<(Vec<fragment::IndexEntry>, Option<u64>)> {
+        offset: u64,
+        header_len: u64,
+        size: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let len = size - header_len;
+        if len > MAX_INDEX_BOX {
+            return Ok(None);
+        }
+        let mut body = vec![0; len as usize];
+        self.source.seek(SeekFrom::Start(offset + header_len))?;
+        self.source.read_exact(&mut body)?;
+        Ok(Some(body))
+    }
+
+    /// The fragments indexed by the `sidx` box at `offset`, following
+    /// references to further `sidx` boxes, and the duration the box
+    /// covers, in `timescale`. `None` when the index is unreadable or
+    /// does not point at fragments.
+    fn sidx_index(
+        &mut self,
+        offset: u64,
+        timescale: u32,
+    ) -> Result<Option<(Vec<fragment::IndexEntry>, u64)>> {
+        let Some(file_len) = self.fragments.as_ref().map(|f| f.file_len) else {
+            return Ok(None);
+        };
+        let Some(root) = self.read_sidx(offset, file_len, timescale)? else {
+            return Ok(None);
+        };
+        let reference_id = root.reference_id;
+        let duration = root.duration;
+        let mut entries = Vec::new();
+        // Depth-first over the index tree: (references, next one, depth).
+        let mut stack = vec![(root.refs, 0usize, 0usize)];
+        let mut boxes_read = 1;
+        while let Some((refs, at, depth)) = stack.last_mut() {
+            let Some(reference) = refs.get(*at).copied() else {
+                stack.pop();
+                continue;
+            };
+            *at += 1;
+            let depth = *depth;
+            match reference.target {
+                fragment::SidxTarget::Media => {
+                    if entries.len() >= fragment::MAX_INDEX {
+                        break;
+                    }
+                    entries.push(fragment::IndexEntry {
+                        time: reference.time,
+                        moof: reference.offset,
+                    });
+                }
+                fragment::SidxTarget::Index => {
+                    if depth + 1 >= MAX_SIDX_DEPTH || boxes_read >= MAX_SIDX_BOXES {
+                        return Ok(None);
+                    }
+                    boxes_read += 1;
+                    match self.read_sidx(reference.offset, file_len, timescale)? {
+                        Some(child) if child.reference_id == reference_id => {
+                            stack.push((child.refs, 0, depth + 1));
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+            }
+        }
+        if !entries.is_sorted_by_key(|e| e.moof) || !self.entries_point_at_fragments(&entries)? {
+            return Ok(None);
+        }
+        Ok(Some((entries, duration)))
+    }
+
+    /// The `sidx` box at `offset`, parsed; `None` when something else
+    /// is there.
+    fn read_sidx(
+        &mut self,
+        offset: u64,
+        file_len: u64,
+        timescale: u32,
+    ) -> Result<Option<fragment::Sidx>> {
+        let Some((kind, header_len, size)) = box_header(&mut self.source, offset, file_len)? else {
+            return Ok(None);
+        };
+        if &kind != b"sidx" {
+            return Ok(None);
+        }
+        let body = self.read_box_body(offset, header_len, size)?;
+        Ok(body.and_then(|body| fragment::parse_sidx(&body, offset + size, timescale)))
+    }
+
+    /// Whether the first, middle and last of `entries` start a fragment.
+    /// Some muxers write `sidx` boxes whose sizes skip the fragments of
+    /// other tracks; their offsets then land inside media data.
+    fn entries_point_at_fragments(&mut self, entries: &[fragment::IndexEntry]) -> Result<bool> {
+        let Some(file_len) = self.fragments.as_ref().map(|f| f.file_len) else {
+            return Ok(false);
+        };
+        let probes = [0, entries.len() / 2, entries.len().saturating_sub(1)];
+        for entry in probes.iter().filter_map(|&i| entries.get(i)) {
+            let kind = box_header(&mut self.source, entry.moof, file_len)?.map(|(kind, ..)| kind);
+            if !matches!(
+                kind.as_ref(),
+                Some(b"moof" | b"styp" | b"sidx" | b"emsg" | b"prft" | b"free" | b"skip")
+            ) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Reads every `moof` of the file (not the media): the index entry of
+    /// each fragment holding a keyframe of `track_id`, of each fragment of
+    /// `secondary`, and where `track_id` ends, in its timescale.
+    fn scan_fragments(&mut self, track_id: u32, secondary: Option<u32>) -> Result<Scan> {
+        let mut scan = Scan::default();
         let Some(fragments) = self.fragments.as_mut() else {
-            return Ok((Vec::new(), None));
+            return Ok(scan);
         };
         let saved = (
             fragments.next_box,
@@ -611,35 +807,38 @@ impl Mp4Demuxer {
         fragments.next_box = 0;
         fragments.ended = false;
         fragments.next_dts.clear();
-        let mut entries = Vec::new();
-        let mut end = None;
-        while entries.len() < fragment::MAX_INDEX
+        while scan.primary.len() < fragment::MAX_INDEX
+            && scan.secondary.len() < fragment::MAX_INDEX
             && let Some((moof, runs)) = fragments.next_moof(&mut self.source)?
         {
-            let Some(run) = runs.into_iter().find(|r| r.track_id == track_id) else {
-                continue;
-            };
-            if let Some(first) = run.samples.iter().find(|s| s.sync) {
-                entries.push(fragment::IndexEntry {
-                    time: u64::try_from(first.presentation_ticks()).unwrap_or(0),
-                    moof,
-                });
-            }
-            if let Some(last) = run.samples.last() {
-                end = Some(last.dts.saturating_add(u64::from(last.duration)));
+            for run in runs {
+                if run.track_id == track_id {
+                    if let Some(first) = run.samples.iter().find(|s| s.sync) {
+                        scan.primary.push(fragment::IndexEntry {
+                            time: u64::try_from(first.presentation_ticks()).unwrap_or(0),
+                            moof,
+                        });
+                    }
+                    if let Some(last) = run.samples.last() {
+                        scan.end = Some(last.dts.saturating_add(u64::from(last.duration)));
+                    }
+                } else if Some(run.track_id) == secondary
+                    && let Some(first) = run.samples.first()
+                {
+                    scan.secondary.push(fragment::IndexEntry {
+                        time: first.dts,
+                        moof,
+                    });
+                }
             }
         }
         (fragments.next_box, fragments.ended, fragments.next_dts) = saved;
-        Ok((entries, end))
+        Ok(scan)
     }
 
-    /// The `tfra` entries of `track_id`, located through the `mfro` box
-    /// that closes the file.
-    fn read_mfra(
-        &mut self,
-        track_id: u32,
-        file_len: u64,
-    ) -> Result<Option<Vec<fragment::IndexEntry>>> {
+    /// The body of the `mfra` box located through the `mfro` box that
+    /// closes the file.
+    fn read_mfra(&mut self, file_len: u64) -> Result<Option<Vec<u8>>> {
         if file_len < 16 {
             return Ok(None);
         }
@@ -659,7 +858,8 @@ impl Mp4Demuxer {
         if mfra.get(4..8) != Some(&b"mfra"[..]) {
             return Ok(None);
         }
-        Ok(fragment::parse_mfra(&mfra[8..], track_id))
+        mfra.drain(..8);
+        Ok(Some(mfra))
     }
 
     /// Where the media of the `moof` at `offset` ends, on the primary
@@ -722,7 +922,8 @@ impl Mp4Demuxer {
             return Ok(false);
         };
         let file_len = fragments.file_len;
-        let primary = self.primary();
+        let primary = self.primary().map(|(id, _)| id);
+        let secondary = self.secondary().map(|(id, _)| id);
         for run in runs {
             let mut samples = run.samples;
             let readable = samples
@@ -730,15 +931,22 @@ impl Mp4Demuxer {
                 .take_while(|s| s.end().is_some_and(|end| end <= file_len))
                 .count();
             samples.truncate(readable);
-            if let Some((id, _)) = primary
-                && id == run.track_id
-                && let Some(first) = samples.iter().find(|s| s.sync)
-                && let Some(fragments) = self.fragments.as_mut()
-            {
-                fragments.remember(fragment::IndexEntry {
-                    time: u64::try_from(first.presentation_ticks()).unwrap_or(0),
-                    moof,
-                });
+            if let Some(fragments) = self.fragments.as_mut() {
+                if primary == Some(run.track_id)
+                    && let Some(first) = samples.iter().find(|s| s.sync)
+                {
+                    fragments.index.remember(fragment::IndexEntry {
+                        time: u64::try_from(first.presentation_ticks()).unwrap_or(0),
+                        moof,
+                    });
+                } else if secondary == Some(run.track_id)
+                    && let Some(first) = samples.first()
+                {
+                    fragments.audio_index.remember(fragment::IndexEntry {
+                        time: first.dts,
+                        moof,
+                    });
+                }
             }
             if let Some(video) = self.video.as_mut().filter(|v| v.id == run.track_id) {
                 video.samples.drain(..video.next.min(video.samples.len()));
@@ -837,13 +1045,14 @@ impl Mp4Demuxer {
             let Some(fragments) = self.fragments.as_mut() else {
                 return Ok(timestamp_us);
             };
-            if fragments.index_complete
-                || fragments.index.last().is_some_and(|e| e.time > target)
-                || fragments.index.len() >= fragment::MAX_INDEX
+            let index = &fragments.index;
+            if index.complete
+                || index.entries.last().is_some_and(|e| e.time > target)
+                || index.entries.len() >= fragment::MAX_INDEX
             {
                 break;
             }
-            if let Some(last) = fragments.index.last() {
+            if let Some(last) = index.entries.last() {
                 fragments.next_box = fragments.next_box.max(last.moof);
             }
             if fragments.ended {
@@ -866,23 +1075,96 @@ impl Mp4Demuxer {
         let Some(fragments) = self.fragments.as_ref() else {
             return Ok(timestamp_us);
         };
-        let at = fragments.index.partition_point(|e| e.time <= target);
+        let at = fragments
+            .index
+            .entries
+            .partition_point(|e| e.time <= target);
         let mut candidate = at.saturating_sub(1);
         loop {
-            let moof = self
-                .fragments
-                .as_ref()
-                .and_then(|f| f.index.get(candidate))
-                .map(|e| e.moof);
+            let moof = self.primary_fragment(candidate);
             self.restart_at(moof)?;
             self.fill()?;
             if self.has_keyframe_by(timestamp_us) || candidate == 0 {
-                return Ok(self.position_tracks(timestamp_us));
+                let landed = self.position_tracks(timestamp_us);
+                return self.align_audio(timestamp_us, landed, moof, candidate);
             }
             // The fragment holds no keyframe at or before the target:
             // try the one before.
             candidate -= 1;
         }
+    }
+
+    /// The `moof` offset of entry `i` of the primary index.
+    fn primary_fragment(&self, i: usize) -> Option<u64> {
+        self.fragments
+            .as_ref()
+            .and_then(|f| f.index.entries.get(i))
+            .map(|e| e.moof)
+    }
+
+    /// When the tracks are fragmented separately, the audio playing at
+    /// `landed` can sit in a fragment before `restarted_at`, the video
+    /// fragment reading restarted from; audio would then resume late, at
+    /// its next fragment. Restarts from the audio fragment instead (from
+    /// the previous video fragment when the audio index does not reach
+    /// back) and returns where playback resumes.
+    fn align_audio(
+        &mut self,
+        timestamp_us: u64,
+        landed: u64,
+        restarted_at: Option<u64>,
+        candidate: usize,
+    ) -> Result<u64> {
+        let (Some(restarted_at), Some(_), Some(audio)) =
+            (restarted_at, self.video.as_ref(), self.audio.as_ref())
+        else {
+            return Ok(landed);
+        };
+        // No audio left to play also counts: its fragment may lie behind.
+        let late = audio
+            .samples
+            .get(audio.next)
+            .is_none_or(|s| audio.ts_us(s) > landed);
+        if !late {
+            return Ok(landed);
+        }
+        let ticks = audio.ticks(landed);
+        let earlier = self
+            .fragments
+            .as_ref()
+            .and_then(|f| f.audio_index.at_or_before(ticks))
+            .filter(|&moof| moof < restarted_at)
+            .or_else(|| {
+                candidate
+                    .checked_sub(1)
+                    .and_then(|c| self.primary_fragment(c))
+            });
+        let Some(earlier) = earlier else {
+            return Ok(landed);
+        };
+        self.restart_at(Some(earlier))?;
+        self.load_through(landed)?;
+        Ok(self.position_tracks(timestamp_us))
+    }
+
+    /// Reads fragments until the video keyframe presented at `landed` is
+    /// loaded, then until every track has a sample waiting; bounded like
+    /// [`Self::fill`].
+    fn load_through(&mut self, landed: u64) -> Result<()> {
+        loop {
+            let loaded = self.video.as_ref().is_none_or(|video| {
+                video
+                    .samples
+                    .iter()
+                    .any(|s| s.sync && video.pts_us(s) >= landed)
+            });
+            let queued = self.video.as_ref().map_or(0, |v| v.samples.len())
+                + self.audio.as_ref().map_or(0, |a| a.samples.len());
+            if loaded || queued >= 2 * MAX_PENDING || !self.load_fragment()? {
+                break;
+            }
+        }
+        self.fill()
     }
 
     /// Drops every queued sample and continues reading at the `moof` at
@@ -1506,6 +1788,99 @@ mod tests {
             cts_offset: 0,
             sync,
         }
+    }
+
+    /// A version 0 `sidx` for track 1 at timescale 1000 whose references
+    /// are `(points at a further sidx, referenced size, duration)`.
+    fn sidx_box(ept: u32, refs: &[(bool, u32, u32)]) -> Vec<u8> {
+        let mut body = [0u32, 1, 1000, ept, 0]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect::<Vec<u8>>();
+        body.extend_from_slice(&(refs.len() as u32).to_be_bytes());
+        for &(index, size, duration) in refs {
+            let reference = size | if index { 0x8000_0000 } else { 0 };
+            for word in [reference, duration, 0x9000_0000] {
+                body.extend_from_slice(&word.to_be_bytes());
+            }
+        }
+        boxed(b"sidx", &body)
+    }
+
+    /// One fragment: an empty `moof` and a small `mdat`.
+    fn segment() -> Vec<u8> {
+        let mut out = boxed(b"moof", &[0; 8]);
+        out.extend(boxed(b"mdat", &[0; 16]));
+        out
+    }
+
+    fn fragmented(bytes: Vec<u8>) -> Mp4Demuxer {
+        let file_len = bytes.len() as u64;
+        Mp4Demuxer {
+            source: Box::new(std::io::Cursor::new(bytes)),
+            video: None,
+            audio: None,
+            duration_us: None,
+            fragments: Some(Fragments {
+                trex: Vec::new(),
+                file_len,
+                next_box: 0,
+                ended: false,
+                index: FragmentIndex::default(),
+                audio_index: FragmentIndex::default(),
+                next_dts: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn hierarchical_sidx_is_followed_to_every_fragment() {
+        let seg = segment();
+        let seg_len = seg.len() as u32;
+        let child = |ept| sidx_box(ept, &[(false, seg_len, 1000), (false, seg_len, 1000)]);
+        let child_len = child(0).len() as u32;
+        let subtree = child_len + 2 * seg_len;
+        let mut file = sidx_box(0, &[(true, subtree, 2000), (true, subtree, 2000)]);
+        let top_len = file.len() as u64;
+        for ept in [0, 2000] {
+            file.extend(child(ept));
+            file.extend(&seg);
+            file.extend(&seg);
+        }
+        let mut demuxer = fragmented(file);
+        let (entries, duration) = demuxer.sidx_index(0, 1000).unwrap().unwrap();
+        let (child_len, seg_len) = (u64::from(child_len), u64::from(seg_len));
+        let first = top_len + child_len;
+        let second = first + 2 * seg_len + child_len;
+        let expected = [
+            (0, first),
+            (1000, first + seg_len),
+            (2000, second),
+            (3000, second + seg_len),
+        ]
+        .map(|(time, moof)| fragment::IndexEntry { time, moof });
+        assert_eq!(entries, expected);
+        assert_eq!(duration, 4000);
+    }
+
+    #[test]
+    fn sidx_trees_too_deep_or_pointing_elsewhere_are_rejected() {
+        // Each level points at the next sidx, one level more than allowed.
+        let seg = segment();
+        let mut levels = vec![sidx_box(0, &[(false, seg.len() as u32, 1000)])];
+        for _ in 0..MAX_SIDX_DEPTH {
+            let below: u32 = levels.iter().map(|l| l.len() as u32).sum::<u32>() + seg.len() as u32;
+            levels.insert(0, sidx_box(0, &[(true, below, 1000)]));
+        }
+        let mut file = levels.concat();
+        file.extend(&seg);
+        assert_eq!(fragmented(file).sidx_index(0, 1000).unwrap(), None);
+
+        // Sizes that skip part of the file land inside media data.
+        let mut file = sidx_box(0, &[(false, 12, 1000), (false, 12, 1000)]);
+        file.extend(segment());
+        file.extend(segment());
+        assert_eq!(fragmented(file).sidx_index(0, 1000).unwrap(), None);
     }
 
     #[test]
