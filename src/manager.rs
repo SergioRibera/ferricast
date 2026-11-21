@@ -245,6 +245,14 @@ pub enum ManagerEvent {
         protocol: &'static str,
         remote: RemoteSender,
     },
+    /// The sender connected as `receiver_id` asks to pair with a PIN
+    /// (AirPlay `pair-pin-start`): show `Some(pin)` to the user, who types
+    /// it on the sender. `None` withdraws a PIN shown before (pairing
+    /// finished or was abandoned); the session ending withdraws it too.
+    ReceiverPin {
+        receiver_id: Uuid,
+        pin: Option<String>,
+    },
     /// The remote sender's first LOAD has been processed and the
     /// puller has resolved [`MediaInfo`]. UI uses this to decide
     /// between a video window and an audio-only card view

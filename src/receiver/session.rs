@@ -413,6 +413,32 @@ impl Session {
                 self.volume.muted = muted;
                 self.send_pump(PumpCmd::Volume(self.volume.gain())).await;
             }
+            MediaCommand::Push(stream) => {
+                self.loading = None;
+                self.stop_pump().await;
+                self.media = None;
+                self.play_when_loaded = true;
+                self.seek_when_loaded = None;
+                self.ctx.playback.claim(self.seq, &self.notice_tx);
+                let ctx = self.ctx.clone();
+                let remote = self.remote.clone();
+                self.loading = Some(LoadingHandle(tokio::spawn(async move {
+                    tokio::time::timeout(LOAD_TIMEOUT, load_pushed(&ctx, &remote, stream))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(FerricastError::Timeout(
+                                "setting up the pushed stream took too long".into(),
+                            ))
+                        })
+                })));
+            }
+            MediaCommand::PairingPin(pin) => {
+                self.event(ManagerEvent::ReceiverPin {
+                    receiver_id: self.receiver_id,
+                    pin,
+                })
+                .await;
+            }
             MediaCommand::GetStatus | MediaCommand::LaunchApp { .. } => {}
             other @ (MediaCommand::QueueLoad { .. }
             | MediaCommand::QueueInsert { .. }
@@ -608,7 +634,30 @@ async fn load(ctx: &PipelineCtx, remote: &RemoteSender, request: LoadRequest) ->
         puller.seek(start).await?;
         start_us = start;
     }
+    prepare(ctx, remote, puller, info, start_us, timeline).await
+}
 
+/// Resolves a stream the sender pushes: decoders, then the sink.
+async fn load_pushed(
+    ctx: &PipelineCtx,
+    remote: &RemoteSender,
+    stream: ferricast_core::PushedStream,
+) -> Result<Prepared> {
+    tracing::info!(info = ?stream.info(), "receiver: sender is pushing media");
+    let (puller, info, timeline) = open(Box::new(stream), "", Timeline::Live).await?;
+    prepare(ctx, remote, puller, info, 0, timeline).await
+}
+
+/// Picks and configures the decoders `info` needs, then asks the
+/// application for a sink.
+async fn prepare(
+    ctx: &PipelineCtx,
+    remote: &RemoteSender,
+    puller: Box<dyn ErasedPuller>,
+    info: MediaInfo,
+    start_us: u64,
+    timeline: Timeline,
+) -> Result<Prepared> {
     let video_dec = info
         .video
         .as_ref()

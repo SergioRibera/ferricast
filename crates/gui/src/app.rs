@@ -192,6 +192,7 @@ impl AppState {
             }
             ManagerEvent::PairingRequired { .. }
             | ManagerEvent::ReceiverIncoming { .. }
+            | ManagerEvent::ReceiverPin { .. }
             | ManagerEvent::ReceiverStarted { .. }
             | ManagerEvent::ReceiverStateChanged { .. }
             | ManagerEvent::ReceiverStopped { .. } => {}
