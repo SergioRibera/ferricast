@@ -62,7 +62,8 @@ impl Shape {
             1 => Ok(Channels::FRONT_LEFT),
             2 => Ok(Channels::FRONT_LEFT | Channels::FRONT_RIGHT),
             other => Err(FerricastError::Decode(format!(
-                "AAC with {other} channels is unsupported (symphonia decodes mono and stereo AAC-LC)"
+                "AAC with {other} channels needs libfdk-aac (the `fdk-aac-decode` feature): \
+                 symphonia decodes mono and stereo AAC-LC only"
             ))),
         }
     }

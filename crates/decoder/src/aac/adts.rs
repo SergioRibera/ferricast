@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use ferricast_core::frame::AacChannelConfig;
+
 use super::Shape;
 
 const HEADER_LEN: usize = 7;
@@ -64,7 +66,7 @@ impl fmt::Display for AdtsError {
             ),
             Self::ChannelConfig(config) => write!(
                 f,
-                "ADTS channel_configuration {config} is unsupported (mono or stereo only)"
+                "ADTS channel_configuration {config} is unsupported (the layout is in a PCE)"
             ),
             Self::RawDataBlocks(count) => write!(
                 f,
@@ -166,9 +168,9 @@ fn parse_frame(data: &[u8], offset: usize) -> Result<(Unit<'_>, usize), AdtsErro
     let sample_rate = *SAMPLE_RATES
         .get(usize::from(rate_index))
         .ok_or(AdtsError::SampleRateIndex(rate_index))?;
-    if !matches!(channel_config, 1 | 2) {
-        return Err(AdtsError::ChannelConfig(channel_config));
-    }
+    let channels = AacChannelConfig::new(channel_config)
+        .ok_or(AdtsError::ChannelConfig(channel_config))?
+        .channels();
     if raw_blocks != 0 {
         return Err(AdtsError::RawDataBlocks(raw_blocks + 1));
     }
@@ -180,7 +182,7 @@ fn parse_frame(data: &[u8], offset: usize) -> Result<(Unit<'_>, usize), AdtsErro
         .ok_or_else(|| truncated(frame_len))?;
     let shape = Shape {
         sample_rate,
-        channels: u16::from(channel_config),
+        channels,
     };
     Ok((
         Unit {
@@ -275,6 +277,15 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn multichannel_configurations_report_their_channel_count() {
+        for (config, channels) in [(3, 3), (6, 6), (7, 8)] {
+            let data = frame(3, config, false, &[9]);
+            let shape = collect(&data).unwrap()[0].shape.unwrap();
+            assert_eq!(shape.channels, channels, "configuration {config}");
+        }
+    }
+
+    #[test]
     fn a_frame_running_past_the_payload_is_truncated() {
         let mut data = frame(3, 2, false, &[1, 2, 3, 4]);
         data.truncate(9);
@@ -302,8 +313,8 @@ pub(super) mod tests {
         reserved_rate[2] = (reserved_rate[2] & 0x3F) | (2 << 6);
         assert_eq!(collect(&reserved_rate), Err(AdtsError::Profile(2)));
         assert_eq!(
-            collect(&frame(3, 6, false, &[1])),
-            Err(AdtsError::ChannelConfig(6))
+            collect(&frame(3, 0, false, &[1])),
+            Err(AdtsError::ChannelConfig(0))
         );
         let mut packed = frame(3, 2, false, &[1]);
         packed[6] |= 0b01;
