@@ -308,6 +308,36 @@ impl SegmentRing {
         }
     }
 
+    /// Whether a blocking reload for `(msn, part)` reaches further past
+    /// the last published Partial Segment than the Advance Part Limit
+    /// allows (rfc8216bis §6.2.5.2). The limit is three parts, or
+    /// three seconds' worth of parts when PART-TARGET is under one
+    /// second. Always `false` while the ring is not in LL-HLS mode or
+    /// before the first part is published: there is no reference point.
+    #[must_use]
+    pub fn exceeds_advance_part_limit(&self, msn: u64, part: u32) -> bool {
+        let Some(part_target) = self.part_target_secs.filter(|pt| *pt > 0.0) else {
+            return false;
+        };
+        let Some((last_msn, last_part)) = self.last_published_part() else {
+            return false;
+        };
+        let parts_per_segment = parts_per_segment(self.target_duration, part_target);
+        let ahead = parts_between((last_msn, last_part), (msn, part), parts_per_segment);
+        ahead > advance_part_limit(part_target)
+    }
+
+    /// `(msn, idx)` of the newest published Partial Segment: the last
+    /// pending part of the segment under construction, or else the
+    /// last part of the newest completed segment.
+    fn last_published_part(&self) -> Option<(u64, u32)> {
+        if let Some(p) = self.pending_parts.last() {
+            return Some((self.next_seq, p.idx));
+        }
+        let seg = self.segments.back()?;
+        seg.parts.last().map(|p| (seg.seq, p.idx))
+    }
+
     /// Build the live media playlist from the current ring contents.
     ///
     /// # Errors
@@ -413,9 +443,90 @@ pub async fn wait_for_segments(
     }
 }
 
+/// Advance Part Limit in parts for a given PART-TARGET (rfc8216bis
+/// §6.2.5.2): three divided by the part target when it is under one
+/// second, three otherwise.
+fn advance_part_limit(part_target_secs: f32) -> u64 {
+    if part_target_secs < 1.0 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "ceil of 3/pt for 0 < pt < 1 is a small positive integer"
+        )]
+        let parts = (3.0 / part_target_secs).ceil() as u64;
+        parts
+    } else {
+        3
+    }
+}
+
+/// Expected parts per full segment, used to measure distances that
+/// cross segment boundaries the ring has not produced yet.
+fn parts_per_segment(target_duration: u8, part_target_secs: f32) -> u64 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "target_duration ≤ 255 s over a positive part target fits u64"
+    )]
+    let parts = (f32::from(target_duration) / part_target_secs).ceil() as u64;
+    parts.max(1)
+}
+
+/// How many parts `to` lies after `from`, both `(msn, part_idx)`.
+/// Zero when `to` is at or before `from`. Indexes past the end of a
+/// segment keep counting, matching how a client names part 0 of the
+/// next segment with an out-of-range index.
+fn parts_between(from: (u64, u32), to: (u64, u32), parts_per_segment: u64) -> u64 {
+    let linear = |(msn, part): (u64, u32)| {
+        msn.saturating_mul(parts_per_segment)
+            .saturating_add(u64::from(part))
+    };
+    linear(to).saturating_sub(linear(from))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advance_part_limit_scales_with_short_part_targets() {
+        assert_eq!(advance_part_limit(1.0), 3);
+        assert_eq!(advance_part_limit(2.0), 3);
+        assert_eq!(advance_part_limit(0.5), 6);
+        assert_eq!(advance_part_limit(0.33), 10);
+    }
+
+    #[test]
+    fn parts_between_counts_across_segment_boundaries() {
+        assert_eq!(parts_between((5, 2), (5, 2), 4), 0);
+        assert_eq!(parts_between((5, 2), (5, 1), 4), 0);
+        assert_eq!(parts_between((5, 2), (5, 5), 4), 3);
+        assert_eq!(parts_between((5, 2), (6, 0), 4), 2);
+        assert_eq!(parts_between((5, 2), (7, 1), 4), 7);
+        assert_eq!(parts_between((5, 2), (4, 3), 4), 0);
+    }
+
+    #[test]
+    fn advance_part_limit_rejects_far_parts_only_in_ll_mode() {
+        let mut ring = SegmentRing::new(4, 2);
+        // Classic ring: never applies.
+        assert!(!ring.exceeds_advance_part_limit(0, 100));
+        ring.enable_low_latency(1.0);
+        // No part published yet: no reference point.
+        assert!(!ring.exceeds_advance_part_limit(0, 100));
+        ring.push_pending_part(1.0, true, Bytes::from_static(&[0x47; 188]));
+        // Last published is (0, 0); limit is 3 parts.
+        assert!(!ring.exceeds_advance_part_limit(0, 3));
+        assert!(ring.exceeds_advance_part_limit(0, 4));
+        // Two parts per segment: (1, 1) is 3 ahead, (2, 0) is 4 ahead.
+        assert!(!ring.exceeds_advance_part_limit(1, 1));
+        assert!(ring.exceeds_advance_part_limit(2, 0));
+        // After closing the segment the reference is its last part.
+        ring.push_pending_part(1.0, false, Bytes::from_static(&[0x47; 188]));
+        ring.complete_pending_segment(2.0, false);
+        assert!(!ring.exceeds_advance_part_limit(2, 0));
+        assert!(ring.exceeds_advance_part_limit(2, 1));
+    }
 
     #[test]
     fn completed_segment_parts_share_the_segment_body() {
