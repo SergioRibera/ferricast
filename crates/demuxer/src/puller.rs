@@ -125,7 +125,10 @@ impl MediaPuller for ProgressivePuller {
         // The worker may be parked on a full channel; drain it (every
         // packet in it is stale now) until the seek is acknowledged.
         let landed = loop {
+            // Biased: the worker queues the seek's first packet only after
+            // acknowledging, so it is never mistaken for a stale one.
             tokio::select! {
+                biased;
                 done = &mut done_rx => {
                     break done.map_err(|_| FerricastError::Pull("demuxer thread ended".into()))??;
                 }
@@ -176,6 +179,15 @@ struct Worker {
 
 impl Worker {
     fn run(mut self) {
+        // Frames ahead of the presentation start (MP4 edit list pre-roll)
+        // are decoded but not shown.
+        if self
+            .demuxer
+            .video()
+            .is_some_and(|v| v.presentation_start_us > 0)
+        {
+            self.present_from(0);
+        }
         loop {
             loop {
                 match self.cmd_rx.try_recv() {
@@ -208,6 +220,15 @@ impl Worker {
         }
     }
 
+    /// Marks what comes before `timestamp_us` (and any pre-roll) as
+    /// decode-only.
+    fn present_from(&self, timestamp_us: u64) {
+        let start = self.demuxer.video().map_or(0, |v| v.presentation_start_us);
+        let timestamp_us = timestamp_us.max(start);
+        let marker = MediaPacket::PresentFrom { timestamp_us };
+        let _ = self.packet_tx.blocking_send((self.generation, Ok(marker)));
+    }
+
     fn handle(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Seek {
@@ -216,7 +237,14 @@ impl Worker {
                 done,
             } => {
                 self.generation = generation;
-                let _ = done.send(self.demuxer.seek(position_us));
+                let landed = self.demuxer.seek(position_us);
+                let ok = landed.is_ok();
+                let _ = done.send(landed);
+                if ok {
+                    // Playback resumes at the target, not at the keyframe
+                    // the demuxer had to go back to.
+                    self.present_from(position_us);
+                }
             }
         }
     }

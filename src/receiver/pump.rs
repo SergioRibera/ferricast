@@ -177,6 +177,9 @@ trait Decode {
     fn decode(&mut self, packet: Self::Packet) -> ferricast_core::Result<Option<Self::Output>>;
     fn flush(&mut self) -> Vec<Self::Output>;
     fn pts_us(output: &Self::Output) -> u64;
+    /// What of `output` may be presented when nothing before
+    /// `from_us` may: all of it, a trimmed part, or nothing.
+    fn trim(output: Self::Output, from_us: u64) -> Option<Self::Output>;
 }
 
 impl Decode for Box<dyn ErasedVideoDecoder> {
@@ -190,6 +193,9 @@ impl Decode for Box<dyn ErasedVideoDecoder> {
     }
     fn pts_us(output: &CapturedFrame) -> u64 {
         output.timestamp_us()
+    }
+    fn trim(output: CapturedFrame, from_us: u64) -> Option<CapturedFrame> {
+        (output.timestamp_us() >= from_us).then_some(output)
     }
 }
 
@@ -205,6 +211,9 @@ impl Decode for Box<dyn ErasedAudioDecoder> {
     fn pts_us(output: &DecodedAudio) -> u64 {
         output.timestamp_us
     }
+    fn trim(output: DecodedAudio, from_us: u64) -> Option<DecodedAudio> {
+        trim_audio(output, from_us)
+    }
 }
 
 /// One elementary stream: queued packets, its decoder, and decoded
@@ -213,6 +222,9 @@ struct Stream<D: Decode> {
     decoder: D,
     packets: VecDeque<D::Packet>,
     ready: VecDeque<D::Output>,
+    /// Output before this timestamp is decode-only (see
+    /// [`MediaPacket::PresentFrom`]).
+    present_from: Option<u64>,
 }
 
 impl<D: Decode> Stream<D> {
@@ -221,6 +233,7 @@ impl<D: Decode> Stream<D> {
             decoder,
             packets: VecDeque::new(),
             ready: VecDeque::new(),
+            present_from: None,
         }
     }
 
@@ -231,7 +244,7 @@ impl<D: Decode> Stream<D> {
                 return;
             };
             match self.decoder.decode(packet) {
-                Ok(Some(out)) => self.ready.push_back(out),
+                Ok(Some(out)) => self.accept(out),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(%e, "pump: decode failed"),
             }
@@ -242,18 +255,30 @@ impl<D: Decode> Stream<D> {
     fn drain(&mut self) {
         while let Some(packet) = self.packets.pop_front() {
             match self.decoder.decode(packet) {
-                Ok(Some(out)) => self.ready.push_back(out),
+                Ok(Some(out)) => self.accept(out),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(%e, "pump: decode failed"),
             }
         }
-        let flushed = self.decoder.flush();
-        self.ready.extend(flushed);
+        for out in self.decoder.flush() {
+            self.accept(out);
+        }
+    }
+
+    /// Queues decoded output for presentation, minus any decode-only
+    /// part.
+    fn accept(&mut self, out: D::Output) {
+        let out = match self.present_from {
+            Some(from_us) => D::trim(out, from_us),
+            None => Some(out),
+        };
+        self.ready.extend(out);
     }
 
     fn clear(&mut self) {
         self.packets.clear();
         self.ready.clear();
+        self.present_from = None;
         let _ = self.decoder.flush();
     }
 
@@ -374,7 +399,11 @@ impl Pump {
             }
             Ok(MediaPacket::Discontinuity) => {
                 self.drain_decoders();
+                self.set_present_from(None);
                 self.input = Input::Discontinuity;
+            }
+            Ok(MediaPacket::PresentFrom { timestamp_us }) => {
+                self.set_present_from(Some(timestamp_us));
             }
             Ok(MediaPacket::Eos) => {
                 self.drain_decoders();
@@ -383,6 +412,15 @@ impl Pump {
             Err(e) => return Some(PumpEnd::Failed(e.to_string())),
         }
         None
+    }
+
+    fn set_present_from(&mut self, from_us: Option<u64>) {
+        if let Some(v) = self.video.as_mut() {
+            v.present_from = from_us;
+        }
+        if let Some(a) = self.audio.as_mut() {
+            a.present_from = from_us;
+        }
     }
 
     fn drain_decoders(&mut self) {
@@ -543,6 +581,25 @@ async fn sleep_until_opt(due: Option<Instant>) {
     }
 }
 
+/// The part of `audio` from `from_us` on, or `None` when it ends
+/// before that.
+fn trim_audio(mut audio: DecodedAudio, from_us: u64) -> Option<DecodedAudio> {
+    if audio.timestamp_us >= from_us {
+        return Some(audio);
+    }
+    let channels = usize::from(audio.channels.max(1));
+    let rate = u64::from(audio.sample_rate.max(1));
+    let frames = (audio.pcm.len() / channels) as u64;
+    let skip = (from_us - audio.timestamp_us).saturating_mul(rate) / 1_000_000;
+    if skip >= frames {
+        return None;
+    }
+    let skip_samples = usize::try_from(skip).unwrap_or(usize::MAX) * channels;
+    audio.pcm.drain(..skip_samples);
+    audio.timestamp_us += skip * 1_000_000 / rate;
+    Some(audio)
+}
+
 /// `duration` of silence in `like`'s format, timed just before it.
 fn silence(like: &DecodedAudio, duration: Duration) -> DecodedAudio {
     let frames = u64::from(like.sample_rate) * duration.as_millis() as u64 / 1000;
@@ -560,6 +617,27 @@ fn silence(like: &DecodedAudio, duration: Duration) -> DecodedAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_before_the_presentation_start_is_trimmed() {
+        let audio = |timestamp_us| DecodedAudio {
+            pcm: vec![7; 4_800 * 2],
+            sample_rate: 48_000,
+            channels: 2,
+            timestamp_us,
+        };
+        // Wholly before: dropped.
+        assert!(trim_audio(audio(0), 100_000).is_none());
+        // Wholly after: kept as is.
+        assert_eq!(
+            trim_audio(audio(200_000), 100_000).unwrap().pcm.len(),
+            9_600
+        );
+        // Straddling: the first 25 ms are cut.
+        let cut = trim_audio(audio(1_000_000), 1_025_000).unwrap();
+        assert_eq!(cut.pcm.len(), (4_800 - 1_200) * 2);
+        assert_eq!(cut.timestamp_us, 1_025_000);
+    }
 
     #[test]
     fn silence_matches_format_and_duration() {

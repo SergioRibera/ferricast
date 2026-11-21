@@ -77,6 +77,10 @@ struct SinkLog {
     audio_chunks: usize,
     /// (arrival, PTS, duration) per audio chunk.
     audio: Vec<(Instant, u64, Duration)>,
+    /// Whether each audio chunk is pure silence (the pipeline's lead-in).
+    audio_silent: Vec<bool>,
+    /// Audio chunks received when each `flush_audio` arrived.
+    flushes: Vec<usize>,
     gains: Vec<f32>,
     sinks_created: usize,
     sinks_dropped: usize,
@@ -104,6 +108,13 @@ impl FrameSink for HeadlessSink {
         log.audio_chunks += 1;
         log.audio
             .push((Instant::now(), audio.timestamp_us, duration));
+        log.audio_silent.push(audio.pcm.iter().all(|&s| s == 0));
+        Ok(())
+    }
+    async fn flush_audio(&mut self) -> Result<()> {
+        let mut log = self.0.lock().unwrap();
+        let at = log.audio.len();
+        log.flushes.push(at);
         Ok(())
     }
     async fn set_volume(&mut self, gain: f32) -> Result<()> {
@@ -859,7 +870,10 @@ async fn seek_in_a_progressive_file_lands_near_the_target() {
     let session_id = reply["status"][0]["mediaSessionId"].clone();
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let shown_before = rx.log.lock().unwrap().video.len();
+    let (shown_before, heard_before) = {
+        let log = rx.log.lock().unwrap();
+        (log.video.len(), log.audio.len())
+    };
     let seek_sent = Instant::now();
     let id = sender
         .request(
@@ -882,6 +896,26 @@ async fn seek_in_a_progressive_file_lands_near_the_target() {
             .copied()
             .expect("frames after the seek");
         (first.1, after.last().unwrap().1, first.0)
+    };
+    let (first_audio, flushed_at, stale) = {
+        let log = rx.log.lock().unwrap();
+        let flushed_at = log
+            .flushes
+            .iter()
+            .copied()
+            .find(|&at| at >= heard_before)
+            .expect("the seek flushes the sink audio");
+        let after = flushed_at..log.audio.len();
+        let first = after
+            .clone()
+            .find(|&i| !log.audio_silent[i])
+            .map(|i| log.audio[i].1)
+            .expect("audio after the seek");
+        // Anything pushed after the flush from before the target is stale.
+        let stale = after
+            .filter(|&i| !log.audio_silent[i] && log.audio[i].1 < 7_400_000)
+            .count();
+        (first, flushed_at, stale)
     };
     let id = sender
         .request(
@@ -907,11 +941,21 @@ async fn seek_in_a_progressive_file_lands_near_the_target() {
         (at_first - seek_sent).as_secs_f64() * 1000.0,
         last_after as f64 / 1e6,
     );
-    // Keyframes every second: playback resumes from the one at 7.0 s.
-    assert!(
-        (6_900_000..=7_500_000).contains(&first_after),
-        "resumed at {first_after}"
+    eprintln!(
+        "E2E seek: first audio after seek at {:.3}s, flush after {flushed_at} chunks, {stale} stale chunks",
+        first_audio as f64 / 1e6
     );
+    // Keyframes every second: decoding restarts at 7.0 s, but nothing
+    // before the target is shown or heard.
+    assert!(
+        first_after.abs_diff(7_500_000) <= 34_000,
+        "first frame after the seek at {first_after}"
+    );
+    assert!(
+        first_audio.abs_diff(7_500_000) <= 25_000,
+        "first audio after the seek at {first_audio}"
+    );
+    assert_eq!(stale, 0, "stale audio after the flush");
     assert!(
         (reported - last_after as f64 / 1e6).abs() < 0.3,
         "status says {reported}, last frame {last_after}"

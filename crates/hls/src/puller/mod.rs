@@ -280,6 +280,9 @@ struct Worker {
     /// Something was emitted already; a timeline reset must then be
     /// signalled downstream.
     timeline_started: bool,
+    /// After a seek: how far into the next segment the target lies.
+    /// That much of the segment is decode-only.
+    seek_offset_us: Option<u64>,
 }
 
 /// Top-level worker entry: resolves the playlist, probes the first
@@ -389,6 +392,7 @@ impl Worker {
             last_reload_changed: false,
             reset_pending: false,
             timeline_started: false,
+            seek_offset_us: None,
         };
 
         // Probe the first segment: codecs and audio parameters are
@@ -477,6 +481,7 @@ impl Worker {
             Some((idx, segment_start_us)) => {
                 tracing::info!(position_us, segment_start_us, "HLS seek");
                 self.next_seq = self.playlist.media_sequence + idx as u64;
+                self.seek_offset_us = Some(position_us.saturating_sub(segment_start_us));
             }
             // Past the end: play nothing more.
             None => {
@@ -595,6 +600,9 @@ impl Worker {
             DemuxedPacket::Video(v) => MediaPacket::Video(v),
             DemuxedPacket::Audio(a) => MediaPacket::Audio(a),
         }));
+        if let Some(offset_us) = self.seek_offset_us.take() {
+            mark_seek_target(&mut out, offset_us);
+        }
         Ok(out)
     }
 
@@ -663,4 +671,29 @@ impl Worker {
         }
         Ok(())
     }
+}
+
+/// Marks the first `offset_us` of a segment's packets as decode-only:
+/// a seek target that falls inside a segment is reached by decoding from
+/// the segment start. The segment start is its first video frame (HLS
+/// segments open on a keyframe), or its first audio packet without video.
+fn mark_seek_target(packets: &mut Vec<MediaPacket>, offset_us: u64) {
+    let first_video = packets.iter().find_map(|p| match p {
+        MediaPacket::Video(v) => Some(v.timestamp_us),
+        _ => None,
+    });
+    let first_audio = packets.iter().find_map(|p| match p {
+        MediaPacket::Audio(a) => Some(a.timestamp_us),
+        _ => None,
+    });
+    let Some(start_us) = first_video.or(first_audio) else {
+        return;
+    };
+    let at = usize::from(matches!(packets.first(), Some(MediaPacket::Discontinuity)));
+    packets.insert(
+        at,
+        MediaPacket::PresentFrom {
+            timestamp_us: start_us.saturating_add(offset_us),
+        },
+    );
 }

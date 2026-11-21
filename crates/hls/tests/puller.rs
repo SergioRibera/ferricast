@@ -26,6 +26,7 @@ struct Collected {
     keyframes: usize,
     audio: usize,
     discontinuities: usize,
+    present_from: Option<u64>,
 }
 
 async fn collect(puller: &mut HlsPuller, limit: Duration) -> Collected {
@@ -44,6 +45,7 @@ async fn collect(puller: &mut HlsPuller, limit: Duration) -> Collected {
             }
             MediaPacket::Audio(_) => c.audio += 1,
             MediaPacket::Discontinuity => c.discontinuities += 1,
+            MediaPacket::PresentFrom { timestamp_us } => c.present_from = Some(timestamp_us),
             MediaPacket::Eos => return c,
         }
     }
@@ -235,6 +237,13 @@ async fn seek_discards_queued_packets_and_restarts_the_timeline() {
     assert!(
         min.abs_diff(first_pts + 4_000_000) < 50_000,
         "{min} vs {first_pts}"
+    );
+    // The half second between the segment start and the target is
+    // marked decode-only.
+    let from = c.present_from.expect("seek target marker");
+    assert!(
+        from.abs_diff(first_pts + 4_500_000) < 50_000,
+        "{from} vs {first_pts}"
     );
 }
 
