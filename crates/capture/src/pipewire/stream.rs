@@ -119,19 +119,25 @@ pub(super) struct WorkerHandle {
 }
 
 impl WorkerHandle {
-    pub(super) fn shutdown(&mut self) {
+    /// Stops the worker and waits for its thread off the async runtime.
+    pub(super) async fn shutdown(mut self) {
         let _ = self.terminator.send(Terminate);
-        if let Some(handle) = self.join.take()
-            && let Err(panic) = handle.join()
-        {
-            error!(?panic, "PipeWire worker panicked during shutdown");
+        let Some(handle) = self.join.take() else {
+            return;
+        };
+        match tokio::task::spawn_blocking(move || handle.join()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => error!(?panic, "PipeWire worker panicked during shutdown"),
+            Err(e) => error!(error = %e, "joining the PipeWire worker failed"),
         }
     }
 }
 
 impl Drop for WorkerHandle {
+    /// Asks the worker to exit and detaches it, so dropping a capture
+    /// never blocks the dropping thread on the PipeWire main loop.
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.terminator.send(Terminate);
     }
 }
 

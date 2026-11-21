@@ -442,11 +442,12 @@ struct WorkerHandle {
 }
 
 impl Drop for WorkerHandle {
+    /// Asks the worker to exit and detaches it. Joining here would
+    /// block whatever thread drops the capture (an async runtime
+    /// worker or the UI thread) for as long as the worker sits in a
+    /// Wayland wait; `stop` joins off the runtime instead.
     fn drop(&mut self) {
         let _ = self.stop.send(());
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
     }
 }
 

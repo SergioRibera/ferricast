@@ -218,11 +218,9 @@ impl ScreenCapture for PipeWireCapture {
 
     async fn stop(&mut self) -> Result<()> {
         info!("stopping PipeWire capture");
-        if let Some(mut worker) = self.worker.take() {
-            // Drop also calls shutdown(), but doing it explicitly here
-            // makes the intent obvious and lets us return after the
-            // worker thread has actually joined.
-            worker.shutdown();
+        if let Some(worker) = self.worker.take() {
+            // Return only after the worker thread has actually joined.
+            worker.shutdown().await;
         }
         // Close the portal session last: the compositor tears the
         // cast down (and clears its sharing indicator) only on Close.
