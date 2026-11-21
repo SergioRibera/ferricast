@@ -213,6 +213,7 @@ impl AudioTrack {
                         sample_rate: OPUS_RATE,
                         channels,
                         duration_us: None,
+                        source: None,
                     },
                 )
             }

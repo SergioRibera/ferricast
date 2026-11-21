@@ -172,6 +172,8 @@ pub struct WindowSink {
     label: String,
     video_tx: mpsc::Sender<VideoFrame>,
     audio_tx: mpsc::Sender<AudioBuf>,
+    /// Channels of the output device the window plays to.
+    output_channels: u16,
 }
 
 impl WindowSink {
@@ -186,7 +188,105 @@ impl WindowSink {
             label: label.into(),
             video_tx,
             audio_tx,
+            output_channels: default_output_channels(),
         }
+    }
+}
+
+/// Channels of the default output device, the one
+/// `rodio::OutputStream::try_default` opens; stereo when it cannot be
+/// queried.
+fn default_output_channels() -> u16 {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    rodio::cpal::default_host()
+        .default_output_device()
+        .and_then(|device| device.default_output_config().ok())
+        .map_or(2, |config| config.channels())
+}
+
+/// Where one input channel goes in a stereo downmix.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Gains {
+    left: f32,
+    right: f32,
+}
+
+/// ITU-R BS.775 stereo downmix of 3 to 8 interleaved channels in WAV
+/// order (the order libfdk-aac and symphonia output): centre and
+/// surrounds go to their side at -3 dB, LFE is dropped, and the result
+/// is scaled so a full-scale signal on every contributing channel
+/// cannot clip.
+#[derive(Debug, Clone, PartialEq)]
+struct StereoDownmix {
+    gains: Vec<Gains>,
+}
+
+impl StereoDownmix {
+    /// The downmix for `channels` input channels; `None` when there is
+    /// nothing to mix (mono, stereo) or the layout is unknown.
+    fn new(channels: u16) -> Option<Self> {
+        const K: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        const L: Gains = Gains {
+            left: 1.0,
+            right: 0.0,
+        };
+        const R: Gains = Gains {
+            left: 0.0,
+            right: 1.0,
+        };
+        const C: Gains = Gains { left: K, right: K };
+        const LFE: Gains = Gains {
+            left: 0.0,
+            right: 0.0,
+        };
+        const LS: Gains = Gains {
+            left: K,
+            right: 0.0,
+        };
+        const RS: Gains = Gains {
+            left: 0.0,
+            right: K,
+        };
+        let layout: &[Gains] = match channels {
+            // FL FR FC
+            3 => &[L, R, C],
+            // FL FR FC BC
+            4 => &[L, R, C, C],
+            // FL FR FC BL BR
+            5 => &[L, R, C, LS, RS],
+            // FL FR FC LFE BL BR
+            6 => &[L, R, C, LFE, LS, RS],
+            // FL FR FC LFE BC SL SR
+            7 => &[L, R, C, LFE, C, LS, RS],
+            // FL FR FC LFE BL BR SL SR
+            8 => &[L, R, C, LFE, LS, RS, LS, RS],
+            _ => return None,
+        };
+        let total: f32 = layout.iter().map(|g| g.left).sum();
+        let gains = layout
+            .iter()
+            .map(|g| Gains {
+                left: g.left / total,
+                right: g.right / total,
+            })
+            .collect();
+        Some(Self { gains })
+    }
+
+    /// Mixes interleaved `pcm` down to interleaved stereo.
+    fn apply(&self, pcm: &[i16]) -> Vec<i16> {
+        let to_i16 = |s: f32| s.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
+        pcm.chunks_exact(self.gains.len())
+            .flat_map(|frame| {
+                let (left, right) = frame
+                    .iter()
+                    .zip(&self.gains)
+                    .fold((0.0f32, 0.0f32), |(l, r), (&s, g)| {
+                        (l + f32::from(s) * g.left, r + f32::from(s) * g.right)
+                    });
+                [to_i16(left), to_i16(right)]
+            })
+            .collect()
     }
 }
 
@@ -240,12 +340,20 @@ impl FrameSink for WindowSink {
                 "WindowSink: audio"
             );
         }
-        let samples = audio.pcm.len() as u64;
-        let rate = audio.sample_rate * u32::from(audio.channels);
+        // rodio fits more channels than the device has by dropping the
+        // extra ones, centre and surrounds included: mix them in first.
+        let (pcm, channels) = match StereoDownmix::new(audio.channels) {
+            Some(downmix) if audio.channels > self.output_channels => {
+                (downmix.apply(&audio.pcm), 2)
+            }
+            _ => (audio.pcm, audio.channels),
+        };
+        let samples = pcm.len() as u64;
+        let rate = audio.sample_rate * u32::from(channels);
         let buf = AudioBuf {
-            samples: audio.pcm,
+            samples: pcm,
             sample_rate: audio.sample_rate,
-            channels: audio.channels,
+            channels,
             epoch: self.counters.audio_epoch(),
         };
         // Drop on backpressure (matches video). The window-side
@@ -480,7 +588,7 @@ impl App for ReceiverWindowApp {
             .map(|a| {
                 format!(
                     "{} {}Hz/{}ch — {} frames",
-                    codec_label_audio(a.codec),
+                    a.source.map_or(codec_label_audio(a.codec), |s| s.label()),
                     a.sample_rate,
                     a.channels,
                     audio_n
@@ -699,5 +807,40 @@ impl<S: rodio::Source<Item = i16>> rodio::Source for Counted<S> {
 
     fn total_duration(&self) -> Option<Duration> {
         self.inner.total_duration()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surround_downmix_follows_itu_gains_without_clipping() {
+        let downmix = StereoDownmix::new(6).unwrap();
+        let scale = 1.0 / (1.0 + 2.0 * std::f32::consts::FRAC_1_SQRT_2);
+        // One frame per channel: FL, FR, FC, LFE, BL, BR at 10 000.
+        let mut pcm = Vec::new();
+        for ch in 0..6 {
+            let mut frame = [0i16; 6];
+            frame[ch] = 10_000;
+            pcm.extend(frame);
+        }
+        let out = downmix.apply(&pcm);
+        let front = (10_000.0 * scale).round() as i16;
+        let side = (10_000.0 * scale * std::f32::consts::FRAC_1_SQRT_2).round() as i16;
+        assert_eq!(
+            out,
+            [front, 0, 0, front, side, side, 0, 0, side, 0, 0, side]
+        );
+        // Full scale everywhere stays in range.
+        let loud = downmix.apply(&[i16::MAX; 6]);
+        assert!(loud.iter().all(|&s| s >= i16::MAX - 1), "{loud:?}");
+    }
+
+    #[test]
+    fn mono_and_stereo_are_not_mixed() {
+        assert!(StereoDownmix::new(1).is_none());
+        assert!(StereoDownmix::new(2).is_none());
+        assert_eq!(StereoDownmix::new(8).unwrap().gains.len(), 8);
     }
 }

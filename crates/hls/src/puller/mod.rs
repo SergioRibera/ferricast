@@ -15,7 +15,8 @@
 //!   [`MediaPacket::Eos`].
 //!
 //! Handled: `EXT-X-BYTERANGE` (HTTP range requests), `EXT-X-KEY`
-//! `METHOD=AES-128`, `EXT-X-DISCONTINUITY`, live sources that restart
+//! `METHOD=AES-128` (media and initialization segments),
+//! `EXT-X-DISCONTINUITY`, live sources that restart
 //! (media sequence going backwards), transient HTTP failures (retried
 //! with backoff) and expired live segments (skip to the live edge).
 //! Fragmented MP4 segments (`EXT-X-MAP` initialization segment plus
@@ -46,7 +47,7 @@ use bytes::Bytes;
 use fetch::{
     ByteRange, FetchError, Fetched, Fetcher, INIT_LIMIT, KEY_LIMIT, PLAYLIST_LIMIT, SEGMENT_LIMIT,
 };
-use playlist::{InitSegment, SegmentKey, SegmentRef};
+use playlist::{InitSegment, MapKeyOrder, SegmentKey, SegmentRef};
 use ts::{DemuxedPacket, TsDemuxer};
 
 /// Puller → worker control messages.
@@ -255,9 +256,12 @@ impl Io {
     }
 }
 
-fn parse_media(body: &[u8]) -> Step<MediaPlaylist> {
-    m3u8_rs::parse_media_playlist_res(body)
-        .map_err(|e| Stop::Failed(FerricastError::Pull(format!("media playlist parse: {e}"))))
+/// Parses a media playlist, with the `EXT-X-KEY` / `EXT-X-MAP` order
+/// the parser does not keep.
+fn parse_media(body: &[u8]) -> Step<(MediaPlaylist, MapKeyOrder)> {
+    let playlist = m3u8_rs::parse_media_playlist_res(body)
+        .map_err(|e| Stop::Failed(FerricastError::Pull(format!("media playlist parse: {e}"))))?;
+    Ok((playlist, MapKeyOrder::scan(body)))
 }
 
 /// Playback state of one HLS media playlist.
@@ -269,6 +273,8 @@ struct Worker {
     /// resolve against it.
     playlist_base: Url,
     playlist: MediaPlaylist,
+    /// Which key encrypts each `EXT-X-MAP` of `playlist`.
+    map_key_order: MapKeyOrder,
     /// Absolute media sequence number of the next segment to fetch.
     next_seq: u64,
     demuxer: TsDemuxer,
@@ -376,7 +382,7 @@ impl Worker {
                 ))));
             }
         };
-        let playlist = parse_media(&fetched.body)?;
+        let (playlist, map_key_order) = parse_media(&fetched.body)?;
         playlist::check_supported(&playlist).map_err(Stop::Failed)?;
         if playlist.segments.is_empty() {
             return Err(Stop::Failed(FerricastError::Pull(
@@ -395,6 +401,7 @@ impl Worker {
             playlist_base: fetched.url,
             next_seq: playlist.media_sequence + start as u64,
             playlist,
+            map_key_order,
             demuxer: TsDemuxer::new(),
             key_cache: None,
             not_found_streak: 0,
@@ -430,6 +437,7 @@ impl Worker {
                         codec,
                         sample_rate: ts_info.audio_sample_rate,
                         channels: ts_info.audio_channels,
+                        source: None,
                     }),
                 )
             }
@@ -545,8 +553,13 @@ impl Worker {
                 continue;
             }
 
-            let seg = playlist::resolve_segment(&self.playlist, &self.playlist_base, idx)
-                .map_err(Stop::Failed)?;
+            let seg = playlist::resolve_segment(
+                &self.playlist,
+                &self.map_key_order,
+                &self.playlist_base,
+                idx,
+            )
+            .map_err(Stop::Failed)?;
             let budget = self.retry_budget();
             match self
                 .io
@@ -643,8 +656,19 @@ impl Worker {
             .fetch(&map.url, map.range, INIT_LIMIT, budget)
             .await?
             .map_err(|e| Stop::Failed(e.into_pull_error(&map.url)))?;
-        self.init_cache = Some((map.clone(), fetched.body.clone()));
-        Ok(fetched.body)
+        let body = match &map.key {
+            Some(key) => {
+                let key_bytes = self.key_bytes(key).await?;
+                let plain =
+                    playlist::decrypt_aes128(&key_bytes, &key.iv, &fetched.body).map_err(|e| {
+                        Stop::Failed(FerricastError::Pull(format!("EXT-X-MAP {}: {e}", map.url)))
+                    })?;
+                Bytes::from(plain)
+            }
+            None => fetched.body,
+        };
+        self.init_cache = Some((map.clone(), body.clone()));
+        Ok(body)
     }
 
     /// Demuxes a fragmented MP4 media segment against its
@@ -663,6 +687,7 @@ impl Worker {
                 codec: a.codec,
                 sample_rate: a.sample_rate,
                 channels: a.channels,
+                source: a.source,
             }),
         ));
         Ok(segment
@@ -711,7 +736,7 @@ impl Worker {
         let url = self.playlist_url.clone();
         let budget = self.retry_budget();
         let fetched = self.io.fetch_required(&url, PLAYLIST_LIMIT, budget).await?;
-        let new = parse_media(&fetched.body)?;
+        let (new, map_key_order) = parse_media(&fetched.body)?;
         playlist::check_supported(&new).map_err(Stop::Failed)?;
 
         let old = &self.playlist;
@@ -721,6 +746,7 @@ impl Worker {
             || new.discontinuity_sequence < old.discontinuity_sequence;
         self.last_reload_changed = new_end != old_end;
         self.playlist = new;
+        self.map_key_order = map_key_order;
         self.playlist_base = fetched.url;
 
         if restarted {

@@ -2061,6 +2061,7 @@ dependencies = [
  "bytes",
  "cros-libva",
  "fdk-aac",
+ "fdk-aac-sys",
  "ferricast-core",
  "ferricast-demuxer",
  "h264-reader",
@@ -2073,6 +2074,7 @@ dependencies = [
  "rusty_vp9",
  "shiguredo_nvcodec",
  "symphonia",
+ "tempfile",
  "tracing",
  "vp8-decoder",
 ]

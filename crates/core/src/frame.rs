@@ -343,6 +343,75 @@ pub enum AudioCodec {
     Alac,
 }
 
+/// The format an audio stream is stored in when the receiver decodes it
+/// to PCM before its pipeline (its packets then say
+/// [`AudioCodec::Pcm`]): what to show the user instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SourceAudioFormat {
+    Mp3,
+    Flac,
+    Vorbis,
+    /// Uncompressed PCM in a WAV file.
+    Wav,
+}
+
+impl SourceAudioFormat {
+    /// A short human-readable name.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Mp3 => "MP3",
+            Self::Flac => "FLAC",
+            Self::Vorbis => "Vorbis",
+            Self::Wav => "WAV (PCM)",
+        }
+    }
+}
+
+/// An AAC `channel_configuration` (ISO/IEC 14496-3 §1.6.3.5): the
+/// 3-bit layout code ADTS headers and `AudioSpecificConfig`s carry.
+/// Codes 1 to 6 name as many channels (6 is 5.1); 7 is 7.1, eight
+/// channels. Code 0 (layout in a program config element) and the
+/// reserved codes are not represented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AacChannelConfig(u8);
+
+impl AacChannelConfig {
+    /// The configuration with code `code`; `None` for 0 and reserved codes.
+    #[must_use]
+    pub const fn new(code: u8) -> Option<Self> {
+        match code {
+            1..=7 => Some(Self(code)),
+            _ => None,
+        }
+    }
+
+    /// The configuration that carries `channels` channels.
+    #[must_use]
+    pub const fn from_channels(channels: u16) -> Option<Self> {
+        match channels {
+            1..=6 => Some(Self(channels as u8)),
+            8 => Some(Self(7)),
+            _ => None,
+        }
+    }
+
+    /// The 3-bit code.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        self.0
+    }
+
+    /// Channels decoded from this configuration.
+    #[must_use]
+    pub const fn channels(self) -> u16 {
+        match self.0 {
+            7 => 8,
+            code => code as u16,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
