@@ -2,7 +2,7 @@
 name = "ferricast-demuxer"
 version = "0.1.0"
 edition = "2024"
-description = "MP4, MOV, WebM and MKV demuxers for ferricast"
+description = "MP4, MOV, WebM, MKV and audio-file demuxers for ferricast"
 
 [features]
 default = ["matroska", "audio-files"]

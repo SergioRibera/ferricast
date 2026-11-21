@@ -1,4 +1,4 @@
-//! [`ProgressivePuller`]: plays a single MP4/MOV/MKV/WebM file over HTTP
+//! [`ProgressivePuller`]: plays a single media file (MP4, MOV, MKV, WebM or audio) over HTTP
 //! as a [`MediaPuller`].
 //!
 //! The demuxer is synchronous, so it runs on a worker thread over an

@@ -1,10 +1,13 @@
-//! MP4/MOV and Matroska/WebM demuxers.
+//! MP4/MOV (plain and fragmented), Matroska/WebM and audio-file demuxers.
 //!
 //! [`Demuxer`] reads from any [`MediaSource`] (a file, an in-memory
 //! buffer, an HTTP range reader) and hands out the packets of the first
 //! supported video track and, optionally, the first supported audio
 //! track (AAC or Opus), interleaved in decode order, with seeking to the
-//! keyframe at or before a target time.
+//! keyframe at or before a target time. Audio-only files are read too:
+//! raw ADTS AAC natively, MP3, FLAC, Ogg (Vorbis, Opus) and WAV through
+//! symphonia. [`demux_segment`] reads fragmented MP4 media segments (HLS
+//! `EXT-X-MAP`, CMAF).
 
 mod adts;
 mod audio;
