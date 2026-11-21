@@ -2105,6 +2105,7 @@ dependencies = [
  "aes",
  "bytes",
  "ferricast-core",
+ "ferricast-demuxer",
  "ferricast-m3u8",
  "ferricast-muxer",
  "futures-util",

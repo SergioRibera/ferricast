@@ -19,6 +19,9 @@ pub(super) const PLAYLIST_LIMIT: usize = 1 << 20;
 pub(super) const SEGMENT_LIMIT: usize = 64 << 20;
 /// AES-128 keys are 16 bytes; anything much larger is not a key.
 pub(super) const KEY_LIMIT: usize = 1024;
+/// Largest `EXT-X-MAP` initialization segment accepted: a `moov` with
+/// empty sample tables is a few KiB.
+pub(super) const INIT_LIMIT: usize = 4 << 20;
 
 /// A successful GET.
 pub(super) struct Fetched {

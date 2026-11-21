@@ -8,7 +8,7 @@ edition = "2024"
 # receiver path depends on it; turn off only when building a sender-
 # only binary that doesn't need to pull foreign streams.
 default = ["pull"]
-pull = ["dep:reqwest", "dep:m3u8-rs", "dep:url", "dep:aes"]
+pull = ["dep:reqwest", "dep:m3u8-rs", "dep:url", "dep:aes", "dep:ferricast-demuxer"]
 
 [dependencies]
 ferricast-core.workspace = true
@@ -40,6 +40,8 @@ futures-util.workspace = true
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls", "stream", "http2"] }
 m3u8-rs = { version = "6", optional = true }
 mpeg2ts-reader = { version = "0.16", optional = true }
+# - `ferricast-demuxer` — fragmented MP4 (`EXT-X-MAP` / CMAF) segments.
+ferricast-demuxer = { path = "../demuxer", default-features = false, optional = true }
 url = { version = "2", optional = true }
 # - `aes` — AES-128 block cipher for `EXT-X-KEY:METHOD=AES-128`
 #   segments (CBC chaining is done by hand; it is a few lines).

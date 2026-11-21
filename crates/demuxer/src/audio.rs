@@ -21,6 +21,13 @@ const ADTS_HEADER: usize = 7;
 /// Largest frame an ADTS header can describe (13-bit length).
 const ADTS_MAX_FRAME: usize = (1 << 13) - 1;
 /// Samples in one AAC-LC access unit.
+#[cfg_attr(
+    not(feature = "matroska"),
+    allow(
+        dead_code,
+        reason = "only the Matroska demuxer times packets by their content"
+    )
+)]
 pub(crate) const AAC_FRAME_SAMPLES: u64 = 1024;
 /// Opus always decodes at 48 kHz (RFC 7845 §5.1).
 pub(crate) const OPUS_RATE: u32 = 48_000;
@@ -63,6 +70,13 @@ impl AudioFormat {
     }
 
     /// Duration of one packet, when it can be told from its bytes.
+    #[cfg_attr(
+        not(feature = "matroska"),
+        allow(
+            dead_code,
+            reason = "only the Matroska demuxer times packets by their content"
+        )
+    )]
     pub(crate) fn packet_duration_us(self, sample: &[u8]) -> Option<u64> {
         match self {
             AudioFormat::Aac(config) => {
@@ -134,6 +148,13 @@ impl AacConfig {
 
     /// AAC-LC at `sample_rate` with `channels`, for containers that
     /// name the codec without carrying its configuration.
+    #[cfg_attr(
+        not(feature = "matroska"),
+        allow(
+            dead_code,
+            reason = "only Matroska names AAC without its configuration"
+        )
+    )]
     pub(crate) fn low_complexity(sample_rate: u32, channels: u16) -> Result<Self> {
         let channels = u8::try_from(channels)
             .ok()
@@ -203,6 +224,13 @@ pub(crate) fn opus_channels(header: &[u8]) -> Option<u16> {
 }
 
 /// Duration of one Opus packet from its TOC byte (RFC 6716 §3.1).
+#[cfg_attr(
+    not(feature = "matroska"),
+    allow(
+        dead_code,
+        reason = "only the Matroska demuxer times packets by their content"
+    )
+)]
 pub(crate) fn opus_packet_duration_us(packet: &[u8]) -> Option<u64> {
     let toc = *packet.first()?;
     let config = toc >> 3;

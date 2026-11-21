@@ -867,40 +867,74 @@ async fn progressive_files_play_paced_with_audio_and_report_duration() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seek_in_a_progressive_file_lands_near_the_target() {
-    seek_lands_on_the_target("long.mp4", &[]).await;
+    let dir = tempfile::tempdir().unwrap();
+    if support::generate_progressive(dir.path(), "long.mp4", 12, support::H264_AAC, &[]) {
+        seek_lands_on_the_target(dir.path(), "long.mp4", "video/mp4", Origin::Zero).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seek_in_a_fragmented_mp4_lands_on_the_target() {
-    seek_lands_on_the_target(
-        "long_fragmented.mp4",
-        &["-movflags", "frag_keyframe+empty_moov+default_base_moof"],
-    )
-    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let extra = ["-movflags", "frag_keyframe+empty_moov+default_base_moof"];
+    let name = "long_fragmented.mp4";
+    if support::generate_progressive(dir.path(), name, 12, support::H264_AAC, &extra) {
+        seek_lands_on_the_target(dir.path(), name, "video/mp4", Origin::Zero).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seek_in_hls_lands_on_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    if support::generate_hls(dir.path(), 12, 2, &[]) {
+        let mime = "application/vnd.apple.mpegurl";
+        seek_lands_on_the_target(dir.path(), "index.m3u8", mime, Origin::FirstFrame).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seek_in_fmp4_hls_lands_on_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    if support::generate_hls(dir.path(), 12, 2, &["-hls_segment_type", "fmp4"]) {
+        let mime = "application/vnd.apple.mpegurl";
+        seek_lands_on_the_target(dir.path(), "index.m3u8", mime, Origin::FirstFrame).await;
+    }
+}
+
+/// Where media time zero is in the timestamps a sink sees.
+#[derive(Clone, Copy)]
+enum Origin {
+    /// Timestamps are media time (progressive files).
+    Zero,
+    /// At the first frame shown (MPEG-TS and HLS start anywhere).
+    FirstFrame,
 }
 
 /// Seeks to 7.5 s into a 12 s clip with a keyframe every second: the
 /// first frame and audio shown are at the target, no stale audio is
 /// pushed after the flush, and the status reports the right position.
-async fn seek_lands_on_the_target(name: &str, extra: &[&str]) {
-    let dir = tempfile::tempdir().unwrap();
-    if !support::generate_progressive(dir.path(), name, 12, support::H264_AAC, extra) {
-        return;
-    }
-    let server = TestServer::start(support::dir_handler(dir.path())).await;
+async fn seek_lands_on_the_target(dir: &std::path::Path, name: &str, mime: &str, origin: Origin) {
+    let server = TestServer::start(support::dir_handler(dir)).await;
     let mut rx = Receiver::start().await;
     let mut sender = Sender::connect(rx.port, "sender-seek").await;
     sender.launch().await;
-    let reply = sender
-        .load(&server.url(&format!("/{name}")), "video/mp4")
-        .await;
+    let reply = sender.load(&server.url(&format!("/{name}")), mime).await;
     assert_eq!(reply["status"][0]["playerState"], "PLAYING", "{reply}");
     let session_id = reply["status"][0]["mediaSessionId"].clone();
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let (shown_before, heard_before) = {
+    let (shown_before, heard_before, base) = {
         let log = rx.log.lock().unwrap();
-        (log.video.len(), log.audio.len())
+        let base = match origin {
+            Origin::Zero => 0,
+            Origin::FirstFrame => log
+                .video
+                .iter()
+                .map(|v| v.1)
+                .min()
+                .expect("frames before the seek"),
+        };
+        (log.video.len(), log.audio.len(), base)
     };
     let seek_sent = Instant::now();
     let id = sender
@@ -920,10 +954,10 @@ async fn seek_lands_on_the_target(name: &str, extra: &[&str]) {
         let after = &log.video[shown_before..];
         let first = after
             .iter()
-            .find(|(_, pts)| *pts >= 5_000_000)
+            .find(|(_, pts)| *pts >= base + 5_000_000)
             .copied()
             .expect("frames after the seek");
-        (first.1, after.last().unwrap().1, first.0)
+        (first.1 - base, after.last().unwrap().1 - base, first.0)
     };
     let (first_audio, flushed_at, stale) = {
         let log = rx.log.lock().unwrap();
@@ -937,11 +971,11 @@ async fn seek_lands_on_the_target(name: &str, extra: &[&str]) {
         let first = after
             .clone()
             .find(|&i| !log.audio_silent[i])
-            .map(|i| log.audio[i].1)
+            .map(|i| log.audio[i].1.saturating_sub(base))
             .expect("audio after the seek");
         // Anything pushed after the flush from before the target is stale.
         let stale = after
-            .filter(|&i| !log.audio_silent[i] && log.audio[i].1 < 7_400_000)
+            .filter(|&i| !log.audio_silent[i] && log.audio[i].1 < base + 7_400_000)
             .count();
         (first, flushed_at, stale)
     };
@@ -1158,4 +1192,37 @@ fn he_aac_adts(seconds: u32, v2: bool) -> Vec<u8> {
         }
     }
     adts
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fmp4_hls_plays_paced_with_audio() {
+    let dir = tempfile::tempdir().unwrap();
+    if !support::generate_hls(dir.path(), 6, 2, &["-hls_segment_type", "fmp4"]) {
+        return;
+    }
+    let server = TestServer::start(support::dir_handler(dir.path())).await;
+    let mut rx = Receiver::start().await;
+    let mut sender = Sender::connect(rx.port, "sender-fmp4-hls").await;
+    sender.launch().await;
+    let reply = play_to_end(
+        &rx,
+        &mut sender,
+        &server.url("/index.m3u8"),
+        "application/vnd.apple.mpegurl",
+    )
+    .await;
+    let p = Playback::of(&rx.log.lock().unwrap());
+    eprintln!(
+        "E2E fMP4 HLS: duration {}, {} frames, PTS span {:.3}s, drift {:+.3}s, {:.3}s of audio",
+        reply["status"][0]["media"]["duration"], p.frames, p.pts_span, p.drift, p.audio_secs
+    );
+    assert!(p.frames >= 170, "only {} frames shown", p.frames);
+    assert!(p.pts_span > 5.8, "PTS span {:.3}s", p.pts_span);
+    assert!(p.drift.abs() < 0.25, "paced {:+.3}s off real time", p.drift);
+    assert!(
+        (p.audio_secs - 6.0).abs() < 0.25,
+        "{:.3}s of audio",
+        p.audio_secs
+    );
+    rx.manager.stop_receivers().await.unwrap();
 }

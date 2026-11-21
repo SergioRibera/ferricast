@@ -171,21 +171,54 @@ async fn transient_server_errors_are_retried() {
 }
 
 #[tokio::test]
-async fn fmp4_is_rejected_with_a_clear_error() {
-    let server = TestServer::start(Arc::new(|path: &str| match path {
-        "/index.m3u8" => Reply::Ok(
-            b"#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"init.mp4\"\n\
-              #EXTINF:2.0,\nseg.m4s\n#EXT-X-ENDLIST\n"
-                .to_vec(),
-        ),
-        _ => Reply::Status(404),
-    }))
-    .await;
-    let err = HlsPuller::new()
-        .open(spec(server.url("/index.m3u8")))
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("EXT-X-MAP"), "{err}");
+async fn fmp4_vod_plays_with_continuous_timestamps_and_seeks() {
+    let dir = tempfile::tempdir().unwrap();
+    if !support::generate_hls(dir.path(), 6, 2, &["-hls_segment_type", "fmp4"]) {
+        return;
+    }
+    let playlist = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
+    assert!(playlist.contains("EXT-X-MAP"), "{playlist}");
+    let server = TestServer::start(support::dir_handler(dir.path())).await;
+    let mut puller = HlsPuller::new();
+    let info = puller.open(spec(server.url("/index.m3u8"))).await.unwrap();
+    let video = info.video.as_ref().unwrap();
+    assert_eq!(
+        (video.codec, video.width, video.height),
+        (Codec::H264, 320, 240)
+    );
+    let audio = info.audio.as_ref().unwrap();
+    assert_eq!(
+        (audio.codec, audio.sample_rate, audio.channels),
+        (AudioCodec::Aac, 48_000, 2)
+    );
+    let c = collect(&mut puller, Duration::from_secs(20)).await;
+    eprintln!(
+        "fMP4 HLS: {} frames, {} keyframes, {} audio packets, DTS {}..{}",
+        c.video_pts.len(),
+        c.keyframes,
+        c.audio,
+        c.video_dts[0],
+        c.video_dts.last().unwrap()
+    );
+    assert_eq!(c.video_pts.len(), 180);
+    assert_eq!(c.keyframes, 3);
+    assert!(c.audio > 250, "audio packets {}", c.audio);
+    // One timeline across segments: DTS advances a frame at a time.
+    assert_monotonic(&c.video_dts);
+    assert!(c.video_dts.windows(2).all(|w| w[1] - w[0] < 40_000));
+    let first_pts = *c.video_pts.iter().min().unwrap();
+
+    puller.seek(3_000_000).await.unwrap();
+    let c = collect(&mut puller, Duration::from_secs(20)).await;
+    // The 2 s segment holds the target; the second before it is
+    // decode-only.
+    assert_eq!(c.video_pts.len(), 120);
+    let from = c.present_from.expect("seek target marker");
+    assert!(
+        from.abs_diff(first_pts + 3_000_000) < 50_000,
+        "{from} vs {first_pts}"
+    );
+    puller.close().await.unwrap();
 }
 
 #[tokio::test]
