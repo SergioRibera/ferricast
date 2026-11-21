@@ -31,13 +31,15 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use ferricast::WindowIdentifier;
 use ferricast::prelude::*;
-use ferricast_dbus::{MonitorInfoDto, SourceDto, WindowInfoDto};
+use ferricast_dbus::{ManagerProxy, MonitorInfoDto, SourceDto, WindowInfoDto};
 use freya::prelude::*;
 use freya::winit::window::WindowLevel;
+use futures_util::StreamExt;
 use tokio::sync::oneshot;
 use tracing::warn;
 use uuid::Uuid;
@@ -310,15 +312,10 @@ impl Component for SourcePicker {
         // once the audio pipeline lands.
         let audio = use_state::<bool>(|| false);
 
-        // One-shot fetch when the picker mounts.
-        use_side_effect_with_deps(&(), {
-            move |_: &()| {
-                let mut entries = entries;
-                spawn(async move {
-                    let loaded = load_entries().await;
-                    entries.set(loaded);
-                });
-            }
+        // List the sources on mount and again whenever the daemon
+        // reports a change, for as long as the picker is open.
+        use_side_effect_with_deps(&(), move |_: &()| {
+            spawn(watch_entries(entries));
         });
 
         let snapshot = entries.read().clone();
@@ -530,11 +527,13 @@ fn grid(
                 ));
             }
             let cards = entries.monitors.into_iter().map(move |m| {
-                MonitorCard {
-                    info: m,
-                    on_select: on_select.clone(),
-                }
-                .into()
+                rect()
+                    .key(m.id.clone())
+                    .child(MonitorCard {
+                        info: m,
+                        on_select: on_select.clone(),
+                    })
+                    .into()
             });
             body.child(
                 ScrollView::new()
@@ -569,11 +568,14 @@ fn grid(
             //     and reads as "this is by design", not "I'm broken".
             if compact_windows {
                 let rows = entries.windows.into_iter().map(move |w| {
-                    WindowRow {
-                        info: w,
-                        on_select: on_select.clone(),
-                    }
-                    .into()
+                    rect()
+                        .key(w.id.clone())
+                        .width(Size::fill())
+                        .child(WindowRow {
+                            info: w,
+                            on_select: on_select.clone(),
+                        })
+                        .into()
                 });
                 body.child(
                     ScrollView::new()
@@ -589,11 +591,13 @@ fn grid(
                 )
             } else {
                 let cards = entries.windows.into_iter().map(move |w| {
-                    WindowCard {
-                        info: w,
-                        on_select: on_select.clone(),
-                    }
-                    .into()
+                    rect()
+                        .key(w.id.clone())
+                        .child(WindowCard {
+                            info: w,
+                            on_select: on_select.clone(),
+                        })
+                        .into()
                 });
                 body.child(
                     ScrollView::new()
@@ -787,15 +791,13 @@ fn card_shell(
     thumb_h: u32,
     on_press: impl Fn(Event<PressEventData>) + 'static,
 ) -> Rect {
-    let thumb = use_state::<Option<Bytes>>(|| None);
+    let thumb = use_state(|| Thumbnail::Loading);
     let cache_key_for_effect = cache_key.clone();
     use_side_effect_with_deps(&cache_key_for_effect, move |key: &String| {
         let mut thumb = thumb;
         let k = key.clone();
         spawn(async move {
-            if let Some(bytes) = fetch_thumbnail_bytes(kind, &k, thumb_w, thumb_h).await {
-                thumb.set(Some(bytes));
-            }
+            thumb.set(Thumbnail::fetch(kind, &k, thumb_w, thumb_h).await);
         });
     });
 
@@ -817,7 +819,7 @@ fn card_shell(
         .center()
         .overflow(Overflow::Clip)
         .child(match thumb.read().clone() {
-            Some(bytes) => {
+            Thumbnail::Ready(bytes) => {
                 let source: ImageSource = ((kind, cache_key.clone()), bytes).into();
                 let viewer: Element = ImageViewer::new(source)
                     .width(Size::px(thumb_w as f32))
@@ -827,18 +829,18 @@ fn card_shell(
                     .into();
                 viewer
             }
-            None => {
-                // No thumbnail bytes. Reasons:
-                //   - Card just mounted, fetch in flight → animated
-                //     placeholder reads "loading".
-                //   - Daemon returned empty bytes → compositor /
-                //     backend doesn't expose the capture path for
-                //     this item (e.g. niri without
-                //     ext_foreign_toplevel_image_capture_source_manager_v1
-                //     for window thumbs). For windows we surface
-                //     the subtitle (app_id) prominently as a
-                //     fallback identifier; for monitors we show
-                //     the id text.
+            state @ (Thumbnail::Loading | Thumbnail::Unavailable) => {
+                // No thumbnail bytes yet, or none coming: the backend
+                // can't preview this item (e.g. no window capture
+                // protocol on the compositor), the request failed or
+                // it timed out. For windows we surface the subtitle
+                // (app_id) prominently as a fallback identifier; for
+                // monitors we show the id text.
+                let status = if state == Thumbnail::Loading {
+                    "loading preview…"
+                } else {
+                    "no preview"
+                };
                 let big = if kind == "window" && subtitle != "—" {
                     subtitle.clone()
                 } else {
@@ -857,12 +859,7 @@ fn card_shell(
                             .max_lines(1)
                             .text_overflow(TextOverflow::Ellipsis),
                     )
-                    .child(
-                        label()
-                            .text("no preview")
-                            .color((110, 110, 125))
-                            .font_size(11.),
-                    )
+                    .child(label().text(status).color((110, 110, 125)).font_size(11.))
                     .into()
             }
         });
@@ -903,59 +900,194 @@ fn card_shell(
 
 // ── Daemon I/O ────────────────────────────────────────────────────
 
-async fn load_entries() -> Entries {
-    let proxy = match client::proxy().await {
-        Ok(p) => p,
-        Err(e) => {
-            return Entries {
-                monitors: Vec::new(),
-                windows: Vec::new(),
-                loaded: true,
-                can_capture_window: false,
-                error: Some(format!("can't reach daemon: {e}")),
-            };
-        }
-    };
-    let monitors = proxy.list_monitors().await.unwrap_or_else(|e| {
-        warn!(%e, "list_monitors failed");
-        Vec::new()
-    });
-    let windows = proxy.list_windows().await.unwrap_or_else(|e| {
-        warn!(%e, "list_windows failed");
-        Vec::new()
-    });
-    // Probe whether the daemon's capture path can actually stream a
-    // window selection. On Wayland today this is `false` because no
-    // compositor exposes ext-foreign-toplevel-image-capture-source
-    // — the picker hides the Windows tab in that case to stop the
-    // user from picking a source the streaming side would silently
-    // fall back to a portal dialog on. The property is missing on
-    // very old daemons; we treat absence as "no" to fail safe.
-    let can_capture_window = proxy
-        .capture_capabilities()
+/// Longest the picker waits for one listing call before reporting the
+/// daemon as unresponsive instead of showing "Loading" forever.
+const DAEMON_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Longest a card waits for its preview. Longer than the backend's own
+/// capture deadline so a slow capture still lands.
+const THUMBNAIL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Change signals arrive in bursts (a window retitling, several outputs
+/// reconfiguring); wait this long and coalesce before listing again.
+const REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Awaits `call`, giving up after `deadline`.
+async fn bounded<T>(
+    deadline: Duration,
+    what: &str,
+    call: impl Future<Output = T>,
+) -> std::result::Result<T, String> {
+    tokio::time::timeout(deadline, call)
         .await
-        .map(|caps| caps.iter().any(|s| s == "window"))
-        .unwrap_or(false);
-    Entries {
-        monitors,
-        windows,
-        loaded: true,
-        can_capture_window,
-        error: None,
+        .map_err(|_| format!("{what}: no answer within {}s", deadline.as_secs()))
+}
+
+impl Entries {
+    fn failed(error: String) -> Self {
+        Self {
+            loaded: true,
+            error: Some(error),
+            ..Self::default()
+        }
+    }
+
+    /// Lists monitors, windows and the capture capabilities.
+    ///
+    /// # Errors
+    ///
+    /// When the daemon doesn't answer within [`DAEMON_CALL_TIMEOUT`].
+    /// A call that answers with an error counts as an empty list.
+    async fn load(proxy: &ManagerProxy<'static>) -> std::result::Result<Self, String> {
+        let monitors = bounded(DAEMON_CALL_TIMEOUT, "ListMonitors", proxy.list_monitors())
+            .await?
+            .unwrap_or_else(|e| {
+                warn!(%e, "list_monitors failed");
+                Vec::new()
+            });
+        let windows = bounded(DAEMON_CALL_TIMEOUT, "ListWindows", proxy.list_windows())
+            .await?
+            .unwrap_or_else(|e| {
+                warn!(%e, "list_windows failed");
+                Vec::new()
+            });
+        // Whether the capture path can stream a window selection
+        // without falling back to a portal dialog. Without it the
+        // Windows tab shows a plain list instead of preview cards. A
+        // daemon without the property counts as "no".
+        let can_capture_window = bounded(
+            DAEMON_CALL_TIMEOUT,
+            "CaptureCapabilities",
+            proxy.capture_capabilities(),
+        )
+        .await?
+        .is_ok_and(|caps| caps.iter().any(|s| s == "window"));
+        Ok(Self {
+            monitors,
+            windows,
+            loaded: true,
+            can_capture_window,
+            error: None,
+        })
     }
 }
 
-async fn fetch_thumbnail_bytes(kind: &str, id: &str, max_w: u32, max_h: u32) -> Option<Bytes> {
-    let proxy = client::proxy().await.ok()?;
-    let bytes = match kind {
-        "monitor" => proxy.get_monitor_thumbnail(id, max_w, max_h).await.ok()?,
-        "window" => proxy.get_window_thumbnail(id, max_w, max_h).await.ok()?,
-        _ => return None,
+/// Keeps `entries` in sync with the daemon while the picker is open:
+/// lists once, then again after each `MonitorsChanged` /
+/// `WindowsChanged` signal. Ends with the picker window, which drops
+/// the task.
+async fn watch_entries(mut entries: State<Entries>) {
+    let proxy = match bounded(DAEMON_CALL_TIMEOUT, "connect", client::proxy())
+        .await
+        .and_then(|proxy| proxy.map_err(|e| e.to_string()))
+    {
+        Ok(proxy) => proxy,
+        Err(e) => {
+            entries.set(Entries::failed(format!("can't reach daemon: {e}")));
+            return;
+        }
     };
-    if bytes.is_empty() {
-        // Daemon returned `[]` → backend can't preview this item.
-        // Card stays on the placeholder.
-        return None;
+    // Subscribe before the first listing so a change in between is not
+    // lost. Without signals the picker still lists once.
+    let subscribe = async {
+        let monitors = proxy.receive_monitors_changed().await?;
+        let windows = proxy.receive_windows_changed().await?;
+        zbus::Result::Ok(futures_util::stream::select(
+            monitors.map(|_| ()),
+            windows.map(|_| ()),
+        ))
+    };
+    let subscribed = bounded(DAEMON_CALL_TIMEOUT, "subscribe", subscribe)
+        .await
+        .and_then(|r| r.map_err(|e| e.to_string()));
+    let mut changes = match subscribed {
+        Ok(changes) => Some(changes),
+        Err(e) => {
+            warn!(%e, "can't watch source changes; the picker lists once");
+            None
+        }
+    };
+    loop {
+        match Entries::load(&proxy).await {
+            Ok(loaded) => entries.set(loaded),
+            // Keep showing the last good listing on a failed refresh.
+            Err(e) if entries.peek().loaded => warn!(%e, "refreshing sources failed"),
+            Err(e) => entries.set(Entries::failed(e)),
+        }
+        let Some(stream) = changes.as_mut() else {
+            return;
+        };
+        if stream.next().await.is_none() {
+            return;
+        }
+        tokio::time::sleep(REFRESH_DEBOUNCE).await;
+        while futures_util::FutureExt::now_or_never(stream.next()).is_some_and(|c| c.is_some()) {}
     }
-    Some(Bytes::from(bytes))
+}
+
+/// Preview state of one picker card.
+#[derive(Clone, PartialEq)]
+enum Thumbnail {
+    Loading,
+    Ready(Bytes),
+    /// The backend can't preview this source, the request failed or it
+    /// timed out.
+    Unavailable,
+}
+
+impl From<Vec<u8>> for Thumbnail {
+    /// The daemon answers `[]` when the backend can't preview a source.
+    fn from(png: Vec<u8>) -> Self {
+        if png.is_empty() {
+            Self::Unavailable
+        } else {
+            Self::Ready(Bytes::from(png))
+        }
+    }
+}
+
+impl Thumbnail {
+    async fn fetch(kind: &str, id: &str, max_w: u32, max_h: u32) -> Self {
+        let request = async {
+            let proxy = client::proxy().await.map_err(|e| e.to_string())?;
+            match kind {
+                "monitor" => proxy.get_monitor_thumbnail(id, max_w, max_h).await,
+                "window" => proxy.get_window_thumbnail(id, max_w, max_h).await,
+                other => return Err(format!("unknown source kind {other:?}")),
+            }
+            .map_err(|e| e.to_string())
+        };
+        match bounded(THUMBNAIL_TIMEOUT, "thumbnail", request).await {
+            Ok(Ok(png)) => png.into(),
+            Ok(Err(e)) | Err(e) => {
+                tracing::debug!(kind, id, %e, "no thumbnail");
+                Self::Unavailable
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_call_times_out_instead_of_waiting_forever() {
+        let never = std::future::pending::<()>();
+        let err = bounded(DAEMON_CALL_TIMEOUT, "ListMonitors", never)
+            .await
+            .unwrap_err();
+        assert!(err.contains("ListMonitors"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answered_call_passes_through() {
+        assert_eq!(bounded(DAEMON_CALL_TIMEOUT, "x", async { 7 }).await, Ok(7));
+    }
+
+    #[test]
+    fn empty_thumbnail_reply_means_no_preview() {
+        assert!(Thumbnail::from(Vec::new()) == Thumbnail::Unavailable);
+        assert!(matches!(Thumbnail::from(vec![1]), Thumbnail::Ready(_)));
+    }
 }

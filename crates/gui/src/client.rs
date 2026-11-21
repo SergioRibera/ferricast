@@ -27,9 +27,17 @@ fn rewrap(err: zbus::Error) -> anyhow::Error {
     anyhow::Error::new(err)
 }
 
+/// Session-bus connection shared by every proxy in the process. The
+/// picker asks for a proxy per thumbnail card; a fresh connection each
+/// time would redo the bus handshake and match-rule setup per card.
+static SESSION: tokio::sync::OnceCell<zbus::Connection> = tokio::sync::OnceCell::const_new();
+
 pub(crate) async fn proxy() -> anyhow::Result<ManagerProxy<'static>> {
-    let conn = zbus::Connection::session().await.map_err(rewrap)?;
-    ManagerProxy::new(&conn).await.map_err(rewrap)
+    let conn = SESSION
+        .get_or_try_init(zbus::Connection::session)
+        .await
+        .map_err(rewrap)?;
+    ManagerProxy::new(conn).await.map_err(rewrap)
 }
 
 pub async fn list(watch: bool) -> anyhow::Result<()> {

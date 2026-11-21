@@ -90,3 +90,7 @@ async-trait.workspace = true
 # decoding later if we want — for now the receiver pipeline
 # pre-decodes via `ferricast-decoder::AacDecoder` and we push PCM.
 rodio = { version = "0.20", default-features = false, features = ["symphonia-aac"] }
+
+[dev-dependencies]
+# Paused-clock tests for the picker's daemon-call timeouts.
+tokio = { workspace = true, features = ["test-util"] }
