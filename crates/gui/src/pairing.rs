@@ -3,7 +3,10 @@
 //!
 //! Opens in its own top-level window, like the source picker, so it
 //! also appears when the main window is hidden (`--background`).
-//! Closing the window counts as cancelling.
+//! Closing the window or pressing Esc counts as cancelling; Enter in
+//! the field answers once the input is complete. The device name sits
+//! on its own line, cut with an ellipsis when long, so the prompt under
+//! it wraps within the window.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -34,7 +37,6 @@ pub fn answer(respond: &PairingResponder, response: PairingResponse) {
 pub enum Secret {
     /// A PIN of `digits` digits shown on the receiver.
     Pin { digits: u8 },
-    /// The receiver's access password.
     /// The receiver's access password; `rejected` when the previous
     /// answer was refused.
     Password { rejected: bool },
@@ -66,14 +68,13 @@ impl Secret {
         }
     }
 
-    fn prompt(self, device_name: &str) -> String {
+    /// What to type, under the device name.
+    fn prompt(self) -> String {
         match self {
-            Self::Pin { digits } => format!("Enter the {digits}-digit PIN shown on {device_name}"),
-            Self::Password { rejected: false } => {
-                format!("Enter the AirPlay password of {device_name}")
-            }
+            Self::Pin { digits } => format!("Enter the {digits}-digit PIN shown on the receiver."),
+            Self::Password { rejected: false } => "Enter its AirPlay password.".into(),
             Self::Password { rejected: true } => {
-                format!("Wrong password. Enter the AirPlay password of {device_name} again")
+                "Wrong password. Enter its AirPlay password again.".into()
             }
         }
     }
@@ -95,7 +96,9 @@ pub fn open_pairing_dialog(
             done: Rc::new(RefCell::new(Some(tx))),
         };
         let config = WindowConfig::new_app(app)
-            .with_size(380., 220.)
+            .with_size(420., 260.)
+            .with_min_size(340., 240.)
+            .with_resizable(true)
             .with_background((20, 20, 28))
             .with_app_id("rs.sergioribera.ferricast.Pairing")
             .with_window_attributes(move |attrs, _| {
@@ -155,6 +158,14 @@ impl App for PairingDialog {
             let done = self.done.clone();
             move |_| Self::reply(&done, PairingResponse::Cancelled)
         };
+        let on_global_key_down = {
+            let done = self.done.clone();
+            move |e: Event<KeyboardEventData>| {
+                if e.key == Key::Named(NamedKey::Escape) {
+                    Self::reply(&done, PairingResponse::Cancelled);
+                }
+            }
+        };
         let (placeholder, mode, width) = match secret {
             Secret::Pin { .. } => ("PIN", InputMode::Shown, 160.),
             Secret::Password { .. } => ("Password", InputMode::new_password(), 240.),
@@ -166,11 +177,25 @@ impl App for PairingDialog {
             .padding(20.)
             .vertical()
             .spacing(14.)
+            .on_global_key_down(on_global_key_down)
             .child(
                 label()
-                    .text(secret.prompt(&self.device_name))
+                    .text(self.device_name.clone())
+                    .width(Size::fill())
+                    .max_lines(1)
+                    .text_overflow(TextOverflow::Ellipsis)
+                    .text_align(TextAlign::Center)
+                    .font_size(16.)
+                    .font_weight(FontWeight::BOLD)
+                    .color((240, 240, 250)),
+            )
+            .child(
+                label()
+                    .text(secret.prompt())
+                    .width(Size::fill())
+                    .text_align(TextAlign::Center)
                     .font_size(14.)
-                    .color((230, 230, 240)),
+                    .color((210, 210, 225)),
             )
             .child(
                 Input::new(text)
@@ -230,10 +255,10 @@ mod tests {
             password.response("secret".into()),
             PairingResponse::Password(p) if p == "secret"
         ));
-        assert!(!password.prompt("TV").contains("Wrong"));
+        assert!(!password.prompt().contains("Wrong"));
         assert!(
             Secret::Password { rejected: true }
-                .prompt("TV")
+                .prompt()
                 .starts_with("Wrong password")
         );
     }
