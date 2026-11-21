@@ -802,6 +802,12 @@ async fn progressive_files_play_paced_with_audio_and_report_duration() {
             &[][..],
             "video/x-matroska",
         ),
+        (
+            "fragmented.mp4",
+            support::H264_AAC,
+            &["-movflags", "frag_keyframe+empty_moov+default_base_moof"][..],
+            "video/mp4",
+        ),
     ];
     if cfg!(all(feature = "vp9-decode", feature = "opus-decode")) {
         cases.push(("vp9_opus.webm", support::VP9_OPUS, &[][..], "video/webm"));
@@ -861,15 +867,33 @@ async fn progressive_files_play_paced_with_audio_and_report_duration() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seek_in_a_progressive_file_lands_near_the_target() {
+    seek_lands_on_the_target("long.mp4", &[]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seek_in_a_fragmented_mp4_lands_on_the_target() {
+    seek_lands_on_the_target(
+        "long_fragmented.mp4",
+        &["-movflags", "frag_keyframe+empty_moov+default_base_moof"],
+    )
+    .await;
+}
+
+/// Seeks to 7.5 s into a 12 s clip with a keyframe every second: the
+/// first frame and audio shown are at the target, no stale audio is
+/// pushed after the flush, and the status reports the right position.
+async fn seek_lands_on_the_target(name: &str, extra: &[&str]) {
     let dir = tempfile::tempdir().unwrap();
-    if !support::generate_progressive(dir.path(), "long.mp4", 12, support::H264_AAC, &[]) {
+    if !support::generate_progressive(dir.path(), name, 12, support::H264_AAC, extra) {
         return;
     }
     let server = TestServer::start(support::dir_handler(dir.path())).await;
     let mut rx = Receiver::start().await;
     let mut sender = Sender::connect(rx.port, "sender-seek").await;
     sender.launch().await;
-    let reply = sender.load(&server.url("/long.mp4"), "video/mp4").await;
+    let reply = sender
+        .load(&server.url(&format!("/{name}")), "video/mp4")
+        .await;
     assert_eq!(reply["status"][0]["playerState"], "PLAYING", "{reply}");
     let session_id = reply["status"][0]["mediaSessionId"].clone();
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -939,14 +963,14 @@ async fn seek_in_a_progressive_file_lands_near_the_target() {
         .await;
     let reported = paused["status"][0]["currentTime"].as_f64().unwrap();
     eprintln!(
-        "E2E seek: target 7.500s, first frame after seek at {:.3}s ({:.0} ms after SEEK), \
+        "E2E seek {name}: target 7.500s, first frame after seek at {:.3}s ({:.0} ms after SEEK), \
          last shown {:.3}s, PAUSED currentTime {reported:.3}s",
         first_after as f64 / 1e6,
         (at_first - seek_sent).as_secs_f64() * 1000.0,
         last_after as f64 / 1e6,
     );
     eprintln!(
-        "E2E seek: first audio after seek at {:.3}s, flush after {flushed_at} chunks, {stale} stale chunks",
+        "E2E seek {name}: first audio after seek at {:.3}s, flush after {flushed_at} chunks, {stale} stale chunks",
         first_audio as f64 / 1e6
     );
     // Keyframes every second: decoding restarts at 7.0 s, but nothing
