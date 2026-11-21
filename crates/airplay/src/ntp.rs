@@ -89,6 +89,8 @@ impl TimingServer {
                     if let Err(e) = socket.send_to(&reply, peer).await {
                         debug!(error = %e, "timing reply failed");
                     }
+                } else {
+                    trace!(%peer, len, "ignoring non-timing packet on the timing port");
                 }
             }
         });

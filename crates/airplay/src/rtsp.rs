@@ -14,6 +14,7 @@ use ferricast_core::{FerricastError, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tracing::{Level, enabled, trace};
 
 /// Upper bound for a response body. AirPlay control responses are small
 /// plists / TLVs; anything larger is a broken or hostile peer.
@@ -193,6 +194,33 @@ impl SecureChannel {
     }
 }
 
+/// Trace rendering of a message body: binary plists decoded, anything else
+/// as hex (truncated).
+struct BodyDump<'a> {
+    content_type: Option<&'a str>,
+    body: &'a [u8],
+}
+
+impl std::fmt::Display for BodyDump<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const MAX_HEX: usize = 512;
+        if self.body.is_empty() {
+            return f.write_str("<empty>");
+        }
+        let is_plist =
+            self.content_type == Some(CONTENT_BPLIST) || self.body.starts_with(b"bplist");
+        if is_plist && let Ok(value) = plist::from_bytes::<plist::Value>(self.body) {
+            return write!(f, "{value:?}");
+        }
+        let shown = &self.body[..self.body.len().min(MAX_HEX)];
+        write!(f, "{} bytes: {}", self.body.len(), hex::encode(shown))?;
+        if shown.len() < self.body.len() {
+            f.write_str("...")?;
+        }
+        Ok(())
+    }
+}
+
 /// RTSP client bound to one TCP connection.
 pub(crate) struct RtspClient {
     stream: TcpStream,
@@ -297,18 +325,40 @@ impl RtspClient {
         }
         let _ = write!(head, "Content-Length: {}\r\n\r\n", body.len());
 
+        if enabled!(Level::TRACE) {
+            trace!(
+                head = %head.trim_end(),
+                body = %BodyDump { content_type, body },
+                "RTSP request"
+            );
+        }
         let mut wire = head.into_bytes();
         wire.extend_from_slice(body);
         if let Some(secure) = self.secure.as_mut() {
             wire = secure.seal(&wire)?;
         }
 
-        timeout(REQUEST_TIMEOUT, async {
+        let response = timeout(REQUEST_TIMEOUT, async {
             self.stream.write_all(&wire).await?;
             self.read_response().await
         })
         .await
-        .map_err(|_| FerricastError::Timeout(format!("RTSP {method} {uri}")))?
+        .map_err(|_| FerricastError::Timeout(format!("RTSP {method} {uri}")))?;
+        match &response {
+            Ok(r) => {
+                if enabled!(Level::TRACE) {
+                    trace!(
+                        status = r.status,
+                        reason = %r.reason,
+                        headers = ?r.headers,
+                        body = %BodyDump { content_type: r.header("Content-Type"), body: &r.body },
+                        "RTSP response"
+                    );
+                }
+            }
+            Err(e) => trace!(method, uri, error = %e, "RTSP request failed"),
+        }
+        response
     }
 
     /// Read more bytes from the socket into `rx`, decrypting if needed.
