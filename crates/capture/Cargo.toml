@@ -81,3 +81,7 @@ libspa = { version = "0.8", features = ["v0_3_75"], optional = true }
 ash = { version = "0.38", optional = true }
 # Polls the xdg-portal session's `Closed` signal stream (pipewire backend).
 futures-util = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Log output for the `enum_thumbs` diagnostic example.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
