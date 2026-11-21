@@ -1,10 +1,23 @@
-//! FairPlay `fp-setup` key material for AirPlay mirroring senders.
+//! FairPlay `fp-setup` for AirPlay mirroring, on both ends of the session.
 //!
 //! The `fp-setup` exchange is two round trips. The first message picks one
 //! of four modes and the receiver answers with a reply that is fixed for
 //! that mode. The second message (the 164-byte key message) is the
 //! sender's FairPlay answer to that reply; the session AES key is later
 //! wrapped in the `ekey` sent in `SETUP`.
+//!
+//! # Receiver
+//!
+//! [`setup1_reply`] and [`setup2_reply`] answer the two messages, and
+//! [`decrypt_ekey`] recovers the session AES key from the stored key
+//! message and the `ekey`. They are a port of UxPlay's receiver code:
+//! `lib/fairplay_playfair.c` (Juho Vähä-Herttua, LGPL-2.1-or-later) and
+//! `lib/playfair` (originally by Esteban Kubata, GPL-3.0), as shipped in
+//! UxPlay 1.73.6. Unlike the C code, every input that would read outside a
+//! table (an unknown mode, a short message) is rejected with a
+//! [`FairPlayError`].
+//!
+//! # Sender
 //!
 //! [`KEY_MESSAGE`] and [`EKEY`] are a genuine pair recorded from an iOS
 //! sender (`AirPlay/675.4.1`) in mode 1, as logged in UxPlay issue
@@ -17,12 +30,90 @@
 //! - shairplay-derived receivers (UxPlay, RPiPlay) store it unverified and
 //!   recover the key with `playfair_decrypt(key_message, ekey)`.
 //!
-//! [`AES_KEY`] is that key: UxPlay logged it for this session, and the
-//! `playfair` implementation shipped in UxPlay 1.73.6 (`lib/playfair`,
-//! originally by Esteban Kubata, GPL-3.0) reproduces it. No playfair code
-//! is included here, only this one input/output vector.
+//! [`AES_KEY`] is that key: UxPlay logged it for this session, and
+//! [`decrypt_ekey`] reproduces it.
 
 #![forbid(unsafe_code)]
+
+mod playfair;
+mod setup;
+
+/// Length of the first `fp-setup` message.
+pub const FP_SETUP1_LEN: usize = 16;
+/// Length of the receiver's reply to the first `fp-setup` message.
+pub const FP_SETUP1_REPLY_LEN: usize = 142;
+/// Length of the second `fp-setup` message (the key message).
+pub const FP_SETUP2_LEN: usize = 164;
+/// Length of the receiver's reply to the second `fp-setup` message.
+pub const FP_SETUP2_REPLY_LEN: usize = 32;
+/// Length of the `ekey` carried in the first `SETUP` request.
+pub const EKEY_LEN: usize = 72;
+
+/// Why an `fp-setup` message or an `ekey` was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FairPlayError {
+    /// The message has the wrong length for its step.
+    #[error("FairPlay message is {actual} bytes, expected {expected}")]
+    Length {
+        /// Length the step requires.
+        expected: usize,
+        /// Length that was received.
+        actual: usize,
+    },
+    /// The message does not start with `FPLY`.
+    #[error("FairPlay message does not start with \"FPLY\"")]
+    Magic,
+    /// The version byte (offset 4) is not [`FAIRPLAY_VERSION`].
+    #[error("unsupported FairPlay version {0}, expected {FAIRPLAY_VERSION}")]
+    Version(u8),
+    /// The mode byte is outside `0..=3`; no reply or key table exists for it.
+    #[error("unsupported fp-setup mode {0}, expected 0..=3")]
+    Mode(u8),
+}
+
+/// Builds the receiver's reply to the first `fp-setup` message.
+///
+/// The reply is the canned table entry for the mode at offset 14.
+///
+/// # Errors
+///
+/// [`FairPlayError::Length`] unless `message1` is [`FP_SETUP1_LEN`] bytes,
+/// [`FairPlayError::Magic`] or [`FairPlayError::Version`] for a bad header,
+/// and [`FairPlayError::Mode`] for a mode above 3.
+pub fn setup1_reply(message1: &[u8]) -> Result<[u8; FP_SETUP1_REPLY_LEN], FairPlayError> {
+    setup::setup1_reply(message1)
+}
+
+/// Builds the receiver's reply to the second `fp-setup` message.
+///
+/// The reply is a fixed `FPLY` header followed by the last 20 bytes of
+/// `message2`. The caller keeps `message2`: [`decrypt_ekey`] needs it.
+///
+/// # Errors
+///
+/// [`FairPlayError::Length`] unless `message2` is [`FP_SETUP2_LEN`] bytes,
+/// and [`FairPlayError::Magic`] or [`FairPlayError::Version`] for a bad
+/// header.
+pub fn setup2_reply(message2: &[u8]) -> Result<[u8; FP_SETUP2_REPLY_LEN], FairPlayError> {
+    setup::setup2_reply(message2)
+}
+
+/// Recovers the session AES key wrapped in `ekey`.
+///
+/// `keymsg` is the second `fp-setup` message the sender sent on this
+/// connection, as passed to [`setup2_reply`].
+///
+/// # Errors
+///
+/// [`FairPlayError::Mode`] when the mode byte of `keymsg` (offset 12) is
+/// above 3.
+pub fn decrypt_ekey(
+    keymsg: &[u8; FP_SETUP2_LEN],
+    ekey: &[u8; EKEY_LEN],
+) -> Result<[u8; 16], FairPlayError> {
+    playfair::decrypt(keymsg, ekey)
+}
 
 /// FairPlay protocol version byte carried at offset 4 of every message.
 pub const FAIRPLAY_VERSION: u8 = 3;
@@ -30,12 +121,6 @@ pub const FAIRPLAY_VERSION: u8 = 3;
 /// `fp-setup` mode [`KEY_MESSAGE`] was produced for. The first message must
 /// ask for it: the key message answers that mode's reply.
 pub const MODE: u8 = 1;
-
-/// Header of the 32-byte reply to the second `fp-setup` message; the
-/// remaining 20 bytes echo `KEY_MESSAGE[144..164]`.
-const REPLY2_HEADER: [u8; 12] = [
-    0x46, 0x50, 0x4c, 0x59, 0x03, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x14,
-];
 
 /// Length of the receiver's reply to [`setup_message1`].
 pub const REPLY1_LEN: usize = 142;
@@ -96,7 +181,7 @@ pub fn setup_message1(mode: u8) -> [u8; 16] {
 #[must_use]
 pub fn expected_reply2() -> [u8; 32] {
     let mut reply = [0_u8; 32];
-    reply[..12].copy_from_slice(&REPLY2_HEADER);
+    reply[..setup::FP_HEADER.len()].copy_from_slice(&setup::FP_HEADER);
     reply[12..].copy_from_slice(&KEY_MESSAGE[144..]);
     reply
 }
@@ -114,5 +199,49 @@ mod tests {
         assert_eq!(setup_message1(2)[14], 2);
         assert_eq!(setup_message1(2)[4], FAIRPLAY_VERSION);
         assert_eq!(&expected_reply2()[12..], &KEY_MESSAGE[144..]);
+    }
+
+    #[test]
+    fn decrypt_ekey_recovers_the_recorded_key() {
+        assert_eq!(decrypt_ekey(&KEY_MESSAGE, &EKEY), Ok(AES_KEY));
+    }
+
+    #[test]
+    fn decrypt_ekey_rejects_unknown_modes() {
+        let mut keymsg = KEY_MESSAGE;
+        keymsg[12] = 4;
+        assert_eq!(decrypt_ekey(&keymsg, &EKEY), Err(FairPlayError::Mode(4)));
+    }
+
+    #[test]
+    fn receiver_answers_the_sender_messages() {
+        for mode in 0..4 {
+            let reply = setup1_reply(&setup_message1(mode)).unwrap();
+            assert_eq!(&reply[..4], b"FPLY");
+            assert_eq!(reply[13], mode);
+        }
+        assert_eq!(setup2_reply(&KEY_MESSAGE).unwrap(), expected_reply2());
+    }
+
+    #[test]
+    fn receiver_rejects_malformed_messages() {
+        let mut message1 = setup_message1(0);
+        message1[14] = 4;
+        assert_eq!(setup1_reply(&message1), Err(FairPlayError::Mode(4)));
+        message1[4] = 2;
+        assert_eq!(setup1_reply(&message1), Err(FairPlayError::Version(2)));
+        message1[0] = b'X';
+        assert_eq!(setup1_reply(&message1), Err(FairPlayError::Magic));
+        assert_eq!(
+            setup1_reply(&KEY_MESSAGE),
+            Err(FairPlayError::Length {
+                expected: FP_SETUP1_LEN,
+                actual: FP_SETUP2_LEN
+            })
+        );
+        assert!(matches!(
+            setup2_reply(&KEY_MESSAGE[..100]),
+            Err(FairPlayError::Length { .. })
+        ));
     }
 }

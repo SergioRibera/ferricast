@@ -2114,6 +2114,9 @@ dependencies = [
 [[package]]
 name = "ferricast-fairplay"
 version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "ferricast-gui"
