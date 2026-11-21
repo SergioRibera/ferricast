@@ -29,8 +29,9 @@ pub(crate) const OPUS_RATE: u32 = 48_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioStream {
     pub codec: AudioCodec,
-    /// Output sample rate of the decoder (the AAC core rate for HE-AAC,
-    /// whose SBR layer is not decoded; always 48 kHz for Opus).
+    /// Output sample rate of the decoder: the SBR rate for HE-AAC that
+    /// signals it explicitly (implicitly signalled SBR is only found by
+    /// the decoder), always 48 kHz for Opus.
     pub sample_rate: u32,
     pub channels: u16,
     pub duration_us: Option<u64>,
@@ -80,6 +81,10 @@ pub(crate) struct AacConfig {
     rate_index: u8,
     pub(crate) sample_rate: u32,
     pub(crate) channels: u8,
+    /// What a decoder that handles SBR and PS outputs: twice the core
+    /// rate for HE-AAC, stereo for HE-AAC v2 (whose core is mono).
+    output_rate: u32,
+    output_channels: u8,
 }
 
 impl AacConfig {
@@ -92,10 +97,15 @@ impl AacConfig {
         let mut object_type = bits.object_type().ok_or_else(malformed)?;
         let (mut rate_index, mut sample_rate) = bits.rate().ok_or_else(malformed)?;
         let channels = bits.read(4).ok_or_else(malformed)? as u8;
+        let mut output_rate = None;
+        let mut output_channels = channels;
         if object_type == AOT_SBR || object_type == AOT_PS {
             // The extension rate belongs to the SBR layer; the core
             // keeps the rate read above.
-            bits.rate().ok_or_else(malformed)?;
+            output_rate = Some(bits.rate().ok_or_else(malformed)?.1);
+            if object_type == AOT_PS {
+                output_channels = 2;
+            }
             object_type = bits.object_type().ok_or_else(malformed)?;
         }
         if !(1..=4).contains(&object_type) {
@@ -117,6 +127,8 @@ impl AacConfig {
             rate_index,
             sample_rate,
             channels,
+            output_rate: output_rate.unwrap_or(sample_rate),
+            output_channels,
         })
     }
 
@@ -130,19 +142,22 @@ impl AacConfig {
                 FerricastError::Demux(format!("AAC with {channels} channels is not supported"))
             })?;
         let rate_index = nearest_rate_index(sample_rate);
+        let sample_rate = AAC_RATES[usize::from(rate_index)];
         Ok(Self {
             object_type: 2,
             rate_index,
-            sample_rate: AAC_RATES[usize::from(rate_index)],
+            sample_rate,
             channels,
+            output_rate: sample_rate,
+            output_channels: channels,
         })
     }
 
     pub(crate) fn stream(self, duration_us: Option<u64>) -> AudioStream {
         AudioStream {
             codec: AudioCodec::Aac,
-            sample_rate: self.sample_rate,
-            channels: u16::from(self.channels),
+            sample_rate: self.output_rate,
+            channels: u16::from(self.output_channels),
             duration_us,
         }
     }
@@ -265,6 +280,19 @@ mod tests {
         assert_eq!(config.object_type, 2);
         assert_eq!(config.sample_rate, 24_000);
         assert_eq!(config.channels, 2);
+        let stream = config.stream(None);
+        assert_eq!((stream.sample_rate, stream.channels), (48_000, 2));
+    }
+
+    #[test]
+    fn he_aac_v2_outputs_stereo_at_the_sbr_rate() {
+        // PS (29), core 24 kHz (index 6), mono, extension 48 kHz
+        // (index 3), core object type 2.
+        let asc = [0xEB, 0x09, 0x88, 0x00];
+        let config = AacConfig::from_asc(&asc).unwrap();
+        assert_eq!((config.sample_rate, config.channels), (24_000, 1));
+        let stream = config.stream(None);
+        assert_eq!((stream.sample_rate, stream.channels), (48_000, 2));
     }
 
     #[test]

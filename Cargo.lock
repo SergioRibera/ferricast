@@ -2017,6 +2017,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "cros-libva",
+ "fdk-aac",
  "ferricast-core",
  "ferricast-demuxer",
  "h264-reader",

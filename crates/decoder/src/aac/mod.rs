@@ -18,6 +18,8 @@
 //! further conversion.
 
 mod adts;
+#[cfg(feature = "fdk-aac-decode")]
+mod fdk;
 
 use std::collections::VecDeque;
 
@@ -94,6 +96,10 @@ pub struct AacDecoder {
     /// Decoded runs not yet handed out: a payload whose frames change
     /// shape mid-way yields one run per shape, but `decode` returns one.
     pending: VecDeque<DecodedAudio>,
+    /// libfdk-aac, preferred when built in: it also decodes the SBR and
+    /// PS layers of HE-AAC, which symphonia skips.
+    #[cfg(feature = "fdk-aac-decode")]
+    fdk: Option<fdk::FdkAac>,
 }
 
 impl AacDecoder {
@@ -173,6 +179,14 @@ impl AudioDecoder for AacDecoder {
                 config.codec
             )));
         }
+        #[cfg(feature = "fdk-aac-decode")]
+        if use_fdk() {
+            self.fdk = Some(fdk::FdkAac::new(config));
+            self.active = None;
+            self.pending.clear();
+            self.configured = true;
+            return Ok(());
+        }
         self.active = match Shape::from_config(config)? {
             Some(shape) => Some(Active {
                 decoder: shape.decoder()?,
@@ -192,6 +206,12 @@ impl AudioDecoder for AacDecoder {
             ));
         }
         let mut runs = Vec::new();
+        #[cfg(feature = "fdk-aac-decode")]
+        let decoded = match self.fdk.as_mut() {
+            Some(fdk) => fdk.decode(&frame.data, frame.timestamp_us, &mut runs),
+            None => self.decode_units(&frame, &mut runs),
+        };
+        #[cfg(not(feature = "fdk-aac-decode"))]
         let decoded = self.decode_units(&frame, &mut runs);
         // Frames decoded before a bad one in the same payload are still
         // good audio; queue them before reporting the failure.
@@ -205,6 +225,13 @@ impl AudioDecoder for AacDecoder {
         // off by a mid-payload shape change can still be waiting.
         Ok(self.pending.drain(..).collect())
     }
+}
+
+/// Whether libfdk-aac decodes: always, unless
+/// `FERRICAST_AAC_DECODER=symphonia` asks for the pure-Rust decoder.
+#[cfg(feature = "fdk-aac-decode")]
+fn use_fdk() -> bool {
+    std::env::var("FERRICAST_AAC_DECODER").map_or(true, |v| !v.eq_ignore_ascii_case("symphonia"))
 }
 
 /// Convert a symphonia `AudioBufferRef` (whatever sample format the
@@ -257,6 +284,13 @@ fn interleave_s16(buf: AudioBufferRef<'_>) -> Vec<i16> {
 
 #[cfg(test)]
 mod tests {
+    fn fdk_in_use() -> bool {
+        #[cfg(feature = "fdk-aac-decode")]
+        return use_fdk();
+        #[cfg(not(feature = "fdk-aac-decode"))]
+        false
+    }
+
     use bytes::Bytes;
 
     use super::adts::tests::frame;
@@ -292,7 +326,11 @@ mod tests {
                 .configure(&config(rate, channels))
                 .unwrap();
         }
-        assert!(AacDecoder::default().configure(&config(48_000, 6)).is_err());
+        // symphonia decodes mono and stereo only; libfdk-aac up to 7.1.
+        assert_eq!(
+            AacDecoder::default().configure(&config(48_000, 6)).is_ok(),
+            fdk_in_use()
+        );
     }
 
     #[test]
