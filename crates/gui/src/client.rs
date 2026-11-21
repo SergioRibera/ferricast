@@ -6,7 +6,7 @@
 //! them touch capture, encoders or protocol code — that's all behind
 //! the daemon.
 
-use ferricast_dbus::{BUS_NAME, ManagerProxy, SourceDto};
+use ferricast_dbus::{BUS_NAME, DeviceDto, ManagerProxy, SourceDto};
 use futures_util::stream::StreamExt;
 
 use crate::cli::SourceKind;
@@ -36,7 +36,7 @@ pub async fn list(watch: bool) -> anyhow::Result<()> {
     let p = proxy().await?;
 
     for d in p.list_devices().await.map_err(rewrap)? {
-        print_device_line(&d.id, &d.name, &d.protocol, &d.model, &d.host);
+        print_device_line(&d);
     }
 
     if !watch {
@@ -53,7 +53,7 @@ pub async fn list(watch: bool) -> anyhow::Result<()> {
                     if let Ok(args) = sig.args() {
                         let d = args.device();
                         print!("+ ");
-                        print_device_line(&d.id, &d.name, &d.protocol, &d.model, &d.host);
+                        print_device_line(d);
                     }
                 } else { break; }
             }
@@ -69,18 +69,12 @@ pub async fn list(watch: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_device_line(id: &str, name: &str, protocol: &str, model: &str, host: &str) {
-    let model_field = if model.is_empty() {
-        "-".into()
-    } else {
-        model.to_string()
-    };
-    let host_field = if host.is_empty() {
-        "-".into()
-    } else {
-        host.to_string()
-    };
-    println!("{id}\t{name}\t{protocol}\t{model_field}\t{host_field}");
+/// One tab-separated line per device; the address column shows the
+/// primary (most preferred) address.
+fn print_device_line(d: &DeviceDto) {
+    let model = if d.model.is_empty() { "-" } else { &d.model };
+    let address = d.addresses.first().map_or("-", String::as_str);
+    println!("{}\t{}\t{}\t{model}\t{address}", d.id, d.name, d.protocol);
 }
 
 pub async fn stream(device: String, source: Option<SourceKind>) -> anyhow::Result<()> {

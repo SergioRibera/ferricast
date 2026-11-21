@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -10,8 +9,8 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use ferricast_core::{
-    Codec, Device, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError, H264Profile,
-    H265Profile, MdnsDiscovery, Result,
+    Codec, Device, DeviceAddresses, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError,
+    H264Profile, H265Profile, MdnsDiscovery, Result,
 };
 
 use crate::self_filter;
@@ -139,29 +138,20 @@ impl Discovery for ChromecastDiscovery {
                         let capabilities =
                             capabilities_for_model(model.as_deref().unwrap_or(""), ca);
 
-                        let candidates: Vec<Ipv4Addr> =
-                            info.get_addresses_v4().into_iter().copied().collect();
-                        let addr: std::net::IpAddr =
-                            match pick_address(&candidates, &local_ipv4_networks()) {
-                                Some(addr) => addr.into(),
-                                None => {
-                                    warn!(
-                                        name = info.get_fullname(),
-                                        "resolved service has no addresses, skipping"
-                                    );
-                                    continue;
-                                }
-                            };
-
-                        let port = info.get_port();
+                        let Some(addresses) = DeviceAddresses::from_mdns(&info) else {
+                            warn!(
+                                name = info.get_fullname(),
+                                "resolved service has no usable addresses, skipping"
+                            );
+                            continue;
+                        };
 
                         let device = Device {
                             id: device_uuid,
                             name: friendly_name,
                             protocol: "chromecast",
                             protocol_icon: CHROMECAST_ICON,
-                            addr,
-                            port,
+                            addresses,
                             model,
                             capabilities,
                             metadata: txt,
@@ -172,8 +162,7 @@ impl Discovery for ChromecastDiscovery {
                         info!(
                             id = %device.id,
                             name = %device.name,
-                            addr = %device.addr,
-                            port = device.port,
+                            addresses = ?device.addresses.as_slice(),
                             "discovered chromecast device"
                         );
 
@@ -205,6 +194,8 @@ impl Discovery for ChromecastDiscovery {
                     ServiceEvent::SearchStopped(stype) => {
                         debug!(service_type = %stype, "mDNS search stopped");
                     }
+
+                    other => debug!(?other, "unhandled mDNS event"),
                 }
             }
 
@@ -408,42 +399,6 @@ fn device_uuid(id_txt: Option<&str>, fullname: &str) -> Uuid {
         })
 }
 
-/// IPv4 networks (address, netmask) of the non-loopback local interfaces.
-fn local_ipv4_networks() -> Vec<(Ipv4Addr, Ipv4Addr)> {
-    if_addrs::get_if_addrs()
-        .map(|ifaces| {
-            ifaces
-                .into_iter()
-                .filter(|i| !i.is_loopback())
-                .filter_map(|i| match i.addr {
-                    if_addrs::IfAddr::V4(v4) => Some((v4.ip, v4.netmask)),
-                    if_addrs::IfAddr::V6(_) => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Picks the advertised address to connect to: one on a directly attached
-/// subnet when available (devices often also advertise addresses of other
-/// interfaces, e.g. a docker bridge on Android TV), otherwise the lowest
-/// address so the choice is deterministic.
-fn pick_address(candidates: &[Ipv4Addr], local: &[(Ipv4Addr, Ipv4Addr)]) -> Option<Ipv4Addr> {
-    let on_local_subnet = |addr: &Ipv4Addr| {
-        local.iter().any(|(ip, mask)| {
-            let mask = u32::from(*mask);
-            mask != 0 && u32::from(*ip) & mask == u32::from(*addr) & mask
-        })
-    };
-    let mut sorted = candidates.to_vec();
-    sorted.sort_unstable();
-    sorted
-        .iter()
-        .copied()
-        .find(on_local_subnet)
-        .or_else(|| sorted.first().copied())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,19 +412,6 @@ mod tests {
         let b = device_uuid(None, "TV._googlecast._tcp.local.");
         assert_eq!(b, device_uuid(Some(""), "TV._googlecast._tcp.local."));
         assert_ne!(a, b);
-    }
-
-    #[test]
-    fn prefers_address_on_local_subnet() {
-        let lan = Ipv4Addr::new(192, 168, 1, 40);
-        let docker = Ipv4Addr::new(172, 17, 0, 1);
-        let local = [(
-            Ipv4Addr::new(192, 168, 1, 10),
-            Ipv4Addr::new(255, 255, 255, 0),
-        )];
-        assert_eq!(pick_address(&[docker, lan], &local), Some(lan));
-        assert_eq!(pick_address(&[lan, docker], &[]), Some(docker));
-        assert_eq!(pick_address(&[], &local), None);
     }
 
     #[test]

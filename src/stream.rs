@@ -273,18 +273,17 @@ where
 /// before the portal opens. A silent drop only shows up as the
 /// [`REACHABILITY_TIMEOUT`], which runs alongside the portal and stops
 /// capture again when it fires. Devices without a known control port
-/// (`port == 0`) are not probed.
+/// (port 0) are not probed. Every address is tried, in order.
 async fn start_capture_if_reachable<C: ScreenCapture>(
     device: &Device,
     capture: &mut C,
     source: CaptureSource,
     capture_config: CaptureConfig,
 ) -> Result<()> {
-    if device.port == 0 {
+    if device.addresses.primary().port() == 0 {
         return capture.start(source, capture_config).await;
     }
-    let target = std::net::SocketAddr::new(device.addr, device.port);
-    let probe = ferricast_core::probe_tcp(target, REACHABILITY_TIMEOUT);
+    let probe = ferricast_core::probe_tcp(device.addresses.as_slice(), REACHABILITY_TIMEOUT);
     tokio::pin!(probe);
     let early = tokio::time::timeout(REACHABILITY_GRACE, &mut probe).await;
     let probe_result = match early {
@@ -1225,7 +1224,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(1024);
         let (factory, _sessions) = session_factory(vec![stop_after(1)]);
         let mut device = device(DeviceCapabilities::default());
-        device.port = port;
+        device.addresses = std::net::SocketAddr::from(([127, 0, 0, 1], port)).into();
         StreamRequest {
             device,
             source: CaptureSource::FullScreen { monitor: None },

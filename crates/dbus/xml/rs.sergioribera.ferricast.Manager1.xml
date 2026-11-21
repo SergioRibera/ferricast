@@ -12,7 +12,9 @@
   only this file.
 
   Struct layouts:
-    DeviceDto       (s s s s s a{sv})  id, name, protocol, model, host, capabilities
+    DeviceDto       (s s s s as a{sv}) id, name, protocol, model, addresses, capabilities
+                    (addresses: "ip:port", most preferred first; IPv6 as
+                    "[addr]:port" or "[addr%ifindex]:port" when link-local)
     SourceDto       (s a{sv})          kind, args
     ActiveStreamDto (s s)              device_id, device_name
     MonitorInfoDto  (s s s s i i u u d u b a{sv})
@@ -30,7 +32,7 @@
 
     <!-- All devices currently known to the daemon. -->
     <method name="ListDevices">
-      <arg name="devices" type="a(sssssa{sv})" direction="out"/>
+      <arg name="devices" type="a(ssssasa{sv})" direction="out"/>
     </method>
 
     <!-- Devices that currently have an active stream. -->
@@ -97,7 +99,7 @@
     </method>
 
     <signal name="DeviceAdded">
-      <arg name="device" type="(sssssa{sv})"/>
+      <arg name="device" type="(ssssasa{sv})"/>
     </signal>
 
     <signal name="DeviceRemoved">

@@ -584,6 +584,13 @@ impl Component for DeviceCard {
                             .font_size(12.)
                             .max_lines(1)
                             .color(status_color),
+                    )
+                    .child(
+                        label()
+                            .text(self.device.addresses.to_string())
+                            .font_size(11.)
+                            .max_lines(1)
+                            .color((130, 130, 150)),
                     ),
             )
     }
@@ -599,8 +606,7 @@ mod tests {
             name: name.into(),
             protocol: "chromecast",
             protocol_icon: bytes::Bytes::new(),
-            addr: std::net::IpAddr::from([127, 0, 0, 1]),
-            port: 8009,
+            addresses: std::net::SocketAddr::from(([127, 0, 0, 1], 8009)).into(),
             model: None,
             capabilities: DeviceCapabilities::default(),
             metadata: HashMap::new(),

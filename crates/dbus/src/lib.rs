@@ -41,7 +41,12 @@ pub const INTROSPECTION_XML: &str = include_str!("../xml/rs.sergioribera.ferrica
 
 /// Snapshot of a device exposed over D-Bus. Mirrors
 /// [`ferricast_core::Device`] minus runtime-only fields (icon bytes,
-/// socket addresses) that don't make sense to ship over the bus.
+/// metadata) that don't make sense to ship over the bus.
+///
+/// `addresses` lists every receiver address as `ip:port`, most
+/// preferred first; IPv6 is written `[addr]:port`, or
+/// `[addr%scope]:port` for link-local addresses (scope = interface
+/// index).
 ///
 /// `capabilities` is a free-form `a{sv}` so we can add new fields
 /// (max_fps, max_bitrate_kbps, max_h264_profile, requires_audio…)
@@ -52,7 +57,7 @@ pub struct DeviceDto {
     pub name: String,
     pub protocol: String,
     pub model: String,
-    pub host: String,
+    pub addresses: Vec<String>,
     pub capabilities: HashMap<String, OwnedValue>,
 }
 

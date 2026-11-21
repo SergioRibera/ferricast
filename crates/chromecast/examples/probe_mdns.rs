@@ -40,7 +40,12 @@ fn main() {
                     .collect();
                 println!("\n=== {} ===", info.get_fullname());
                 println!("  hostname: {}", info.get_hostname());
-                println!("  addrs:    {:?}", info.get_addresses_v4());
+                println!("  addrs:    {:?}", info.get_addresses());
+                println!(
+                    "  ranked:   {:?}",
+                    ferricast_core::DeviceAddresses::from_mdns(&info)
+                        .map(|a| a.as_slice().to_vec())
+                );
                 println!("  port:     {}", info.get_port());
                 println!("  txt ({} keys):", txt.len());
                 for t in txt {
@@ -57,6 +62,7 @@ fn main() {
                 println!("  search started for {}", ty);
             }
             Ok(ServiceEvent::SearchStopped(_)) => {}
+            Ok(other) => println!("  other event: {other:?}"),
             Err(_) => break,
         }
     }

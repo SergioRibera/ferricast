@@ -1,7 +1,6 @@
 //! AirPlay receiver discovery over mDNS (`_airplay._tcp`).
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -9,8 +8,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use ferricast_core::device::{AirplayConfig, Features, Flags};
 use ferricast_core::{
-    Codec, Device, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError, MdnsDiscovery,
-    Result,
+    Codec, Device, DeviceAddresses, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError,
+    MdnsDiscovery, Result,
 };
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use plist::Value;
@@ -25,10 +24,6 @@ use crate::rtsp::{ClientIdentity, RtspClient};
 const AIRPLAY_SERVICE_TYPE: &str = "_airplay._tcp.local.";
 const AIRPLAY_ICON: Bytes = Bytes::from_static(include_bytes!("../../../assets/airplay.svg"));
 const INFO_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// `Device::metadata` key holding further receiver addresses (comma
-/// separated), tried in order when the primary address is unreachable.
-pub const META_ADDRESSES: &str = "airplay.addresses";
 
 /// AirPlay device discovery using mDNS-SD.
 #[derive(Default)]
@@ -48,32 +43,11 @@ fn stable_id(device_id: &str) -> Uuid {
         .into_uuid()
 }
 
-/// Order addresses so the most likely reachable one comes first. IPv6
-/// link-local addresses are dropped: they need a scope id we don't have.
-fn rank_addresses(addrs: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
-    let rank = |ip: &IpAddr| match ip {
-        IpAddr::V4(v4) if v4.is_private() => 0,
-        IpAddr::V4(v4) if !v4.is_link_local() => 1,
-        IpAddr::V4(_) => 2,
-        IpAddr::V6(_) => 3,
-    };
-    let mut addrs: Vec<IpAddr> = addrs
-        .into_iter()
-        .filter(|ip| match ip {
-            IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
-            IpAddr::V4(_) => true,
-        })
-        .collect();
-    addrs.sort_by_key(|ip| (rank(ip), *ip));
-    addrs
-}
-
 /// Build a [`Device`] from a resolved service, or `None` if it cannot
 /// mirror the screen.
 fn device_from_service(
     fullname: &str,
-    port: u16,
-    addrs: Vec<IpAddr>,
+    addresses: DeviceAddresses,
     txt: &HashMap<String, String>,
 ) -> Option<Device> {
     let Some(features) = txt.get("features").and_then(|f| Features::parse_txt(f)) else {
@@ -101,29 +75,17 @@ fn device_from_service(
     {
         flags |= Flags::PASSWORD_REQUIRED;
     }
-    let addrs = rank_addresses(addrs);
-    let (&addr, rest) = addrs.split_first()?;
     let device_id = txt.get("deviceid").cloned();
     let id = stable_id(device_id.as_deref().unwrap_or(fullname));
-    let mut metadata = HashMap::new();
-    if !rest.is_empty() {
-        let rest: Vec<String> = rest.iter().map(ToString::to_string).collect();
-        metadata.insert(META_ADDRESSES.to_owned(), rest.join(","));
-    }
     Some(Device {
         id,
-        name: fullname
-            .strip_suffix(".")
-            .unwrap_or(fullname)
-            .strip_suffix("._airplay._tcp.local")
-            .unwrap_or(fullname)
-            .to_owned(),
+        // mdns-sd escapes dots inside the instance name.
+        name: mdns_sd::instance_name_unescaped(fullname),
         protocol: "airplay",
         protocol_icon: AIRPLAY_ICON,
-        addr,
-        port,
+        addresses,
         model: txt.get("model").cloned(),
-        metadata,
+        metadata: HashMap::new(),
         capabilities: DeviceCapabilities {
             supports_audio: features.contains(Features::AUDIO_SUPPORTED),
             supports_video: features.contains(Features::VIDEO_SUPPORTED),
@@ -145,8 +107,8 @@ fn device_from_service(
 
 /// Display limits from `GET /info`: `(width, height, fps)`.
 async fn probe_info(device: &Device) -> Result<(u32, u32, u32)> {
-    let addr = std::net::SocketAddr::new(device.addr, device.port);
-    let mut rtsp = RtspClient::connect(&[addr], ClientIdentity::default(), None).await?;
+    let mut rtsp =
+        RtspClient::connect(device.addresses.as_slice(), ClientIdentity::default(), None).await?;
     let reply = rtsp
         .request("GET", "/info", None, &[])
         .await?
@@ -207,9 +169,14 @@ impl Discovery for AirPlayDiscovery {
                             .map(|p| (p.key().to_owned(), p.val_str().to_owned()))
                             .collect();
                         let fullname = service.get_fullname().to_owned();
-                        let addrs = service.get_addresses().iter().copied().collect();
-                        let Some(mut device) =
-                            device_from_service(&fullname, service.get_port(), addrs, &txt)
+                        let Some(addresses) = DeviceAddresses::from_mdns(&service) else {
+                            warn!(
+                                name = fullname,
+                                "AirPlay service without usable addresses, skipping"
+                            );
+                            continue;
+                        };
+                        let Some(mut device) = device_from_service(&fullname, addresses, &txt)
                         else {
                             continue;
                         };
@@ -231,7 +198,7 @@ impl Discovery for AirPlayDiscovery {
                                     debug!(name = %device.name, "AirPlay /info probe timed out")
                                 }
                             }
-                            info!(name = %device.name, addr = %device.addr, port = device.port, "discovered AirPlay receiver");
+                            info!(name = %device.name, addresses = ?device.addresses.as_slice(), "discovered AirPlay receiver");
                             let _ = tx.send(DiscoveryEvent::DeviceFound(device)).await;
                         });
                     }
@@ -245,6 +212,7 @@ impl Discovery for AirPlayDiscovery {
                     ServiceEvent::SearchStarted(_)
                     | ServiceEvent::ServiceFound(_, _)
                     | ServiceEvent::SearchStopped(_) => {}
+                    other => debug!(?other, "unhandled mDNS event"),
                 }
             }
             running.store(false, Ordering::SeqCst);
@@ -277,6 +245,10 @@ impl Discovery for AirPlayDiscovery {
 mod tests {
     use super::*;
 
+    fn addrs(list: &[&str]) -> DeviceAddresses {
+        DeviceAddresses::ranked(list.iter().map(|a| a.parse().unwrap()), &[]).unwrap()
+    }
+
     /// TXT record UxPlay 1.73.6 registers for `_airplay._tcp`.
     fn uxplay_txt(pw: bool) -> HashMap<String, String> {
         [
@@ -299,32 +271,26 @@ mod tests {
 
     #[test]
     fn uxplay_record_becomes_a_legacy_mirroring_device() {
-        let addrs = vec![
-            "fe80::1".parse().unwrap(),
-            "192.168.1.20".parse().unwrap(),
-            "10.0.0.5".parse().unwrap(),
-        ];
         let d = device_from_service(
             "ferricast-test._airplay._tcp.local.",
-            7000,
-            addrs,
+            addrs(&["[fe80::1%2]:7000", "192.168.1.20:7000", "10.0.0.5:7000"]),
             &uxplay_txt(false),
         )
         .unwrap();
         assert_eq!(d.name, "ferricast-test");
-        assert_eq!(d.addr, "10.0.0.5".parse::<IpAddr>().unwrap());
+        let all: Vec<String> = d.addresses.iter().map(|a| a.to_string()).collect();
         assert_eq!(
-            d.metadata.get(META_ADDRESSES).map(String::as_str),
-            Some("192.168.1.20")
+            all,
+            ["10.0.0.5:7000", "192.168.1.20:7000", "[fe80::1%2]:7000"]
         );
+        assert!(d.metadata.is_empty());
         let cfg = d.capabilities.airplay_config.unwrap();
         assert_eq!(cfg.pairing_mode(), ferricast_core::AirPlayPairing::Legacy);
         assert_eq!(cfg.device_id.as_deref(), Some("60:cf:84:ad:6f:97"));
         // Same deviceid → same UUID on every resolve.
         let again = device_from_service(
             "x._airplay._tcp.local.",
-            7000,
-            vec!["10.0.0.5".parse().unwrap()],
+            addrs(&["10.0.0.5:7000"]),
             &uxplay_txt(false),
         )
         .unwrap();
@@ -335,8 +301,7 @@ mod tests {
     fn pw_true_requires_pin_pairing() {
         let d = device_from_service(
             "u._airplay._tcp.local.",
-            7000,
-            vec!["10.0.0.5".parse().unwrap()],
+            addrs(&["10.0.0.5:7000"]),
             &uxplay_txt(true),
         )
         .unwrap();
@@ -352,23 +317,13 @@ mod tests {
         let mut txt = uxplay_txt(false);
         txt.insert("features".into(), "0x10".into());
         assert!(
-            device_from_service(
-                "a._airplay._tcp.local.",
-                7000,
-                vec!["10.0.0.5".parse().unwrap()],
-                &txt
-            )
-            .is_none()
+            device_from_service("a._airplay._tcp.local.", addrs(&["10.0.0.5:7000"]), &txt)
+                .is_none()
         );
         txt.insert("features".into(), "nope".into());
         assert!(
-            device_from_service(
-                "a._airplay._tcp.local.",
-                7000,
-                vec!["10.0.0.5".parse().unwrap()],
-                &txt
-            )
-            .is_none()
+            device_from_service("a._airplay._tcp.local.", addrs(&["10.0.0.5:7000"]), &txt)
+                .is_none()
         );
     }
 }
