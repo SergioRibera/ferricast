@@ -23,8 +23,9 @@ type Attributes = Vec<(&'static str, String)>;
 /// A secret the credential store keeps in the keyring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SecretEntry<'a> {
-    /// Seed of this sender's long-term Ed25519 pairing key.
-    IdentitySeed,
+    /// Seed of this sender's long-term Ed25519 pairing key, for the identity
+    /// with this pairing id (one per data directory).
+    IdentitySeed { pairing_id: &'a str },
     /// Access password of the receiver with this device id.
     Password { device_id: &'a str },
 }
@@ -32,7 +33,7 @@ pub(crate) enum SecretEntry<'a> {
 impl SecretEntry<'_> {
     fn label(self) -> String {
         match self {
-            Self::IdentitySeed => "ferricast AirPlay pairing key".to_owned(),
+            Self::IdentitySeed { .. } => "ferricast AirPlay pairing key".to_owned(),
             Self::Password { device_id } => format!("ferricast AirPlay password for {device_id}"),
         }
     }
@@ -41,7 +42,10 @@ impl SecretEntry<'_> {
     fn attributes(self) -> Attributes {
         let mut attributes = vec![("application", "ferricast".to_owned())];
         match self {
-            Self::IdentitySeed => attributes.push(("kind", "airplay-identity-seed".to_owned())),
+            Self::IdentitySeed { pairing_id } => {
+                attributes.push(("kind", "airplay-identity-seed".to_owned()));
+                attributes.push(("pairing-id", pairing_id.to_owned()));
+            }
             Self::Password { device_id } => {
                 attributes.push(("kind", "airplay-password".to_owned()));
                 attributes.push(("device-id", device_id.to_owned()));

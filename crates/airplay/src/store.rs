@@ -160,7 +160,13 @@ impl CredentialStore {
                     }
                     warn!(path = %path.display(), "ignoring corrupt AirPlay identity seed");
                 }
-                None => match self.secrets.load(SecretEntry::IdentitySeed).await {
+                None => match self
+                    .secrets
+                    .load(SecretEntry::IdentitySeed {
+                        pairing_id: &file.pairing_id,
+                    })
+                    .await
+                {
                     Ok(Some(seed)) => {
                         if let Some(identity) = Identity::with_seed(&file, &seed) {
                             return identity;
@@ -190,7 +196,12 @@ impl CredentialStore {
     async fn move_seed_to_keyring(&self, path: &Path, file: &IdentityFile, identity: &Identity) {
         match self
             .secrets
-            .store(SecretEntry::IdentitySeed, &identity.key.to_bytes())
+            .store(
+                SecretEntry::IdentitySeed {
+                    pairing_id: &file.pairing_id,
+                },
+                &identity.key.to_bytes(),
+            )
             .await
         {
             Ok(()) => {
@@ -212,7 +223,16 @@ impl CredentialStore {
 
     async fn save_identity(&self, path: &Path, identity: &Identity) {
         let seed = identity.key.to_bytes();
-        let file_seed = match self.secrets.store(SecretEntry::IdentitySeed, &seed).await {
+        let file_seed = match self
+            .secrets
+            .store(
+                SecretEntry::IdentitySeed {
+                    pairing_id: &identity.pairing_id,
+                },
+                &seed,
+            )
+            .await
+        {
             Ok(()) => None,
             Err(e) => {
                 warn_seed_in_file(&e);
@@ -468,7 +488,9 @@ mod tests {
         assert_eq!(a.key.to_bytes(), b.key.to_bytes());
         assert_eq!(a.device_id.len(), 17);
         assert_eq!(
-            keyring.get(SecretEntry::IdentitySeed),
+            keyring.get(SecretEntry::IdentitySeed {
+                pairing_id: &a.pairing_id
+            }),
             Some(a.key.to_bytes().to_vec())
         );
         let file = dir.read("identity.json");
@@ -493,7 +515,12 @@ mod tests {
         let identity = store.identity().await;
         assert_eq!(identity.pairing_id, "PAIRING");
         assert_eq!(identity.key.to_bytes(), seed);
-        assert_eq!(keyring.get(SecretEntry::IdentitySeed), Some(seed.to_vec()));
+        assert_eq!(
+            keyring.get(SecretEntry::IdentitySeed {
+                pairing_id: "PAIRING"
+            }),
+            Some(seed.to_vec())
+        );
         assert!(!dir.read("identity.json").contains("seed"));
         assert!(!dir.file("identity.json.tmp").exists());
         // Later loads read the seed back from the keyring.
