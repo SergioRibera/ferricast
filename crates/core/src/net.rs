@@ -13,9 +13,10 @@
 //! `127.0.0.1` keep working).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
+use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{FerricastError, Result};
 
@@ -149,6 +150,29 @@ pub async fn bind_udp(
     }
     Err(FerricastError::Other(format!(
         "no free UDP port in range {start}–{end}"
+    )))
+}
+
+/// Check that `target` accepts TCP connections, giving up after
+/// `timeout`. The connection is closed straight away; nothing is sent.
+///
+/// Used before a stream starts so an offline or firewalled receiver is
+/// reported in about a second instead of after the full handshake
+/// timeout.
+///
+/// # Errors
+///
+/// [`FerricastError::Connection`] (`device unreachable: <addr>:<port>`)
+/// when the connection is refused, has no route or does not complete
+/// within `timeout`.
+pub async fn probe_tcp(target: SocketAddr, timeout: Duration) -> Result<()> {
+    let reason = match tokio::time::timeout(timeout, TcpStream::connect(target)).await {
+        Ok(Ok(_stream)) => return Ok(()),
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => format!("no answer within {} ms", timeout.as_millis()),
+    };
+    Err(FerricastError::Connection(format!(
+        "device unreachable: {target} ({reason})"
     )))
 }
 
@@ -287,5 +311,38 @@ mod tests {
             // `next` happened to be in use by something else.
             Err(e) => assert!(e.to_string().contains("no free TCP port"), "{e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn probe_passes_for_an_open_listener() {
+        let l = bind_tcp(V4_LOOPBACK, None).await.unwrap();
+        let target = SocketAddr::new(V4_LOOPBACK, l.local_addr().unwrap().port());
+        probe_tcp(target, Duration::from_secs(3)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_fails_fast_for_a_closed_port() {
+        // Bind then drop to get a port nothing listens on.
+        let port = bind_tcp(V4_LOOPBACK, None)
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let target = SocketAddr::new(V4_LOOPBACK, port);
+        let started = std::time::Instant::now();
+        let err = probe_tcp(target, Duration::from_secs(3))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refusal took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.contains(&format!("device unreachable: 127.0.0.1:{port}")),
+            "{err}"
+        );
     }
 }

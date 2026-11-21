@@ -45,7 +45,9 @@ pub use frame::{
     DmaBufPlane, EncodedFrame, GpuFrame, PixelFormat, RawFrame,
 };
 #[cfg(feature = "net")]
-pub use net::{bind_tcp, bind_udp, local_addr_for, local_socket_addr_for, unspecified_for};
+pub use net::{
+    bind_tcp, bind_udp, local_addr_for, local_socket_addr_for, probe_tcp, unspecified_for,
+};
 pub use pairing::{PairingChallenge, PairingResponse};
 #[cfg(feature = "net")]
 pub use protocol::{ProtocolHandler, ReceiverProtocol};

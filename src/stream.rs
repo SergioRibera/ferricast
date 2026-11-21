@@ -37,6 +37,12 @@ type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// How long to wait for capture to deliver its first frame (the
 /// portal dialog and PipeWire format negotiation happen before it).
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the reachability probe of the device's control port may
+/// take before the device counts as unreachable.
+const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the probe may hold back capture start (and with it the
+/// portal dialog) to report a fast failure first.
+const REACHABILITY_GRACE: Duration = Duration::from_millis(250);
 /// How long the user has to answer a pairing prompt.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
 /// Reconnect attempts in a row before the stream is given up.
@@ -214,7 +220,7 @@ where
             height: caps.max_height,
             show_cursor: true,
         };
-        capture.start(source, capture_config).await?;
+        start_capture_if_reachable(&device, &mut capture, source, capture_config).await?;
 
         let audio = config.audio.clone();
         let negotiated = match negotiate(
@@ -252,6 +258,49 @@ where
             event_tx,
         })
     }
+}
+
+/// Start capture while probing the device's control port, so an
+/// offline or firewalled receiver fails the start in seconds instead
+/// of after the user picked a source and the handshake timed out.
+///
+/// A refusal or missing route usually answers within a few
+/// milliseconds: the probe gets [`REACHABILITY_GRACE`] to report one
+/// before the portal opens. A silent drop only shows up as the
+/// [`REACHABILITY_TIMEOUT`], which runs alongside the portal and stops
+/// capture again when it fires. Devices without a known control port
+/// (`port == 0`) are not probed.
+async fn start_capture_if_reachable<C: ScreenCapture>(
+    device: &Device,
+    capture: &mut C,
+    source: CaptureSource,
+    capture_config: CaptureConfig,
+) -> Result<()> {
+    if device.port == 0 {
+        return capture.start(source, capture_config).await;
+    }
+    let target = std::net::SocketAddr::new(device.addr, device.port);
+    let probe = ferricast_core::probe_tcp(target, REACHABILITY_TIMEOUT);
+    tokio::pin!(probe);
+    let early = tokio::time::timeout(REACHABILITY_GRACE, &mut probe).await;
+    let probe_result = match early {
+        Ok(result) => {
+            result?;
+            capture.start(source, capture_config).await?;
+            return Ok(());
+        }
+        Err(_still_probing) => {
+            let (started, probed) = tokio::join!(capture.start(source, capture_config), probe);
+            started?;
+            probed
+        }
+    };
+    if let Err(e) = probe_result {
+        tracing::warn!(device = %device.name, error = %e, "receiver unreachable; stopping capture");
+        let _ = capture.stop().await;
+        return Err(e);
+    }
+    Ok(())
 }
 
 async fn negotiate<C: ScreenCapture, E: VideoEncoder>(
@@ -1135,6 +1184,53 @@ mod tests {
             encoder: encoder_log,
             sessions,
         }
+    }
+
+    /// Run `prepare` against a receiver whose control port is `port`
+    /// on loopback.
+    async fn prepare_with_port(port: u16) -> Result<StreamTask<FakeCapture, FakeEncoder>> {
+        let (event_tx, _event_rx) = mpsc::channel(1024);
+        let (factory, _sessions) = session_factory(vec![stop_after(1)]);
+        let mut device = device(DeviceCapabilities::default());
+        device.port = port;
+        StreamRequest {
+            device,
+            source: CaptureSource::FullScreen { monitor: None },
+            capture: FakeCapture::new(&[(64, 36)]),
+            encoder: FakeEncoder::default(),
+            config: StreamConfig::default(),
+            create_session: factory,
+            event_tx,
+        }
+        .prepare()
+        .await
+    }
+
+    #[tokio::test]
+    async fn unreachable_device_fails_the_start_quickly() {
+        // Bind then drop to get a loopback port nothing listens on.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let started = std::time::Instant::now();
+        let Err(err) = prepare_with_port(port).await else {
+            panic!("prepare succeeded against a closed port");
+        };
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            err.to_string()
+                .contains(&format!("device unreachable: 127.0.0.1:{port}")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reachable_device_starts_normally() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(prepare_with_port(port).await.is_ok());
     }
 
     fn stop_after(n: usize) -> SessionScript {
