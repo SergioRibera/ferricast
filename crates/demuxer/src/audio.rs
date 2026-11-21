@@ -3,7 +3,7 @@
 //! decoder reads, and Opus identification headers.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use ferricast_core::frame::AacChannelConfig;
+use ferricast_core::frame::{AacChannelConfig, SourceAudioFormat};
 use ferricast_core::{AudioCodec, FerricastError, Result};
 
 /// Sampling frequencies indexed by `samplingFrequencyIndex`
@@ -43,6 +43,8 @@ pub struct AudioStream {
     pub sample_rate: u32,
     pub channels: u16,
     pub duration_us: Option<u64>,
+    /// The stored format when `codec` is PCM decoded from it.
+    pub source: Option<SourceAudioFormat>,
 }
 
 /// How the packets of an audio track are handed out.
@@ -176,6 +178,7 @@ impl AacConfig {
             sample_rate: self.output_rate,
             channels: self.output_channels,
             duration_us,
+            source: None,
         }
     }
 

@@ -12,6 +12,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Mutex, PoisonError};
 
 use bytes::Bytes;
+use ferricast_core::frame::SourceAudioFormat;
 use ferricast_core::{AudioCodec, AudioFrame, FerricastError, Result};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, CODEC_TYPE_OPUS, Decoder, DecoderOptions};
@@ -128,12 +129,16 @@ impl AudioFileDemuxer {
         let duration_us = params
             .n_frames
             .map(|frames| micros(time_base, frames.saturating_add(params.start_ts)));
-        let (codec, output_rate, output) = if params.codec == CODEC_TYPE_OPUS {
-            (AudioCodec::Opus, OPUS_RATE, Output::Opus)
+        let (codec, output_rate, output, source) = if params.codec == CODEC_TYPE_OPUS {
+            (AudioCodec::Opus, OPUS_RATE, Output::Opus, None)
         } else {
-            let decoder = symphonia::default::get_codecs()
+            let codecs = symphonia::default::get_codecs();
+            let decoder = codecs
                 .make(params, &DecoderOptions::default())
                 .map_err(|e| FerricastError::Demux(format!("unsupported audio codec: {e}")))?;
+            let source = codecs
+                .get_codec(params.codec)
+                .and_then(|descriptor| source_format(descriptor.short_name));
             (
                 AudioCodec::Pcm,
                 sample_rate,
@@ -141,6 +146,7 @@ impl AudioFileDemuxer {
                     decoder,
                     samples: None,
                 },
+                source,
             )
         };
         Ok(Self {
@@ -152,6 +158,7 @@ impl AudioFileDemuxer {
                 sample_rate: output_rate,
                 channels,
                 duration_us,
+                source,
             },
             output,
         })
@@ -260,4 +267,16 @@ fn micros(time_base: TimeBase, ts: u64) -> u64 {
     time.seconds
         .saturating_mul(1_000_000)
         .saturating_add((time.frac * 1e6) as u64)
+}
+
+/// The stored format behind a symphonia decoder's short name. Only the
+/// WAV reader yields raw PCM among the formats enabled here.
+fn source_format(short_name: &str) -> Option<SourceAudioFormat> {
+    match short_name {
+        "mp3" => Some(SourceAudioFormat::Mp3),
+        "flac" => Some(SourceAudioFormat::Flac),
+        "vorbis" => Some(SourceAudioFormat::Vorbis),
+        name if name.starts_with("pcm_") => Some(SourceAudioFormat::Wav),
+        _ => None,
+    }
 }

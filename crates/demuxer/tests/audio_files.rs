@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ferricast_core::AudioCodec;
+use ferricast_core::frame::SourceAudioFormat;
 use ferricast_demuxer::{Demuxer, Packet};
 
 const SECONDS: f64 = 3.0;
@@ -102,6 +103,14 @@ fn audio_files_report_their_duration_and_seek_accurately() {
         assert!(demuxer.video().is_none(), "{name}");
         let audio = demuxer.audio().unwrap().clone();
         assert_eq!(audio.codec, codec, "{name}");
+        let source = match name.rsplit_once('.').map(|(_, ext)| ext) {
+            Some("mp3") => Some(SourceAudioFormat::Mp3),
+            Some("flac") => Some(SourceAudioFormat::Flac),
+            Some("wav") => Some(SourceAudioFormat::Wav),
+            _ if name.starts_with("vorbis") => Some(SourceAudioFormat::Vorbis),
+            _ => None,
+        };
+        assert_eq!(audio.source, source, "{name}");
         assert_eq!(audio.channels, 2, "{name}");
         let duration = demuxer.duration_us().expect("duration") as f64 / 1e6;
 

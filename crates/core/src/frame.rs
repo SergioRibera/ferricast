@@ -343,6 +343,31 @@ pub enum AudioCodec {
     Alac,
 }
 
+/// The format an audio stream is stored in when the receiver decodes it
+/// to PCM before its pipeline (its packets then say
+/// [`AudioCodec::Pcm`]): what to show the user instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SourceAudioFormat {
+    Mp3,
+    Flac,
+    Vorbis,
+    /// Uncompressed PCM in a WAV file.
+    Wav,
+}
+
+impl SourceAudioFormat {
+    /// A short human-readable name.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Mp3 => "MP3",
+            Self::Flac => "FLAC",
+            Self::Vorbis => "Vorbis",
+            Self::Wav => "WAV (PCM)",
+        }
+    }
+}
+
 /// An AAC `channel_configuration` (ISO/IEC 14496-3 §1.6.3.5): the
 /// 3-bit layout code ADTS headers and `AudioSpecificConfig`s carry.
 /// Codes 1 to 6 name as many channels (6 is 5.1); 7 is 7.1, eight

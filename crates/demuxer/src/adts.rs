@@ -124,6 +124,7 @@ impl AdtsDemuxer {
                 sample_rate: first.sample_rate,
                 channels: first.channels,
                 duration_us,
+                source: None,
             },
             offset: start,
             position: 0,

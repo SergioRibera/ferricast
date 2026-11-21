@@ -437,6 +437,7 @@ impl Worker {
                         codec,
                         sample_rate: ts_info.audio_sample_rate,
                         channels: ts_info.audio_channels,
+                        source: None,
                     }),
                 )
             }
@@ -686,6 +687,7 @@ impl Worker {
                 codec: a.codec,
                 sample_rate: a.sample_rate,
                 channels: a.channels,
+                source: a.source,
             }),
         ));
         Ok(segment

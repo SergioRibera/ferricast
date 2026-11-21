@@ -58,6 +58,10 @@ pub struct AudioStreamInfo {
     pub codec: AudioCodec,
     pub sample_rate: u32,
     pub channels: u16,
+    /// The stored format when the packets are PCM decoded from it (an
+    /// MP3, FLAC, Vorbis or WAV file); `None` when `codec` is the
+    /// stored format.
+    pub source: Option<crate::frame::SourceAudioFormat>,
 }
 
 /// One demuxed packet. Video and audio share a single stream so the

@@ -588,7 +588,7 @@ impl App for ReceiverWindowApp {
             .map(|a| {
                 format!(
                     "{} {}Hz/{}ch — {} frames",
-                    codec_label_audio(a.codec),
+                    a.source.map_or(codec_label_audio(a.codec), |s| s.label()),
                     a.sample_rate,
                     a.channels,
                     audio_n

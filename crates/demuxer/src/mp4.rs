@@ -1479,6 +1479,7 @@ fn parse_audio_entry(kind: [u8; 4], entry: &[u8], duration_us: u64) -> Option<Au
                     sample_rate: OPUS_RATE,
                     channels,
                     duration_us,
+                    source: None,
                 },
             })
         }

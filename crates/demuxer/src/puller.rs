@@ -164,6 +164,7 @@ fn media_info(demuxer: &Demuxer) -> MediaInfo {
             codec: a.codec,
             sample_rate: a.sample_rate,
             channels: a.channels,
+            source: a.source,
         }),
         duration_us: demuxer.duration_us(),
         is_live: false,
