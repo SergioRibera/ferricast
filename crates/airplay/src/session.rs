@@ -67,6 +67,9 @@ struct Stream {
     /// `None` when audio is off or the receiver refused the audio stream.
     audio: Option<AudioStream>,
     _timing: TimingServer,
+    /// Connection to the receiver's `eventPort`, held open like iOS does;
+    /// `None` when the receiver announces none (UxPlay) or refuses it.
+    _event: Option<TcpStream>,
     _feedback: TaskGuard,
 }
 
@@ -396,7 +399,18 @@ impl AirPlaySession {
         let reply = self
             .authorized_setup(&mut guard, link, &bplist(setup)?)
             .await?;
-        debug!(reply = ?reply_dict(&reply, "SETUP").ok(), "SETUP session reply");
+        let reply = reply_dict(&reply, "SETUP").unwrap_or_default();
+        debug!(?reply, "SETUP session reply");
+        let event = connect_event(&guard, &reply).await;
+
+        // iOS opens the event connection and sends RECORD before it sets up
+        // the mirroring stream. Receivers written against iOS (AirScreen)
+        // can drop the connection when the mirroring SETUP arrives right
+        // behind the session SETUP instead.
+        guard
+            .request("RECORD", &uri, None, &[])
+            .await?
+            .ensure_success("RECORD")?;
 
         // Keep the id below 2^63: receivers parse it into signed integers.
         let stream_connection_id = rand::random::<u64>() >> 1;
@@ -442,11 +456,6 @@ impl AirPlaySession {
             },
             None => None,
         };
-
-        guard
-            .request("RECORD", &uri, None, &[])
-            .await?
-            .ensure_success("RECORD")?;
         drop(guard);
 
         info!(%data_addr, timing_port = timing.port(), "AirPlay mirroring stream established");
@@ -460,6 +469,7 @@ impl AirPlaySession {
             ),
             audio,
             _timing: timing,
+            _event: event,
             _feedback: TaskGuard(feedback),
         })
     }
@@ -546,6 +556,32 @@ fn reply_stream_port(reply: &Dictionary, stream_type: u64, key: &str) -> Option<
         .as_unsigned_integer()
         .and_then(|p| u16::try_from(p).ok())
         .filter(|p| *p != 0)
+}
+
+/// Open the event connection to the `eventPort` of the session `SETUP`
+/// reply. Receivers that announce 0 or no port get none; a refused or slow
+/// connection is not fatal either, mirroring works without it.
+async fn connect_event(rtsp: &RtspClient, reply: &Dictionary) -> Option<TcpStream> {
+    let port = reply
+        .get("eventPort")
+        .and_then(Value::as_unsigned_integer)
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p != 0)?;
+    let addr = rtsp.peer_at(port);
+    match tokio::time::timeout(DATA_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+        Ok(Ok(tcp)) => {
+            debug!(%addr, "AirPlay event connection open");
+            Some(tcp)
+        }
+        Ok(Err(e)) => {
+            debug!(%addr, error = %e, "AirPlay event connection refused");
+            None
+        }
+        Err(_) => {
+            debug!(%addr, "AirPlay event connection timed out");
+            None
+        }
+    }
 }
 
 /// `SETUP` the AAC-ELD audio stream and open its sockets.
