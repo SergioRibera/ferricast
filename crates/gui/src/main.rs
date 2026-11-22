@@ -437,7 +437,8 @@ fn init_tracing_for_daemon() {
                           ragnarok=off,ferricast=info,ferricast_chromecast=info,\
                           ferricast_encoder=info,ferricast_gui=info,\
                           ferricast_hls=info,ferricast_muxer=info,\
-                          ferricast_capture=info";
+                          ferricast_capture=info,ferricast_airplay=info,\
+                          ferricast_decoder=info,ferricast_demuxer=info";
     let make_filter =
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
