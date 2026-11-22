@@ -431,9 +431,11 @@ fn run_window(
                             }
                             _ => None,
                         };
-                        radio_events
-                            .write_channel(AppChannel::Devices)
-                            .apply(&event);
+                        if radio_events.peek().changed_by(&event) {
+                            radio_events
+                                .write_channel(AppChannel::Devices)
+                                .apply(&event);
+                        }
                         if let Some(command) = command
                             && ui_cmd_tx.send(command).await.is_err()
                         {

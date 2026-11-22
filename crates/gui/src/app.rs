@@ -81,6 +81,8 @@ pub struct Notice {
     pub id: u64,
     pub level: NoticeLevel,
     pub text: String,
+    /// How many times in a row the same notice was raised.
+    pub repeats: u32,
 }
 
 /// Notices kept on screen; older ones are dropped.
@@ -99,11 +101,22 @@ pub struct AppState {
 
 impl AppState {
     pub fn notify(&mut self, level: NoticeLevel, text: impl Into<String>) {
+        let text = text.into();
+        // A failure that keeps happening is counted on one notice
+        // instead of pushing the others off screen.
+        if let Some(last) = self.notices.last_mut()
+            && last.level == level
+            && last.text == text
+        {
+            last.repeats = last.repeats.saturating_add(1);
+            return;
+        }
         self.next_notice += 1;
         self.notices.push(Notice {
             id: self.next_notice,
             level,
-            text: text.into(),
+            text,
+            repeats: 1,
         });
         let excess = self.notices.len().saturating_sub(MAX_NOTICES);
         self.notices.drain(..excess);
@@ -111,6 +124,32 @@ impl AppState {
 
     pub fn dismiss(&mut self, id: u64) {
         self.notices.retain(|n| n.id != id);
+    }
+
+    /// Whether folding `event` in would change what the main window
+    /// shows. Events that change nothing must not re-render it: a
+    /// casting app on the LAN produces them every second or so.
+    pub fn changed_by(&self, event: &ManagerEvent) -> bool {
+        match event {
+            ManagerEvent::DeviceFound(device) => {
+                self.lost.contains(&device.id) || self.devices.get(&device.id) != Some(device)
+            }
+            ManagerEvent::DeviceLost(id) => self.devices.contains_key(id),
+            ManagerEvent::PairingRequired { .. }
+            | ManagerEvent::ReceiverIncoming { .. }
+            | ManagerEvent::ReceiverPin { .. }
+            | ManagerEvent::ReceiverStarted { .. }
+            | ManagerEvent::ReceiverStateChanged { .. }
+            | ManagerEvent::ReceiverStopped { .. } => false,
+            ManagerEvent::StreamStarting { .. }
+            | ManagerEvent::StreamStarted { .. }
+            | ManagerEvent::StreamReconnecting { .. }
+            | ManagerEvent::StreamError { .. }
+            | ManagerEvent::StreamWarning { .. }
+            | ManagerEvent::StreamStopped { .. }
+            | ManagerEvent::DiscoveryError { .. }
+            | ManagerEvent::ReceiverError { .. } => true,
+        }
     }
 
     fn device_name(&self, id: Uuid) -> String {
@@ -485,6 +524,7 @@ fn notice_banner(notice: Notice, mut on_dismiss: impl FnMut() + 'static) -> Rect
         NoticeLevel::Error => ((56, 26, 30), (220, 80, 90)),
     };
     rect()
+        .key(notice.id)
         .width(Size::fill())
         .background(bg)
         .corner_radius(8.)
@@ -493,7 +533,11 @@ fn notice_banner(notice: Notice, mut on_dismiss: impl FnMut() + 'static) -> Rect
         .on_press(move |_| on_dismiss())
         .child(
             label()
-                .text(notice.text)
+                .text(if notice.repeats > 1 {
+                    format!("{} (×{})", notice.text, notice.repeats)
+                } else {
+                    notice.text
+                })
                 .font_size(13.)
                 .color((235, 235, 240)),
         )
@@ -714,6 +758,44 @@ mod tests {
         s.apply(&ManagerEvent::DeviceFound(d));
         s.apply(&ManagerEvent::DeviceLost(id));
         assert!(s.devices.is_empty());
+    }
+
+    #[test]
+    fn repeated_notice_is_counted_not_stacked() {
+        let mut s = AppState::default();
+        s.notify(NoticeLevel::Info, "other");
+        for _ in 0..1000 {
+            s.apply(&ManagerEvent::ReceiverError {
+                receiver_id: Uuid::new_v4(),
+                message: "peer closed".into(),
+            });
+        }
+        assert_eq!(s.notices.len(), 2);
+        assert_eq!(s.notices[0].text, "other");
+        assert_eq!(s.notices[1].repeats, 1000);
+    }
+
+    #[test]
+    fn churn_events_do_not_touch_the_window_state() {
+        let mut s = AppState::default();
+        let d = device("tv");
+        assert!(s.changed_by(&ManagerEvent::DeviceFound(d.clone())));
+        s.apply(&ManagerEvent::DeviceFound(d.clone()));
+        assert!(!s.changed_by(&ManagerEvent::DeviceFound(d.clone())));
+        let remote = ferricast::RemoteSender {
+            id: Uuid::new_v4(),
+            addr: std::net::IpAddr::from([192, 168, 0, 2]),
+            name: None,
+        };
+        let receiver_id = Uuid::new_v4();
+        assert!(!s.changed_by(&ManagerEvent::ReceiverIncoming {
+            receiver_id,
+            protocol: "chromecast",
+            remote,
+        }));
+        assert!(!s.changed_by(&ManagerEvent::ReceiverStopped { receiver_id }));
+        assert!(!s.changed_by(&ManagerEvent::DeviceLost(Uuid::new_v4())));
+        assert!(s.changed_by(&ManagerEvent::DeviceLost(d.id)));
     }
 
     #[test]
