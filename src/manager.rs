@@ -907,6 +907,63 @@ mod tests {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 
+    /// Announces the same device `times` times, then a changed copy.
+    struct RepeatingDiscovery {
+        device: Device,
+        times: usize,
+    }
+
+    impl ErasedDiscovery for RepeatingDiscovery {
+        fn start(&mut self, tx: mpsc::Sender<DiscoveryEvent>) -> BoxFut<'_, Result<()>> {
+            let device = self.device.clone();
+            let times = self.times;
+            Box::pin(async move {
+                for _ in 0..times {
+                    let _ = tx.send(DiscoveryEvent::DeviceFound(device.clone())).await;
+                }
+                let mut renamed = device;
+                renamed.name = "renamed".into();
+                let _ = tx.send(DiscoveryEvent::DeviceFound(renamed)).await;
+                Ok(())
+            })
+        }
+        fn stop(&mut self) -> BoxFut<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn unchanged_reannouncements_are_not_reported_again() {
+        let mut manager = StreamManager::default();
+        let device = device(DeviceCapabilities::default());
+        let announced = device.clone();
+        manager.protocols.push(RegisteredProtocol {
+            protocol: "fake",
+            create_discovery: Box::new(move || {
+                Box::new(RepeatingDiscovery {
+                    device: announced.clone(),
+                    times: 40,
+                }) as Box<dyn ErasedDiscovery>
+            }),
+            create_session: session_factory(Vec::new()).0,
+        });
+        let mut events = manager.take_event_rx().unwrap();
+        manager.start_discovery().await.unwrap();
+        let mut names = Vec::new();
+        while names.len() < 2 {
+            let ev = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("discovery events")
+                .expect("event channel open");
+            if let ManagerEvent::DeviceFound(d) = ev {
+                names.push(d.name);
+            }
+        }
+        assert_eq!(names, [device.name.clone(), "renamed".to_string()]);
+        assert!(drain(&mut events).is_empty());
+        assert_eq!(manager.devices().await.len(), 1);
+    }
+
     #[test]
     fn registry_rejects_a_second_reservation() {
         let mut reg = StreamRegistry::default();
