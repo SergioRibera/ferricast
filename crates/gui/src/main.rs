@@ -23,8 +23,48 @@ mod receiver_window;
 use crate::app::*;
 use crate::cli::{Cli, Command};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let Some(daemon) = runtime.block_on(start())? else {
+        return Ok(());
+    };
+    {
+        // The window's event loop must run outside `block_on`. Inside
+        // it, every tokio resource polled on this thread draws from the
+        // one cooperative budget of the `block_on` future, which is
+        // never refilled while the loop runs: once spent, each poll
+        // returns `Pending` and wakes itself again, and the event pump
+        // floods the loop with wake-ups (exponentially, as `join!`
+        // wakes on both branches) until memory runs out.
+        let _runtime = runtime.enter();
+        run_window(
+            daemon.manager.clone(),
+            daemon.ui_rx,
+            daemon.picker_rx,
+            daemon.receiver_window_rx,
+            daemon.hidden,
+        );
+    }
+    runtime.block_on(shutdown_manager(&daemon.manager));
+    Ok(())
+}
+
+/// What the window needs from the start-up, which runs on the runtime.
+struct Daemon {
+    manager: SharedManager,
+    ui_rx: mpsc::Receiver<ManagerEvent>,
+    picker_rx: mpsc::Receiver<PickerRequest>,
+    receiver_window_rx: mpsc::Receiver<ReceiverWindowReq>,
+    hidden: bool,
+    /// Owns the bus name for as long as the window runs.
+    _bus: zbus::Connection,
+}
+
+/// Sets up the manager, the D-Bus service, discovery and receivers, or
+/// runs a client subcommand (returning `None`).
+async fn start() -> anyhow::Result<Option<Daemon>> {
     let args = Cli::parse();
 
     if args.background && args.command.is_some() {
@@ -49,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
     // they're a thin proxy to the bus, so we short-circuit early.
     if let Some(cmd) = args.command {
         init_tracing_for_client();
-        return run_client(cmd).await;
+        return run_client(cmd).await.map(|()| None);
     }
 
     init_tracing_for_daemon();
@@ -252,15 +292,14 @@ async fn main() -> anyhow::Result<()> {
              Ctrl-C to exit"
         );
     }
-    run_window(
-        manager.clone(),
+    Ok(Some(Daemon {
+        manager,
         ui_rx,
         picker_rx,
         receiver_window_rx,
-        args.background,
-    );
-    shutdown_manager(&manager).await;
-    Ok(())
+        hidden: args.background,
+        _bus: _conn,
+    }))
 }
 
 /// Stop streams (receivers get a STOP, nothing keeps showing our
