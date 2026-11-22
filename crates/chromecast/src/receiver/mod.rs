@@ -27,6 +27,7 @@
 
 mod advertiser;
 mod control;
+mod listener;
 mod tls;
 mod util;
 
@@ -38,7 +39,7 @@ use ferricast_core::{
     ReceiverProtocol, Result,
 };
 use ferricast_hls::HlsPuller;
-use tokio::net::{TcpListener, TcpSocket};
+use tokio::net::TcpSocket;
 use uuid::Uuid;
 
 pub use advertiser::ChromecastReceiverAdvertiser;
@@ -60,7 +61,7 @@ struct Inner {
     /// The bound TLS listener, shared by every live control. Held
     /// weakly so the port is released once all controls are gone
     /// (receivers stopped) and re-bound by the next `create_control`.
-    listener: Mutex<Weak<TcpListener>>,
+    listener: Mutex<Weak<listener::Listener>>,
     /// TLS config and volume, created on first use.
     shared: Mutex<Weak<Shared>>,
 }
@@ -127,7 +128,7 @@ impl ChromecastReceiver {
 
     /// The TLS listener, bound on first use and shared until every
     /// control holding it is dropped.
-    fn listener(&self) -> Result<Arc<TcpListener>> {
+    fn listener(&self, shared: &Arc<Shared>) -> Result<Arc<listener::Listener>> {
         let mut slot = self
             .inner
             .listener
@@ -142,7 +143,7 @@ impl ChromecastReceiver {
             FerricastError::Receiver(format!("receiver control needs a tokio runtime: {e}"))
         })?;
         let addr = SocketAddr::from(([0, 0, 0, 0], self.inner.port));
-        let bind = || -> std::io::Result<TcpListener> {
+        let bind = || -> std::io::Result<tokio::net::TcpListener> {
             let socket = TcpSocket::new_v4()?;
             // Rebinding right after a restart must not fail on
             // connections lingering in TIME_WAIT.
@@ -150,11 +151,12 @@ impl ChromecastReceiver {
             socket.bind(addr)?;
             socket.listen(128)
         };
-        let listener = Arc::new(
+        let listener = Arc::new(listener::Listener::start(
             bind().map_err(|e| FerricastError::Receiver(format!("bind tcp {addr}: {e}")))?,
-        );
+            shared.clone(),
+        )?);
         tracing::info!(
-            addr = %listener.local_addr().unwrap_or(addr),
+            addr = %listener.local_addr(),
             "Chromecast receiver TLS listener up"
         );
         *slot = Arc::downgrade(&listener);
@@ -207,9 +209,10 @@ impl ReceiverProtocol for ChromecastReceiver {
     /// Binds the shared listener on first use, so a port conflict
     /// surfaces here, before anything is advertised.
     fn create_control(&self) -> Result<Self::Control> {
+        let shared = self.shared()?;
         Ok(ChromecastReceiverControl::new(
-            self.listener()?,
-            self.shared()?,
+            self.listener(&shared)?,
+            shared,
         ))
     }
 

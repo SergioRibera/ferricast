@@ -36,8 +36,8 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -50,17 +50,16 @@ use ferricast_core::{
 use crate::castv2::{CastMessage, DEFAULT_MEDIA_RECEIVER_APP_ID, MAX_MESSAGE_SIZE, namespace};
 
 use super::Shared;
+use super::listener::{Admitted, Listener};
 
 /// Device-authentication namespace. Senders issue an `AuthChallenge`
 /// here right after connecting.
-const DEVICE_AUTH_NAMESPACE: &str = "urn:x-cast:com.google.cast.tp.deviceauth";
+pub(super) const DEVICE_AUTH_NAMESPACE: &str = "urn:x-cast:com.google.cast.tp.deviceauth";
 /// `DeviceAuthMessage { error: AuthError { error_type: INTERNAL_ERROR } }`
 /// in protobuf wire format (field 3, length 2, { field 1 = 0 }).
 const DEVICE_AUTH_ERROR: [u8; 4] = [0x1a, 0x02, 0x08, 0x00];
 /// The id this receiver answers platform messages from.
 const PLATFORM_ID: &str = "receiver-0";
-/// How long a TLS handshake may take before the connection is dropped.
-const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 // Cast `supportedMediaCommands` bits.
 const CMD_PAUSE: u32 = 1;
@@ -68,8 +67,8 @@ const CMD_SEEK: u32 = 2;
 const CMD_STREAM_VOLUME: u32 = 4;
 const CMD_STREAM_MUTE: u32 = 8;
 
-type ServerStream = tokio_rustls::server::TlsStream<TcpStream>;
-type ServerWriter = Arc<Mutex<WriteHalf<ServerStream>>>;
+pub(super) type ServerStream = tokio_rustls::server::TlsStream<TcpStream>;
+pub(super) type ServerWriter = Arc<Mutex<WriteHalf<ServerStream>>>;
 
 async fn server_send(writer: &ServerWriter, msg: &CastMessage) -> Result<()> {
     let bytes = msg
@@ -85,7 +84,29 @@ async fn server_send(writer: &ServerWriter, msg: &CastMessage) -> Result<()> {
     Ok(())
 }
 
-async fn server_recv<R: tokio::io::AsyncRead + Unpin>(
+/// Answers a device-auth challenge with an auth error: the challenge
+/// must be signed by a Google-issued device certificate, which
+/// third-party receivers cannot have.
+pub(super) async fn answer_device_auth(
+    writer: &ServerWriter,
+    challenge: &CastMessage,
+) -> Result<()> {
+    tracing::debug!(
+        source = %challenge.source_id,
+        "Chromecast receiver: device-auth challenge, answering with AuthError"
+    );
+    let reply = CastMessage::new_binary(
+        &challenge.destination_id,
+        &challenge.source_id,
+        DEVICE_AUTH_NAMESPACE,
+        DEVICE_AUTH_ERROR.to_vec(),
+    );
+    server_send(writer, &reply).await
+}
+
+/// Next message, or `None` once the peer closed the connection, with
+/// or without a TLS `close_notify` (phones drop sockets without one).
+pub(super) async fn server_recv<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut BytesMut,
 ) -> Result<Option<CastMessage>> {
@@ -104,14 +125,27 @@ async fn server_recv<R: tokio::io::AsyncRead + Unpin>(
                 "incoming cast frame exceeds MAX_MESSAGE_SIZE".into(),
             ));
         }
-        let n = reader
-            .read_buf(buf)
-            .await
-            .map_err(|e| FerricastError::Receiver(format!("read: {e}")))?;
+        let n = match reader.read_buf(buf).await {
+            Ok(n) => n,
+            Err(e) if is_peer_gone(&e) => return Ok(None),
+            Err(e) => return Err(FerricastError::Receiver(format!("read: {e}"))),
+        };
         if n == 0 {
             return Ok(None);
         }
     }
+}
+
+/// Whether a read error just means the peer went away.
+fn is_peer_gone(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        e.kind(),
+        ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,7 +292,7 @@ impl SessionState {
 type StateRef = Arc<Mutex<Option<SessionState>>>;
 
 pub struct ChromecastReceiverControl {
-    listener: Arc<TcpListener>,
+    listener: Arc<Listener>,
     shared: Arc<Shared>,
     reader_task: Option<JoinHandle<()>>,
     commands_rx: Option<mpsc::Receiver<Result<MediaCommand>>>,
@@ -267,7 +301,7 @@ pub struct ChromecastReceiverControl {
 }
 
 impl ChromecastReceiverControl {
-    pub(super) fn new(listener: Arc<TcpListener>, shared: Arc<Shared>) -> Self {
+    pub(super) fn new(listener: Arc<Listener>, shared: Arc<Shared>) -> Self {
         Self {
             listener,
             shared,
@@ -283,7 +317,7 @@ impl ChromecastReceiverControl {
     /// # Errors
     /// When the socket can no longer report its address.
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.listener.local_addr().map_err(FerricastError::Io)
+        Ok(self.listener.local_addr())
     }
 }
 
@@ -297,26 +331,13 @@ impl Drop for ChromecastReceiverControl {
 
 impl ControlSession for ChromecastReceiverControl {
     async fn accept(&mut self) -> Result<RemoteSender> {
-        let (tcp, peer) = self
-            .listener
-            .accept()
-            .await
-            .map_err(|e| FerricastError::Receiver(format!("tcp accept: {e}")))?;
-        tracing::info!(%peer, "Chromecast receiver: TCP connect");
-
-        let acceptor = tokio_rustls::TlsAcceptor::from(self.shared.tls_config.clone());
-        let tls = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
-            .await
-            .map_err(|_| {
-                FerricastError::Receiver(format!(
-                    "TLS handshake with {peer} did not complete in time"
-                ))
-            })?
-            .map_err(|e| FerricastError::Receiver(format!("TLS handshake with {peer}: {e}")))?;
-        tracing::info!(%peer, "Chromecast receiver: TLS handshake complete");
-
-        let (read_half, write_half) = split(tls);
-        let writer = Arc::new(Mutex::new(write_half));
+        let Admitted {
+            peer,
+            reader,
+            writer,
+            buf,
+            first,
+        } = self.listener.next().await?;
         self.writer = Some(writer.clone());
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Result<MediaCommand>>(32);
@@ -327,7 +348,7 @@ impl ControlSession for ChromecastReceiverControl {
             state: self.state.clone(),
             shared: self.shared.clone(),
         };
-        self.reader_task = Some(tokio::spawn(run_reader(read_half, ctx)));
+        self.reader_task = Some(tokio::spawn(run_reader(reader, buf, first, ctx)));
 
         Ok(RemoteSender {
             id: Uuid::new_v4(),
@@ -464,8 +485,16 @@ impl Ctx {
 
 /// Reader loop: answers platform namespaces inline and forwards
 /// media commands to the manager.
-async fn run_reader(mut reader: ReadHalf<ServerStream>, ctx: Ctx) {
-    let mut buf = BytesMut::with_capacity(8 * 1024);
+async fn run_reader(
+    mut reader: ReadHalf<ServerStream>,
+    mut buf: BytesMut,
+    first: CastMessage,
+    ctx: Ctx,
+) {
+    if let Err(e) = dispatch(&first, &ctx).await {
+        tracing::info!(%e, "Chromecast receiver: connection lost");
+        return;
+    }
     loop {
         match server_recv(&mut reader, &mut buf).await {
             Ok(Some(msg)) => {
@@ -494,18 +523,7 @@ async fn dispatch(msg: &CastMessage, ctx: &Ctx) -> Result<()> {
     let ns = msg.namespace.as_str();
 
     if ns == DEVICE_AUTH_NAMESPACE {
-        tracing::info!(
-            source = %msg.source_id,
-            "Chromecast receiver: device-auth challenge — answering with AuthError \
-             (Google-signed device certificates are unavailable to third-party receivers)"
-        );
-        let reply = CastMessage::new_binary(
-            &msg.destination_id,
-            &msg.source_id,
-            DEVICE_AUTH_NAMESPACE,
-            DEVICE_AUTH_ERROR.to_vec(),
-        );
-        return ctx.send(&reply).await;
+        return answer_device_auth(&ctx.writer, msg).await;
     }
 
     let Some(payload) = msg.payload_utf8.as_deref() else {
