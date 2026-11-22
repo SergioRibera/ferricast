@@ -8,16 +8,18 @@
 //! once the sender asks for a PIN or sets up a session (pairing alone
 //! does not count: senders pair on every connection).
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use ferricast_core::{
     ControlSession, FerricastError, MediaCommand, PlaybackState, RemoteSender, Result,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 
 use super::Settings;
@@ -25,6 +27,12 @@ use super::connection::Connection;
 
 /// Connections waiting to be accepted by the pipeline, at most.
 const READY_QUEUE: usize = 8;
+/// Control connections open at once, at most.
+const MAX_CONNECTIONS: usize = 32;
+/// Control connections open at once from one address, at most.
+const MAX_CONNECTIONS_PER_PEER: usize = 8;
+const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(50);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// A connection handed to the pipeline.
 pub(super) struct Accepted {
@@ -153,22 +161,7 @@ impl Server {
             next_id: AtomicU64::new(1),
         });
         let (ready_tx, ready_rx) = mpsc::channel(READY_QUEUE);
-        let acceptor = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, peer)) => {
-                        debug!(%peer, "AirPlay control connection");
-                        let _ = stream.set_nodelay(true);
-                        let conn = Connection::new(shared.clone(), peer, ready_tx.clone());
-                        tokio::spawn(conn.run(stream));
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "AirPlay accept failed");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        });
+        let acceptor = tokio::spawn(accept_loop(listener, shared, ready_tx));
         Ok(Arc::new(Self {
             port,
             ready: tokio::sync::Mutex::new(ready_rx),
@@ -252,5 +245,54 @@ impl ControlSession for AirPlayReceiverControl {
 
     fn is_alive(&self) -> bool {
         self.alive
+    }
+}
+
+/// Accepts control connections and runs each one in its own task. The
+/// tasks belong to the loop, so they all end when the receiver stops.
+/// One connection failing never slows accepting the next; only the
+/// listener failing (out of fds, …) backs off.
+async fn accept_loop(listener: TcpListener, shared: Arc<Shared>, ready: mpsc::Sender<Accepted>) {
+    let mut connections: JoinSet<IpAddr> = JoinSet::new();
+    let mut per_peer: HashMap<IpAddr, usize> = HashMap::new();
+    let mut backoff = ACCEPT_BACKOFF_START;
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, peer)) => {
+                    backoff = ACCEPT_BACKOFF_START;
+                    let open = per_peer.entry(peer.ip()).or_default();
+                    if connections.len() >= MAX_CONNECTIONS || *open >= MAX_CONNECTIONS_PER_PEER {
+                        debug!(%peer, "too many AirPlay connections; dropping");
+                        if *open == 0 {
+                            per_peer.remove(&peer.ip());
+                        }
+                        continue;
+                    }
+                    *open += 1;
+                    debug!(%peer, "AirPlay control connection");
+                    let _ = stream.set_nodelay(true);
+                    let conn = Connection::new(shared.clone(), peer, ready.clone());
+                    connections.spawn(async move {
+                        conn.run(stream).await;
+                        peer.ip()
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, retry_in = ?backoff, "AirPlay accept failed");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                }
+            },
+            Some(joined) = connections.join_next() => {
+                let Ok(ip) = joined else { continue };
+                if let Some(open) = per_peer.get_mut(&ip) {
+                    *open = open.saturating_sub(1);
+                    if *open == 0 {
+                        per_peer.remove(&ip);
+                    }
+                }
+            }
+        }
     }
 }

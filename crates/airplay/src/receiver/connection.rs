@@ -34,6 +34,8 @@ const BIND_RETRY: Duration = Duration::from_secs(2);
 const BIND_RETRY_STEP: Duration = Duration::from_millis(50);
 /// How long the sender has to open the mirroring connection.
 const MIRROR_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a connection without a session may go without a request.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Media events queued from the stream receivers.
 const MEDIA_QUEUE: usize = 256;
 /// UUID UxPlay reports for its one display.
@@ -201,10 +203,19 @@ impl Connection {
 
     pub async fn run(mut self, stream: TcpStream) {
         let mut rtsp = RtspServerConn::new(stream);
+        let mut idle_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
         loop {
             let deadline = self.assembler.deadline();
+            // Only a connection without a session can idle out: one
+            // with media keeps streaming while the sender sends nothing.
+            let can_idle = self.promoted.is_none() && self.media.is_none();
             tokio::select! {
+                () = tokio::time::sleep_until(idle_deadline), if can_idle => {
+                    debug!(peer = %self.peer, "AirPlay control connection idle; closing");
+                    break;
+                }
                 request = rtsp.read_request() => {
+                    idle_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
                     let request = match request {
                         Ok(Some(r)) => r,
                         Ok(None) => break,
