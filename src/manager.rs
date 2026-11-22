@@ -511,6 +511,13 @@ impl StreamManager {
         self.receiver.stop_receivers().await
     }
 
+    /// Receiver sessions (accepted sender connections) currently
+    /// running, across every receiver protocol.
+    #[must_use]
+    pub fn receiver_session_count(&self) -> usize {
+        self.receiver.session_count()
+    }
+
     pub async fn devices(&self) -> Vec<Device> {
         self.devices.read().await.values().cloned().collect()
     }

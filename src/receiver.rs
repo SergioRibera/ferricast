@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc, watch};
@@ -185,6 +186,8 @@ pub(crate) struct ReceiverHost {
     sink_factory: Option<SinkFactory>,
     active_receivers: Arc<Mutex<HashMap<Uuid, ActiveReceiver>>>,
     receivers_running: bool,
+    /// Sessions alive across every protocol.
+    sessions: Arc<AtomicUsize>,
 }
 
 /// Everything a session needs to run LOADs, shared by all sessions
@@ -199,6 +202,8 @@ struct PipelineCtx {
     /// Which session currently owns playback (Cast semantics: the
     /// latest LOAD wins, the previous one is interrupted).
     playback: session::PlaybackOwner,
+    /// Sessions alive across every protocol.
+    sessions: Arc<AtomicUsize>,
 }
 
 impl ReceiverHost {
@@ -272,6 +277,10 @@ impl ReceiverHost {
         }));
     }
 
+    pub(crate) fn session_count(&self) -> usize {
+        self.sessions.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn registered_receivers(&self) -> Vec<&'static str> {
         self.receivers.iter().map(|r| r.protocol).collect()
     }
@@ -335,6 +344,7 @@ impl ReceiverHost {
                 sink_factory: sink_factory.clone(),
                 event_tx: event_tx.clone(),
                 playback: session::PlaybackOwner::default(),
+                sessions: self.sessions.clone(),
             });
             let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
             let supervisor = Supervisor {

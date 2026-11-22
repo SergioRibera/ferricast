@@ -6,7 +6,7 @@
 //! to the sender (`LOAD_FAILED`) without dropping the connection.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -186,7 +186,24 @@ enum End {
     Failed(FerricastError),
 }
 
+/// Counts a session as alive from creation until it is dropped.
+struct LiveSession(Arc<AtomicUsize>);
+
+impl LiveSession {
+    fn new(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for LiveSession {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub(super) struct Session {
+    _live: LiveSession,
     ctx: Arc<PipelineCtx>,
     control: Box<dyn ErasedControlSession>,
     remote: RemoteSender,
@@ -224,6 +241,7 @@ impl Session {
     ) -> Self {
         let (notice_tx, notice_rx) = mpsc::channel(4);
         Self {
+            _live: LiveSession::new(&ctx.sessions),
             ctx,
             control,
             remote,
