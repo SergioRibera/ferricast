@@ -160,7 +160,8 @@ impl Discovery for AirPlayDiscovery {
 
         let running = self.running.clone();
         self.handle = Some(tokio::spawn(async move {
-            let mut known: HashMap<String, Uuid> = HashMap::new();
+            // Last announcement per service, before the `/info` probe.
+            let mut known: HashMap<String, Device> = HashMap::new();
             while running.load(Ordering::SeqCst) {
                 let Ok(event) = events.recv_async().await else {
                     break;
@@ -184,7 +185,13 @@ impl Discovery for AirPlayDiscovery {
                         else {
                             continue;
                         };
-                        known.insert(fullname, device.id);
+                        // mDNS re-resolves a service on every announcement;
+                        // an unchanged one needs no new probe or event.
+                        if known.get(&fullname) == Some(&device) {
+                            debug!(name = %device.name, "AirPlay receiver re-announced unchanged");
+                            continue;
+                        }
+                        known.insert(fullname, device.clone());
                         let tx = tx.clone();
                         // Probe display limits off the event loop so one slow
                         // receiver doesn't delay the others.
@@ -207,7 +214,7 @@ impl Discovery for AirPlayDiscovery {
                         });
                     }
                     ServiceEvent::ServiceRemoved(_, fullname) => {
-                        if let Some(id) = known.remove(&fullname)
+                        if let Some(id) = known.remove(&fullname).map(|d| d.id)
                             && tx.send(DiscoveryEvent::DeviceLost(id)).await.is_err()
                         {
                             break;

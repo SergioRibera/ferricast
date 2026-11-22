@@ -71,7 +71,8 @@ impl Discovery for ChromecastDiscovery {
         let running = self.running.clone();
 
         let handle = tokio::task::spawn(async move {
-            let mut known: HashMap<String, Uuid> = HashMap::new();
+            // Last announcement per service.
+            let mut known: HashMap<String, Device> = HashMap::new();
 
             while running.load(Ordering::SeqCst) {
                 let event = {
@@ -157,7 +158,13 @@ impl Discovery for ChromecastDiscovery {
                             metadata: txt,
                         };
 
-                        known.insert(info.get_fullname().to_string(), device_uuid);
+                        // mDNS re-resolves a service on every announcement;
+                        // an unchanged one is not news.
+                        if known.get(info.get_fullname()) == Some(&device) {
+                            debug!(name = %device.name, "chromecast device re-announced unchanged");
+                            continue;
+                        }
+                        known.insert(info.get_fullname().to_string(), device.clone());
 
                         info!(
                             id = %device.id,
@@ -175,7 +182,7 @@ impl Discovery for ChromecastDiscovery {
                     ServiceEvent::ServiceRemoved(_, fullname) => {
                         info!(name = %fullname, "chromecast service removed");
 
-                        if let Some(uuid) = known.remove(fullname.as_str())
+                        if let Some(uuid) = known.remove(fullname.as_str()).map(|d| d.id)
                             && tx.send(DiscoveryEvent::DeviceLost(uuid)).await.is_err()
                         {
                             debug!("discovery event channel closed, stopping");

@@ -444,9 +444,14 @@ impl StreamManager {
             while let Some(event) = disc_rx.recv().await {
                 match event {
                     DiscoveryEvent::DeviceFound(device) => {
-                        let id = device.id;
+                        // mDNS re-resolves a device on every announcement;
+                        // only a new or changed device is news.
+                        let previous = devices.write().await.insert(device.id, device.clone());
+                        if previous.as_ref() == Some(&device) {
+                            tracing::trace!(name = %device.name, "Device re-announced unchanged");
+                            continue;
+                        }
                         tracing::info!(name = %device.name, protocol = device.protocol, "Device found");
-                        devices.write().await.insert(id, device.clone());
                         let _ = event_tx.send(ManagerEvent::DeviceFound(device)).await;
                     }
                     DiscoveryEvent::DeviceLost(id) => {
