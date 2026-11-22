@@ -2134,6 +2134,7 @@ dependencies = [
  "futures-util",
  "rodio",
  "rustls",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",

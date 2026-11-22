@@ -16,6 +16,7 @@ mod app;
 mod cli;
 mod client;
 mod daemon;
+mod log_file;
 mod pairing;
 mod picker;
 mod receiver_window;
@@ -509,11 +510,13 @@ fn init_tracing_for_daemon() {
             );
             return None;
         }
-        let filename = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "ferricast.log".to_string());
-        let appender = tracing_appender::rolling::never(parent, &filename);
+        let appender = match log_file::RotatingFile::open(path, log_file::MAX_LOG_BYTES) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("ferricast: cannot open trace log {}: {e}", path.display());
+                return None;
+            }
+        };
         let (writer, guard) = tracing_appender::non_blocking(appender);
         // Leak the guard so the worker thread lives for the whole
         // process; otherwise it drops at function exit and flushes
