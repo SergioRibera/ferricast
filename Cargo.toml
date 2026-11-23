@@ -173,6 +173,8 @@ async-trait.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "1"
 tempfile = "3"
+# Binary plists the AirPlay video test sends and reads.
+plist = "1.10"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Paused clock for the pipeline tests (reconnect backoff, pacing).
 tokio = { workspace = true, features = ["test-util"] }
