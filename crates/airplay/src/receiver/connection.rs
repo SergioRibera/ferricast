@@ -382,9 +382,9 @@ impl Connection {
             };
             dict.insert(q.clone(), Value::Data(txt_bytes(&txt)));
         }
-        if is_plist {
-            return bplist_response(dict);
-        }
+        // A qualified request still gets the full device description:
+        // senders read deviceID, features and statusFlags from the same
+        // reply that carries the requested TXT records.
         let id = &settings.identity;
         let config = &settings.config;
         let (low, high) = settings.features();
