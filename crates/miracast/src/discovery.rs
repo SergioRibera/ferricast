@@ -19,9 +19,16 @@ use ferricast_core::{
 
 use crate::transport::mice::MICE_SERVICE_TYPE;
 
+#[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+use crate::ie::{DeviceInformation, WfdIe};
+#[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+use crate::transport::linux_p2p::{DiscoveredPeer, LinuxP2pClient};
+
 #[derive(Default)]
 pub struct MiracastDiscovery {
     running: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    #[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+    p2p_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl MiracastDiscovery {
@@ -45,7 +52,9 @@ impl Discovery for MiracastDiscovery {
             .browse(Self::SERVICE_TYPE)
             .map_err(|e| FerricastError::Discovery(format!("browse: {e}")))?;
         let running = Arc::clone(&self.running);
+        let tx_mdns = tx.clone();
         let handle = tokio::spawn(async move {
+            let tx = tx_mdns;
             let mut seen: HashSet<String> = HashSet::new();
             while let Ok(event) = receiver.recv_async().await {
                 match event {
@@ -111,6 +120,16 @@ impl Discovery for MiracastDiscovery {
         });
         let mut slot = self.running.lock().await;
         *slot = Some(handle);
+        drop(slot);
+
+        #[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+        {
+            if let Err(e) = self.start_linux_p2p(tx.clone()).await {
+                tracing::warn!(error = %e, "miracast p2p: Wi-Fi Direct discovery disabled");
+            }
+        }
+        #[cfg(not(all(target_os = "linux", feature = "linux-p2p")))]
+        let _ = &tx;
         Ok(())
     }
 
@@ -118,6 +137,13 @@ impl Discovery for MiracastDiscovery {
         let mut slot = self.running.lock().await;
         if let Some(handle) = slot.take() {
             handle.abort();
+        }
+        #[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+        {
+            let mut p2p = self.p2p_task.lock().await;
+            if let Some(h) = p2p.take() {
+                h.abort();
+            }
         }
         Ok(())
     }
@@ -136,4 +162,69 @@ fn is_mice(service: &mdns_sd::ResolvedService) -> bool {
         .get_property_val_str("mice")
         .map(|v| v.trim() == "1")
         .unwrap_or(false)
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+impl MiracastDiscovery {
+    async fn start_linux_p2p(&self, tx: mpsc::Sender<DiscoveryEvent>) -> Result<()> {
+        let wfd_ie = WfdIe::new(DeviceInformation::linux_dual_role());
+        let client = LinuxP2pClient::connect(&wfd_ie)
+            .await
+            .map_err(|e| FerricastError::Discovery(format!("wpa_supplicant: {e}")))?;
+        let mut rx = client
+            .start_discovery()
+            .await
+            .map_err(|e| FerricastError::Discovery(format!("wpa_supplicant Find: {e}")))?;
+        let tx_out = tx;
+        let handle = tokio::spawn(async move {
+            let _client = client; // keep alive
+            while let Some(peer) = rx.recv().await {
+                if !peer.is_sink() {
+                    continue;
+                }
+                if let Some(device) = p2p_peer_to_device(&peer) {
+                    if tx_out.send(DiscoveryEvent::DeviceFound(device)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        *self.p2p_task.lock().await = Some(handle);
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+fn p2p_peer_to_device(peer: &DiscoveredPeer) -> Option<Device> {
+    let addr: std::net::SocketAddr = "0.0.0.0:7236".parse().expect("literal");
+    let addresses = DeviceAddresses::ranked(
+        std::iter::once(addr),
+        &ferricast_core::net::local_ipv4_subnets(),
+    )?;
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("p2p_peer_path".to_string(), peer.path.clone());
+    metadata.insert(
+        "mac".to_string(),
+        peer.address
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    );
+    Some(Device {
+        id: Uuid::new_v4(),
+        name: peer.name.clone(),
+        protocol: "miracast",
+        protocol_icon: bytes::Bytes::new(),
+        addresses,
+        model: None,
+        capabilities: DeviceCapabilities {
+            supported_codecs: vec![Codec::H264],
+            max_width: Some(1920),
+            max_height: Some(1080),
+            max_fps: Some(30),
+            ..DeviceCapabilities::default()
+        },
+        metadata,
+    })
 }
