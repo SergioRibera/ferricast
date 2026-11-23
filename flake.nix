@@ -110,6 +110,10 @@
             cargo-dist
             cargo-release
             git-cliff
+
+            # Freya shows a fatal panic in a dialog through rfd, which needs
+            # zenity when the desktop portal cannot show message dialogs.
+            zenity
           ] ++ libraries;
           # `/run/opengl-driver/lib` is where NixOS hosts with
           # `hardware.opengl.enable` install GPU runtime libraries —
