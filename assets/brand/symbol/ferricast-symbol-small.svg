@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" aria-label="ferricast (small-size cut)">
+  <title>ferricast · small-size</title>
+  <!-- Small-size cut: single top cast wedge, mid arm kept flat for 16–24 px legibility. -->
+  <path d="M 60 56
+           L 196 56
+           L 156 96
+           L 108 96
+           L 108 128
+           L 168 128
+           L 168 156
+           L 108 156
+           L 108 200
+           L 60 200 Z"
+        fill="#1C1814"/>
+</svg>

@@ -1,0 +1,71 @@
+{
+  "name": "ferricast",
+  "version": "1.0.0",
+  "primary": "#C85A2D",
+  "colors": {
+    "iron.50":  "#F6F1EC",
+    "iron.100": "#E8DED2",
+    "iron.300": "#B0A090",
+    "iron.500": "#6C5D4E",
+    "iron.700": "#3A3128",
+    "iron.900": "#1C1814",
+    "ember.300": "#E88057",
+    "ember.500": "#C85A2D",
+    "ember.700": "#8A3B1A",
+    "steel.50":  "#F2F5F8",
+    "steel.400": "#9AA4B1",
+    "steel.500": "#5F6B78",
+    "steel.600": "#262C35",
+    "steel.700": "#1D232C",
+    "steel.800": "#161B22",
+    "steel.900": "#0E1218",
+    "signal.ready": "#4F8F6B",
+    "signal.warn":  "#C89A2D",
+    "signal.error": "#B7311F",
+    "signal.cast":  "#C85A2D"
+  },
+  "themes": {
+    "light": {
+      "bg.canvas": "#F6F1EC",
+      "bg.surface": "#FFFFFF",
+      "fg.default": "#1C1814",
+      "fg.muted":   "#6C5D4E",
+      "accent":     "#C85A2D",
+      "border":     "#E8DED2"
+    },
+    "dark": {
+      "bg.canvas":  "#0E1218",
+      "bg.surface": "#161B22",
+      "fg.default": "#F6F1EC",
+      "fg.muted":   "#9AA4B1",
+      "accent":     "#C85A2D",
+      "border":     "#262C35"
+    },
+    "hc.light": {
+      "bg.canvas":  "#FFFFFF",
+      "bg.surface": "#FFFFFF",
+      "fg.default": "#000000",
+      "fg.muted":   "#1C1814",
+      "accent":     "#8A3B1A",
+      "border":     "#000000"
+    },
+    "hc.dark": {
+      "bg.canvas":  "#000000",
+      "bg.surface": "#050505",
+      "fg.default": "#FFFFFF",
+      "fg.muted":   "#F2F5F8",
+      "accent":     "#E88057",
+      "border":     "#FFFFFF"
+    },
+    "receiver.amoled": {
+      "bg.canvas":  "#000000",
+      "bg.surface": "#050505",
+      "fg.default": "#FFFFFF",
+      "accent":     "#E88057"
+    }
+  },
+  "typography": {
+    "sans": {"family": "Inter", "fallback": "system-ui, -apple-system, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif", "weights": [400, 500, 700]},
+    "mono": {"family": "JetBrains Mono", "fallback": "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", "weights": [400, 500]}
+  }
+}

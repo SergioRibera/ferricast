@@ -1,0 +1,26 @@
+[Desktop Entry]
+Type=Application
+Name=ferricast
+GenericName=Cast transmitter and receiver
+GenericName[es]=Emisor y receptor de cast
+Comment=Send and receive screen casts over AirPlay, Miracast and Chromecast
+Comment[es]=Enviá y recibí pantallas por AirPlay, Miracast y Chromecast
+Exec=ferricast %U
+Icon=ferricast
+Terminal=false
+Categories=Network;AudioVideo;Video;RemoteAccess;
+StartupNotify=true
+StartupWMClass=ferricast
+MimeType=x-scheme-handler/ferricast;
+Keywords=cast;airplay;miracast;chromecast;screen;mirror;broadcast;
+Actions=receive;window;
+
+[Desktop Action receive]
+Name=Start as receiver
+Name[es]=Iniciar como receptor
+Exec=ferricast --receive
+
+[Desktop Action window]
+Name=Open ferricast window
+Name[es]=Abrir ventana de ferricast
+Exec=ferricast --window
