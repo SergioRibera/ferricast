@@ -166,6 +166,8 @@ pub struct VideoRenderer {
     image: Option<(u64, Image)>,
     /// Reused BGRA buffer of the software path.
     scratch: Vec<u8>,
+    /// Whether the first drawn frame was logged.
+    announced: bool,
 }
 
 impl VideoRenderer {
@@ -184,6 +186,18 @@ impl VideoRenderer {
                 _ => frame.raster(&mut self.scratch),
             },
         };
+        if !self.announced
+            && let Some(image) = &image
+        {
+            self.announced = true;
+            tracing::info!(
+                width = frame.width,
+                height = frame.height,
+                layout = ?frame.layout,
+                gpu = image.is_texture_backed(),
+                "receiver window: first video frame"
+            );
+        }
         let Some(image) = image else {
             tracing::warn!(
                 width = frame.width,
