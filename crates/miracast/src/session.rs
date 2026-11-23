@@ -292,6 +292,15 @@ fn rtsp_err(err: crate::rtsp::RtspError) -> FerricastError {
 
 impl CastSession for MiracastSession {
     async fn connect(&mut self, device: &Device) -> Result<ConnectOutcome> {
+        // Wi-Fi Direct bridge (Linux): when the device was found via
+        // supplicant P2P discovery its metadata carries the peer object
+        // path. Trigger GO negotiation first and let the resulting
+        // group interface stand up before we even try RTSP.
+        #[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+        if let Some(peer_path) = device.metadata.get("p2p_peer_path").cloned() {
+            self.establish_wfd_p2p_group(&peer_path).await?;
+        }
+
         let discovered = device.addresses.primary();
         // The RTSP port lives on either a `rtsp_port` TXT record (MS-MICE
         // advertises the MICE control port on its mDNS SRV and the WFD
@@ -434,3 +443,34 @@ fn local_ip_string(_rtsp: &Option<RtspFramed>) -> Result<String> {
 /// don't accidentally drop it.
 #[doc(alias = "wfd_keepalive")]
 pub const KEEPALIVE: Duration = KEEPALIVE_INTERVAL;
+
+#[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+impl MiracastSession {
+    /// Open a short-lived supplicant client, trigger GO negotiation
+    /// with `peer_path`, and wait for the `GroupStarted` signal. On
+    /// success the virtual group interface is up and routable; by WFD
+    /// convention the GO advertises itself on `192.168.49.1` so RTSP
+    /// goes there unless the caller overrode the device address.
+    async fn establish_wfd_p2p_group(&mut self, peer_path: &str) -> Result<()> {
+        use crate::ie::{DeviceInformation, WfdIe};
+        use crate::transport::linux_p2p::LinuxP2pClient;
+
+        let wfd_ie = WfdIe::new(DeviceInformation::linux_dual_role());
+        let client = LinuxP2pClient::connect(&wfd_ie)
+            .await
+            .map_err(|e| FerricastError::Connection(format!("wpa_supplicant: {e}")))?;
+        let group = client
+            .connect_peer(peer_path)
+            .await
+            .map_err(|e| FerricastError::Connection(format!("GO negotiation: {e}")))?;
+        tracing::info!(
+            interface = %group.interface_path,
+            role = ?group.role,
+            "miracast: Wi-Fi Direct group up"
+        );
+        // Give supplicant a beat to publish a DHCP lease on the new
+        // iface — stream open wrangles the rest.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        Ok(())
+    }
+}
