@@ -1,7 +1,9 @@
-//! NVDEC only opens its decode session when the parser reaches the
-//! first sequence header, so a stream it cannot handle (below the
-//! minimum size, unsupported profile or chroma format) is rejected on
-//! the first `decode()`, after `configure()` already succeeded. Until a
+//! Hardware decoders can accept a configuration and still reject the
+//! bitstream: NVDEC only opens its decode session when the parser reaches
+//! the first sequence header, and a VA-API driver may fail on the first
+//! slices, so a stream it cannot handle (below the minimum size,
+//! unsupported profile or chroma format) fails on the first `decode()`,
+//! after `configure()` already succeeded. Until a
 //! backend has produced its first picture, the facades keep the packets
 //! they fed it, so a software decoder can take over from the start of
 //! the stream instead of the whole session failing.

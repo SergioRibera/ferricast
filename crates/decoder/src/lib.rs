@@ -36,6 +36,9 @@ pub mod h265;
 #[cfg(feature = "nvdec-decode")]
 pub mod nvdec;
 
+#[cfg(any(feature = "nvdec-decode", feature = "vaapi-decode"))]
+mod probation;
+
 #[cfg(feature = "aac")]
 pub mod aac;
 

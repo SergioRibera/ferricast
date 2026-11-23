@@ -18,7 +18,7 @@
 //! from the slice headers instead (see the `timestamps` module).
 
 mod h264;
-pub(crate) mod probation;
+
 mod timestamps;
 
 use std::collections::VecDeque;

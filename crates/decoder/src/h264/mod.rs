@@ -4,21 +4,25 @@
 //!
 //! 1. **NVDEC** — NVIDIA hardware. Tried first when `nvdec-decode` is
 //!    compiled in and a CUDA-capable GPU is present at runtime.
-//! 2. **VA-API** — opt-in only. Engaged when
-//!    `FERRICAST_H264_DECODE_BACKEND=vaapi` is set in the environment.
-//!    The decode path is complete but has not been run on every driver,
-//!    so it stays out of the default chain. A stream using a feature it
-//!    does not implement (interlacing, 4:2:2, high bit depth, scaling
+//! 2. **VA-API** — Intel/AMD hardware, when `vaapi-decode` is compiled in
+//!    and a driver accepts the stream's profile. A stream using a feature
+//!    it does not implement (interlacing, 4:2:2, high bit depth, scaling
 //!    matrices, FMO) is handed over to openh264 mid-stream.
 //! 3. **openh264** — software CPU decode. Default fallback. Always
 //!    works when compiled in.
+//!
+//! A hardware backend that fails before producing its first picture
+//! hands the stream to openh264 from its first packet, so a driver
+//! that accepts the configuration but not the bitstream never breaks
+//! playback. `FERRICAST_H264_DECODE_BACKEND` (`nvdec`, `vaapi`,
+//! `software`) forces one backend.
 
 #[cfg(not(feature = "openh264-decode"))]
 compile_error!(
     "ferricast-decoder requires the `openh264-decode` feature today — \
      it's the only universally-working H.264 backend wired up. VA-API \
-     is opt-in (off by default); NVDEC needs an NVIDIA GPU at runtime \
-     so it can't be the sole backend."
+     and NVDEC depend on the GPU and driver present at runtime, \
+     so neither can be the sole backend."
 );
 
 #[cfg(feature = "vaapi-decode")]
@@ -44,8 +48,8 @@ use tracing::warn;
 
 #[cfg(feature = "nvdec-decode")]
 pub use crate::nvdec::NvdecH264Decoder;
-#[cfg(feature = "nvdec-decode")]
-use crate::nvdec::probation::Probation;
+#[cfg(any(feature = "nvdec-decode", feature = "vaapi-decode"))]
+use crate::probation::Probation;
 #[cfg(feature = "openh264-decode")]
 pub use openh264_impl::OpenH264Decoder;
 #[cfg(feature = "vaapi-decode")]
@@ -117,17 +121,15 @@ impl H264Decoder {
             }
         }
 
-        // VA-API is opt-in: only engage when the env var explicitly
-        // names it. Default chain skips straight to openh264.
         #[cfg(feature = "vaapi-decode")]
         {
-            if var == "vaapi" {
+            if var.is_empty() || var == "vaapi" {
                 match VaapiBackend::open(config) {
                     Ok(d) => {
                         info!(
                             width = config.width,
                             height = config.height,
-                            "H.264 decoder backend: VA-API (opt-in via env var)"
+                            "H.264 decoder backend: VA-API"
                         );
                         return Ok(Backend::Vaapi(Box::new(d)));
                     }
@@ -160,9 +162,15 @@ impl H264Decoder {
             ));
         };
         vaapi.parameter_sets.remember(&frame.data);
+        vaapi.probation.record(&frame);
         let replay = frame.clone();
         match vaapi.decoder.decode_packet(frame) {
-            Ok(picture) => Ok(picture),
+            Ok(picture) => {
+                if picture.is_some() {
+                    vaapi.probation.settle();
+                }
+                Ok(picture)
+            }
             Err(VaapiH264Error::Unsupported(reason)) => {
                 warn!(%reason, "VA-API cannot decode this stream; switching to openh264");
                 let mut software = software(&vaapi.config)?;
@@ -179,8 +187,39 @@ impl H264Decoder {
                 self.handed_over.extend(first?);
                 Ok(self.handed_over.pop_front())
             }
-            Err(VaapiH264Error::Failed(reason)) => Err(FerricastError::Decode(reason)),
+            Err(VaapiH264Error::Failed(reason)) => {
+                let Some(replay) = vaapi.probation.take_replay() else {
+                    return Err(FerricastError::Decode(reason));
+                };
+                let config = vaapi.config.clone();
+                warn!(%reason, "VA-API failed on the stream; switching to openh264");
+                let software = self.replay_into_software(&config, replay)?;
+                self.backend = Backend::OpenH264(software);
+                Ok(self.handed_over.pop_front())
+            }
         }
+    }
+}
+
+#[cfg(any(feature = "nvdec-decode", feature = "vaapi-decode"))]
+impl H264Decoder {
+    /// Decodes the packets a hardware backend was fed into a fresh
+    /// openh264 decoder and queues its pictures. A packet openh264
+    /// rejects (e.g. a P slice before the first IDR) is skipped, as it
+    /// would have been had openh264 decoded the stream from the start.
+    fn replay_into_software(
+        &mut self,
+        config: &DecoderConfig,
+        replay: Vec<EncodedFrame>,
+    ) -> Result<OpenH264Decoder> {
+        let mut software = software(config)?;
+        for packet in replay {
+            match software.decode(packet) {
+                Ok(picture) => self.handed_over.extend(picture),
+                Err(error) => warn!(%error, "openh264 skipped a replayed packet"),
+            }
+        }
+        Ok(software)
     }
 }
 
@@ -241,25 +280,6 @@ impl H264Decoder {
                 Ok(self.handed_over.drain(..).collect())
             }
         }
-    }
-
-    /// Decodes the packets NVDEC was fed into a fresh openh264 decoder
-    /// and queues its pictures. A packet openh264 rejects (e.g. a P
-    /// slice before the first IDR) is skipped, as it would have been
-    /// had openh264 decoded the stream from the start.
-    fn replay_into_software(
-        &mut self,
-        config: &DecoderConfig,
-        replay: Vec<EncodedFrame>,
-    ) -> Result<OpenH264Decoder> {
-        let mut software = software(config)?;
-        for packet in replay {
-            match software.decode(packet) {
-                Ok(picture) => self.handed_over.extend(picture),
-                Err(error) => warn!(%error, "openh264 skipped a replayed packet"),
-            }
-        }
-        Ok(software)
     }
 }
 
@@ -341,6 +361,7 @@ struct VaapiBackend {
     decoder: VaapiH264Decoder,
     config: DecoderConfig,
     parameter_sets: ParameterSets,
+    probation: Probation,
 }
 
 #[cfg(feature = "vaapi-decode")]
@@ -352,6 +373,7 @@ impl VaapiBackend {
             decoder,
             config: config.clone(),
             parameter_sets: ParameterSets::default(),
+            probation: Probation::default(),
         })
     }
 }

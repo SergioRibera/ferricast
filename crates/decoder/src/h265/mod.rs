@@ -46,7 +46,7 @@ use tracing::warn;
 #[cfg(feature = "nvdec-hevc-decode")]
 pub use crate::nvdec::NvdecH265Decoder;
 #[cfg(feature = "nvdec-hevc-decode")]
-use crate::nvdec::probation::Probation;
+use crate::probation::Probation;
 #[cfg(feature = "hevc-decode")]
 pub use software_impl::SoftwareH265Decoder;
 #[cfg(feature = "vaapi-hevc-decode")]
