@@ -56,7 +56,9 @@ pub use net::{
 };
 pub use pairing::{PairingChallenge, PairingResponse};
 #[cfg(feature = "net")]
-pub use protocol::{ProtocolHandler, ReceiverProtocol};
+pub use protocol::{
+    DeviceCompatibility, ProtocolAvailability, ProtocolHandler, ReceiverProtocol,
+};
 pub use puller::{AudioStreamInfo, MediaInfo, MediaPacket, MediaPuller, PullSpec, VideoStreamInfo};
 #[cfg(feature = "net")]
 pub use push::{PushError, PushSender, PushedStream};

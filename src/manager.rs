@@ -752,11 +752,11 @@ impl StreamManagerBuilder {
     /// Register the Miracast (Wi-Fi Display) sender.
     ///
     /// Discovers MS-MICE sinks over mDNS and drives WFD M1-M7 + MPEG2-TS
-    /// over RTP against them. On Linux with the `miracast-linux-p2p`
-    /// feature the handler also offers Wi-Fi Direct discovery via
-    /// wpa_supplicant; on Windows with `miracast-windows-native` it
-    /// bridges to `Windows.Media.Casting`.
-    #[cfg(feature = "miracast")]
+    /// over RTP against them. On Linux the handler additionally runs
+    /// Wi-Fi Direct discovery via wpa_supplicant; on Windows it
+    /// enumerates `CastingDevice`s via WinRT. Runtime blockers
+    /// (no P2P radio, IWD-managed wifi, missing WDI driver) surface
+    /// through [`ProtocolHandler::availability`].
     pub fn with_miracast(self) -> Self {
         self.register::<ferricast_miracast::MiracastHandler>()
     }
@@ -764,7 +764,6 @@ impl StreamManagerBuilder {
     /// Register a Miracast *receiver* — advertise this process as a
     /// `_display._tcp` MS-MICE sink and accept WFD M1-M7 from Windows
     /// "Cast to" / Android Smart View.
-    #[cfg(feature = "miracast")]
     pub fn with_miracast_receiver(
         self,
         receiver: ferricast_miracast::MiracastReceiver,

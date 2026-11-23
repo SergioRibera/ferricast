@@ -17,10 +17,10 @@
 
 pub mod mice;
 
-#[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+#[cfg(target_os = "linux")]
 pub mod linux_p2p;
 
-#[cfg(all(target_os = "windows", feature = "windows-native"))]
+#[cfg(target_os = "windows")]
 pub mod windows_native;
 
 use std::net::SocketAddr;
@@ -37,7 +37,7 @@ pub enum PeerAddress {
         mice_addr: SocketAddr,
     },
     /// Wi-Fi Direct P2P peer discovered via wpa_supplicant.
-    #[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+    #[cfg(target_os = "linux")]
     LinuxP2p {
         /// supplicant's `Peer` D-Bus object path.
         peer_path: String,
@@ -48,7 +48,7 @@ pub enum PeerAddress {
     },
     /// Windows native sender — the WinRT stack handles negotiation
     /// internally. We only carry the picker's device ID.
-    #[cfg(all(target_os = "windows", feature = "windows-native"))]
+    #[cfg(target_os = "windows")]
     WindowsNative { device_id: String, name: String },
 }
 
@@ -56,10 +56,10 @@ pub enum PeerAddress {
 pub enum TransportError {
     #[error("mDNS/MICE: {0}")]
     Mice(String),
-    #[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+    #[cfg(target_os = "linux")]
     #[error("wpa_supplicant D-Bus: {0}")]
     LinuxP2p(String),
-    #[cfg(all(target_os = "windows", feature = "windows-native"))]
+    #[cfg(target_os = "windows")]
     #[error("Windows Media Casting: {0}")]
     WindowsNative(String),
     #[error("I/O: {0}")]

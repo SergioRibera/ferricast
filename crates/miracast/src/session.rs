@@ -296,7 +296,7 @@ impl CastSession for MiracastSession {
         // supplicant P2P discovery its metadata carries the peer object
         // path. Trigger GO negotiation first and let the resulting
         // group interface stand up before we even try RTSP.
-        #[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+        #[cfg(target_os = "linux")]
         if let Some(peer_path) = device.metadata.get("p2p_peer_path").cloned() {
             self.establish_wfd_p2p_group(&peer_path).await?;
         }
@@ -444,7 +444,7 @@ fn local_ip_string(_rtsp: &Option<RtspFramed>) -> Result<String> {
 #[doc(alias = "wfd_keepalive")]
 pub const KEEPALIVE: Duration = KEEPALIVE_INTERVAL;
 
-#[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+#[cfg(target_os = "linux")]
 impl MiracastSession {
     /// Open a short-lived supplicant client, trigger GO negotiation
     /// with `peer_path`, and wait for the `GroupStarted` signal. On

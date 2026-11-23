@@ -4,21 +4,6 @@ version = "0.1.0"
 edition = "2024"
 description = "Miracast (Wi-Fi Display) sender + receiver for ferricast"
 
-[features]
-# Portable path: MS-MICE (Miracast over Infrastructure). Discovered via mDNS,
-# runs standard WFD RTSP + MPEG2-TS/RTP over plain TCP/UDP on the LAN. Only
-# viable transport on macOS; on Linux/Windows it's the fallback when Wi-Fi
-# Direct isn't available.
-default = ["mice"]
-mice = []
-# Wi-Fi Direct via wpa_supplicant D-Bus. Linux-only; the crate falls back
-# to MICE when disabled or when the adapter lacks P2P-Device iftype.
-linux-p2p = ["dep:zbus"]
-# Windows-native Miracast via WinRT (Windows.Media.Casting sender). The
-# receiver (MiracastReceiver) is gated behind MSIX packaging and lives
-# outside this feature; see the per-platform plan.
-windows-native = ["dep:windows"]
-
 [dependencies]
 # `net` activates the receiver protocol / push surface the sink needs.
 ferricast-core = { workspace = true, features = ["net"] }
@@ -31,17 +16,24 @@ uuid.workspace = true
 httparse = "1"
 # Random SSRCs, RTSP session tokens, RTP initial sequence.
 rand = "0.8"
-# MS-MICE discovery + sink advertisement.
+# MS-MICE discovery + sink advertisement — portable path, used on
+# every platform.
 mdns-sd.workspace = true
 # MICE control port 7250 + RTP socket tuning (reuseport, rcvbuf).
 socket2 = { version = "0.6", features = ["all"] }
 futures-util = { workspace = true }
 
-# Linux P2P: optional, default-off. Pulled in by the `linux-p2p` feature.
+# Linux Wi-Fi Direct via wpa_supplicant D-Bus. Linked only on Linux
+# hosts; on other targets the module isn't compiled. Runtime failure
+# modes (no P2P-Device iftype, IWD-managed radio, NM-exclusive lock)
+# are surfaced via `MiracastHandler::availability()` so callers can
+# keep offering the MICE fallback.
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = { workspace = true, optional = true }
+zbus = { workspace = true }
 
-# Windows-native sender via WinRT.
+# Windows-native Miracast enumerator via WinRT. `CastingConnection`
+# itself has to live in a COM-STA window the GUI owns; this crate
+# only surfaces the device list + capability probe.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Foundation",
@@ -49,7 +41,7 @@ windows = { version = "0.58", features = [
     "Media_Casting",
     "Devices_Enumeration",
     "UI_ViewManagement",
-], optional = true }
+] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "full"] }

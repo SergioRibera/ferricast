@@ -95,12 +95,10 @@ pub mod protocols {
     #[cfg(feature = "chromecast")]
     pub use ferricast_chromecast::ChromecastHandler as Chromecast;
 
-    #[cfg(feature = "miracast")]
     pub use ferricast_miracast::MiracastHandler as Miracast;
 }
 
 /// Miracast (Wi-Fi Display) receiver building blocks.
-#[cfg(feature = "miracast")]
 pub mod miracast {
     pub use ferricast_miracast::{MiracastReceiver, MiracastReceiverAdvertiser};
 }

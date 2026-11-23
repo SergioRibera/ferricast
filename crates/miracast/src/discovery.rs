@@ -19,15 +19,15 @@ use ferricast_core::{
 
 use crate::transport::mice::MICE_SERVICE_TYPE;
 
-#[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+#[cfg(target_os = "linux")]
 use crate::ie::{DeviceInformation, WfdIe};
-#[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+#[cfg(target_os = "linux")]
 use crate::transport::linux_p2p::{DiscoveredPeer, LinuxP2pClient};
 
 #[derive(Default)]
 pub struct MiracastDiscovery {
     running: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    #[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+    #[cfg(target_os = "linux")]
     p2p_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -122,13 +122,13 @@ impl Discovery for MiracastDiscovery {
         *slot = Some(handle);
         drop(slot);
 
-        #[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+        #[cfg(target_os = "linux")]
         {
             if let Err(e) = self.start_linux_p2p(tx.clone()).await {
                 tracing::warn!(error = %e, "miracast p2p: Wi-Fi Direct discovery disabled");
             }
         }
-        #[cfg(not(all(target_os = "linux", feature = "linux-p2p")))]
+        #[cfg(not(target_os = "linux"))]
         let _ = &tx;
         Ok(())
     }
@@ -138,7 +138,7 @@ impl Discovery for MiracastDiscovery {
         if let Some(handle) = slot.take() {
             handle.abort();
         }
-        #[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+        #[cfg(target_os = "linux")]
         {
             let mut p2p = self.p2p_task.lock().await;
             if let Some(h) = p2p.take() {
@@ -164,7 +164,7 @@ fn is_mice(service: &mdns_sd::ResolvedService) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+#[cfg(target_os = "linux")]
 impl MiracastDiscovery {
     async fn start_linux_p2p(&self, tx: mpsc::Sender<DiscoveryEvent>) -> Result<()> {
         let wfd_ie = WfdIe::new(DeviceInformation::linux_dual_role());
@@ -194,7 +194,7 @@ impl MiracastDiscovery {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "linux-p2p"))]
+#[cfg(target_os = "linux")]
 fn p2p_peer_to_device(peer: &DiscoveredPeer) -> Option<Device> {
     let addr: std::net::SocketAddr = "0.0.0.0:7236".parse().expect("literal");
     let addresses = DeviceAddresses::ranked(
