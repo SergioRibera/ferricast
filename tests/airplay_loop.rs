@@ -21,8 +21,9 @@ use ferricast::encoder::h264::X264Encoder;
 use ferricast::{
     AdvertiseInfo, Advertiser, AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame,
     AudioStreamConfig, CapturedFrame, CastSession, Codec, ConnectOutcome, DecodedAudio, Device,
-    DeviceCapabilities, EncoderConfig, FrameSink, ManagerEvent, PairingResponse, PixelFormat,
-    RawFrame, ReceiverProtocol, Result, StreamConfig, StreamManager, VideoEncoder,
+    DeviceCapabilities, EncoderConfig, FrameSink, ManagerEvent, MediaInfo, PairingResponse,
+    PixelFormat, RawFrame, ReceiverProtocol, RemoteSender, Result, StreamConfig, StreamManager,
+    VideoEncoder,
 };
 use ferricast_airplay::AirPlaySession;
 use tokio::sync::mpsc;
@@ -211,7 +212,7 @@ async fn wait_event(
     }
 }
 
-async fn mirror_loop(pin: bool) {
+fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -219,143 +220,178 @@ async fn mirror_loop(pin: bool) {
         )
         .with_test_writer()
         .try_init();
+}
 
-    let receiver = AirPlayReceiver::new(
-        AirPlayReceiverConfig {
-            name: "ferricast loop".into(),
-            require_pin: pin,
-            credentials: CredentialStorage::Ephemeral,
-            ..Default::default()
+/// A receiver behind a `StreamManager`, and a sender session paired and
+/// set up with it.
+struct Loop {
+    manager: StreamManager,
+    events: mpsc::Receiver<ManagerEvent>,
+    session: AirPlaySession,
+}
+
+impl Loop {
+    async fn start<F, Fut>(pin: bool, sink_factory: F) -> Self
+    where
+        F: Fn(&RemoteSender, &MediaInfo) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Box<dyn FrameSink>>> + Send + 'static,
+    {
+        let receiver = AirPlayReceiver::new(
+            AirPlayReceiverConfig {
+                name: "ferricast loop".into(),
+                require_pin: pin,
+                credentials: CredentialStorage::Ephemeral,
+                ..Default::default()
+            }
+            .with_ephemeral_ports(),
+        )
+        .await;
+        let (mut manager, mut events) = StreamManager::builder()
+            .with_receiver(TestReceiver(receiver.clone()))
+            .register_audio_decoder::<ferricast::decoder::AacEldDecoder>()
+            .with_h264_decoder()
+            .set_sink_factory(sink_factory)
+            .build_with_events();
+        manager.start_receivers().await.unwrap();
+        let port = receiver.bound_rtsp_port().expect("control port bound");
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+        // ── Pairing ──
+        let mut session = AirPlaySession::ephemeral();
+        match session.connect(&device(addr, pin)).await.unwrap() {
+            ConnectOutcome::Ready => assert!(!pin, "PIN mode connected without a PIN"),
+            ConnectOutcome::PairingRequired(_) => {
+                assert!(pin, "pairing asked for without PIN mode");
+                let mut shown = None;
+                wait_event(&mut events, "the PIN", |ev| {
+                    if let ManagerEvent::ReceiverPin { pin: Some(p), .. } = ev {
+                        shown = Some(p.clone());
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .await;
+                let shown = shown.unwrap();
+                assert_eq!(shown.len(), 4);
+                session
+                    .submit_pairing(PairingResponse::Pin(shown))
+                    .await
+                    .expect("PIN pairing");
+            }
         }
-        .with_ephemeral_ports(),
-    )
-    .await;
-    let log = Arc::new(Mutex::new(SinkLog::default()));
-    let log_factory = log.clone();
-    let (mut manager, mut events) = StreamManager::builder()
-        .with_receiver(TestReceiver(receiver.clone()))
-        .register_audio_decoder::<ferricast::decoder::AacEldDecoder>()
-        .with_h264_decoder()
-        .set_sink_factory(move |_remote, info| {
-            assert!(info.video.is_some(), "stream announced without video");
-            assert!(info.audio.is_some(), "stream announced without audio");
-            log_factory.lock().unwrap().sinks += 1;
-            let sink = HeadlessSink(log_factory.clone());
-            async move { Ok(Box::new(sink) as Box<dyn FrameSink>) }
-        })
-        .build_with_events();
-    manager.start_receivers().await.unwrap();
-    let port = receiver.bound_rtsp_port().expect("control port bound");
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
-    // ── Pairing ──
-    let mut session = AirPlaySession::ephemeral();
-    match session.connect(&device(addr, pin)).await.unwrap() {
-        ConnectOutcome::Ready => assert!(!pin, "PIN mode connected without a PIN"),
-        ConnectOutcome::PairingRequired(_) => {
-            assert!(pin, "pairing asked for without PIN mode");
-            let mut shown = None;
-            wait_event(&mut events, "the PIN", |ev| {
-                if let ManagerEvent::ReceiverPin { pin: Some(p), .. } = ev {
-                    shown = Some(p.clone());
-                    true
-                } else {
-                    false
-                }
+        // ── fp-setup + SETUP ──
+        session
+            .setup_stream(&StreamConfig {
+                width: WIDTH,
+                height: HEIGHT,
+                fps: FPS,
+                bitrate_kbps: 3000,
+                codec: Codec::H264,
+                audio: Some(AudioStreamConfig {
+                    codec: AudioCodec::AacEld,
+                    sample_rate: ELD_SAMPLE_RATE,
+                    ..Default::default()
+                }),
+                ..Default::default()
             })
-            .await;
-            let shown = shown.unwrap();
-            assert_eq!(shown.len(), 4);
-            session
-                .submit_pairing(PairingResponse::Pin(shown))
-                .await
-                .expect("PIN pairing");
+            .await
+            .expect("setup_stream");
+        Self {
+            manager,
+            events,
+            session,
         }
     }
 
-    // ── fp-setup + SETUP ──
-    session
-        .setup_stream(&StreamConfig {
-            width: WIDTH,
-            height: HEIGHT,
-            fps: FPS,
-            bitrate_kbps: 3000,
-            codec: Codec::H264,
-            audio: Some(AudioStreamConfig {
-                codec: AudioCodec::AacEld,
-                sample_rate: ELD_SAMPLE_RATE,
+    /// Mirrors the test pattern and the tone for `seconds`, each frame
+    /// stamped with its capture time. Returns when streaming started.
+    async fn stream(&mut self, seconds: u32) -> u64 {
+        let mut encoder = X264Encoder::default();
+        encoder
+            .configure(&EncoderConfig {
+                width: WIDTH,
+                height: HEIGHT,
+                fps: FPS,
+                bitrate_kbps: 3000,
+                keyframe_interval_secs: 2.0,
+                pixel_format: PixelFormat::Bgra,
                 ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .await
-        .expect("setup_stream");
-
-    // ── Stream ──
-    let mut encoder = X264Encoder::default();
-    encoder
-        .configure(&EncoderConfig {
-            width: WIDTH,
-            height: HEIGHT,
-            fps: FPS,
-            bitrate_kbps: 3000,
-            keyframe_interval_secs: 2.0,
-            pixel_format: PixelFormat::Bgra,
-            ..Default::default()
-        })
-        .unwrap();
-    let mut audio_encoder = FdkEldEncoder::new();
-    audio_encoder
-        .configure(&AudioEncoderConfig {
-            codec: AudioCodec::AacEld,
-            sample_rate: ELD_SAMPLE_RATE,
-            channels: 2,
-            bitrate_kbps: 128,
-        })
-        .unwrap();
-    let start_us = now_us();
-    let mut samples_sent = 0_u64;
-    let mut tick = tokio::time::interval(Duration::from_secs(1) / FPS);
-    for n in 0..SECONDS * FPS {
-        tick.tick().await;
-        let now = now_us();
-        let frame = CapturedFrame::Cpu(RawFrame {
-            colour: None,
-            width: WIDTH,
-            height: HEIGHT,
-            stride: WIDTH * 4,
-            format: PixelFormat::Bgra,
-            data: pattern(n),
-            timestamp_us: now,
-        });
-        let encoded = encoder.encode(frame).unwrap();
-        session.send_frame(&encoded).await.unwrap();
-        let due = (now - start_us) * u64::from(ELD_SAMPLE_RATE) / 1_000_000;
-        audio_encoder
-            .encode(&AudioFrame {
-                codec: AudioCodec::Pcm,
-                data: tone(samples_sent, due - samples_sent),
-                timestamp_us: start_us + samples_sent * 1_000_000 / u64::from(ELD_SAMPLE_RATE),
-                sample_rate: ELD_SAMPLE_RATE,
-                channels: 2,
             })
             .unwrap();
-        samples_sent = due;
-        for aac in audio_encoder.take_output() {
-            session.send_audio_frame(&aac).await.unwrap();
+        let mut audio_encoder = FdkEldEncoder::new();
+        audio_encoder
+            .configure(&AudioEncoderConfig {
+                codec: AudioCodec::AacEld,
+                sample_rate: ELD_SAMPLE_RATE,
+                channels: 2,
+                bitrate_kbps: 128,
+            })
+            .unwrap();
+        let start_us = now_us();
+        let mut samples_sent = 0_u64;
+        let mut tick = tokio::time::interval(Duration::from_secs(1) / FPS);
+        for n in 0..seconds * FPS {
+            tick.tick().await;
+            let now = now_us();
+            let frame = CapturedFrame::Cpu(RawFrame {
+                colour: None,
+                width: WIDTH,
+                height: HEIGHT,
+                stride: WIDTH * 4,
+                format: PixelFormat::Bgra,
+                data: pattern(n),
+                timestamp_us: now,
+            });
+            let encoded = encoder.encode(frame).unwrap();
+            self.session.send_frame(&encoded).await.unwrap();
+            let due = (now - start_us) * u64::from(ELD_SAMPLE_RATE) / 1_000_000;
+            audio_encoder
+                .encode(&AudioFrame {
+                    codec: AudioCodec::Pcm,
+                    data: tone(samples_sent, due - samples_sent),
+                    timestamp_us: start_us + samples_sent * 1_000_000 / u64::from(ELD_SAMPLE_RATE),
+                    sample_rate: ELD_SAMPLE_RATE,
+                    channels: 2,
+                })
+                .unwrap();
+            samples_sent = due;
+            for aac in audio_encoder.take_output() {
+                self.session.send_audio_frame(&aac).await.unwrap();
+            }
+            assert!(self.session.is_alive(), "receiver dropped the session");
         }
-        assert!(session.is_alive(), "receiver dropped the session");
+        start_us
     }
-    // Let the pipeline present what is queued.
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // ── TEARDOWN ──
-    session.stop().await.unwrap();
-    wait_event(&mut events, "the session to stop", |ev| {
-        matches!(ev, ManagerEvent::ReceiverStopped { .. })
+    /// `TEARDOWN`, then stops the receiver.
+    async fn stop(mut self) {
+        self.session.stop().await.unwrap();
+        wait_event(&mut self.events, "the session to stop", |ev| {
+            matches!(ev, ManagerEvent::ReceiverStopped { .. })
+        })
+        .await;
+        self.manager.stop_receivers().await.unwrap();
+    }
+}
+
+async fn mirror_loop(pin: bool) {
+    init_tracing();
+    let log = Arc::new(Mutex::new(SinkLog::default()));
+    let log_factory = log.clone();
+    let mut mirror = Loop::start(pin, move |_remote, info| {
+        assert!(info.video.is_some(), "stream announced without video");
+        assert!(info.audio.is_some(), "stream announced without audio");
+        log_factory.lock().unwrap().sinks += 1;
+        let sink = HeadlessSink(log_factory.clone());
+        async move { Ok(Box::new(sink) as Box<dyn FrameSink>) }
     })
     .await;
-    manager.stop_receivers().await.unwrap();
+    let start_us = mirror.stream(SECONDS).await;
+    // Let the pipeline present what is queued.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    mirror.stop().await;
 
     // ── What came out ──
     let log = log.lock().unwrap();
@@ -419,4 +455,149 @@ async fn mirrors_to_our_own_receiver() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mirrors_to_our_own_receiver_with_a_pin() {
     mirror_loop(true).await;
+}
+
+// ── Live latency ────────────────────────────────────────────────
+
+/// How long the pipeline takes to come up before the first packet is
+/// decoded (hardware decoder start, window creation).
+const PIPELINE_START: Duration = Duration::from_millis(400);
+/// When the audio device starts playing, after the sink exists: the
+/// window opens its output on its first render.
+const DEVICE_OPEN: Duration = Duration::from_millis(900);
+const LIVE_SECONDS: u32 = 8;
+
+/// What the viewer got: when each item was seen or heard, and how long
+/// after its capture.
+#[derive(Default)]
+struct LatencyLog {
+    video: Vec<(Instant, Duration)>,
+    /// When each buffer starts to be heard, and its latency then.
+    audio: Vec<(Instant, Duration)>,
+}
+
+/// A sink that behaves like the receiver window: video is on screen
+/// when pushed; audio queues for a device that opens late and then plays
+/// it back to back, and the backlog is reported once it is open.
+struct WindowLikeSink {
+    log: Arc<Mutex<LatencyLog>>,
+    device_open: Instant,
+    /// When everything queued will have played.
+    play_head: Instant,
+}
+
+impl WindowLikeSink {
+    fn new(log: Arc<Mutex<LatencyLog>>) -> Self {
+        let now = Instant::now();
+        Self {
+            log,
+            device_open: now + DEVICE_OPEN,
+            play_head: now + DEVICE_OPEN,
+        }
+    }
+}
+
+fn latency_of(at: Instant, pts_us: u64) -> Duration {
+    let now = Instant::now();
+    let wall = now_us() + u64::try_from(at.saturating_duration_since(now).as_micros()).unwrap();
+    Duration::from_micros(wall.saturating_sub(pts_us))
+}
+
+#[async_trait::async_trait]
+impl FrameSink for WindowLikeSink {
+    async fn push_video(&mut self, frame: CapturedFrame) -> Result<()> {
+        let now = Instant::now();
+        let latency = latency_of(now, frame.timestamp_us());
+        self.log.lock().unwrap().video.push((now, latency));
+        Ok(())
+    }
+
+    async fn push_audio(&mut self, audio: DecodedAudio) -> Result<()> {
+        let frames = audio.pcm.len() / usize::from(audio.channels.max(1));
+        let length = Duration::from_secs_f64(frames as f64 / f64::from(audio.sample_rate));
+        let start = self.play_head.max(Instant::now());
+        self.play_head = start + length;
+        let latency = latency_of(start, audio.timestamp_us);
+        self.log.lock().unwrap().audio.push((start, latency));
+        Ok(())
+    }
+
+    fn audio_backlog(&self) -> Option<Duration> {
+        let now = Instant::now();
+        (now >= self.device_open).then(|| self.play_head.saturating_duration_since(now))
+    }
+
+    async fn flush_audio(&mut self) -> Result<()> {
+        let now = Instant::now();
+        self.log
+            .lock()
+            .unwrap()
+            .audio
+            .retain(|&(heard, _)| heard <= now);
+        self.play_head = now.max(self.device_open);
+        Ok(())
+    }
+}
+
+fn median(mut values: Vec<Duration>) -> Duration {
+    values.sort();
+    values.get(values.len() / 2).copied().unwrap_or_default()
+}
+
+/// Capture-to-presentation latency of what the viewer sees and hears,
+/// at start-up and once streaming has settled, with a pipeline that
+/// comes up slowly and an audio device that opens late (as the window
+/// does).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mirroring_stays_at_the_live_edge() {
+    init_tracing();
+    let log = Arc::new(Mutex::new(LatencyLog::default()));
+    let log_factory = log.clone();
+    let mut mirror = Loop::start(false, move |_remote, _info| {
+        let sink = WindowLikeSink::new(log_factory.clone());
+        async move {
+            tokio::time::sleep(PIPELINE_START).await;
+            Ok(Box::new(sink) as Box<dyn FrameSink>)
+        }
+    })
+    .await;
+    mirror.stream(LIVE_SECONDS).await;
+    let end = Instant::now();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    mirror.stop().await;
+
+    let log = log.lock().unwrap();
+    let steady_from = end - Duration::from_secs(3);
+    let steady = |items: &[(Instant, Duration)]| {
+        median(
+            items
+                .iter()
+                .filter(|&&(at, _)| at >= steady_from && at <= end)
+                .map(|&(_, l)| l)
+                .collect(),
+        )
+    };
+    let first = |items: &[(Instant, Duration)]| items.first().map(|&(_, l)| l).unwrap_or_default();
+    let video_first = first(&log.video);
+    let audio_first = first(&log.audio);
+    let video_steady = steady(&log.video);
+    let audio_steady = steady(&log.audio);
+    println!(
+        "live latency: video first {video_first:?}, steady {video_steady:?}; \
+         audio first heard {audio_first:?}, steady {audio_steady:?}; \
+         {} frames shown",
+        log.video.len()
+    );
+    assert!(log.video.len() > (LIVE_SECONDS * FPS) as usize / 2);
+    // Generous bounds: debug builds, a loaded CI machine.
+    assert!(
+        video_steady < Duration::from_millis(500),
+        "{video_steady:?}"
+    );
+    assert!(
+        audio_steady < Duration::from_millis(500),
+        "{audio_steady:?}"
+    );
+    let av = video_steady.as_secs_f64() - audio_steady.as_secs_f64();
+    assert!(av.abs() < 0.08, "audio and video {av:+.3} s apart");
 }
