@@ -611,3 +611,164 @@ async fn refuses_youtube_playlists_and_bad_bodies() {
         "a refused /play reached the pipeline"
     );
 }
+
+/// Mirrors a test pattern from ferricast's own AirPlay sender until the
+/// receiver drops the session; returns how many frames went out.
+#[cfg(all(feature = "openh264", feature = "fdk-aac"))]
+async fn mirror_until_dropped(
+    addr: SocketAddr,
+) -> (tokio::task::JoinHandle<u32>, mpsc::Receiver<()>) {
+    use bytes::Bytes;
+    use ferricast::device::{AirplayConfig, Features, Flags};
+    use ferricast::encoder::h264::X264Encoder;
+    use ferricast::{
+        CastSession, ConnectOutcome, Device, DeviceCapabilities, EncoderConfig, PixelFormat,
+        RawFrame, StreamConfig, VideoEncoder,
+    };
+    use ferricast_airplay::AirPlaySession;
+
+    const W: u32 = 640;
+    const H: u32 = 360;
+    let device = Device {
+        id: uuid::Uuid::new_v4(),
+        name: "loop".into(),
+        protocol: "airplay",
+        protocol_icon: Bytes::new(),
+        addresses: addr.into(),
+        model: None,
+        metadata: std::collections::HashMap::new(),
+        capabilities: DeviceCapabilities {
+            supports_screen_mirror: true,
+            airplay_config: Some(AirplayConfig {
+                features: Features::parse_txt("0x5A7FFEF7,0x0").unwrap(),
+                flags: Flags::empty(),
+                pk: None,
+                device_id: Some("loop-receiver".into()),
+            }),
+            ..Default::default()
+        },
+    };
+    let mut session = AirPlaySession::ephemeral();
+    assert!(matches!(
+        session.connect(&device).await.unwrap(),
+        ConnectOutcome::Ready
+    ));
+    session
+        .setup_stream(&StreamConfig {
+            width: W,
+            height: H,
+            fps: 30,
+            bitrate_kbps: 1500,
+            codec: Codec::H264,
+            audio: None,
+            ..Default::default()
+        })
+        .await
+        .expect("mirroring setup");
+    let (started_tx, started_rx) = mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        let mut encoder = X264Encoder::default();
+        encoder
+            .configure(&EncoderConfig {
+                width: W,
+                height: H,
+                fps: 30,
+                bitrate_kbps: 1500,
+                keyframe_interval_secs: 1.0,
+                pixel_format: PixelFormat::Bgra,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut tick = tokio::time::interval(Duration::from_secs(1) / 30);
+        let mut sent = 0;
+        // At most 30 s: the receiver is expected to drop it well before.
+        while sent < 900 {
+            tick.tick().await;
+            let shade = u8::try_from(sent % 256).unwrap();
+            let frame = CapturedFrame::Cpu(RawFrame {
+                width: W,
+                height: H,
+                stride: W * 4,
+                format: PixelFormat::Bgra,
+                data: Bytes::from(vec![shade; (W * H * 4) as usize]),
+                timestamp_us: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as u64,
+            });
+            let encoded = encoder.encode(frame).unwrap();
+            if session.send_frame(&encoded).await.is_err() || !session.is_alive() {
+                break;
+            }
+            sent += 1;
+            if sent == 1 {
+                let _ = started_tx.send(()).await;
+            }
+        }
+        sent
+    });
+    (task, started_rx)
+}
+
+/// A `/play` takes the receiver from a mirroring sender, and a new
+/// mirroring session takes it back from the video.
+#[cfg(all(feature = "openh264", feature = "fdk-aac"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn video_and_mirroring_replace_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    if !support::generate_progressive(dir.path(), "clip.mp4", 30, support::H264_AAC, &[]) {
+        return;
+    }
+    let server = TestServer::start(support::dir_handler(dir.path())).await;
+    let mut rig = rig().await;
+    let started = |ev: &ManagerEvent| matches!(ev, ManagerEvent::ReceiverStarted { .. });
+
+    // ── Mirroring first ──
+    let (mirror, mut first_frame) = mirror_until_dropped(rig.addr).await;
+    first_frame
+        .recv()
+        .await
+        .expect("mirroring never sent a frame");
+    wait_manager(&mut rig.events, "mirroring to start", started).await;
+
+    // ── /play takes over: the mirroring connection is closed ──
+    let mut events = reverse(rig.addr).await;
+    let mut sender = Sender::connect(rig.addr).await;
+    let play = bplist(&[
+        ("Content-Location", Value::String(server.url("/clip.mp4"))),
+        ("Start-Position", Value::Real(0.0)),
+    ]);
+    let reply = sender
+        .request(
+            "POST",
+            "/play",
+            Some("application/x-apple-binary-plist"),
+            &play,
+        )
+        .await;
+    assert_eq!(reply.status, 200);
+    let sent = tokio::time::timeout(Duration::from_secs(10), mirror)
+        .await
+        .expect("the mirroring session outlived /play")
+        .unwrap();
+    assert!(sent < 900, "mirroring kept going");
+    wait_state(&mut events, "playing").await;
+    assert!(sender.playback_info().await.is_some());
+
+    // ── Mirroring again: the video stops ──
+    let (mirror, mut first_frame) = mirror_until_dropped(rig.addr).await;
+    wait_state(&mut events, "stopped").await;
+    first_frame
+        .recv()
+        .await
+        .expect("mirroring never sent a frame");
+    assert!(
+        sender.playback_info().await.is_none(),
+        "video still reported after mirroring took over"
+    );
+    assert!(
+        !mirror.is_finished(),
+        "the new mirroring session was dropped"
+    );
+    mirror.abort();
+}
