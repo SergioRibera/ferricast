@@ -23,8 +23,9 @@
         # --target …` verifies the Windows / Apple / Android backends from
         # Linux. Checking needs no SDK: the platform bindings (`windows`,
         # `objc2-*`, `ndk`) ship their declarations in Rust; only linking
-        # needs the vendor toolchains.
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+        # needs the vendor toolchains. Pinned to the rustc nixpkgs shipped
+        # before, so the switch to rust-overlay changes no lint or codegen.
+        rustToolchain = pkgs.rust-bin.stable."1.95.0".default.override {
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
           targets = [
             "x86_64-pc-windows-msvc"

@@ -46,9 +46,11 @@ pub use discovery::{Discovery, MdnsDiscovery};
 pub use encoder::{AudioEncoder, AudioEncoderConfig, EncoderConfig, VideoEncoder};
 pub use error::{FerricastError, Result};
 pub use frame::{
-    AacChannelConfig, AudioCodec, AudioFrame, BufferLease, CapturedFrame, DmaBufFd, DmaBufId,
-    DmaBufImporter, DmaBufPlane, EncodedFrame, GpuFrame, PixelFormat, RawFrame, SourceAudioFormat,
+    AacChannelConfig, AudioCodec, AudioFrame, BufferLease, CapturedFrame, EncodedFrame, FrameError,
+    PixelFormat, RawFrame, SourceAudioFormat,
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use frame::{DmaBufFd, DmaBufId, DmaBufImporter, DmaBufPlane, GpuFrame};
 #[cfg(feature = "net")]
 pub use net::{
     bind_tcp, bind_udp, connect_tcp_any, local_addr_for, local_ipv4_subnets, local_socket_addr_for,

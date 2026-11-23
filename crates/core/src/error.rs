@@ -79,6 +79,9 @@ pub enum FerricastError {
     #[error("Timeout: {0}")]
     Timeout(String),
 
+    #[error(transparent)]
+    Frame(#[from] crate::frame::FrameError),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
