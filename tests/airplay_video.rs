@@ -562,6 +562,53 @@ async fn play_and_drive(rig: &mut Rig, url: &str, body: PlayBody) {
     );
 }
 
+/// A `/info` that asks for TXT records still describes the device:
+/// senders read `deviceID`, `features` and `statusFlags` from that reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn qualified_info_keeps_the_device_description() {
+    let rig = rig().await;
+    let mut sender = Sender::connect(rig.addr).await;
+    let qualifier = {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "qualifier".into(),
+            Value::Array(vec![Value::String("txtAirPlay".into())]),
+        );
+        let mut out = Vec::new();
+        Value::Dictionary(dict).to_writer_binary(&mut out).unwrap();
+        out
+    };
+    let reply = sender
+        .request(
+            "GET",
+            "/info",
+            Some("application/x-apple-binary-plist"),
+            &qualifier,
+        )
+        .await;
+    assert_eq!(reply.status, 200);
+    let info = reply.plist();
+    assert!(
+        info.get("deviceID").and_then(Value::as_string).is_some(),
+        "deviceID missing: {info:?}"
+    );
+    assert!(
+        info.get("features")
+            .and_then(Value::as_unsigned_integer)
+            .is_some()
+    );
+    assert!(
+        info.get("statusFlags")
+            .and_then(Value::as_unsigned_integer)
+            .is_some()
+    );
+    assert_eq!(
+        info.get("pk").and_then(Value::as_data).map(<[u8]>::len),
+        Some(32)
+    );
+    assert!(info.get("txtAirPlay").and_then(Value::as_data).is_some());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn plays_hls_by_url() {
     let dir = tempfile::tempdir().unwrap();
