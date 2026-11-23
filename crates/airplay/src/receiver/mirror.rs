@@ -171,9 +171,11 @@ pub(super) async fn receive<S: AsyncRead + Unpin>(
     events: mpsc::Sender<MediaEvent>,
 ) -> Result<()> {
     let mut config: Option<CodecConfig> = None;
-    // Parameter sets waiting for the video packet they belong to, with
-    // the timestamp of their codec packet.
-    let mut pending_params: Option<(u64, Vec<u8>)> = None;
+    // Parameter sets from the last codec packet, not yet handed to the
+    // decoder. Senders differ in how they time codec packets (iOS stamps
+    // them like the following frame, others do not), so they go in front
+    // of the next video packet whatever its timestamp.
+    let mut pending_params: Option<Vec<u8>> = None;
     let mut frames = 0_u64;
     let mut bad = 0_u64;
     loop {
@@ -206,14 +208,17 @@ pub(super) async fn receive<S: AsyncRead + Unpin>(
                     }
                     continue;
                 };
-                let data = match pending_params.take() {
-                    Some((ts, mut params)) if ts == raw_ts => {
+                // Every keyframe also carries the current parameter sets, so
+                // a decoder that missed or dropped them can start there.
+                let params = pending_params.take().or_else(|| {
+                    keyframe
+                        .then(|| config.as_ref().map(|c| c.annexb.clone()))
+                        .flatten()
+                });
+                let data = match params {
+                    Some(mut params) => {
                         params.extend_from_slice(&payload);
                         params
-                    }
-                    Some(_) => {
-                        debug!("parameter sets without a matching video packet; dropped");
-                        payload
                     }
                     None => payload,
                 };
@@ -245,7 +250,7 @@ pub(super) async fn receive<S: AsyncRead + Unpin>(
                     height = parsed.height,
                     "mirroring codec packet"
                 );
-                pending_params = Some((raw_ts, parsed.annexb.clone()));
+                pending_params = Some(parsed.annexb.clone());
                 let changed = config.as_ref().is_none_or(|c| {
                     (c.codec, c.width, c.height) != (parsed.codec, parsed.width, parsed.height)
                 });
