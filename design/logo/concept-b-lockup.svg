@@ -1,0 +1,8 @@
+<svg viewBox="0 0 640 160" xmlns="http://www.w3.org/2000/svg">
+  <g transform="scale(0.625)">
+    <path d="M 40 72 L 40 184 L 96 128 Z" fill="#111111"/>
+    <path d="M 112 72 L 112 184 L 168 128 Z" fill="#111111"/>
+    <path d="M 184 72 L 184 184 L 240 128 Z" fill="#111111"/>
+  </g>
+  <text x="180" y="112" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="96" font-weight="700" fill="#111111" letter-spacing="-3">ferricast</text>
+</svg>
