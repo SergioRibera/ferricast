@@ -983,6 +983,7 @@ fn run_worker(
             }
             Transport::Shm(shm_buf) => CapturedFrame::Cpu(orient_raw_frame(
                 RawFrame {
+                    colour: None,
                     width: shm_buf.width,
                     height: shm_buf.height,
                     stride: shm_buf.stride,
@@ -1028,6 +1029,7 @@ fn orient_raw_frame(raw: RawFrame, orientation: Orientation) -> RawFrame {
     };
     let img = orientation.apply(img);
     RawFrame {
+        colour: None,
         width: img.width(),
         height: img.height(),
         stride: img.width() * 4,
@@ -1357,6 +1359,7 @@ fn mmap_bo_to_raw(alloc: &AllocatedBuffer) -> std::result::Result<RawFrame, Ferr
     let _ = dma_buf_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
 
     Ok(RawFrame {
+        colour: None,
         width: alloc.width,
         height: alloc.height,
         stride: dst_stride as u32,
@@ -2019,6 +2022,7 @@ mod tests {
 
     fn raw(width: u32, height: u32, stride: u32, data: Vec<u8>) -> RawFrame {
         RawFrame {
+            colour: None,
             width,
             height,
             stride,

@@ -10,7 +10,7 @@ use bytes::Bytes;
 
 use ferricast_core::{
     CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, PixelFormat, Result,
-    VideoDecoder,
+    VideoDecoder, YuvColour,
 };
 use h264_reader::{
     Context as H264Context,
@@ -858,7 +858,7 @@ impl Active {
         };
         let (_, _, width, height) = self.sps.visible_rect();
         let size = (width as usize, height as usize);
-        let colour = nv12::Colour::signalled(
+        let colour = YuvColour::signalled(
             self.sps.matrix_coefficients.map(u32::from),
             self.sps.full_range,
             size.1,

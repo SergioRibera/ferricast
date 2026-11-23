@@ -621,6 +621,7 @@ fn handle_process(
                 return;
             };
             CapturedFrame::Cpu(RawFrame {
+                colour: None,
                 width: neg.width,
                 height: neg.height,
                 stride,
@@ -634,6 +635,7 @@ fn handle_process(
                 return;
             };
             CapturedFrame::Cpu(RawFrame {
+                colour: None,
                 width: neg.width,
                 height: neg.height,
                 stride,

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use crate::colour::YuvColour;
 use crate::error::{FerricastError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,9 @@ pub struct RawFrame {
     pub format: PixelFormat,
     pub data: Bytes,
     pub timestamp_us: u64,
+    /// How the samples of a YCbCr picture map to RGB, when the
+    /// producer knows; `None` for RGB formats or an undescribed picture.
+    pub colour: Option<YuvColour>,
 }
 
 /// A frame that lives on the GPU as a DMA-BUF.
@@ -286,6 +290,7 @@ impl CapturedFrame {
                 })?;
                 let bytes = importer.readback(&g.plane, g.width, g.height, g.format)?;
                 Ok(RawFrame {
+                    colour: None,
                     width: g.width,
                     height: g.height,
                     // `readback` returns packed rows, not the

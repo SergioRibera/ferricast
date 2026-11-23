@@ -218,6 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tick.tick().await;
         let now = now_us();
         let frame = CapturedFrame::Cpu(RawFrame {
+            colour: None,
             width: WIDTH,
             height: HEIGHT,
             stride: WIDTH * 4,

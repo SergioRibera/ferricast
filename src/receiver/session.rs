@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use ferricast_core::{
     AudioDecoderConfig, DecoderConfig, FerricastError, FrameSink, MediaCommand, MediaInfo,
-    PixelFormat, PlaybackState, PlaybackStatus, PullSpec, RemoteSender, Result,
+    PlaybackState, PlaybackStatus, PullSpec, RemoteSender, Result,
 };
 use ferricast_demuxer::ProgressivePuller;
 
@@ -666,8 +666,9 @@ async fn load_pushed(
     prepare(ctx, remote, puller, info, 0, timeline).await
 }
 
-/// Picks and configures the decoders `info` needs, then asks the
-/// application for a sink.
+/// Picks the decoders `info` needs, asks the application for a sink,
+/// then configures the video decoder for the pixel format the sink
+/// wants.
 async fn prepare(
     ctx: &PipelineCtx,
     remote: &RemoteSender,
@@ -683,15 +684,7 @@ async fn prepare(
             let factory = ctx.video_decoders.get(&v.codec).ok_or_else(|| {
                 FerricastError::Decode(format!("no video decoder for {:?}", v.codec))
             })?;
-            let mut d = factory();
-            d.configure(&DecoderConfig {
-                codec: v.codec,
-                width: v.width,
-                height: v.height,
-                pixel_format: PixelFormat::Bgra,
-                low_latency: true,
-            })?;
-            Ok::<_, FerricastError>(d)
+            Ok::<_, FerricastError>((factory(), v))
         })
         .transpose()?;
     let audio_dec = match &info.audio {
@@ -725,6 +718,18 @@ async fn prepare(
     }
 
     let sink = (ctx.sink_factory)(remote, &info).await?;
+    let video_dec = video_dec
+        .map(|(mut d, v)| {
+            d.configure(&DecoderConfig {
+                codec: v.codec,
+                width: v.width,
+                height: v.height,
+                pixel_format: sink.video_format(),
+                low_latency: true,
+            })?;
+            Ok::<_, FerricastError>(d)
+        })
+        .transpose()?;
     Ok(Prepared {
         puller,
         info,

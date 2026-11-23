@@ -4,6 +4,7 @@ use std::ptr::NonNull;
 
 use ferricast_core::{
     CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
+    YuvColour,
 };
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
@@ -13,7 +14,7 @@ use rav1d::src::lib::{
     dav1d_open, dav1d_picture_unref, dav1d_send_data,
 };
 
-use crate::nv12::{self, Colour, OutputFormat, Planar};
+use crate::nv12::{self, OutputFormat, Planar};
 
 const I420: u32 = 1;
 const MAX_FRAME_PIXELS: u32 = 8192 * 8192;
@@ -222,9 +223,9 @@ fn nv12_frame(picture: &Dav1dPicture, format: OutputFormat) -> Result<CapturedFr
             // SAFETY: a picture returned by dav1d_get_picture holds a reference on its sequence
             // header, and the caller unreferences the picture only after this function returns.
             let header = unsafe { header.as_ref() };
-            Colour::signalled(Some(header.mtrx), header.color_range != 0, height)
+            YuvColour::signalled(Some(header.mtrx), header.color_range != 0, height)
         }
-        None => Colour::guess(height),
+        None => YuvColour::guess(height),
     };
     nv12::deliver(
         data,

@@ -5,7 +5,7 @@ use std::ptr::{addr_of_mut, from_mut, null_mut};
 
 use ferricast_core::{
     CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, PixelFormat, Result,
-    VideoDecoder,
+    VideoDecoder, YuvColour,
 };
 use h264_reader::nal::sps::SeqParameterSet;
 use h264_reader::rbsp::{BitReader, decode_nal};
@@ -17,7 +17,7 @@ use openh264_sys2::{
     DECODER_OPTION, DECODER_OPTION_NUM_OF_FRAMES_REMAINING_IN_BUFFER, SBufferInfo,
 };
 
-use crate::nv12::{self, Colour, OutputFormat, Planar};
+use crate::nv12::{self, OutputFormat, Planar};
 
 /// `profile_idc` of Baseline and Constrained Baseline, which have no B
 /// slices and so never reorder pictures.
@@ -310,7 +310,7 @@ impl Picture<'_> {
             (width, height),
             output.info.uiOutYuvTimeStamp,
             format,
-            Colour::guess(height),
+            YuvColour::guess(height),
         )
         .map(|raw| Some(CapturedFrame::Cpu(raw)))
         .ok_or_else(short)

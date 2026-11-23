@@ -320,6 +320,7 @@ async fn mirror_loop(pin: bool) {
         tick.tick().await;
         let now = now_us();
         let frame = CapturedFrame::Cpu(RawFrame {
+            colour: None,
             width: WIDTH,
             height: HEIGHT,
             stride: WIDTH * 4,

@@ -629,6 +629,7 @@ mod tests {
             }
         }
         CapturedFrame::Cpu(RawFrame {
+            colour: None,
             width,
             height,
             stride,
@@ -745,6 +746,7 @@ mod tests {
             })
             .collect();
         CapturedFrame::Cpu(RawFrame {
+            colour: None,
             width: 320,
             height: 240,
             stride: 1280,

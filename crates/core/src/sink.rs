@@ -24,10 +24,18 @@ use async_trait::async_trait;
 
 use crate::decoder::DecodedAudio;
 use crate::error::Result;
-use crate::frame::CapturedFrame;
+use crate::frame::{CapturedFrame, PixelFormat};
 
 #[async_trait]
 pub trait FrameSink: Send {
+    /// The pixel format video decoders should hand this sink. BGRA by
+    /// default; a sink that converts YCbCr itself (on the GPU, say)
+    /// asks for [`PixelFormat::Nv12`] and gets each frame's
+    /// [`crate::RawFrame::colour`] with it.
+    fn video_format(&self) -> PixelFormat {
+        PixelFormat::Bgra
+    }
+
     async fn push_video(&mut self, frame: CapturedFrame) -> Result<()>;
 
     async fn push_audio(&mut self, _audio: DecodedAudio) -> Result<()> {

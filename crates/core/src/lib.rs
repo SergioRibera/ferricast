@@ -2,6 +2,7 @@ pub mod adaptive;
 pub mod advertiser;
 pub mod capture;
 pub mod codec;
+pub mod colour;
 pub mod control;
 pub mod decoder;
 pub mod device;
@@ -30,6 +31,7 @@ pub use capture::{
     ScreenCapture, WindowIdentifier,
 };
 pub use codec::Codec;
+pub use colour::{YuvColour, YuvMatrix};
 pub use control::{
     ControlSession, MediaCommand, PlaybackState, PlaybackStatus, QueueItem, RemoteSender,
     RepeatMode, TrackSelection,

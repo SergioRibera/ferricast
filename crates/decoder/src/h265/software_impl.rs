@@ -2,11 +2,12 @@ use std::collections::VecDeque;
 
 use ferricast_core::{
     CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
+    YuvColour,
 };
 use rust_h265::{Decoder, Frame, PixelData, parse_annex_b};
 
 use super::timestamps::Timestamps;
-use crate::nv12::{self, Colour, OutputFormat, Planar};
+use crate::nv12::{self, OutputFormat, Planar};
 
 const MAX_THREADS: usize = 4;
 
@@ -110,7 +111,7 @@ fn picture(decoded: &Frame, timestamp_us: u64, format: OutputFormat) -> Result<C
         (width, height),
         timestamp_us,
         format.0,
-        Colour::guess(height),
+        YuvColour::guess(height),
     )
     .map(CapturedFrame::Cpu)
     .ok_or_else(short)

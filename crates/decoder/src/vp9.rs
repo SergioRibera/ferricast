@@ -2,10 +2,11 @@ use std::collections::VecDeque;
 
 use ferricast_core::{
     CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
+    YuvColour,
 };
 use rusty_vp9::{DecodedFrame, Error as Vp9Error};
 
-use crate::nv12::{self, Colour, OutputFormat, Planar};
+use crate::nv12::{self, OutputFormat, Planar};
 
 /// A VP9 superframe index holds at most eight frames (Annex B.3).
 const SUPERFRAME_MAX_FRAMES: usize = 8;
@@ -128,7 +129,7 @@ fn picture(decoded: &DecodedFrame, format: OutputFormat) -> Result<CapturedFrame
         (width, height),
         decoded.pts.map_or(0, |pts| pts as u64),
         format.0,
-        Colour::guess(height),
+        YuvColour::guess(height),
     )
     .map(CapturedFrame::Cpu)
     .ok_or_else(short)

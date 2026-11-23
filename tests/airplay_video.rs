@@ -746,6 +746,7 @@ async fn mirror_until_dropped(
             tick.tick().await;
             let shade = u8::try_from(sent % 256).unwrap();
             let frame = CapturedFrame::Cpu(RawFrame {
+                colour: None,
                 width: W,
                 height: H,
                 stride: W * 4,

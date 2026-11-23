@@ -206,6 +206,7 @@ mod tests {
 
     fn raw(format: PixelFormat, width: u32, height: u32, stride: u32, len: usize) -> RawFrame {
         RawFrame {
+            colour: None,
             width,
             height,
             stride,
@@ -252,6 +253,7 @@ mod tests {
             data.extend_from_slice(&[0xEE; 4]); // padding
         }
         let f = RawFrame {
+            colour: None,
             width: 2,
             height: 3,
             stride: 12,

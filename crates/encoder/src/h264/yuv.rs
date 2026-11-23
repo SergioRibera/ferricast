@@ -237,6 +237,7 @@ mod tests {
 
     fn frame(format: PixelFormat, w: u32, h: u32, stride: u32, fill: u8) -> RawFrame {
         RawFrame {
+            colour: None,
             width: w,
             height: h,
             stride,
@@ -311,6 +312,7 @@ mod tests {
             row[..(w * 4) as usize].fill(0xFF);
         }
         let raw = RawFrame {
+            colour: None,
             width: w,
             height: h,
             stride: stride as u32,
