@@ -31,7 +31,10 @@ pub use capture::{
     ScreenCapture, WindowIdentifier,
 };
 pub use codec::Codec;
-pub use colour::{YuvColour, YuvMatrix};
+pub use colour::{
+    ChromaLocation, ColourDescription, ColourPrimaries, ColourRange, MatrixCoefficients,
+    ReservedColourCode, TransferCharacteristics, YuvColour, YuvMatrix,
+};
 pub use control::{
     ControlSession, MediaCommand, PlaybackState, PlaybackStatus, QueueItem, RemoteSender,
     RepeatMode, TrackSelection,

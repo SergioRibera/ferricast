@@ -3,8 +3,8 @@ use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
-    YuvColour,
+    CapturedFrame, ChromaLocation, Codec, ColourDescription, ColourRange, DecoderConfig,
+    EncodedFrame, FerricastError, Result, VideoDecoder,
 };
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
@@ -223,9 +223,9 @@ fn nv12_frame(picture: &Dav1dPicture, format: OutputFormat) -> Result<CapturedFr
             // SAFETY: a picture returned by dav1d_get_picture holds a reference on its sequence
             // header, and the caller unreferences the picture only after this function returns.
             let header = unsafe { header.as_ref() };
-            YuvColour::signalled(Some(header.mtrx), header.color_range != 0, height)
+            av1_colour(header)
         }
-        None => YuvColour::guess(height),
+        None => ColourDescription::unspecified(ColourRange::Limited),
     };
     nv12::deliver(
         data,
@@ -237,4 +237,22 @@ fn nv12_frame(picture: &Dav1dPicture, format: OutputFormat) -> Result<CapturedFr
     )
     .map(CapturedFrame::Cpu)
     .ok_or_else(short)
+}
+
+/// The colour description of an AV1 sequence header. AV1 codes
+/// primaries, transfer and matrix as H.273 does; its chroma sample
+/// position has its own codes (1 vertical, 2 co-located).
+fn av1_colour(header: &rav1d::include::dav1d::headers::Dav1dSequenceHeader) -> ColourDescription {
+    let code = |value: u32| u8::try_from(value).unwrap_or(u8::MAX);
+    let description = ColourDescription::from_codes(
+        code(header.pri),
+        code(header.trc),
+        code(header.mtrx),
+        header.color_range != 0,
+    );
+    match header.chr {
+        1 => description.with_chroma_location(ChromaLocation::Left),
+        2 => description.with_chroma_location(ChromaLocation::TopLeft),
+        _ => description,
+    }
 }

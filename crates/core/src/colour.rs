@@ -1,6 +1,15 @@
-//! How a picture's YCbCr samples map to RGB.
+//! Colour: what a picture's samples mean ([`ColourDescription`], the
+//! H.273 signalling a stream carries) and how to turn its YCbCr samples
+//! into RGB ([`YuvColour`], the conversion a renderer applies).
 
-/// YCbCr → RGB matrix (ITU-T H.273 `matrix_coefficients`).
+mod description;
+
+pub use description::{
+    ChromaLocation, ColourDescription, ColourPrimaries, ColourRange, MatrixCoefficients,
+    ReservedColourCode, TransferCharacteristics,
+};
+
+/// The YCbCr → RGB matrices a renderer implements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum YuvMatrix {
     Bt601,
@@ -8,13 +17,14 @@ pub enum YuvMatrix {
     Bt2020,
 }
 
-/// The colour description of a decoded YCbCr picture: which matrix
-/// turns its samples into RGB and whether they use the full 0-255
-/// range or the limited 16-235 (luma) / 16-240 (chroma) one.
+/// The conversion that turns a YCbCr picture into RGB: which matrix,
+/// and whether samples use the full or the limited range. Derive it
+/// from a picture's [`ColourDescription`] with
+/// [`ColourDescription::yuv`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct YuvColour {
     pub matrix: YuvMatrix,
-    pub full_range: bool,
+    pub range: ColourRange,
 }
 
 impl YuvColour {
@@ -31,27 +41,14 @@ impl YuvColour {
             } else {
                 YuvMatrix::Bt601
             },
-            full_range: false,
+            range: ColourRange::Limited,
         }
-    }
-
-    /// From a bitstream's `matrix_coefficients` code and range flag;
-    /// codes this crate does not know fall back to [`Self::guess`].
-    #[must_use]
-    pub fn signalled(matrix_coefficients: Option<u32>, full_range: bool, height: usize) -> Self {
-        let matrix = match matrix_coefficients {
-            Some(1) => YuvMatrix::Bt709,
-            Some(4..=6) => YuvMatrix::Bt601,
-            Some(9 | 10) => YuvMatrix::Bt2020,
-            _ => Self::guess(height).matrix,
-        };
-        Self { matrix, full_range }
     }
 
     /// Fixed-point (×256) coefficients: luma gain, then the Cr→R, Cb→G,
     /// Cr→G and Cb→B weights.
     fn coefficients(self) -> [i32; 5] {
-        match (self.matrix, self.full_range) {
+        match (self.matrix, self.range.is_full()) {
             (YuvMatrix::Bt601, false) => [298, 409, 100, 208, 516],
             (YuvMatrix::Bt709, false) => [298, 459, 55, 136, 541],
             (YuvMatrix::Bt2020, false) => [298, 430, 48, 167, 548],
@@ -88,7 +85,7 @@ impl YuvColour {
         out: &mut Vec<u8>,
     ) -> Option<()> {
         let [gain, cr_r, cb_g, cr_g, cb_b] = self.coefficients();
-        let black = if self.full_range { 0 } else { 16 };
+        let black = if self.range.is_full() { 0 } else { 16 };
         let (luma, chroma) = data.split_at_checked(stride.checked_mul(height)?)?;
         if width == 0 {
             return None;
@@ -125,27 +122,27 @@ mod tests {
     const ALL: [YuvColour; 6] = [
         YuvColour {
             matrix: YuvMatrix::Bt601,
-            full_range: false,
+            range: ColourRange::Limited,
         },
         YuvColour {
             matrix: YuvMatrix::Bt709,
-            full_range: false,
+            range: ColourRange::Limited,
         },
         YuvColour {
             matrix: YuvMatrix::Bt2020,
-            full_range: false,
+            range: ColourRange::Limited,
         },
         YuvColour {
             matrix: YuvMatrix::Bt601,
-            full_range: true,
+            range: ColourRange::Full,
         },
         YuvColour {
             matrix: YuvMatrix::Bt709,
-            full_range: true,
+            range: ColourRange::Full,
         },
         YuvColour {
             matrix: YuvMatrix::Bt2020,
-            full_range: true,
+            range: ColourRange::Full,
         },
     ];
 
@@ -158,7 +155,7 @@ mod tests {
     #[test]
     fn white_and_black_map_to_the_rgb_extremes_for_every_matrix_and_range() {
         for colour in ALL {
-            let (black, white) = if colour.full_range {
+            let (black, white) = if colour.range.is_full() {
                 (0, 255)
             } else {
                 (16, 235)
@@ -189,21 +186,7 @@ mod tests {
     fn unsignalled_colour_is_guessed_from_the_picture_height() {
         assert_eq!(YuvColour::guess(720).matrix, YuvMatrix::Bt709);
         assert_eq!(YuvColour::guess(576).matrix, YuvMatrix::Bt601);
-        assert_eq!(
-            YuvColour::signalled(Some(6), true, 1080),
-            YuvColour {
-                matrix: YuvMatrix::Bt601,
-                full_range: true
-            }
-        );
-        assert_eq!(
-            YuvColour::signalled(Some(2), false, 1080).matrix,
-            YuvMatrix::Bt709
-        );
-        assert_eq!(
-            YuvColour::signalled(Some(9), false, 480).matrix,
-            YuvMatrix::Bt2020
-        );
+        assert_eq!(YuvColour::guess(1080).range, ColourRange::Limited);
     }
 
     #[test]

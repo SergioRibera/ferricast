@@ -4,8 +4,8 @@ use std::os::raw::c_int;
 use std::ptr::{addr_of_mut, from_mut, null_mut};
 
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, PixelFormat, Result,
-    VideoDecoder, YuvColour,
+    CapturedFrame, Codec, ColourDescription, ColourRange, DecoderConfig, EncodedFrame,
+    FerricastError, PixelFormat, Result, VideoDecoder,
 };
 use h264_reader::nal::sps::SeqParameterSet;
 use h264_reader::rbsp::{BitReader, decode_nal};
@@ -310,7 +310,7 @@ impl Picture<'_> {
             (width, height),
             output.info.uiOutYuvTimeStamp,
             format,
-            YuvColour::guess(height),
+            ColourDescription::unspecified(ColourRange::Limited),
         )
         .map(|raw| Some(CapturedFrame::Cpu(raw)))
         .ok_or_else(short)

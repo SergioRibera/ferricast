@@ -35,14 +35,12 @@ use std::rc::Rc;
 use bytes::Bytes;
 use cros_libva::*;
 use ferricast_core::{
-    CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, GpuFrame, H264Profile,
-    PixelFormat, Result, VideoEncoder,
+    CapturedFrame, Codec, ColourDescription, EncodedFrame, EncoderConfig, FerricastError, GpuFrame,
+    H264Profile, PixelFormat, Result, VideoEncoder,
 };
 use tracing::{debug, info, trace, warn};
 
-use super::headers::{
-    self, ColourDescription, FrameCrop, PpsParams, SpsParams, VuiParams, profile,
-};
+use super::headers::{self, FrameCrop, PpsParams, SpsParams, VuiParams, profile};
 use super::yuv::{
     self, VPP_BACKGROUND_BLACK, VPP_INPUT_STANDARD, VPP_OUTPUT_STANDARD, vpp_input_colour,
     vpp_output_colour,

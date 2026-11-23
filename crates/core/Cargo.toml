@@ -7,6 +7,10 @@ description = "Core traits and types for ferricast streaming protocols"
 [features]
 default = ["net"]
 net = ["dep:tokio", "dep:socket2", "dep:if-addrs", "dep:mdns-sd"]
+# wincode derives on the colour, codec and backend types, so the istmo
+# codec plugin can carry them across its wire (istmo encodes with wincode).
+wire = ["dep:wincode"]
+wincode = ["dep:wincode"]
 
 [dependencies]
 tokio = { workspace = true, features = ["sync", "macros", "net", "rt", "time"], optional = true }
@@ -22,6 +26,7 @@ bytes.workspace = true
 uuid.workspace = true
 bitflags = "2.13.1"
 async-trait = { workspace = true }
+wincode = { version = "0.6", default-features = false, features = ["derive", "std"], optional = true }
 # `fstat` for DMA-BUF identity (`DmaBufFd::buffer_id` in `frame/dmabuf.rs`),
 # which only exists on Linux and Android.
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]

@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
-    YuvColour,
+    CapturedFrame, Codec, ColourDescription, ColourRange, DecoderConfig, EncodedFrame,
+    FerricastError, Result, VideoDecoder,
 };
 use rust_h265::{Decoder, Frame, PixelData, parse_annex_b};
 
@@ -111,7 +111,7 @@ fn picture(decoded: &Frame, timestamp_us: u64, format: OutputFormat) -> Result<C
         (width, height),
         timestamp_us,
         format.0,
-        YuvColour::guess(height),
+        ColourDescription::unspecified(ColourRange::Limited),
     )
     .map(CapturedFrame::Cpu)
     .ok_or_else(short)

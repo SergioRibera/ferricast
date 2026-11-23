@@ -11,7 +11,7 @@ use ferricast_demuxer::Demuxer;
 
 pub use clock::{Clock, Due};
 pub use ferricast_core::{CapturedFrame, PixelFormat, RawFrame};
-pub use ferricast_demuxer::{Color, VideoStream};
+pub use ferricast_demuxer::VideoStream;
 pub use limiter::FrameLimiter;
 
 use decoder::Decoder;

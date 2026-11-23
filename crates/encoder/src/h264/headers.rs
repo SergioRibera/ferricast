@@ -12,6 +12,8 @@
 //! `libavcodec/vaapi_encode_h264.c` and ChromiumOS' cros-codecs
 //! H.264 encoder.
 
+use ferricast_core::ColourDescription;
+
 use super::bitstream::{BitWriter, finalize_nal};
 
 /// Profile IDCs we target. See §A.2 (profile definitions).
@@ -64,25 +66,6 @@ pub(super) struct VuiParams {
     /// `video_signal_type` + `colour_description`; `None` leaves them
     /// unsignalled.
     pub colour: Option<ColourDescription>,
-}
-
-/// Colour signalling (E.2.1) using ITU-T H.273 code points.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ColourDescription {
-    pub full_range: bool,
-    pub colour_primaries: u8,
-    pub transfer_characteristics: u8,
-    pub matrix_coefficients: u8,
-}
-
-impl ColourDescription {
-    /// What the RGB → YUV conversion produces: BT.709, limited range.
-    pub(crate) const BT709_LIMITED: Self = Self {
-        full_range: false,
-        colour_primaries: 1,
-        transfer_characteristics: 1,
-        matrix_coefficients: 1,
-    };
 }
 
 /// Build the SPS NAL byte stream (Annex B). `nal_ref_idc=3` is the
@@ -172,17 +155,25 @@ fn write_vui(w: &mut BitWriter, v: &VuiParams) {
         // video_format u(3) = 5 (unspecified)
         w.write_bits(5, 3);
         // video_full_range_flag u(1)
-        w.write_flag(c.full_range);
+        w.write_flag(c.range.is_full());
         // colour_description_present_flag u(1) = 1
         w.write_flag(true);
-        w.write_bits(u32::from(c.colour_primaries), 8);
-        w.write_bits(u32::from(c.transfer_characteristics), 8);
-        w.write_bits(u32::from(c.matrix_coefficients), 8);
+        w.write_bits(u32::from(c.primaries.code()), 8);
+        w.write_bits(u32::from(c.transfer.code()), 8);
+        w.write_bits(u32::from(c.matrix.code()), 8);
     } else {
         w.write_flag(false);
     }
-    // chroma_loc_info_present_flag u(1) = 0
-    w.write_flag(false);
+    // chroma_loc_info_present_flag u(1), then the top- and bottom-field
+    // chroma_sample_loc_type ue(v) (identical for progressive pictures)
+    match v.colour.and_then(|c| c.chroma_location) {
+        Some(location) => {
+            w.write_flag(true);
+            w.write_ue(u32::from(location.code()));
+            w.write_ue(u32::from(location.code()));
+        }
+        None => w.write_flag(false),
+    }
     // timing_info_present_flag u(1) = 1
     w.write_flag(true);
     // num_units_in_tick u(32)

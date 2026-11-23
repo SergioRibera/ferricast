@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
-    YuvColour,
+    CapturedFrame, Codec, ColourDescription, ColourRange, DecoderConfig, EncodedFrame,
+    FerricastError, Result, VideoDecoder,
 };
 use rusty_vp9::{DecodedFrame, Error as Vp9Error};
 
@@ -129,7 +129,7 @@ fn picture(decoded: &DecodedFrame, format: OutputFormat) -> Result<CapturedFrame
         (width, height),
         decoded.pts.map_or(0, |pts| pts as u64),
         format.0,
-        YuvColour::guess(height),
+        ColourDescription::unspecified(ColourRange::Limited),
     )
     .map(CapturedFrame::Cpu)
     .ok_or_else(short)

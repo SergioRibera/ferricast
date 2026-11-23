@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::colour::YuvColour;
+use crate::colour::ColourDescription;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod dmabuf;
@@ -39,9 +39,9 @@ pub struct RawFrame {
     pub format: PixelFormat,
     pub data: Bytes,
     pub timestamp_us: u64,
-    /// How the samples of a YCbCr picture map to RGB, when the
+    /// The colour signalling of a YCbCr picture, when the
     /// producer knows; `None` for RGB formats or an undescribed picture.
-    pub colour: Option<YuvColour>,
+    pub colour: Option<ColourDescription>,
 }
 
 /// Holds a producer's buffer out of its pool while a consumer may

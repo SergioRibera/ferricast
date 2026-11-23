@@ -26,8 +26,8 @@ use std::marker::PhantomData;
 
 use bytes::Bytes;
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
-    YuvColour,
+    CapturedFrame, Codec, ColourDescription, ColourRange, DecoderConfig, EncodedFrame,
+    FerricastError, Result, VideoDecoder,
 };
 use shiguredo_nvcodec::{
     Decoder as NvDecoder, DecoderCodec, DecoderConfig as NvDecCfg, SurfaceFormat,
@@ -157,7 +157,7 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
                 (width, height),
                 self.timestamps.claim(),
                 self.format.0,
-                YuvColour::guess(height),
+                ColourDescription::unspecified(ColourRange::Limited),
             )
             .ok_or_else(|| {
                 FerricastError::Decode(format!("NVDEC ({}) returned short planes", C::NAME))

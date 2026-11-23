@@ -1,6 +1,6 @@
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
-    YuvColour, YuvMatrix,
+    CapturedFrame, Codec, ColourDescription, DecoderConfig, EncodedFrame, FerricastError, Result,
+    VideoDecoder,
 };
 use vp8_decoder::DecodeError;
 
@@ -49,10 +49,8 @@ impl VideoDecoder for Vp8Decoder {
         })
         .ok_or_else(short)?;
         // VP8 is always BT.601 (RFC 6386 §9.2).
-        let colour = YuvColour {
-            matrix: YuvMatrix::Bt601,
-            full_range: false,
-        };
+        // VP8 is always BT.601 (RFC 6386 §9.2).
+        let colour = ColourDescription::BT601_LIMITED;
         nv12::deliver(
             data,
             stride,

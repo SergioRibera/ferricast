@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, PixelFormat, Result,
-    VideoDecoder, YuvColour,
+    CapturedFrame, ChromaLocation, Codec, ColourDescription, ColourRange, DecoderConfig,
+    EncodedFrame, FerricastError, MatrixCoefficients, PixelFormat, Result, VideoDecoder,
 };
 use h264_reader::{
     Context as H264Context,
@@ -858,12 +858,7 @@ impl Active {
         };
         let (_, _, width, height) = self.sps.visible_rect();
         let size = (width as usize, height as usize);
-        let colour = YuvColour::signalled(
-            self.sps.matrix_coefficients.map(u32::from),
-            self.sps.full_range,
-            size.1,
-        );
-        nv12::deliver(data, stride, size, timestamp_us, format, colour)
+        nv12::deliver(data, stride, size, timestamp_us, format, self.sps.colour)
             .map(CapturedFrame::Cpu)
             .ok_or_else(|| FerricastError::Decode("VA-API: NV12 conversion failed".into()))
     }
@@ -881,10 +876,6 @@ fn convert_sps(sps: &SeqParameterSet, rbsp: &[u8]) -> Sps {
         .vui_parameters
         .as_ref()
         .and_then(|vui| vui.bitstream_restrictions.as_ref());
-    let signal = sps
-        .vui_parameters
-        .as_ref()
-        .and_then(|vui| vui.video_signal_type.as_ref());
     Sps {
         profile_idc: u8::from(sps.profile_idc),
         level_idc: sps.level_idc,
@@ -939,10 +930,7 @@ fn convert_sps(sps: &SeqParameterSet, rbsp: &[u8]) -> Sps {
         num_reorder_frames: restrictions.map(|r| r.max_num_reorder_frames),
         max_dec_frame_buffering: restrictions.map(|r| r.max_dec_frame_buffering),
         scaling_matrix_present: slice::sps_has_scaling_matrix(rbsp),
-        matrix_coefficients: signal
-            .and_then(|signal| signal.colour_description.as_ref())
-            .map(|description| description.matrix_coefficients),
-        full_range: signal.is_some_and(|signal| signal.video_full_range_flag),
+        colour: sps_colour(sps),
     }
 }
 
@@ -1115,4 +1103,32 @@ mod tests {
             );
         }
     }
+}
+
+/// The colour signalling of an SPS's VUI: unspecified when the SPS
+/// carries no video signal type, H.264's implied BT.601-era defaults
+/// (unspecified codes) when it has no colour description.
+fn sps_colour(sps: &SeqParameterSet) -> ColourDescription {
+    let vui = sps.vui_parameters.as_ref();
+    let Some(signal) = vui.and_then(|vui| vui.video_signal_type.as_ref()) else {
+        return ColourDescription::unspecified(ColourRange::Limited);
+    };
+    let unspecified = MatrixCoefficients::Unspecified.code();
+    let (primaries, transfer, matrix) = signal.colour_description.as_ref().map_or(
+        (unspecified, unspecified, unspecified),
+        |description| {
+            (
+                description.colour_primaries,
+                description.transfer_characteristics,
+                description.matrix_coefficients,
+            )
+        },
+    );
+    let colour =
+        ColourDescription::from_codes(primaries, transfer, matrix, signal.video_full_range_flag);
+    let location = vui
+        .and_then(|vui| vui.chroma_loc_info.as_ref())
+        .and_then(|info| u8::try_from(info.chroma_sample_loc_type_top_field).ok())
+        .and_then(|code| ChromaLocation::try_from(code).ok());
+    location.map_or(colour, |location| colour.with_chroma_location(location))
 }
