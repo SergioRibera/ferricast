@@ -29,10 +29,12 @@ None.
 ## Important (pick these up during the Freya implementation pass)
 
 1. **Freya `theme.rs` generator.** Pull `design/tokens.json` into a `build.rs` that writes a module exposing semantic names (`fg.default`, `bg.surface`, etc.). Rationale: hard-coding hex into components will drift; the three-layer design pivots on resolved-value correctness.
-2. **Tray template icon honoured per OS.** On macOS, the SVG must be marked template; on KDE Plasma 6 Wayland, verify the `-symbolic` suffix route (BREAK-UI risk). Ship both `-mono` and a coloured fallback.
-3. **D-Bus provider surfaces same state as tray/window.** The tray shows real-time sessions that may originate from D-Bus, CLI, or GUI. Treat D-Bus as a UI client, not a shadow path.
-4. **Receiver idle must be AMOLED-safe when target screen reports OLED.** Auto-swap to `receiver.amoled` tokens when `is-oled` is true (Wayland output name match on known brands as first heuristic).
-5. **Reduced motion is system-level, not app-level.** Hook into `prefers-reduced-motion` via `mundy` on macOS/Linux + the Windows Settings API. Breathing dot is the single motion that MUST die when it's set.
+2. **Linux tray is hybrid, not a popup port.** SNI/Dbusmenu only lets the shell render plain menus. Ship a minimal DBusmenu (Stop · Nearby submenu · Open ferricast… · Settings · Quit) plus a frameless rich window-popup that opens on left-click or hotkey. See page 05 variants G (DBusmenu), H (window-popup), I (trigger map).
+3. **Tray template icon honoured per OS.** On macOS, the SVG must be marked template; on KDE Plasma 6 Wayland, verify the `-symbolic` suffix route (BREAK-UI risk). Ship both `-mono` and a coloured fallback.
+4. **D-Bus provider surfaces same state as tray/window.** The tray shows real-time sessions that may originate from D-Bus, CLI, or GUI. Treat D-Bus as a UI client, not a shadow path.
+5. **Receiver idle must be AMOLED-safe when target screen reports OLED.** Auto-swap to `receiver.amoled` tokens when `is-oled` is true (Wayland output name match on known brands as first heuristic).
+6. **Reduced motion is system-level, not app-level.** Hook into `prefers-reduced-motion` via `mundy` on macOS/Linux + the Windows Settings API. Breathing dot is the single motion that MUST die when it's set. The Accept-button countdown collapses to 3 discrete steps (0/50/100%).
+7. **Noise policy.** No raw fingerprints, IP:port strings, BSSIDs, RSSI or MAC addresses in UI. If the user cannot act on it, it goes to `Settings · About · Copy diagnostics`, not the main surfaces.
 
 ## Polish
 

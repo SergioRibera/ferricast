@@ -8,11 +8,19 @@ Two personas drive the design: **Sender** (someone wanting to throw content) and
 
 | Surface | OS | Trigger | Default |
 | --- | --- | --- | --- |
-| **Tray popup** | all | Click tray icon → anchored popup | always-on, startup |
-| **D-Bus service** | Linux | `org.gnome.NetworkDisplays` / portal `screen-cast` compatible API | runs headless, no popup |
-| **GUI window** | all | Tray → "Open ferricast…" or `ferricast --window` | optional |
+| **Tray popup (Win/mac)** | Windows, macOS | Click tray icon → anchored popup (rich UI) | always-on, startup |
+| **Tray hybrid (Linux)** | Linux | Left-click → rich window-popup · Right-click → DBusmenu (native, shell-rendered) | SNI can't host a rich popup — see below |
+| **D-Bus service** | Linux | `org.ferricast.Cast.*` on the session bus | runs headless, no popup |
+| **GUI window** | all | Tray → "Open ferricast…" or `ferricast --window` | optional, but the sole sender UI on Linux without the tray |
 | **Receiver fullscreen** | all | `ferricast --receive` or systemd service | always advertises via mDNS |
 | **CLI** | all | `ferricast send <device>`, `ferricast devices` | power users |
+
+### Linux tray hybrid — why
+
+SNI/Dbusmenu only lets the shell render **plain menus** (text, separators, submenus, checkmarks). You cannot expose a device-row with chips, ember borders or progress bars through the protocol. So on Linux we ship **both**:
+
+- A minimal DBusmenu drawn by the shell: Stop · Nearby submenu · Open ferricast… · Settings… · Quit. Fast, native, keyboard-navigable.
+- A frameless rich window-popup launched explicitly (left-click default, hotkey, or `Open ferricast…` from the menu). The popup follows the cursor on X11 and `xdg_popup` on Wayland; on wlroots we can ask `wlr-layer-shell` to anchor near the tray. It is **not** auto-positioned against the tray icon because SNI does not expose icon coordinates.
 
 The GUI, D-Bus and tray are **three faces of the same state**. Starting a cast from the CLI appears live in the tray popup; stopping from the tray stops the D-Bus session. One source of truth.
 
