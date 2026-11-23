@@ -75,6 +75,7 @@ impl ReceiverProtocol for TestReceiver {
 struct SinkLog {
     video_frames: usize,
     audio_chunks: usize,
+    gains: Vec<f32>,
     created: usize,
     dropped: usize,
 }
@@ -95,6 +96,10 @@ impl FrameSink for HeadlessSink {
     }
     async fn push_audio(&mut self, _audio: DecodedAudio) -> Result<()> {
         self.0.lock().unwrap().audio_chunks += 1;
+        Ok(())
+    }
+    async fn set_volume(&mut self, gain: f32) -> Result<()> {
+        self.0.lock().unwrap().gains.push(gain);
         Ok(())
     }
 }
@@ -518,6 +523,14 @@ async fn play_and_drive(rig: &mut Rig, url: &str, body: PlayBody) {
         resumed > still + 0.5,
         "not playing after resume: {still} -> {resumed}"
     );
+
+    // ── Volume ──
+    sender.post("/volume?volume=0.250000").await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rig.log.lock().unwrap().gains.last() != Some(&0.25) {
+        assert!(Instant::now() < deadline, "volume never reached the sink");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // ── Properties senders set before playing ──
     let reply = sender
