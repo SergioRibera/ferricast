@@ -175,7 +175,7 @@ async fn bind_tcp(peer: IpAddr, port: u16, what: &str) -> Result<TcpListener> {
 }
 
 /// Linear gain of a volume in the sender's dB scale.
-fn gain_from_db(db: f32) -> f32 {
+pub(super) fn gain_from_db(db: f32) -> f32 {
     if db <= -30.0 {
         0.0
     } else {
@@ -825,6 +825,10 @@ impl Connection {
                 let gain = gain_from_db(db);
                 debug!(db, gain, "AirPlay volume");
                 self.command(MediaCommand::SetVolume(gain)).await;
+                // The sender's video playback, if any, follows the same volume.
+                self.shared
+                    .videos
+                    .broadcast(|| super::video::VideoRequest::Volume(gain));
             }
         }
         Response::ok()

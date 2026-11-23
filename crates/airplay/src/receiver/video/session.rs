@@ -37,6 +37,8 @@ pub(in crate::receiver) enum VideoRequest {
     Stop,
     /// `/action` `playlistRemove`: stop if this `uuid` is playing.
     Remove(String),
+    /// Playback gain, `0.0..=1.0`.
+    Volume(f32),
 }
 
 /// A connection's way to the video session of its sender. Cheap to clone.
@@ -73,6 +75,14 @@ pub(in crate::receiver) struct VideoHub {
 }
 
 impl VideoHub {
+    /// Sends `request` to every live session that has room for it.
+    pub fn broadcast(&self, request: impl Fn() -> VideoRequest) {
+        let sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+        for tx in sessions.values().filter_map(mpsc::WeakSender::upgrade) {
+            let _ = tx.try_send(request());
+        }
+    }
+
     /// The session of `key`, started when there is none.
     pub fn handle(
         &self,
@@ -198,6 +208,9 @@ impl VideoSession {
                 }
             }
             VideoRequest::Stop => self.stop().await,
+            VideoRequest::Volume(gain) => {
+                self.command(MediaCommand::SetVolume(gain)).await;
+            }
             VideoRequest::Remove(uuid) => {
                 let current = self
                     .playback
@@ -242,6 +255,8 @@ impl VideoSession {
             self.promoted = Some(Promoted::open(&self.ready, remote).await);
         }
         self.command(load).await;
+        let gain = crate::receiver::connection::gain_from_db(self.shared.volume_db());
+        self.command(MediaCommand::SetVolume(gain)).await;
         self.event(EventState::Loading);
         Ok(())
     }

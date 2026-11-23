@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 use super::{Connection, Next};
 use crate::receiver::rtsp::{Request, Response};
 use crate::receiver::video::{
-    PlayRequest, VideoHandle, VideoRequest, rate_playing, scrub_position_us,
+    PlayRequest, VideoHandle, VideoRequest, rate_playing, scrub_position_us, volume_gain,
 };
 use crate::receiver::{MODEL, SOURCE_VERSION};
 
@@ -47,7 +47,7 @@ impl Connection {
             route,
             (
                 "POST",
-                "/reverse" | "/play" | "/scrub" | "/rate" | "/stop" | "/action"
+                "/reverse" | "/play" | "/scrub" | "/rate" | "/stop" | "/action" | "/volume"
             ) | ("GET", "/playback-info" | "/scrub" | "/server-info")
                 | ("PUT", "/setProperty")
                 | ("POST" | "GET", "/getProperty")
@@ -100,6 +100,14 @@ impl Connection {
                 Some(playing) => {
                     debug!(playing, "AirPlay video rate");
                     self.video(request).send(VideoRequest::Rate(playing)).await;
+                    Response::ok()
+                }
+                None => Response::status(400, "Bad Request"),
+            },
+            ("POST", "/volume") => match volume_gain(&request.uri) {
+                Some(gain) => {
+                    debug!(gain, "AirPlay video volume");
+                    self.video(request).send(VideoRequest::Volume(gain)).await;
                     Response::ok()
                 }
                 None => Response::status(400, "Bad Request"),

@@ -312,6 +312,12 @@ pub(super) fn scrub_position_us(uri: &str) -> Option<u64> {
     StartPosition::Seconds(secs).resolve_us(None)
 }
 
+/// Parses `volume=0.5` (linear, `0..=1`) from a `/volume` query.
+pub(super) fn volume_gain(uri: &str) -> Option<f32> {
+    let gain = query_value(uri, "volume")?.parse::<f32>().ok()?;
+    gain.is_finite().then(|| gain.clamp(0.0, 1.0))
+}
+
 /// Parses `value=0` / `value=1.000000` from a `/rate` query: whether to play.
 pub(super) fn rate_playing(uri: &str) -> Option<bool> {
     let rate = query_value(uri, "value")?.parse::<f64>().ok()?;
@@ -362,6 +368,9 @@ mod tests {
         assert_eq!(rate_playing("/rate?value=0.000000"), Some(false));
         assert_eq!(rate_playing("/rate?value=1"), Some(true));
         assert_eq!(rate_playing("/rate?x=1&value=1.0"), Some(true));
+        assert_eq!(volume_gain("/volume?volume=0.5"), Some(0.5));
+        assert_eq!(volume_gain("/volume?volume=3"), Some(1.0));
+        assert_eq!(volume_gain("/volume?volume=inf"), None);
     }
 
     #[tokio::test(start_paused = true)]
