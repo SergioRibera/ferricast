@@ -63,6 +63,9 @@ const MAX_CONSECUTIVE_ENCODE_ERRORS: u32 = 3;
 /// Encoded audio frames buffered between the audio task and the
 /// sender loop.
 const AUDIO_QUEUE_FRAMES: usize = 64;
+/// Frames read off the capture queue at most when a session becomes
+/// ready; captures queue a few at most.
+const MAX_STALE_FRAMES: usize = 16;
 
 /// Object-safe view of a [`CastSession`]; the native trait returns
 /// `impl Future`, which can't be boxed as `dyn`.
@@ -826,7 +829,32 @@ where
             tracing::debug!(stale, "dropped audio queued before the session was ready");
         }
         self.apply_bitrate(session.feeds_adaptive_bitrate());
+        self.discard_queued_video();
         self.encoder.request_keyframe();
+    }
+
+    /// Keeps only the newest frame captured while the session was being
+    /// set up (pairing can take minutes), stamped now: sent with their
+    /// capture times, those frames would start the receiver's timeline
+    /// in the past.
+    fn discard_queued_video(&mut self) {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut stale = 0_usize;
+        while stale < MAX_STALE_FRAMES {
+            // Polled once and dropped, as in `idle`: reading a frame is
+            // cancellation-safe.
+            let std::task::Poll::Ready(Ok(frame)) =
+                std::pin::pin!(self.capture.next_frame()).poll(&mut cx)
+            else {
+                break;
+            };
+            self.frames.remember(frame);
+            stale += 1;
+        }
+        self.frames.retime();
+        if stale > 0 {
+            tracing::debug!(stale, "dropped video captured before the session was ready");
+        }
     }
 
     /// Rebuild the session after it dropped, with backoff. Capture and
@@ -1236,6 +1264,25 @@ mod tests {
         }
         .prepare()
         .await
+    }
+
+    #[tokio::test]
+    async fn the_first_frame_is_stamped_when_the_session_is_ready() {
+        // The fake capture stamps its frames in 2023: what was captured
+        // before the session was set up must not go out with that time.
+        let before = now_us();
+        let run = run_stream(
+            DeviceCapabilities::default(),
+            &[(64, 36)],
+            vec![stop_after(1)],
+            StreamConfig::default(),
+        )
+        .await;
+        let first = run.sessions.lock().unwrap().first_frame_us.unwrap();
+        assert!(
+            first >= before,
+            "first frame stamped {first}, start {before}"
+        );
     }
 
     #[tokio::test]

@@ -68,6 +68,27 @@ impl Clock {
         self.follow = None;
     }
 
+    /// Starts a timeline that presents `pts_us` at `at`.
+    pub(super) fn anchor_due(&mut self, pts_us: u64, at: Instant) {
+        self.anchor = Some((at, pts_us));
+        self.follow = None;
+    }
+
+    /// Moves the timeline: everything is presented `by` earlier
+    /// (`earlier`) or later. The audio-master filter starts over, since
+    /// the audio the sink holds no longer matches the timeline.
+    pub(super) fn shift(&mut self, by: Duration, earlier: bool) {
+        let Some((t0, p0)) = self.anchor else {
+            return;
+        };
+        let t0 = if earlier {
+            t0.checked_sub(by).unwrap_or(t0)
+        } else {
+            t0.checked_add(by).unwrap_or(t0)
+        };
+        self.anchor_due(p0, t0);
+    }
+
     /// Presentation instant of `pts_us`, re-anchoring on jumps.
     pub(super) fn due(&mut self, pts_us: u64, now: Instant) -> Instant {
         let (t0, p0) = match self.anchor {

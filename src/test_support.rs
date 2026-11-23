@@ -194,6 +194,8 @@ pub(crate) struct SessionLog {
     pub created: usize,
     pub setups: Vec<StreamConfig>,
     pub frames: usize,
+    /// Timestamp of the first frame sent.
+    pub first_frame_us: Option<u64>,
     pub stops: usize,
     /// Passwords submitted through `submit_pairing`.
     pub passwords: Vec<String>,
@@ -239,9 +241,12 @@ impl CastSession for FakeSession {
         Ok(())
     }
 
-    async fn send_frame(&mut self, _frame: &EncodedFrame) -> Result<()> {
+    async fn send_frame(&mut self, frame: &EncodedFrame) -> Result<()> {
         self.frames += 1;
-        self.log.lock().unwrap().frames += 1;
+        let mut log = self.log.lock().unwrap();
+        log.frames += 1;
+        log.first_frame_us.get_or_insert(frame.timestamp_us);
+        drop(log);
         if self
             .script
             .remote_stop_after
