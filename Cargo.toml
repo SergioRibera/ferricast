@@ -34,6 +34,7 @@ ferricast-dbus = { path = "crates/dbus" }
 ferricast-airplay = { path = "crates/airplay" }
 # GPL-3.0-or-later; only pulled in through the `airplay` feature below.
 ferricast-fairplay = { path = "crates/fairplay" }
+ferricast-miracast = { path = "crates/miracast", default-features = false }
 
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -145,9 +146,13 @@ wlroots = ["ferricast-capture/wlroots"]
 # gbm for GPU end-to-end. Falls back to PipeWire/portal at runtime
 # if the protocols aren't available.
 wayland-direct = ["ferricast-capture/wayland-direct", "wlroots"]
-# Reserved for upcoming protocol crates; toggling on requires
-# uncommenting the matching workspace member + dep below.
-# miracast = ["dep:ferricast-miracast"]
+# Miracast (Wi-Fi Display) sender + receiver. Portable over MS-MICE
+# (mDNS + TCP on the normal LAN); Linux Wi-Fi Direct requires the
+# `miracast-linux-p2p` feature on top; Windows native sender requires
+# `miracast-windows-native`. See crates/miracast/src/transport.
+miracast = ["dep:ferricast-miracast"]
+miracast-linux-p2p = ["miracast", "ferricast-miracast/linux-p2p"]
+miracast-windows-native = ["miracast", "ferricast-miracast/windows-native"]
 
 [dependencies]
 ferricast-core.workspace = true
@@ -164,7 +169,7 @@ ferricast-demuxer = { workspace = true, features = ["http"] }
 ferricast-hls.workspace = true
 ferricast-airplay = { workspace = true, optional = true }
 ferricast-chromecast = { workspace = true, optional = true }
-# ferricast-miracast = { workspace = true, optional = true }
+ferricast-miracast = { workspace = true, optional = true }
 
 tokio.workspace = true
 tracing.workspace = true

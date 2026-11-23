@@ -749,6 +749,30 @@ impl StreamManagerBuilder {
         self.register::<ferricast_airplay::AirPlayHandler>()
     }
 
+    /// Register the Miracast (Wi-Fi Display) sender.
+    ///
+    /// Discovers MS-MICE sinks over mDNS and drives WFD M1-M7 + MPEG2-TS
+    /// over RTP against them. On Linux with the `miracast-linux-p2p`
+    /// feature the handler also offers Wi-Fi Direct discovery via
+    /// wpa_supplicant; on Windows with `miracast-windows-native` it
+    /// bridges to `Windows.Media.Casting`.
+    #[cfg(feature = "miracast")]
+    pub fn with_miracast(self) -> Self {
+        self.register::<ferricast_miracast::MiracastHandler>()
+    }
+
+    /// Register a Miracast *receiver* — advertise this process as a
+    /// `_display._tcp` MS-MICE sink and accept WFD M1-M7 from Windows
+    /// "Cast to" / Android Smart View.
+    #[cfg(feature = "miracast")]
+    pub fn with_miracast_receiver(
+        self,
+        receiver: ferricast_miracast::MiracastReceiver,
+    ) -> Self {
+        let builder = self.with_receiver(receiver);
+        builder.register_video_decoder::<ferricast_decoder::H264Decoder>()
+    }
+
     /// Register the Chromecast *receiver* — advertise this process
     /// as a Cast target and accept LOAD / PLAY / PAUSE / SEEK from
     /// senders.
