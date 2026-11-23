@@ -725,18 +725,26 @@ async fn prepare(
     }
 
     let sink = (ctx.sink_factory)(remote, &info).await?;
-    let video_dec = video_dec
-        .map(|(mut d, v)| {
-            d.configure(&DecoderConfig {
+    let video_dec = match video_dec {
+        Some((mut d, v)) => {
+            let config = DecoderConfig {
                 codec: v.codec,
                 width: v.width,
                 height: v.height,
                 pixel_format: sink.video_format(),
                 low_latency: true,
-            })?;
-            Ok::<_, FerricastError>(d)
-        })
-        .transpose()?;
+            };
+            // Starting a hardware decoder blocks for hundreds of
+            // milliseconds; on a runtime worker that would hold up
+            // whatever else is queued there, a live sender's media
+            // included.
+            let configured = tokio::task::spawn_blocking(move || d.configure(&config).map(|()| d))
+                .await
+                .map_err(|e| FerricastError::Decode(format!("decoder set-up failed: {e}")))??;
+            Some(configured)
+        }
+        None => None,
+    };
     Ok(Prepared {
         puller,
         info,
