@@ -121,6 +121,7 @@ async fn start() -> anyhow::Result<Option<Daemon>> {
             ferricast::airplay::AirPlayReceiver::new(ferricast::airplay::AirPlayReceiverConfig {
                 name: args.receiver_name.clone(),
                 require_pin: args.airplay_pin,
+                video: !args.no_airplay_video,
                 ..Default::default()
             })
             .await;

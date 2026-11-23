@@ -56,6 +56,12 @@ pub struct Cli {
     #[arg(long)]
     pub no_airplay_receiver: bool,
 
+    /// Do not play the videos AirPlay senders hand over by URL (AirPlay
+    /// video, what apps that cast videos rather than the screen use);
+    /// only screen mirroring and audio are offered.
+    #[arg(long)]
+    pub no_airplay_video: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
