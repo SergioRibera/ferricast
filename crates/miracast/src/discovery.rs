@@ -67,6 +67,13 @@ impl Discovery for MiracastDiscovery {
                             .unwrap_or_else(|| service.get_hostname())
                             .trim_end_matches('.')
                             .to_string();
+                        let mut metadata = std::collections::HashMap::new();
+                        if let Some(port) = service
+                            .get_properties()
+                            .get_property_val_str("rtsp_port")
+                        {
+                            metadata.insert("rtsp_port".to_string(), port.to_string());
+                        }
                         let device = Device {
                             id: Uuid::new_v4(),
                             name,
@@ -81,7 +88,7 @@ impl Discovery for MiracastDiscovery {
                                 max_fps: Some(30),
                                 ..DeviceCapabilities::default()
                             },
-                            metadata: std::collections::HashMap::new(),
+                            metadata,
                         };
                         if tx
                             .send(DiscoveryEvent::DeviceFound(device))

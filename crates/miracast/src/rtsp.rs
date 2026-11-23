@@ -278,17 +278,27 @@ pub struct RtspFramed {
     reader: BufReader<tokio::io::ReadHalf<TcpStream>>,
     writer: tokio::io::WriteHalf<TcpStream>,
     outgoing_cseq: u32,
+    peer_addr: std::net::SocketAddr,
 }
 
 impl RtspFramed {
     #[must_use]
     pub fn new(stream: TcpStream) -> Self {
+        let peer_addr = stream
+            .peer_addr()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("fallback"));
         let (r, w) = tokio::io::split(stream);
         Self {
             reader: BufReader::new(r),
             writer: w,
             outgoing_cseq: 0,
+            peer_addr,
         }
+    }
+
+    #[must_use]
+    pub const fn peer_addr(&self) -> std::net::SocketAddr {
+        self.peer_addr
     }
 
     /// Next CSeq to allocate for a message we initiate.

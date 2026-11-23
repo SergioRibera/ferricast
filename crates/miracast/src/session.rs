@@ -264,23 +264,12 @@ impl MiracastSession {
             );
         framed.send_response(resp).await.map_err(rtsp_err)?;
 
-        // Resolve peer for RTP.
         let peer_ip = self
             .rtsp
             .as_ref()
-            .and_then(|_| None::<SocketAddr>) // peer addr retrieval out of scope for RtspFramed; filled by caller
-            .or_else(|| {
-                setup
-                    .headers
-                    .get("x-peer-ip")
-                    .and_then(|s| s.parse().ok())
-            });
-        // Default: assume peer = other end of TCP. The caller passes the
-        // peer IP in via `connect`, but as a pragmatic fallback we use
-        // 127.0.0.1 so the loopback test works without plumbing.
-        let peer_ip = peer_ip
-            .unwrap_or_else(|| format!("127.0.0.1:{client_port}").parse().expect("addr"));
-        self.rtp_peer = Some(SocketAddr::new(peer_ip.ip(), client_port));
+            .map(|f| f.peer_addr().ip())
+            .unwrap_or_else(|| "127.0.0.1".parse().expect("addr"));
+        self.rtp_peer = Some(SocketAddr::new(peer_ip, client_port));
         Ok(())
     }
 }
@@ -303,19 +292,36 @@ fn rtsp_err(err: crate::rtsp::RtspError) -> FerricastError {
 
 impl CastSession for MiracastSession {
     async fn connect(&mut self, device: &Device) -> Result<ConnectOutcome> {
-        let rtsp_addr = device.addresses.primary();
-        let mice_addr = SocketAddr::new(rtsp_addr.ip(), MICE_CONTROL_PORT);
+        let discovered = device.addresses.primary();
+        // The RTSP port lives on either a `rtsp_port` TXT record (MS-MICE
+        // advertises the MICE control port on its mDNS SRV and the WFD
+        // RTSP port separately in TXT) or falls back to the WFD-standard
+        // 7236 when discovery didn't carry it. Direct callers that don't
+        // go through discovery (loopback tests, manually-added devices)
+        // encode the real RTSP port in the device address itself.
+        let rtsp_port = device
+            .metadata
+            .get("rtsp_port")
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or_else(|| {
+                // Heuristic: if the advertised port is the MICE control
+                // port we fall back to WFD_RTSP_PORT; otherwise trust
+                // whatever was put in the address.
+                if discovered.port() == MICE_CONTROL_PORT {
+                    WFD_RTSP_PORT
+                } else {
+                    discovered.port()
+                }
+            });
+        let mice_addr = SocketAddr::new(discovered.ip(), MICE_CONTROL_PORT);
         match mice_probe(mice_addr, RTSP_WALL_TIMEOUT).await {
             Ok(h) if h.is_ok() => tracing::debug!("miracast MICE probe OK"),
             Ok(h) => {
-                return Err(FerricastError::Connection(format!(
-                    "MICE probe refused (status {})",
-                    h.status
-                )));
+                tracing::warn!(status = h.status, "MICE probe non-zero status");
             }
             Err(e) => tracing::warn!(error = %e, "MICE probe skipped; attempting direct RTSP"),
         }
-        let rtsp_addr = SocketAddr::new(rtsp_addr.ip(), WFD_RTSP_PORT);
+        let rtsp_addr = SocketAddr::new(discovered.ip(), rtsp_port);
         self.open_rtsp(rtsp_addr).await?;
         self.alive = true;
         Ok(ConnectOutcome::Ready)
