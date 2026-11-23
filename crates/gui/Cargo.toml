@@ -92,8 +92,14 @@ async-trait.workspace = true
 # decoding later if we want — for now the receiver pipeline
 # pre-decodes via `ferricast-decoder::AacDecoder` and we push PCM.
 rodio = { version = "0.20", default-features = false, features = ["symphonia-aac"] }
+# Skia itself, for the YUVA texture upload Freya's engine re-export leaves
+# out. Same version and a subset of the features Freya enables on Linux, so
+# both resolve to the one prebuilt Skia.
+skia-safe = { version = "0.105.0-beta.3", package = "freya-skia-safe", default-features = false, features = ["gl", "vulkan"] }
 
 [dev-dependencies]
+# Headless Vulkan device for the receiver window's GPU video tests.
+ash = "0.38"
 # Scratch directories for the log rotation tests.
 tempfile = "3.27"
 # Paused-clock tests for the picker's daemon-call timeouts.

@@ -2078,12 +2078,14 @@ name = "ferricast-gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
  "async-trait",
  "bytes",
  "clap",
  "ferricast",
  "ferricast-dbus",
  "freya",
+ "freya-skia-safe",
  "futures-util",
  "rodio",
  "rustls",

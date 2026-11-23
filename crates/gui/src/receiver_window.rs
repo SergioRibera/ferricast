@@ -3,12 +3,13 @@
 //! Three subsystems work together:
 //!
 //! 1. [`WindowSink`] — the [`FrameSink`] the manager pipeline pipes
-//!    decoded frames into. It splits the stream: BGRA video frames
-//!    go to a video mpsc; PCM s16le audio goes to an audio mpsc.
+//!    decoded frames into. It asks the decoders for NV12 and splits
+//!    the stream: video frames go to a video mpsc; PCM s16le audio
+//!    goes to an audio mpsc.
 //! 2. [`ReceiverWindowApp`] — the Freya `App` that owns the audio
 //!    output (rodio `Sink` over PipeWire), the latest video frame
-//!    slot, and a [`canvas`] element that blits the latest decoded
-//!    frame using Skia each render pass.
+//!    slot, and a render callback that draws that frame with Skia
+//!    each render pass.
 //! 3. Window opener ([`open_receiver_window`]) — wires the rx ends
 //!    into the App and calls `Platform::launch_window`.
 //!
@@ -19,28 +20,26 @@
 //! rodio's decode path today — it's there to keep the door open for
 //! a future "skip the decoder, feed rodio ADTS directly" shortcut.
 //!
-//! Video render uses Freya's [`canvas`] which exposes a Skia
-//! `SkCanvas` per render. We build a raster `SkImage` wrapping the
-//! latest BGRA buffer and draw it scaled to the canvas area. Skia
-//! does the resampling on whatever backend (Vulkan / OpenGL) the
-//! window happens to be running on.
+//! Video drawing lives in [`video`]: the YCbCr → RGB conversion and
+//! the scaling to the window both run on the GPU.
+
+mod video;
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use ferricast::{
-    AudioCodec, CapturedFrame, Codec, DecodedAudio, FerricastError, FrameSink, MediaInfo,
-    PixelFormat, RemoteSender, Result,
-};
-use freya::engine::prelude::{
-    AlphaType, ColorType, Data, ISize, ImageInfo, Paint, SamplingOptions, raster_from_data,
+    AudioCodec, CapturedFrame, Codec, DecodedAudio, FrameSink, MediaInfo, PixelFormat,
+    RemoteSender, Result,
 };
 use freya::prelude::*;
 use freya::winit::window::WindowLevel;
 use tokio::sync::mpsc;
+
+pub use video::VideoFrame;
+use video::{FrameSlot, VideoRenderer};
 
 /// Frame counters surfaced to the receiver-side telemetry — kept
 /// public because `main.rs` collects them across active sessions
@@ -126,27 +125,6 @@ impl ReceiverCounters {
             .store(self.audio_queued.load(Ordering::Relaxed), Ordering::Relaxed);
         self.audio_flushed.notify_one();
     }
-}
-
-/// Cross-thread payload for one decoded video frame. Skia images
-/// can't be `Send` across thread boundaries in all configurations,
-/// so we ship raw bytes + dims and reconstruct the `SkImage` inside
-/// the render closure on the Freya thread.
-#[derive(Clone, Debug)]
-pub struct VideoFrame {
-    pub width: u32,
-    pub height: u32,
-    /// Tightly packed BGRA8888 — what openh264's CPU path emits
-    /// after we swap R↔B in `OpenH264Decoder::decode`. When a GPU
-    /// decoder lands and produces `CapturedFrame::Gpu` (DMA-BUF),
-    /// the sink readbacks here too — the canvas only knows about
-    /// the CPU shape.
-    pub bgra: Bytes,
-    pub stride: u32,
-    /// Presentation timestamp. The pipeline already delivers each
-    /// frame at its presentation time, so the window shows frames as
-    /// they arrive; the PTS is kept for diagnostics.
-    pub pts_us: u64,
 }
 
 /// Cross-thread payload for one decoded audio buffer. Already s16
@@ -292,34 +270,23 @@ impl StereoDownmix {
 
 #[async_trait::async_trait]
 impl FrameSink for WindowSink {
+    fn video_format(&self) -> PixelFormat {
+        // The window converts YCbCr on the GPU.
+        PixelFormat::Nv12
+    }
+
     async fn push_video(&mut self, frame: CapturedFrame) -> Result<()> {
-        let raw = frame.into_cpu()?;
-        if raw.format != PixelFormat::Bgra {
-            // Future GPU decoders may emit NV12; convert there when
-            // they land. The openh264 path always produces BGRA so
-            // we don't carry a conversion table here yet.
-            return Err(FerricastError::Decode(format!(
-                "WindowSink: expected BGRA frame, got {:?}",
-                raw.format
-            )));
-        }
+        let frame = VideoFrame::try_from(frame.into_cpu()?)?;
         let n = self.counters.video_frames.fetch_add(1, Ordering::Relaxed) + 1;
         if n.is_multiple_of(120) {
             tracing::debug!(
                 receiver = %self.label,
                 count = n,
-                width = raw.width,
-                height = raw.height,
+                width = frame.width,
+                height = frame.height,
                 "WindowSink: video"
             );
         }
-        let frame = VideoFrame {
-            width: raw.width,
-            height: raw.height,
-            stride: raw.stride,
-            pts_us: raw.timestamp_us,
-            bgra: raw.data,
-        };
         // try_send drops on backpressure: a frame older than the
         // newest in flight is useless for display anyway, and
         // blocking the decoder would back-pressure into the puller
@@ -434,14 +401,14 @@ impl App for ReceiverWindowApp {
         let counters = self.counters.clone();
 
         // Shared video slot: the drain task writes the most recent
-        // frame, the canvas closure reads it and draws. Stored in
+        // frame, the render callback reads it and draws. Stored in
         // `use_hook` so the same Arc is returned on every render
         // pass — if we allocate a fresh slot each render the task
-        // keeps writing to the first-render slot while the canvas
+        // keeps writing to the first-render slot while the callback
         // reads from the current-render slot (always None).
-        // `StdMutex` because the canvas closure runs sync on the
+        // `StdMutex` because the render callback runs sync on the
         // Freya render thread.
-        let video_slot = use_hook(|| Arc::new(StdMutex::new(None::<VideoFrame>)));
+        let video_slot = use_hook(|| Arc::new(StdMutex::new(FrameSlot::default())));
 
         // Tick signal: drain task increments per video frame. The
         // render() body reads it so Freya schedules a redraw on
@@ -472,7 +439,7 @@ impl App for ReceiverWindowApp {
                     while let Some(frame) = rx.recv().await {
                         tracing::trace!(pts_us = frame.pts_us, "receiver window: frame");
                         if let Ok(mut g) = slot.lock() {
-                            *g = Some(frame);
+                            g.replace(frame);
                         }
                         *tick.write() += 1;
                     }
@@ -597,46 +564,19 @@ impl App for ReceiverWindowApp {
             .unwrap_or_else(|| "no audio".to_string());
 
         let audio_only = info.video.is_none();
+        // One renderer per window, kept across renders so a frame is
+        // uploaded once however often the window redraws.
         let render_slot = video_slot.clone();
-        let on_render = RenderCallback::new(move |ctx| {
-            let Ok(g) = render_slot.lock() else { return };
-            let Some(frame) = g.as_ref() else { return };
-            // Build a raster SkImage that wraps the bytes — Skia
-            // copies into its own surface on draw, so we don't have
-            // to keep the bytes alive past this closure call.
-            let info = ImageInfo::new(
-                ISize::new(frame.width as i32, frame.height as i32),
-                ColorType::BGRA8888,
-                AlphaType::Premul,
-                None,
-            );
-            let data = Data::new_copy(&frame.bgra);
-            let Some(image) = raster_from_data(&info, data, frame.stride as usize) else {
-                return;
-            };
-            // Use the visible-area dimensions Freya gave us; the
-            // canvas() layout determines the rect. We scale-to-fit
-            // letterbox-style by computing the largest src→dst
-            // aspect-preserving rectangle.
-            let RenderTarget::Background { canvas, .. } = &ctx.target else {
-                return;
-            };
-            let dst = aspect_fit(
-                ctx.size.width,
-                ctx.size.height,
-                frame.width as f32,
-                frame.height as f32,
-            );
-            let paint = Paint::default();
-            canvas.draw_image_rect_with_sampling_options(
-                &image,
-                None,
-                freya::engine::prelude::SkRect::new(dst.0, dst.1, dst.0 + dst.2, dst.1 + dst.3),
-                SamplingOptions::default(),
-                &paint,
-            );
+        let on_render = use_hook(move || {
+            let mut renderer = VideoRenderer::default();
+            RenderCallback::new(move |ctx| {
+                let RenderTarget::Background { canvas, .. } = &ctx.target else {
+                    return;
+                };
+                let Ok(slot) = render_slot.lock() else { return };
+                renderer.draw(canvas, &slot, ctx.size.width, ctx.size.height);
+            })
         });
-
         rect()
             .expanded()
             .background((10, 10, 14))
@@ -688,25 +628,6 @@ impl App for ReceiverWindowApp {
                     ),
             )
     }
-}
-
-/// Aspect-fit `src` into `dst`, return `(x, y, w, h)` of the inset
-/// rectangle. Used by the canvas closure to letterbox the decoded
-/// frame inside the visible-area Freya measured for the canvas.
-fn aspect_fit(dst_w: f32, dst_h: f32, src_w: f32, src_h: f32) -> (f32, f32, f32, f32) {
-    if src_w <= 0.0 || src_h <= 0.0 || dst_w <= 0.0 || dst_h <= 0.0 {
-        return (0.0, 0.0, 0.0, 0.0);
-    }
-    let src_aspect = src_w / src_h;
-    let dst_aspect = dst_w / dst_h;
-    let (w, h) = if src_aspect > dst_aspect {
-        (dst_w, dst_w / src_aspect)
-    } else {
-        (dst_h * src_aspect, dst_h)
-    };
-    let x = (dst_w - w) / 2.0;
-    let y = (dst_h - h) / 2.0;
-    (x, y, w, h)
 }
 
 /// Launch a top-level receiver window. Returns the window id so the
