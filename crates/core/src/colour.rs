@@ -71,7 +71,8 @@ impl YuvColour {
         width: usize,
         height: usize,
     ) -> Option<Vec<u8>> {
-        let mut out = Vec::new();
+        // `vec!` of zeros comes from calloc, which skips the memset.
+        let mut out = vec![0; width.checked_mul(height)?.checked_mul(4)?];
         self.nv12_to_bgra_into(data, stride, (width, height), &mut out)?;
         Some(out)
     }
@@ -89,8 +90,16 @@ impl YuvColour {
         let [gain, cr_r, cb_g, cr_g, cb_b] = self.coefficients();
         let black = if self.full_range { 0 } else { 16 };
         let (luma, chroma) = data.split_at_checked(stride.checked_mul(height)?)?;
-        out.clear();
-        out.resize(width.checked_mul(height)?.checked_mul(4)?, 0);
+        if width == 0 {
+            return None;
+        }
+        let len = width.checked_mul(height)?.checked_mul(4)?;
+        // Every byte is written below, so a buffer of the right size
+        // is not cleared first.
+        if out.len() != len {
+            out.clear();
+            out.resize(len, 0);
+        }
         for (row, line) in out.chunks_exact_mut(width * 4).enumerate() {
             let luma_row = luma.get(row * stride..)?.get(..width)?;
             let chroma_row = chroma.get(row / 2 * stride..)?.get(..stride)?;
