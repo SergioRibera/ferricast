@@ -30,6 +30,8 @@
 mod clock;
 mod latency;
 mod live;
+#[cfg(test)]
+mod live_tests;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
