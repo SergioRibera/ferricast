@@ -217,6 +217,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RtspServerConn<S> {
         Ok(())
     }
 
+    /// The connection itself, once it stops carrying requests (a reversed
+    /// connection). Bytes read past the last request are dropped.
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+
     pub async fn shutdown(&mut self) {
         let _ = self.stream.shutdown().await;
     }

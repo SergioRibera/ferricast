@@ -13,6 +13,8 @@ fairplay = ["dep:ferricast-fairplay"]
 
 [dependencies]
 ferricast-core.workspace = true
+# Plays the HLS URLs AirPlay video senders hand the receiver.
+ferricast-hls.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "rt", "macros"] }
 tracing.workspace = true
 thiserror.workspace = true

@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use ferricast_core::{
-    ControlSession, FerricastError, MediaCommand, PlaybackState, RemoteSender, Result,
+    ControlSession, FerricastError, MediaCommand, PlaybackState, PlaybackStatus, RemoteSender,
+    Result,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::{mpsc, oneshot};
@@ -24,6 +25,7 @@ use tracing::{debug, info, warn};
 
 use super::Settings;
 use super::connection::Connection;
+use super::video::{ReverseHub, VideoHub};
 
 /// Connections waiting to be accepted by the pipeline, at most.
 const READY_QUEUE: usize = 8;
@@ -33,13 +35,82 @@ const MAX_CONNECTIONS: usize = 32;
 const MAX_CONNECTIONS_PER_PEER: usize = 8;
 const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(50);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+/// Status reports queued for a connection; older ones are stale anyway.
+const STATUS_QUEUE: usize = 32;
 
 /// A connection handed to the pipeline.
 pub(super) struct Accepted {
     pub remote: RemoteSender,
     pub commands: mpsc::Receiver<MediaCommand>,
+    /// Where the pipeline reports playback status (AirPlay video
+    /// answers `/playback-info` and sends events from it).
+    pub status: mpsc::Sender<PlaybackStatus>,
     /// Dropped (or fired) to make the connection close.
     pub close: oneshot::Sender<()>,
+}
+
+/// The connection side of a session handed to the pipeline.
+pub(super) struct Promoted {
+    commands: mpsc::Sender<MediaCommand>,
+    close: oneshot::Receiver<()>,
+    status: mpsc::Receiver<PlaybackStatus>,
+}
+
+impl Promoted {
+    /// Hands a new session from `remote` to the pipeline.
+    pub async fn open(ready: &mpsc::Sender<Accepted>, remote: RemoteSender) -> Self {
+        let (commands_tx, commands_rx) = mpsc::channel(32);
+        let (close_tx, close_rx) = oneshot::channel();
+        let (status_tx, status_rx) = mpsc::channel(STATUS_QUEUE);
+        let accepted = Accepted {
+            remote,
+            commands: commands_rx,
+            status: status_tx,
+            close: close_tx,
+        };
+        if ready.send(accepted).await.is_err() {
+            warn!("AirPlay receiver stopped; the session goes nowhere");
+        }
+        Self {
+            commands: commands_tx,
+            close: close_rx,
+            status: status_rx,
+        }
+    }
+
+    pub async fn command(&self, cmd: MediaCommand) {
+        if self.commands.send(cmd).await.is_err() {
+            debug!("pipeline session gone; command dropped");
+        }
+    }
+}
+
+/// Resolves when the pipeline closes a promoted session.
+pub(super) async fn closed(promoted: &mut Option<Promoted>) {
+    match promoted {
+        Some(p) => {
+            let _ = (&mut p.close).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// What the pipeline did with a promoted session.
+pub(super) enum PipelineEvent {
+    Status(PlaybackStatus),
+    /// The pipeline closed the session.
+    Closed,
+}
+
+/// The next [`PipelineEvent`] of a promoted session.
+pub(super) async fn pipeline_event(promoted: &mut Option<Promoted>) -> PipelineEvent {
+    let Some(p) = promoted else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        Some(status) = p.status.recv() => PipelineEvent::Status(status),
+        _ = &mut p.close => PipelineEvent::Closed,
+    }
 }
 
 /// State shared by every connection of the receiver.
@@ -55,6 +126,10 @@ pub(super) struct Shared {
     /// Volume in the sender's dB scale (-144 mute, -30 to 0).
     volume_db: Mutex<f32>,
     next_id: AtomicU64,
+    /// Reverse (event) connections of video senders.
+    pub reverse: ReverseHub,
+    /// Video playbacks, by sender session.
+    pub videos: VideoHub,
 }
 
 impl Shared {
@@ -159,6 +234,8 @@ impl Server {
             paired: Mutex::new(std::collections::HashSet::new()),
             volume_db: Mutex::new(0.0),
             next_id: AtomicU64::new(1),
+            reverse: ReverseHub::default(),
+            videos: VideoHub::default(),
         });
         let (ready_tx, ready_rx) = mpsc::channel(READY_QUEUE);
         let acceptor = tokio::spawn(accept_loop(listener, shared, ready_tx));
@@ -230,8 +307,17 @@ impl ControlSession for AirPlayReceiverControl {
         }
     }
 
-    async fn report_state(&mut self, _state: PlaybackState) -> Result<()> {
-        // Mirroring has no status channel back to the sender.
+    async fn report_state(&mut self, state: PlaybackState) -> Result<()> {
+        self.report_status(PlaybackStatus::from(state)).await
+    }
+
+    /// Mirroring ignores it; a video session follows it to answer
+    /// `/playback-info` and send `/event`s. Never waits on the session: a
+    /// report finding the queue full is dropped.
+    async fn report_status(&mut self, status: PlaybackStatus) -> Result<()> {
+        if let Some(conn) = &self.conn {
+            let _ = conn.status.try_send(status);
+        }
         Ok(())
     }
 

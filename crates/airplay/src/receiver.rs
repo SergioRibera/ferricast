@@ -1,5 +1,6 @@
-//! AirPlay receiver: make this process an AirPlay screen-mirroring and
-//! audio target for iPhones, iPads, Macs and ferricast's own sender.
+//! AirPlay receiver: make this process an AirPlay screen-mirroring, audio
+//! and video target for iPhones, iPads, Macs, Android AirPlay apps and
+//! ferricast's own sender.
 //!
 //! It speaks the legacy AirPlay mirroring protocol of the open-source
 //! receivers (UxPlay, RPiPlay), which every Apple sender still uses with
@@ -13,8 +14,12 @@
 //!    audio (type 96) streams, volume, `TEARDOWN`.
 //! 3. The media connections the sender opens are received, decrypted and
 //!    handed to the pipeline as a [`ferricast_core::PushedStream`]
-//!    through [`ferricast_core::MediaCommand::Push`]; the
-//!    [`ferricast_core::ReceiverProtocol::Puller`] is never used.
+//!    through [`ferricast_core::MediaCommand::Push`].
+//! 4. AirPlay video (URL playback, the `uxplay -hls` protocol): `/play`
+//!    hands over a media URL, loaded through the pipeline like a Cast
+//!    LOAD (the HLS puller, or the demuxer for progressive files) and
+//!    driven with `/rate`, `/scrub`, `/stop` and `/playback-info`; state
+//!    changes go back as `/event`s over the `/reverse` connection.
 //!
 //! Every port is fixed (see [`AirPlayReceiverConfig`]) so a firewall rule
 //! can let senders in; `0` picks an ephemeral port instead.
@@ -28,6 +33,7 @@ mod mirror;
 mod pairing;
 mod rtsp;
 mod server;
+mod video;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -35,6 +41,7 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use ferricast_core::{
     AdvertiseInfo, Codec, DeviceCapabilities, FerricastError, H264Profile, ReceiverProtocol, Result,
 };
+use ferricast_hls::HlsPuller;
 
 pub use advertiser::AirPlayReceiverAdvertiser;
 pub use server::AirPlayReceiverControl;
@@ -48,8 +55,12 @@ const MODEL: &str = "AppleTV3,2";
 /// AirPlay server version announced (`srcvers`, `Server: AirTunes/…`).
 const SOURCE_VERSION: &str = "220.68";
 /// Feature bits 0-31 (UxPlay's set): mirroring, audio, FairPlay, legacy
-/// pairing, no AirPlay video (HLS).
+/// pairing.
 const FEATURES_LOW: u32 = 0x5A7F_FEE6;
+/// Feature bits 0 (`Video`) and 4 (`VideoHTTPLiveStreams`): URL playback
+/// (`POST /play`), what `uxplay -hls` adds. Senders that only send videos
+/// (not the screen) skip receivers without them.
+const FEATURES_VIDEO: u32 = (1 << 0) | (1 << 4);
 /// Feature bit 42 (`SupportsScreenMultiCodec`, in the high word) lets
 /// senders mirror in HEVC.
 const FEATURE_SCREEN_MULTI_CODEC: u32 = 1 << (42 - 32);
@@ -99,6 +110,9 @@ pub struct AirPlayReceiverConfig {
     pub require_pin: bool,
     /// Accept HEVC mirroring (advertises feature bit 42).
     pub hevc: bool,
+    /// Play the media URLs senders hand over (AirPlay video: `/play`,
+    /// advertises feature bits 0 and 4). On by default.
+    pub video: bool,
     /// Display size and refresh rate offered to senders.
     pub width: u32,
     pub height: u32,
@@ -118,6 +132,7 @@ impl Default for AirPlayReceiverConfig {
             timing_port: 7011,
             require_pin: false,
             hevc: false,
+            video: true,
             width: 1920,
             height: 1080,
             max_fps: 60,
@@ -195,7 +210,12 @@ impl Settings {
         } else {
             0
         };
-        (FEATURES_LOW, high)
+        let low = if self.config.video {
+            FEATURES_LOW | FEATURES_VIDEO
+        } else {
+            FEATURES_LOW
+        };
+        (low, high)
     }
 
     fn features_txt(&self) -> String {
@@ -321,34 +341,13 @@ impl AirPlayReceiver {
     }
 }
 
-/// Never used: AirPlay media is pushed through
-/// [`ferricast_core::MediaCommand::Push`]. Fails if asked to open a URL.
-pub struct NoPuller;
-
-impl ferricast_core::MediaPuller for NoPuller {
-    async fn open(&mut self, _spec: ferricast_core::PullSpec) -> Result<ferricast_core::MediaInfo> {
-        Err(FerricastError::Pull(
-            "the AirPlay receiver does not pull URLs".into(),
-        ))
-    }
-    async fn next(&mut self) -> Result<ferricast_core::MediaPacket> {
-        Err(FerricastError::Pull("nothing to pull".into()))
-    }
-    async fn seek(&mut self, _position_us: u64) -> Result<()> {
-        Err(FerricastError::Pull("nothing to seek".into()))
-    }
-    async fn close(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
 impl ReceiverProtocol for AirPlayReceiver {
     const PROTOCOL: &'static str = "airplay";
     const SUPPORTED_CODECS: &'static [Codec] = &[Codec::H264, Codec::H265];
 
     type Advertiser = AirPlayReceiverAdvertiser;
     type Control = AirPlayReceiverControl;
-    type Puller = NoPuller;
+    type Puller = HlsPuller;
 
     fn create_advertiser(&self) -> Self::Advertiser {
         AirPlayReceiverAdvertiser::new(self.settings.clone(), self.server.clone())
@@ -361,7 +360,7 @@ impl ReceiverProtocol for AirPlayReceiver {
     }
 
     fn create_puller(&self) -> Result<Self::Puller> {
-        Ok(NoPuller)
+        Ok(HlsPuller::new())
     }
 
     fn advertise_info(&self) -> AdvertiseInfo {
@@ -412,11 +411,12 @@ mod tests {
                 .find(|(key, _)| *key == k)
                 .map(|(_, v)| v.clone())
         };
-        assert_eq!(get(&txt, "features").as_deref(), Some("0x5A7FFEE6,0x0"));
+        assert_eq!(get(&txt, "features").as_deref(), Some("0x5A7FFEF7,0x0"));
         assert_eq!(get(&txt, "pw").as_deref(), Some("false"));
         assert_eq!(get(&txt, "deviceid").unwrap().len(), 17);
         config.require_pin = true;
         config.hevc = true;
+        config.video = false;
         let r = AirPlayReceiver::new(config).await;
         let raop = r.settings.raop_txt();
         assert_eq!(get(&raop, "sf").as_deref(), Some("0x8c"));

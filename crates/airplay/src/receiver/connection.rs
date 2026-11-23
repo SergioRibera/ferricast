@@ -1,6 +1,8 @@
 //! One RTSP control connection: answers the sender's requests, sets up
 //! the media streams it asks for and feeds the pipeline.
 
+mod video;
+
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +12,7 @@ use ferricast_core::{
 };
 use plist::{Dictionary, Value};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -20,7 +22,8 @@ use super::audio::{AudioFormat, AudioReceiver, PayloadDecipher};
 use super::clock::{RemoteClock, TimingClient};
 use super::pairing::{Pairing, random_pin};
 use super::rtsp::{Request, Response, RtspServerConn};
-use super::server::{Accepted, Shared};
+use super::server::{Accepted, Promoted, Shared, closed};
+use super::video::VideoHandle;
 use super::{MODEL, SOURCE_VERSION, txt_bytes};
 use crate::crypto::sha512_16;
 use crate::store::PairedSender;
@@ -40,12 +43,6 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MEDIA_QUEUE: usize = 256;
 /// UUID UxPlay reports for its one display.
 const DISPLAY_UUID: &str = "e0ff8a27-6738-3d56-8a16-cc53aacee925";
-
-/// The pipeline side of a promoted connection.
-struct Promoted {
-    commands: mpsc::Sender<MediaCommand>,
-    close: oneshot::Receiver<()>,
-}
 
 /// Media streams of the connection, torn down when dropped.
 struct Media {
@@ -96,12 +93,17 @@ pub(super) struct Connection {
     assembler: Assembler,
     media_tx: mpsc::Sender<MediaEvent>,
     media_rx: mpsc::Receiver<MediaEvent>,
+    /// The video session of the sender, once it sent a video request.
+    video: Option<VideoHandle>,
 }
 
 /// Whether the loop goes on after a request.
 enum Next {
     Continue,
     Close,
+    /// The sender reversed the connection (`POST /reverse`) for the
+    /// events of this session key.
+    Reverse(String),
 }
 
 fn plist_body(dict: Dictionary) -> Result<Vec<u8>> {
@@ -198,17 +200,20 @@ impl Connection {
             assembler: Assembler::default(),
             media_tx,
             media_rx,
+            video: None,
         }
     }
 
     pub async fn run(mut self, stream: TcpStream) {
         let mut rtsp = RtspServerConn::new(stream);
         let mut idle_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+        let mut reversed = None;
         loop {
             let deadline = self.assembler.deadline();
             // Only a connection without a session can idle out: one
-            // with media keeps streaming while the sender sends nothing.
-            let can_idle = self.promoted.is_none() && self.media.is_none();
+            // with media keeps streaming while the sender sends nothing, and
+            // a paused video may go unpolled.
+            let can_idle = self.promoted.is_none() && self.media.is_none() && self.video.is_none();
             tokio::select! {
                 () = tokio::time::sleep_until(idle_deadline), if can_idle => {
                     debug!(peer = %self.peer, "AirPlay control connection idle; closing");
@@ -236,8 +241,14 @@ impl Connection {
                         debug!(error = %e, "AirPlay response failed");
                         break;
                     }
-                    if response.close || matches!(next, Next::Close) {
-                        break;
+                    match next {
+                        _ if response.close => break,
+                        Next::Close => break,
+                        Next::Reverse(key) => {
+                            reversed = Some(key);
+                            break;
+                        }
+                        Next::Continue => {}
                     }
                 }
                 Some(event) = self.media_rx.recv() => {
@@ -265,8 +276,17 @@ impl Connection {
         if self.pin_shown {
             self.command(MediaCommand::PairingPin(None)).await;
         }
-        rtsp.shutdown().await;
-        debug!(peer = %self.peer, "AirPlay control connection closed");
+        match reversed {
+            Some(key) => {
+                let shared = self.shared.clone();
+                drop(self);
+                shared.reverse.serve(&key, rtsp.into_inner()).await;
+            }
+            None => {
+                rtsp.shutdown().await;
+                debug!(peer = %self.peer, "AirPlay control connection closed");
+            }
+        }
     }
 
     /// Hand the connection to the pipeline, once.
@@ -274,32 +294,18 @@ impl Connection {
         if self.promoted.is_some() {
             return;
         }
-        let (commands_tx, commands_rx) = mpsc::channel(32);
-        let (close_tx, close_rx) = oneshot::channel();
-        let accepted = Accepted {
-            remote: RemoteSender {
-                id: Uuid::new_v4(),
-                addr: self.peer.ip(),
-                name: self.name.clone(),
-            },
-            commands: commands_rx,
-            close: close_tx,
+        let remote = RemoteSender {
+            id: Uuid::new_v4(),
+            addr: self.peer.ip(),
+            name: self.name.clone(),
         };
-        if self.ready.send(accepted).await.is_err() {
-            warn!("AirPlay receiver stopped; the session goes nowhere");
-        }
-        self.promoted = Some(Promoted {
-            commands: commands_tx,
-            close: close_rx,
-        });
+        self.promoted = Some(Promoted::open(&self.ready, remote).await);
     }
 
     async fn command(&mut self, cmd: MediaCommand) {
         self.promote().await;
-        if let Some(p) = &self.promoted
-            && p.commands.send(cmd).await.is_err()
-        {
-            debug!("pipeline session gone; command dropped");
+        if let Some(p) = &self.promoted {
+            p.command(cmd).await;
         }
     }
 
@@ -308,6 +314,9 @@ impl Connection {
     }
 
     async fn handle(&mut self, request: &Request) -> (Response, Next) {
+        if let Some(handled) = self.handle_video(request).await {
+            return handled;
+        }
         let result = match (request.method.as_str(), request.path()) {
             ("GET", "/info") => Ok(self.info(request)),
             ("POST", "/pair-setup") => self.pair_setup(request).await,
@@ -876,16 +885,6 @@ impl Connection {
 async fn sleep_until(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(d) => tokio::time::sleep_until(d).await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Resolves when the pipeline closes a promoted connection.
-async fn closed(promoted: &mut Option<Promoted>) {
-    match promoted {
-        Some(p) => {
-            let _ = (&mut p.close).await;
-        }
         None => std::future::pending().await,
     }
 }
