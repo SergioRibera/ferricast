@@ -21,6 +21,7 @@
 //! stalls and timestamp jumps.
 
 mod clock;
+mod latency;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -35,6 +36,7 @@ use ferricast_core::{
 
 use super::{ErasedAudioDecoder, ErasedPuller, ErasedVideoDecoder};
 use clock::Clock;
+use latency::{Kind, LatencyMeter, Stage};
 
 /// Audio queued ahead of its presentation time; also the start-up
 /// delay of every timeline.
@@ -99,8 +101,8 @@ pub(super) enum Timeline {
 pub(super) async fn run(parts: PumpParts, cmd_rx: mpsc::Receiver<PumpCmd>) -> PumpEnd {
     let mut pump = Pump {
         puller: parts.puller,
-        video: parts.video_dec.map(Stream::new),
-        audio: parts.audio_dec.map(Stream::new),
+        video: parts.video_dec.map(|d| Stream::new(d, Kind::Video)),
+        audio: parts.audio_dec.map(|d| Stream::new(d, Kind::Audio)),
         sink: parts.sink,
         cmd_rx,
         playing: parts.playing,
@@ -109,6 +111,7 @@ pub(super) async fn run(parts: PumpParts, cmd_rx: mpsc::Receiver<PumpCmd>) -> Pu
         audio_primed: false,
         input: Input::Open,
         late_drops: 0,
+        meter: (parts.timeline == Timeline::Live).then(LatencyMeter::default),
     };
     if let Err(e) = pump.sink.set_volume(parts.gain).await {
         tracing::warn!(%e, "pump: sink.set_volume failed");
@@ -224,6 +227,7 @@ impl Decode for Box<dyn ErasedAudioDecoder> {
 /// output waiting for its turn (in presentation order).
 struct Stream<D: Decode> {
     decoder: D,
+    kind: Kind,
     packets: VecDeque<D::Packet>,
     ready: VecDeque<D::Output>,
     /// Output before this timestamp is decode-only (see
@@ -232,9 +236,10 @@ struct Stream<D: Decode> {
 }
 
 impl<D: Decode> Stream<D> {
-    fn new(decoder: D) -> Self {
+    fn new(decoder: D, kind: Kind) -> Self {
         Self {
             decoder,
+            kind,
             packets: VecDeque::new(),
             ready: VecDeque::new(),
             present_from: None,
@@ -242,13 +247,13 @@ impl<D: Decode> Stream<D> {
     }
 
     /// Decodes queued packets until an output is ready.
-    fn fill(&mut self) {
+    fn fill(&mut self, meter: &mut Option<LatencyMeter>) {
         while self.ready.is_empty() {
             let Some(packet) = self.packets.pop_front() else {
                 return;
             };
             match self.decoder.decode(packet) {
-                Ok(Some(out)) => self.accept(out),
+                Ok(Some(out)) => self.accept(out, meter),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(%e, "pump: decode failed"),
             }
@@ -256,26 +261,29 @@ impl<D: Decode> Stream<D> {
     }
 
     /// Moves everything the decoder still buffers into `ready`.
-    fn drain(&mut self) {
+    fn drain(&mut self, meter: &mut Option<LatencyMeter>) {
         while let Some(packet) = self.packets.pop_front() {
             match self.decoder.decode(packet) {
-                Ok(Some(out)) => self.accept(out),
+                Ok(Some(out)) => self.accept(out, meter),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(%e, "pump: decode failed"),
             }
         }
         for out in self.decoder.flush() {
-            self.accept(out);
+            self.accept(out, meter);
         }
     }
 
     /// Queues decoded output for presentation, minus any decode-only
     /// part.
-    fn accept(&mut self, out: D::Output) {
+    fn accept(&mut self, out: D::Output, meter: &mut Option<LatencyMeter>) {
         let out = match self.present_from {
             Some(from_us) => D::trim(out, from_us),
             None => Some(out),
         };
+        if let (Some(meter), Some(out)) = (meter.as_mut(), out.as_ref()) {
+            meter.record(self.kind, Stage::Decoded, D::pts_us(out), Duration::ZERO);
+        }
         self.ready.extend(out);
     }
 
@@ -307,12 +315,6 @@ enum Flow {
     Exit(PumpEnd),
 }
 
-#[derive(Clone, Copy)]
-enum Which {
-    Video,
-    Audio,
-}
-
 struct Pump {
     puller: Box<dyn ErasedPuller>,
     video: Option<Stream<Box<dyn ErasedVideoDecoder>>>,
@@ -326,16 +328,19 @@ struct Pump {
     audio_primed: bool,
     input: Input,
     late_drops: u64,
+    /// Capture-to-output latency, for live streams (their timestamps
+    /// are on the local wall clock).
+    meter: Option<LatencyMeter>,
 }
 
 impl Pump {
     async fn run(&mut self) -> PumpEnd {
         loop {
             if let Some(v) = self.video.as_mut() {
-                v.fill();
+                v.fill(&mut self.meter);
             }
             if let Some(a) = self.audio.as_mut() {
-                a.fill();
+                a.fill(&mut self.meter);
             }
             let video_ready = self.video.as_ref().map(|s| !s.ready.is_empty());
             let audio_ready = self.audio.as_ref().map(|s| !s.ready.is_empty());
@@ -396,11 +401,17 @@ impl Pump {
     fn on_packet(&mut self, packet: ferricast_core::Result<MediaPacket>) -> Option<PumpEnd> {
         match packet {
             Ok(MediaPacket::Video(f)) => {
+                if let Some(meter) = self.meter.as_mut() {
+                    meter.record(Kind::Video, Stage::Arrival, f.timestamp_us, Duration::ZERO);
+                }
                 if let Some(v) = self.video.as_mut() {
                     v.packets.push_back(f);
                 }
             }
             Ok(MediaPacket::Audio(a)) => {
+                if let Some(meter) = self.meter.as_mut() {
+                    meter.record(Kind::Audio, Stage::Arrival, a.timestamp_us, Duration::ZERO);
+                }
                 if let Some(s) = self.audio.as_mut() {
                     s.packets.push_back(a);
                 }
@@ -433,10 +444,10 @@ impl Pump {
 
     fn drain_decoders(&mut self) {
         if let Some(v) = self.video.as_mut() {
-            v.drain();
+            v.drain(&mut self.meter);
         }
         if let Some(a) = self.audio.as_mut() {
-            a.drain();
+            a.drain(&mut self.meter);
         }
     }
 
@@ -456,7 +467,7 @@ impl Pump {
     }
 
     /// The earliest due item, anchoring the timeline if needed.
-    fn next_due(&mut self) -> Option<(Instant, Which)> {
+    fn next_due(&mut self) -> Option<(Instant, Kind)> {
         let video_pts = self.video.as_ref().and_then(Stream::front_pts);
         let audio_pts = self.audio.as_ref().and_then(Stream::front_pts);
         let now = Instant::now();
@@ -464,10 +475,10 @@ impl Pump {
             let first = video_pts.into_iter().chain(audio_pts).min()?;
             self.clock.anchor_at(first, now);
         }
-        let video = video_pts.map(|p| (self.clock.due(p, now), Which::Video));
+        let video = video_pts.map(|p| (self.clock.due(p, now), Kind::Video));
         let audio = audio_pts.map(|p| {
             let due = self.clock.due(p, now);
-            (due.checked_sub(AUDIO_LEAD).unwrap_or(due), Which::Audio)
+            (due.checked_sub(AUDIO_LEAD).unwrap_or(due), Kind::Audio)
         });
         match (video, audio) {
             (Some(v), Some(a)) => Some(if a.0 <= v.0 { a } else { v }),
@@ -518,10 +529,10 @@ impl Pump {
 
     /// Pushes the front item of `which`, or drops it when it is too
     /// late to be worth showing.
-    async fn present(&mut self, which: Which) {
+    async fn present(&mut self, which: Kind) {
         let lateness = |due: Instant| Instant::now().saturating_duration_since(due);
         match which {
-            Which::Video => {
+            Kind::Video => {
                 let Some(stream) = self.video.as_mut() else {
                     return;
                 };
@@ -538,14 +549,20 @@ impl Pump {
                 }
                 if late > MAX_VIDEO_LATENESS {
                     self.late_drops += 1;
+                    if let Some(meter) = self.meter.as_mut() {
+                        meter.stale(Kind::Video);
+                    }
                     return;
                 }
                 self.position.presented(pts, Duration::ZERO);
+                if let Some(meter) = self.meter.as_mut() {
+                    meter.record(Kind::Video, Stage::Output, pts, Duration::ZERO);
+                }
                 if let Err(e) = self.sink.push_video(frame).await {
                     tracing::warn!(%e, "pump: sink.push_video failed");
                 }
             }
-            Which::Audio => {
+            Kind::Audio => {
                 let Some(stream) = self.audio.as_mut() else {
                     return;
                 };
@@ -573,6 +590,15 @@ impl Pump {
                 }
                 if self.video.is_none() {
                     self.position.presented(pcm.timestamp_us, AUDIO_LEAD);
+                }
+                if let Some(meter) = self.meter.as_mut() {
+                    // Heard once what the sink holds has played, or, when
+                    // it cannot tell, at its presentation time.
+                    let ahead = self
+                        .sink
+                        .audio_backlog()
+                        .unwrap_or_else(|| due.saturating_duration_since(now));
+                    meter.record(Kind::Audio, Stage::Output, pcm.timestamp_us, ahead);
                 }
                 if let Err(e) = self.sink.push_audio(pcm).await {
                     tracing::warn!(%e, "pump: sink.push_audio failed");
