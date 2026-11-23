@@ -197,3 +197,20 @@ opt-level = 3
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
+
+# The receiver decodes, decrypts (AirPlay AES-CTR), colour-converts (core,
+# for sinks that want RGB) and paces 1080p60 video in these crates; at
+# opt-level 0 they cannot keep up and debug builds drop frames release builds
+# show. Dependencies are built once and rarely rebuilt, so optimising them
+# costs little. The GUI crate stays unoptimised: it only hands the frames to
+# Skia, which converts and scales them on the GPU.
+[profile.dev.package."*"]
+opt-level = 2
+[profile.dev.package.ferricast-core]
+opt-level = 3
+[profile.dev.package.ferricast]
+opt-level = 3
+[profile.dev.package.ferricast-decoder]
+opt-level = 3
+[profile.dev.package.ferricast-airplay]
+opt-level = 3
