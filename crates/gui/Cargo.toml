@@ -20,6 +20,7 @@ default = [
     "openh264",
     "vaapi",
     "nvenc",
+    "nvdec",
     "aac",
     "airplay",
     "fdk-aac",
@@ -41,6 +42,7 @@ pipewire = ["ferricast/pipewire"]
 openh264 = ["ferricast/openh264"]
 vaapi = ["ferricast/vaapi"]
 nvenc = ["ferricast/nvenc"]
+nvdec = ["ferricast/nvdec"]
 aac = ["ferricast/aac"]
 # Software decoders for progressive media in receiver windows.
 hevc-decode = ["ferricast/hevc-decode"]

@@ -64,6 +64,7 @@ default = [
     "openh264",
     "vaapi",
     "nvenc",
+    "nvdec",
     "aac",
     "airplay",
     "fdk-aac",
@@ -100,6 +101,10 @@ pipewire = ["ferricast-capture/pipewire"]
 openh264 = ["ferricast-encoder/x264", "ferricast-decoder/openh264-decode"]
 vaapi = ["ferricast-encoder/vaapi", "ferricast-decoder/vaapi-decode"]
 nvenc = ["ferricast-encoder/nvenc"]
+# NVIDIA hardware decode for receivers. CUDA is loaded at runtime, so the
+# build needs no NVIDIA SDK; without a GPU the decoders fall back to VA-API
+# or software.
+nvdec = ["ferricast-decoder/nvdec-decode", "ferricast-decoder/nvdec-hevc-decode"]
 nvenc-zero-copy = ["ferricast-encoder/nvenc-zero-copy", "nvenc"]
 # Pure-Rust AAC decode for receivers. CPU only (no consumer driver
 # does hardware AAC); plenty fast for one stream. Default on so
