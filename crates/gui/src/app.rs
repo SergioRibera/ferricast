@@ -312,7 +312,7 @@ pub struct FerricastApp {
 impl App for FerricastApp {
     fn render(&self) -> impl IntoElement {
         let stream_manager = self.stream_manager.clone();
-        use_share_radio(move || self.radio_station);
+        use_provide_context(|| self.radio_station);
 
         let devices_radio = use_radio::<AppState, AppChannel>(AppChannel::Devices);
         let streaming_radio = use_radio::<AppState, AppChannel>(AppChannel::Streaming);
@@ -429,7 +429,6 @@ impl App for FerricastApp {
                                         key: DiffKey::default(),
                                     }
                                     .key(device_id)
-                                    .into()
                                 })),
                         )
                     }),
@@ -442,7 +441,7 @@ impl App for FerricastApp {
                     .spacing(6.)
                     .children(notices.into_iter().map(|notice| {
                         let id = notice.id;
-                        notice_banner(notice, move || notices_radio.write().dismiss(id)).into()
+                        notice_banner(notice, move || notices_radio.write().dismiss(id))
                     }))
             }))
     }
@@ -560,7 +559,7 @@ struct DeviceCard {
 }
 
 impl KeyExt for DeviceCard {
-    fn write_key(&mut self) -> &mut DiffKey {
+    fn key_mut(&mut self) -> &mut DiffKey {
         &mut self.key
     }
 }
@@ -606,7 +605,9 @@ impl Component for DeviceCard {
             _ => ((28, 28, 38), (50, 50, 65)),
         };
 
-        let icon = svg(self.device.protocol_icon.clone())
+        let icon = SvgViewer::new(self.device.protocol_icon.clone())
+            .show_loader(false)
+            .error_renderer(|_| rect().width(Size::px(36.)).height(Size::px(36.)).into())
             .width(Size::px(36.))
             .height(Size::px(36.));
         let icon = if self.device.protocol == "chromecast" {

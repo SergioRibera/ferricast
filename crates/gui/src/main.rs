@@ -363,7 +363,7 @@ fn run_window(
 
     launch(
         LaunchConfig::new()
-            .with_future(move |proxy| async move {
+            .with_task(move |proxy| async move {
                 // Two concurrent jobs on the Freya local runtime:
                 // - drain the manager-events channel into the radio
                 //   station so the device list updates live;

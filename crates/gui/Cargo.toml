@@ -80,7 +80,7 @@ zbus.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 
-freya = { version = "0.4.0-rc.19", features = ["icons", "router", "radio", "engine"] }
+freya = { version = "0.6.0-alpha.2", features = ["icons", "router", "radio", "engine"] }
 rustls = { version = "0.23", features = ["ring"] }
 anyhow = "1"
 bytes.workspace = true

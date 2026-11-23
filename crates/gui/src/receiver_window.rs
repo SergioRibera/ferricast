@@ -618,15 +618,17 @@ impl App for ReceiverWindowApp {
             // canvas() layout determines the rect. We scale-to-fit
             // letterbox-style by computing the largest src→dst
             // aspect-preserving rectangle.
-            let area = ctx.layout_node.visible_area();
+            let RenderTarget::Background { canvas, .. } = &ctx.target else {
+                return;
+            };
             let dst = aspect_fit(
-                area.width(),
-                area.height(),
+                ctx.size.width,
+                ctx.size.height,
                 frame.width as f32,
                 frame.height as f32,
             );
             let paint = Paint::default();
-            ctx.canvas.draw_image_rect_with_sampling_options(
+            canvas.draw_image_rect_with_sampling_options(
                 &image,
                 None,
                 freya::engine::prelude::SkRect::new(dst.0, dst.1, dst.0 + dst.2, dst.1 + dst.3),
@@ -654,7 +656,7 @@ impl App for ReceiverWindowApp {
                             .font_size(20.)
                             .color((150, 150, 170))
                     }))
-                    .maybe_child((!audio_only).then(|| canvas(on_render).expanded())),
+                    .maybe_child((!audio_only).then(|| rect().expanded().background(on_render))),
             )
             .child(
                 // Metadata strip across the bottom.

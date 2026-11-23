@@ -92,7 +92,7 @@ pub fn open_picker_for_dto(platform: Platform, reply_tx: oneshot::Sender<Option<
             });
 
         let wid = platform.launch_window(config).await;
-        platform.focus_window(Some(wid));
+        platform.focus_window(wid);
 
         let picked = match rx.await {
             Ok(Some(dto)) => Some(dto),
@@ -527,13 +527,10 @@ fn grid(
                 ));
             }
             let cards = entries.monitors.into_iter().map(move |m| {
-                rect()
-                    .key(m.id.clone())
-                    .child(MonitorCard {
-                        info: m,
-                        on_select: on_select.clone(),
-                    })
-                    .into()
+                rect().key(m.id.clone()).child(MonitorCard {
+                    info: m,
+                    on_select: on_select.clone(),
+                })
             });
             body.child(
                 ScrollView::new()
@@ -575,7 +572,6 @@ fn grid(
                             info: w,
                             on_select: on_select.clone(),
                         })
-                        .into()
                 });
                 body.child(
                     ScrollView::new()
@@ -591,13 +587,10 @@ fn grid(
                 )
             } else {
                 let cards = entries.windows.into_iter().map(move |w| {
-                    rect()
-                        .key(w.id.clone())
-                        .child(WindowCard {
-                            info: w,
-                            on_select: on_select.clone(),
-                        })
-                        .into()
+                    rect().key(w.id.clone()).child(WindowCard {
+                        info: w,
+                        on_select: on_select.clone(),
+                    })
                 });
                 body.child(
                     ScrollView::new()

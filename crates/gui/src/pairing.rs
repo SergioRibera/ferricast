@@ -107,7 +107,7 @@ pub fn open_pairing_dialog(
                     .with_window_level(WindowLevel::AlwaysOnTop)
             });
         let wid = platform.launch_window(config).await;
-        platform.focus_window(Some(wid));
+        platform.focus_window(wid);
         // A dropped sender means the window was closed.
         let response = rx.await.unwrap_or(PairingResponse::Cancelled);
         platform.close_window(wid);
