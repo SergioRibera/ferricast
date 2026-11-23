@@ -407,7 +407,14 @@ impl Session {
                 }
             }
             MediaCommand::Seek { position_us } => {
-                if !self.send_pump(PumpCmd::Seek(position_us)).await && self.loading.is_some() {
+                if self.send_pump(PumpCmd::Seek(position_us)).await {
+                    // The pump seeks when it reads the command; a status
+                    // reported before then (a pause right after the seek)
+                    // must not carry the position from before the seek.
+                    if let Some(media) = &self.media {
+                        media.position.store(position_us, Ordering::Relaxed);
+                    }
+                } else if self.loading.is_some() {
                     self.seek_when_loaded = Some(position_us);
                 }
             }
