@@ -18,6 +18,26 @@
           config.allowUnfree = true;
         };
 
+        # One toolchain for the host build plus the standard libraries of
+        # every platform the codec crates target, so `cargo check
+        # --target …` verifies the Windows / Apple / Android backends from
+        # Linux. Checking needs no SDK: the platform bindings (`windows`,
+        # `objc2-*`, `ndk`) ship their declarations in Rust; only linking
+        # needs the vendor toolchains.
+        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+          extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
+          targets = [
+            "x86_64-pc-windows-msvc"
+            "aarch64-pc-windows-msvc"
+            "aarch64-apple-darwin"
+            "x86_64-apple-darwin"
+            "aarch64-apple-ios"
+            "aarch64-apple-ios-sim"
+            "aarch64-linux-android"
+            "x86_64-linux-android"
+          ];
+        };
+
         libraries = with pkgs; [
           # libappindicator
           #
@@ -102,10 +122,7 @@
       {
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
-            cargo
-            rustc
-	    rustfmt
-	    rust-analyzer
+            rustToolchain
 
             cargo-dist
             cargo-release
