@@ -106,7 +106,8 @@ pub struct AudioSpecificConfig {
     pub sample_rate: u32,
     /// `channelConfiguration` (0 = program config element).
     pub channel_config: u8,
-    /// Output sample rate of the SBR tool, when SBR is signalled.
+    /// Output sample rate of the SBR tool, when SBR is signalled (for ELD,
+    /// LD-SBR: the core rate when single-rate).
     pub sbr_sample_rate: Option<u32>,
     /// Parametric stereo is signalled (mono core, stereo output).
     pub ps: bool,
@@ -217,7 +218,21 @@ impl AudioSpecificConfig {
                 }
                 short_frames
             }
-            OBJECT_TYPE_ELD => bits.read(1)? == 1,
+            OBJECT_TYPE_ELD => {
+                let short_frames = bits.read(1)? == 1;
+                // Section / scalefactor / spectral data resilience.
+                bits.read(3)?;
+                if bits.read(1)? == 1 {
+                    // ldSbrPresentFlag; ldSbrSamplingRate picks dual-rate SBR.
+                    let dual = bits.read(1)? == 1;
+                    sbr_sample_rate = Some(if dual {
+                        sample_rate.checked_mul(2)?
+                    } else {
+                        sample_rate
+                    });
+                }
+                short_frames
+            }
             _ => return None,
         };
         Some(Self {
@@ -232,9 +247,12 @@ impl AudioSpecificConfig {
 
     /// The configuration's bytes: explicit hierarchical signalling for
     /// SBR / PS, an `ELDSpecificConfig` without extensions for ELD.
-    /// `None` when a rate has no index.
+    /// `None` when a rate has no index, and for ELD with LD-SBR.
     #[must_use]
     pub fn to_bytes(self) -> Option<Vec<u8>> {
+        if self.object_type == OBJECT_TYPE_ELD && self.sbr_sample_rate.is_some() {
+            return None;
+        }
         let mut out = BitWriter::default();
         let index = |rate| sample_rate_index(rate).map(u32::from);
         if let Some(sbr_rate) = self.sbr_sample_rate {
@@ -401,6 +419,11 @@ mod tests {
             Some(eld)
         );
         assert_eq!(eld.core_frame_samples(), 480);
+        // The same with ldSbrPresentFlag and dual-rate SBR.
+        let sbr = AudioSpecificConfig::parse(&[0xF8, 0xE8, 0x51, 0x80]).unwrap();
+        assert_eq!(sbr.sbr_sample_rate, Some(88_200));
+        assert_eq!(sbr.output_frame_samples(), 960);
+        assert!(sbr.to_bytes().is_none());
     }
 
     #[test]

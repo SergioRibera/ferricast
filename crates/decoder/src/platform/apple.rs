@@ -1,5 +1,6 @@
 //! Apple platform decoders: VideoToolbox (`VTDecompressionSession`) for
-//! H.264 / H.265 and AudioToolbox (`AudioConverter`) for AAC-LC.
+//! H.264 / H.265 / VP9 / AV1 and AudioToolbox (`AudioConverter`) for
+//! AAC (LC, HE-AAC v1 / v2), AAC-ELD and ALAC.
 
 #[cfg(feature = "audiotoolbox")]
 mod audio;
