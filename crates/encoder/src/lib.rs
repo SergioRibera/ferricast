@@ -31,6 +31,8 @@ mod nv12;
 pub mod nvenc;
 pub mod opus;
 mod platform;
+// The scaler is crate-private: an audio-only build leaves it unused.
+#[allow(dead_code, reason = "conditional: used by the video encoders only")]
 pub mod scale;
 
 pub use ferricast_codec::{Availability, BackendReport};

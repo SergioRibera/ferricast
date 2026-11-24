@@ -38,6 +38,10 @@ mod av1;
 mod facades;
 pub mod h264;
 pub mod h265;
+#[allow(
+    dead_code,
+    reason = "conditional: shared by the video decoders; each backend set uses a different subset"
+)]
 mod nv12;
 #[cfg(feature = "nvdec-decode")]
 pub mod nvdec;
