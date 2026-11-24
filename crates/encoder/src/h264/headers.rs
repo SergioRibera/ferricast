@@ -9,7 +9,7 @@
 //!
 //! The shape of these builders is informed by Intel's
 //! `libva-utils/encode/h264encode.c`, ffmpeg's
-//! `libavcodec/vaapi_encode_h264.c` and ChromiumOS' cros-codecs
+//! `libavcodec/vaapi_encode_h264.c` and `ChromiumOS`' cros-codecs
 //! H.264 encoder.
 
 use ferricast_core::ColourDescription;
@@ -28,14 +28,14 @@ pub(super) mod profile {
 pub(super) struct SpsParams {
     pub profile_idc: u8,
     /// `constraint_set0_flag`..`constraint_set5_flag` packed into
-    /// the top byte (§7.3.2.1.1, "constraint_setN_flag"). Bit 7 =
-    /// constraint_set0_flag.
+    /// the top byte (§7.3.2.1.1, "`constraint_setN_flag`"). Bit 7 =
+    /// `constraint_set0_flag`.
     pub constraint_flags: u8,
     pub level_idc: u8,
     /// Default 0; only one SPS today.
     pub seq_parameter_set_id: u32,
     /// In macroblocks (each 16 px). For 1920×1080: width=120,
-    /// height=68 (1920/16=120, ceil(1080/16)=68 with frame_crop
+    /// height=68 (1920/16=120, ceil(1080/16)=68 with `frame_crop`
     /// trimming the bottom 8 px).
     pub pic_width_in_mbs_minus1: u32,
     pub pic_height_in_map_units_minus1: u32,
@@ -74,11 +74,11 @@ pub(super) fn build_sps(p: &SpsParams) -> Vec<u8> {
     let mut w = BitWriter::new();
 
     // profile_idc u(8)
-    w.write_bits(p.profile_idc as u32, 8);
+    w.write_bits(u32::from(p.profile_idc), 8);
     // constraint_set0..5_flag u(1)*6 + reserved_zero_2bits u(2)
-    w.write_bits(p.constraint_flags as u32, 8);
+    w.write_bits(u32::from(p.constraint_flags), 8);
     // level_idc u(8)
-    w.write_bits(p.level_idc as u32, 8);
+    w.write_bits(u32::from(p.level_idc), 8);
 
     // seq_parameter_set_id ue(v)
     w.write_ue(p.seq_parameter_set_id);
@@ -295,8 +295,8 @@ mod tests {
         assert_eq!(sps[4], 0x67, "SPS NAL header");
     }
 
-    /// aspect=0, overscan=0, video_signal_type=1, format=5 (101),
-    /// full_range=0, colour_description=1 → 0b0011_0101, then
+    /// aspect=0, overscan=0, `video_signal_type=1`, format=5 (101),
+    /// `full_range=0`, `colour_description=1` → `0b0011_0101`, then
     /// primaries / transfer / matrix = 1.
     #[test]
     fn vui_signals_bt709_limited() {

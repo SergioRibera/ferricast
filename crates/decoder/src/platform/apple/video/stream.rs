@@ -1,5 +1,5 @@
-//! Packets of each codec as VideoToolbox samples, and the format
-//! description VideoToolbox decodes them against.
+//! Packets of each codec as `VideoToolbox` samples, and the format
+//! description `VideoToolbox` decodes them against.
 //!
 //! - H.264 / H.265: Annex B in, length-prefixed (4-byte) NAL units out;
 //!   the description comes from the in-band parameter sets.
@@ -27,21 +27,21 @@ use super::{BACKEND, fail};
 use crate::platform::apple::os_status;
 use ferricast_codec::bitstream::{av1, h264, hevc, vp9};
 
-/// The VideoToolbox codec type of `codec`.
+/// The `VideoToolbox` codec type of `codec`.
 pub(super) fn codec_type(codec: Codec) -> CodecResult<CMVideoCodecType> {
     match codec {
         Codec::H264 => Ok(kCMVideoCodecType_H264),
         Codec::H265 => Ok(kCMVideoCodecType_HEVC),
         Codec::Vp9 => Ok(kCMVideoCodecType_VP9),
         Codec::Av1 => Ok(kCMVideoCodecType_AV1),
-        other => Err(CodecError::BackendCannotHandle {
+        other @ Codec::Vp8 => Err(CodecError::BackendCannotHandle {
             backend: BACKEND,
             target: CodecTarget::decode(other),
         }),
     }
 }
 
-/// A stream configuration as VideoToolbox describes it.
+/// A stream configuration as `VideoToolbox` describes it.
 pub(super) struct Format {
     pub(super) description: CFRetained<CMFormatDescription>,
     /// Luma bit depth: 8 decodes to NV12, more to P010.
@@ -63,7 +63,7 @@ impl Stream {
             Codec::H264 | Codec::H265 => Self::Nal(Nal::new(codec)),
             Codec::Vp9 => Self::Vp9(Vp9::default()),
             Codec::Av1 => Self::Av1(Av1::default()),
-            other => {
+            other @ Codec::Vp8 => {
                 return Err(CodecError::BackendCannotHandle {
                     backend: BACKEND,
                     target: CodecTarget::decode(other),
@@ -181,7 +181,7 @@ impl Nal {
             return Ok(None);
         };
         if self.format.is_none() || self.built_from != sets {
-            let sps = &sets[if self.codec == Codec::H265 { 1 } else { 0 }];
+            let sps = &sets[usize::from(self.codec == Codec::H265)];
             let depth = match self.codec {
                 Codec::H265 => hevc::sps_bit_depth(sps).map(|(luma, _)| luma),
                 _ => h264::sps_bit_depth(sps),

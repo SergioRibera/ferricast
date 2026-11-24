@@ -108,6 +108,11 @@ enum Reply {
 }
 
 impl VaapiH264Decoder {
+    /// Opens a VA-API H.264 decoding session for `config` on its worker thread.
+    ///
+    /// # Errors
+    /// [`FerricastError::Decode`] when `config` is not H.264 or the VA-API
+    /// bring-up fails.
     pub fn probe_with(config: &DecoderConfig) -> Result<Self> {
         if config.codec != Codec::H264 {
             return Err(FerricastError::Decode(format!(
@@ -228,6 +233,10 @@ impl VideoDecoder for VaapiH264Decoder {
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the worker thread's entry point owns its channels for the thread's lifetime"
+)]
 fn run_worker(
     probe_tx: SyncSender<std::result::Result<(), String>>,
     cmd_rx: Receiver<Cmd>,
@@ -642,6 +651,10 @@ impl Active {
         PictureH264::new(surface.id(), index, flags, frame.top_poc, frame.bottom_poc)
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "fields of a validated SPS / PPS / slice header, which the spec bounds to the VA field widths"
+    )]
     fn pic_param(
         &self,
         sps: &Sps,
@@ -720,6 +733,10 @@ impl Active {
         )
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "fields of a validated SPS / PPS / slice header, which the spec bounds to the VA field widths"
+    )]
     fn slice_param(
         &self,
         nal: &[u8],
@@ -915,7 +932,7 @@ fn convert_sps(sps: &SeqParameterSet, rbsp: &[u8]) -> Sps {
             ChromaFormat::YUV420 => 1,
             ChromaFormat::YUV422 => 2,
             ChromaFormat::YUV444 => 3,
-            ChromaFormat::Invalid(value) => value as u8,
+            ChromaFormat::Invalid(value) => u8::try_from(value).unwrap_or(u8::MAX),
         },
         separate_colour_plane: sps.chroma_info.separate_colour_plane_flag,
         bit_depth_luma: sps.chroma_info.bit_depth_luma_minus8.saturating_add(8),
@@ -1026,6 +1043,10 @@ fn sps_colour(sps: &SeqParameterSet) -> ColourDescription {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::items_after_statements,
+    reason = "test helpers sit next to their use"
+)]
 mod tests {
     use super::*;
 

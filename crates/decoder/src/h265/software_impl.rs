@@ -42,7 +42,7 @@ impl SoftwareH265Decoder {
         Ok(())
     }
 
-    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: &EncodedFrame) -> Result<Option<CapturedFrame>> {
         let decoder = self.decoder.as_mut().ok_or_else(|| {
             FerricastError::Decode("SoftwareH265Decoder::decode before configure()".into())
         })?;
@@ -98,7 +98,7 @@ impl VideoDecoder for SoftwareH265Decoder {
     }
 
     fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
-        self.try_decode(frame).map_err(CodecError::from_backend(
+        self.try_decode(&frame).map_err(CodecError::from_backend(
             BackendId::RustHevc,
             Operation::Decode,
         ))

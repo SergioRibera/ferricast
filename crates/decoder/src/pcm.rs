@@ -24,7 +24,7 @@ impl PcmPassthrough {
         Ok(())
     }
 
-    fn try_decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
+    fn try_decode(&mut self, frame: &AudioFrame) -> Result<Option<DecodedAudio>> {
         if !self.configured {
             return Err(FerricastError::Decode(
                 "PcmPassthrough::decode before configure()".into(),
@@ -44,10 +44,6 @@ impl PcmPassthrough {
             timestamp_us: frame.timestamp_us,
         }))
     }
-
-    fn try_flush(&mut self) -> Result<Vec<DecodedAudio>> {
-        Ok(Vec::new())
-    }
 }
 
 impl AudioDecoder for PcmPassthrough {
@@ -61,13 +57,12 @@ impl AudioDecoder for PcmPassthrough {
     }
 
     fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>> {
-        self.try_decode(frame)
+        self.try_decode(&frame)
             .map_err(CodecError::from_backend(BackendId::Pcm, Operation::Decode))
     }
 
     fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>> {
-        self.try_flush()
-            .map_err(CodecError::from_backend(BackendId::Pcm, Operation::Flush))
+        Ok(Vec::new())
     }
 }
 

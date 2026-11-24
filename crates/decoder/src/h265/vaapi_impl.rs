@@ -34,7 +34,10 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 
-use cros_libva::*;
+use cros_libva::{
+    Config, Context, Display, Surface, UsageHint, VAConfigAttrib, VAConfigAttribType, VAEntrypoint,
+    VAProfile,
+};
 use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
     CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, H265Profile, Result,
@@ -48,10 +51,10 @@ const RENDER_NODES: &[&str] = &[
     "/dev/dri/renderD130",
 ];
 
-const VA_FOURCC_NV12: u32 = 0x3231564E;
+const VA_FOURCC_NV12: u32 = 0x3231_564E;
 const VA_RT_FORMAT_YUV420: u32 = 0x01;
 
-/// VAProfileHEVCMain / VAProfileHEVCMain10 (`va.h`).
+/// `VAProfileHEVCMain` / `VAProfileHEVCMain10` (`va.h`).
 const VA_PROFILE_HEVC_MAIN: VAProfile::Type = 17;
 const VA_PROFILE_HEVC_MAIN10: VAProfile::Type = 18;
 
@@ -83,6 +86,9 @@ impl VaapiH265Decoder {
     /// Open the VA display and confirm the driver advertises at least
     /// one HEVC encode-decode profile. Returns `Err` if the host has
     /// no usable DRM render node or no HEVC decoder.
+    ///
+    /// # Errors
+    /// [`FerricastError::Decode`] naming the VA-API bring-up step that failed.
     pub fn probe_with(config: &DecoderConfig) -> Result<Self> {
         // Spin the bring-up off onto the worker so the non-`Send`
         // display handle never crosses a thread boundary. Worker
@@ -213,13 +219,17 @@ impl VideoDecoder for VaapiH265Decoder {
 struct WorkerState {
     display: Rc<Display>,
     profile: VAProfile::Type,
-    /// VAConfig handle. Stays Some after `configure`; the rest of the
+    /// `VAConfig` handle. Stays Some after `configure`; the rest of the
     /// decode-loop scaffolding will key off it.
     config: Option<Config>,
     context: Option<Rc<Context>>,
     surfaces: Vec<Surface<()>>,
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the worker thread's entry point owns its channels and config for the thread's lifetime"
+)]
 fn worker_main(
     cmd_rx: mpsc::Receiver<Cmd>,
     reply_tx: mpsc::Sender<Reply>,

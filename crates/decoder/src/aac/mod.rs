@@ -14,7 +14,7 @@
 //! with the configured sample rate / channels reconfigures the decoder.
 //!
 //! Output format: interleaved signed-16-bit PCM, the format every
-//! Linux audio sink (PipeWire, ALSA, PulseAudio) accepts without
+//! Linux audio sink (`PipeWire`, ALSA, `PulseAudio`) accepts without
 //! further conversion.
 
 use crate::adts::{self, Shape};
@@ -69,7 +69,7 @@ impl Shape {
         }
     }
 
-    /// Without an AudioSpecificConfig symphonia takes the shape from the
+    /// Without an `AudioSpecificConfig` symphonia takes the shape from the
     /// codec parameters, and refuses to build when channels are missing.
     fn decoder(self) -> Result<SymphoniaCodec> {
         let mut params = CodecParameters::new();
@@ -187,14 +187,14 @@ impl SymphoniaAacDecoder {
         Ok(())
     }
 
-    fn try_decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
+    fn try_decode(&mut self, frame: &AudioFrame) -> Result<Option<DecodedAudio>> {
         if !self.configured {
             return Err(FerricastError::Decode(
                 "SymphoniaAacDecoder::decode before configure()".into(),
             ));
         }
         let mut runs = Vec::new();
-        let decoded = self.decode_units(&frame, &mut runs);
+        let decoded = self.decode_units(frame, &mut runs);
         // Frames decoded before a bad one in the same payload are still
         // good audio; queue them before reporting the failure.
         self.pending.extend(runs);
@@ -202,10 +202,10 @@ impl SymphoniaAacDecoder {
         Ok(self.pending.pop_front())
     }
 
-    fn try_flush(&mut self) -> Result<Vec<DecodedAudio>> {
+    fn take_ready(&mut self) -> Vec<DecodedAudio> {
         // Symphonia decoders don't buffer across packets; only runs split
         // off by a mid-payload shape change can still be waiting.
-        Ok(self.pending.drain(..).collect())
+        self.pending.drain(..).collect()
     }
 }
 
@@ -220,17 +220,14 @@ impl AudioDecoder for SymphoniaAacDecoder {
     }
 
     fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>> {
-        self.try_decode(frame).map_err(CodecError::from_backend(
+        self.try_decode(&frame).map_err(CodecError::from_backend(
             BackendId::Symphonia,
             Operation::Decode,
         ))
     }
 
     fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>> {
-        self.try_flush().map_err(CodecError::from_backend(
-            BackendId::Symphonia,
-            Operation::Flush,
-        ))
+        Ok(self.take_ready())
     }
 }
 
@@ -238,6 +235,11 @@ impl AudioDecoder for SymphoniaAacDecoder {
 /// decoder picked internally) into interleaved i16 samples. AAC's
 /// natural output is f32; the conversion clips at ±1.0 and rounds
 /// to the nearest integer.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "sample-format conversion to 16-bit PCM is lossy by design; samples are clamped to [-1, 1] first"
+)]
 pub(crate) fn interleave_s16(buf: AudioBufferRef<'_>) -> Vec<i16> {
     let frames = buf.frames();
     let channels = buf.spec().channels.count();
@@ -265,18 +267,18 @@ pub(crate) fn interleave_s16(buf: AudioBufferRef<'_>) -> Vec<i16> {
         AudioBufferRef::S24(b) => pack!(b, |x: symphonia::core::sample::i24| {
             x.inner() as f32 / (1 << 23) as f32
         }),
-        AudioBufferRef::S16(b) => pack!(b, |x: i16| x as f32 / i16::MAX as f32),
-        AudioBufferRef::S8(b) => pack!(b, |x: i8| x as f32 / i8::MAX as f32),
+        AudioBufferRef::S16(b) => pack!(b, |x: i16| f32::from(x) / f32::from(i16::MAX)),
+        AudioBufferRef::S8(b) => pack!(b, |x: i8| f32::from(x) / f32::from(i8::MAX)),
         AudioBufferRef::U32(b) => {
-            pack!(b, |x: u32| (x as f32 / u32::MAX as f32) * 2.0 - 1.0)
+            pack!(b, |x: u32| (x as f32 / u32::MAX as f32) * 2.0 - 1.0);
         }
         AudioBufferRef::U24(b) => pack!(b, |x: symphonia::core::sample::u24| {
             (x.inner() as f32 / (1 << 24) as f32) * 2.0 - 1.0
         }),
         AudioBufferRef::U16(b) => {
-            pack!(b, |x: u16| (x as f32 / u16::MAX as f32) * 2.0 - 1.0)
+            pack!(b, |x: u16| (f32::from(x) / f32::from(u16::MAX)) * 2.0 - 1.0);
         }
-        AudioBufferRef::U8(b) => pack!(b, |x: u8| (x as f32 / u8::MAX as f32) * 2.0 - 1.0),
+        AudioBufferRef::U8(b) => pack!(b, |x: u8| (f32::from(x) / f32::from(u8::MAX)) * 2.0 - 1.0),
     }
 
     out
@@ -289,7 +291,7 @@ mod tests {
     use super::*;
     use crate::adts::tests::frame;
 
-    /// A silent mono `raw_data_block()`: one SCE with max_sfb = 0, then END.
+    /// A silent mono `raw_data_block()`: one SCE with `max_sfb` = 0, then END.
     const SILENT_MONO: [u8; 4] = [0x00, 0xC8, 0x00, 0x07];
     const RATE_48K: u8 = 3;
     const RATE_44K1: u8 = 4;

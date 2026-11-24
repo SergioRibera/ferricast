@@ -26,7 +26,19 @@ use std::path::Path;
 use std::rc::Rc;
 
 use bytes::Bytes;
-use cros_libva::*;
+use cros_libva::{
+    Buffer, BufferType, Config, Context, Display, EncMiscParameter, EncMiscParameterFrameRate,
+    EncMiscParameterHRD, EncMiscParameterRateControl, EncPackedHeaderParameter,
+    EncPackedHeaderType, EncPictureParameter, EncPictureParameterBufferHEVC, EncSequenceParameter,
+    EncSequenceParameterBufferHEVC, EncSliceParameter, EncSliceParameterBufferHEVC,
+    ExternalBufferDescriptor, HEVCEncPicFields, HEVCEncSeqFields, HevcEncPicSccFields,
+    HevcEncSeqSccFields, HevcEncSliceFields, HevcEncVuiFields, MappedCodedBuffer, MemoryType,
+    Picture, PictureHEVC, ProcPipelineParameterBuffer, RcFlags, Surface, UsageHint,
+    VA_ATTRIB_NOT_SUPPORTED, VA_ENC_PACKED_HEADER_SEQUENCE, VA_INVALID_ID, VA_RC_CBR, VABufferID,
+    VABufferType, VAConfigAttrib, VAConfigAttribType, VADRMPRIMESurfaceDescriptor, VAEntrypoint,
+    VAProfile, VARectangle, VAStatus, vaBeginPicture, vaCreateBuffer, vaDestroyBuffer,
+    vaEndPicture, vaRenderPicture, vaSyncSurface,
+};
 use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
     CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, GpuFrame, H265Profile,
@@ -50,11 +62,11 @@ const RENDER_NODES: &[&str] = &[
     "/dev/dri/renderD130",
 ];
 
-const VA_FOURCC_NV12: u32 = 0x3231564E;
-const VA_FOURCC_BGRA: u32 = 0x41524742;
-const VA_FOURCC_RGBA: u32 = 0x41424752;
-const DRM_FORMAT_ARGB8888: u32 = 0x34325241;
-const DRM_FORMAT_ABGR8888: u32 = 0x34324241;
+const VA_FOURCC_NV12: u32 = 0x3231_564E;
+const VA_FOURCC_BGRA: u32 = 0x4152_4742;
+const VA_FOURCC_RGBA: u32 = 0x4142_4752;
+const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
 const VA_RT_FORMAT_YUV420: u32 = 0x01;
 const VA_RT_FORMAT_RGB32: u32 = 0x04;
 
@@ -78,14 +90,14 @@ const VA_PROFILE_HEVC_MAIN10: VAProfile::Type = 18;
 
 pub struct VaapiH265Encoder {
     display: Rc<Display>,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "held so the VA config outlives the context")]
     config: Config,
     context: Rc<Context>,
 
     /// VPP plumbing for zero-copy DMA-BUF → NV12 conversion. Same
     /// fallback story as the H.264 path: `None` means we still work
     /// but DMA-BUF frames take the CPU path.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "held so the VPP config outlives its context")]
     vpp_config: Option<Config>,
     vpp_context: Option<Rc<Context>>,
 
@@ -117,14 +129,14 @@ struct EncoderCfg {
     fps: u32,
     bitrate_bps: u32,
     keyframe_interval: u32,
-    initial_qp: u32,
+    initial_qp: u8,
     level_idc: u8,
     bit_depth_luma_minus8: u8,
     bit_depth_chroma_minus8: u8,
 }
 
 impl EncoderCfg {
-    /// CTU-aligned encoded width. A multiple of 32, hence of MinCbSizeY
+    /// CTU-aligned encoded width. A multiple of 32, hence of `MinCbSizeY`
     /// (8) as `pic_width_in_luma_samples` requires; the visible width
     /// comes back through the SPS conformance window.
     fn padded_width(&self) -> u32 {
@@ -160,7 +172,7 @@ impl EncoderCfg {
 
     /// Right / bottom conformance-window offsets trimming the CTU
     /// padding back to `width × height`. They count chroma samples
-    /// (SubWidthC = SubHeightC = 2 in 4:2:0, §7.4.3.2.1). `None` when
+    /// (`SubWidthC` = `SubHeightC` = 2 in 4:2:0, §7.4.3.2.1). `None` when
     /// the picture is CTU-aligned.
     fn conformance_offsets(&self) -> Option<(u32, u32)> {
         let right = (self.padded_width() - self.width) / 2;
@@ -193,11 +205,21 @@ impl FrameState {
 unsafe impl Send for VaapiH265Encoder {}
 
 impl VaapiH265Encoder {
+    /// [`Self::probe_with`] with the default configuration.
+    ///
+    /// # Errors
+    /// As [`Self::probe_with`].
     pub fn probe() -> Result<Self> {
-        Self::probe_with(EncoderConfig::default())
+        Self::probe_with(&EncoderConfig::default())
     }
 
-    pub fn probe_with(cfg: EncoderConfig) -> Result<Self> {
+    /// Brings up VA-API HEVC encoding for `cfg`.
+    ///
+    /// # Errors
+    /// [`FerricastError::Encoder`] for an input format other than BGRA / RGBA,
+    /// or naming the VA-API step that failed.
+    #[expect(clippy::too_many_lines, reason = "one linear VA-API bring-up sequence")]
+    pub fn probe_with(cfg: &EncoderConfig) -> Result<Self> {
         if !matches!(cfg.pixel_format, PixelFormat::Bgra | PixelFormat::Rgba) {
             return Err(FerricastError::Encoder(format!(
                 "VA-API HEVC: input pixel format {:?} not supported (need Bgra/Rgba)",
@@ -237,7 +259,7 @@ impl VaapiH265Encoder {
         info!(?profile, %vendor, "VA-API HEVC encoder selected");
 
         let requested = cfg.clone();
-        let cfg = build_encoder_cfg(profile_idc, bit_depth, &cfg)?;
+        let cfg = build_encoder_cfg(profile_idc, bit_depth, cfg)?;
 
         let mut config_attribs = vec![
             VAConfigAttrib {
@@ -299,7 +321,7 @@ impl VaapiH265Encoder {
         let sps_nal = headers::build_sps(
             &stream, /* min_cb_log2_minus3 */ 0, /* diff_max_min_cb_log2 */ 3,
         );
-        let pps_nal = headers::build_pps(cfg.initial_qp as i32 - 26);
+        let pps_nal = headers::build_pps(i32::from(cfg.initial_qp) - 26);
 
         let (vpp_config, vpp_context) = match build_vpp(&display, &cfg) {
             Ok((c, ctx)) => {
@@ -406,8 +428,14 @@ fn build_encoder_cfg(profile_idc: u8, bit_depth: u8, cfg: &EncoderConfig) -> Res
     // CTU = 32 luma samples. Width / height counted in CTUs, rounded
     // up. The encoder's surface is the CTU-padded height; the user's
     // crop comes back through the SPS conformance window.
-    let width_ctus = width.div_ceil(32) as u16;
-    let height_ctus = height.div_ceil(32) as u16;
+    let ctus = |samples: u32| {
+        u16::try_from(samples.div_ceil(32)).map_err(|_| {
+            FerricastError::Encoder(format!(
+                "VA-API: {samples} samples exceed the HEVC CTU range"
+            ))
+        })
+    };
+    let (width_ctus, height_ctus) = (ctus(width)?, ctus(height)?);
     let bitrate_bps = cfg.bitrate_kbps.max(1).saturating_mul(1000);
     let level_idc = pick_level(
         u32::from(width_ctus) * 32,
@@ -433,8 +461,8 @@ fn build_encoder_cfg(profile_idc: u8, bit_depth: u8, cfg: &EncoderConfig) -> Res
 }
 
 /// HEVC Tables A.8 / A.9, Main tier: `(general_level_idc, MaxLumaPs,
-/// MaxLumaSr, MaxBR)`; level_idc is the level × 30, MaxBR in 1000 bit/s
-/// (CpbBrVclFactor of Main / Main10).
+/// MaxLumaSr, MaxBR)`; `level_idc` is the level × 30, `MaxBR` in 1000 bit/s
+/// (`CpbBrVclFactor` of Main / Main10).
 const HEVC_LEVELS: &[(u8, u64, u64, u64)] = &[
     (30, 36_864, 552_960, 128),
     (60, 122_880, 3_686_400, 1_500),
@@ -451,8 +479,8 @@ const HEVC_LEVELS: &[(u8, u64, u64, u64)] = &[
     (186, 35_651_584, 4_278_190_080, 240_000),
 ];
 
-/// Smallest HEVC level (A.4.1) whose MaxLumaPs, MaxLumaSr, picture
-/// dimensions (each ≤ √(8·MaxLumaPs)) and MaxBR admit the coded
+/// Smallest HEVC level (A.4.1) whose `MaxLumaPs`, `MaxLumaSr`, picture
+/// dimensions (each ≤ √(8·MaxLumaPs)) and `MaxBR` admit the coded
 /// picture size `width × height`. Anything beyond clamps to 6.2.
 fn pick_level(width: u32, height: u32, fps: u32, bitrate_bps: u32) -> u8 {
     let (w, h) = (u64::from(width), u64::from(height));
@@ -480,7 +508,7 @@ impl VaapiH265Encoder {
         }
         // Surfaces, context, rate control and packed headers are all
         // derived from the config: open a new session.
-        *self = Self::probe_with(config.clone())?;
+        *self = Self::probe_with(config)?;
         Ok(())
     }
 
@@ -494,17 +522,13 @@ impl VaapiH265Encoder {
         result
     }
 
-    fn try_flush(self) -> Result<Vec<EncodedFrame>> {
-        Ok(Vec::new())
-    }
-
-    fn try_get_headers(&mut self) -> Result<Vec<u8>> {
+    fn headers(&self) -> Vec<u8> {
         let mut out =
             Vec::with_capacity(self.vps_nal.len() + self.sps_nal.len() + self.pps_nal.len());
         out.extend_from_slice(&self.vps_nal);
         out.extend_from_slice(&self.sps_nal);
         out.extend_from_slice(&self.pps_nal);
-        Ok(out)
+        out
     }
 }
 
@@ -527,15 +551,11 @@ impl VideoEncoder for VaapiH265Encoder {
     }
 
     fn flush(self) -> CodecResult<Vec<EncodedFrame>> {
-        self.try_flush()
-            .map_err(CodecError::from_backend(BackendId::Vaapi, Operation::Flush))
+        Ok(Vec::new())
     }
 
     fn get_headers(&mut self) -> CodecResult<Vec<u8>> {
-        self.try_get_headers().map_err(CodecError::from_backend(
-            BackendId::Vaapi,
-            Operation::Headers,
-        ))
+        Ok(self.headers())
     }
 
     fn request_keyframe(&mut self) {
@@ -572,13 +592,17 @@ impl VaapiH265Encoder {
             codec: Codec::H265,
             data: Bytes::from(encoded_bytes),
             timestamp_us,
-            duration_us: Some(1_000_000 / self.cfg.fps as u64),
+            duration_us: Some(1_000_000 / u64::from(self.cfg.fps)),
             is_keyframe,
             pts_dts: (poc.unsigned_abs().into(), frame_idx.into()),
         })
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear per-frame VA-API submission"
+)]
 fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>, bool, u32, i32)> {
     let cfg = &enc.cfg;
     // State only advances after the driver returned the picture (see
@@ -603,8 +627,7 @@ fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         if i == 0 {
             prev_ref
                 .as_ref()
-                .map(clone_pic_hevc)
-                .unwrap_or_else(invalid_picture_hevc)
+                .map_or_else(invalid_picture_hevc, clone_pic_hevc)
         } else {
             invalid_picture_hevc()
         }
@@ -644,7 +667,7 @@ fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         }
     }
 
-    let pic = build_pic_param(cfg, &curr_pic, reference_frames, coded.id(), is_idr);
+    let pic = build_pic_param(cfg, &curr_pic, &reference_frames, coded.id(), is_idr);
     buffers.push(
         enc.context
             .create_buffer(cros_libva::BufferType::EncPictureParameter(
@@ -676,6 +699,8 @@ fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>
 
     let mut all_ids: Vec<VABufferID> = Buffer::as_id_vec(&buffers);
     all_ids.extend_from_slice(&packed.ids);
+    let buffer_count = i32::try_from(all_ids.len())
+        .map_err(|_| FerricastError::Encoder("VA-API: too many buffers for one picture".into()))?;
 
     unsafe {
         let dpy = enc.display.handle();
@@ -685,8 +710,7 @@ fn run_encode(enc: &VaapiH265Encoder, state: &mut FrameState) -> Result<(Vec<u8>
         check_status(vaBeginPicture(dpy, ctx, target))
             .map_err(|s| FerricastError::Encoder(format!("vaBeginPicture(HEVC): {s:#x}")))?;
 
-        let render_status =
-            vaRenderPicture(dpy, ctx, all_ids.as_ptr() as *mut _, all_ids.len() as i32);
+        let render_status = vaRenderPicture(dpy, ctx, all_ids.as_ptr().cast_mut(), buffer_count);
         if let Err(s) = check_status(render_status) {
             let _ = vaEndPicture(dpy, ctx);
             return Err(FerricastError::Encoder(format!(
@@ -728,8 +752,8 @@ fn build_seq_param(cfg: &EncoderCfg) -> EncSequenceParameterBufferHEVC {
     let seq_fields = HEVCEncSeqFields::new(
         /* chroma_format_idc */ 1,
         /* separate_colour_plane_flag */ 0,
-        /* bit_depth_luma_minus8 */ cfg.bit_depth_luma_minus8 as u32,
-        /* bit_depth_chroma_minus8 */ cfg.bit_depth_chroma_minus8 as u32,
+        /* bit_depth_luma_minus8 */ u32::from(cfg.bit_depth_luma_minus8),
+        /* bit_depth_chroma_minus8 */ u32::from(cfg.bit_depth_chroma_minus8),
         /* scaling_list_enabled_flag */ 0,
         /* strong_intra_smoothing_enabled_flag */ 1,
         /* amp_enabled_flag */ 1,
@@ -791,7 +815,7 @@ fn build_seq_param(cfg: &EncoderCfg) -> EncSequenceParameterBufferHEVC {
 fn build_pic_param(
     cfg: &EncoderCfg,
     curr_pic: &PictureHEVC,
-    reference_frames: [PictureHEVC; 15],
+    reference_frames: &[PictureHEVC; 15],
     coded_buf: VABufferID,
     is_idr: bool,
 ) -> EncPictureParameterBufferHEVC {
@@ -804,7 +828,7 @@ fn build_pic_param(
     };
 
     let pic_fields = HEVCEncPicFields::new(
-        /* idr_pic_flag */ if is_idr { 1 } else { 0 },
+        /* idr_pic_flag */ u32::from(is_idr),
         coding_type,
         /* reference_pic_flag */ 1,
         /* dependent_slice_segments_enabled_flag */ 0,
@@ -828,11 +852,11 @@ fn build_pic_param(
 
     EncPictureParameterBufferHEVC::new(
         clone_pic_hevc(curr_pic),
-        reference_frames,
+        *reference_frames,
         coded_buf,
         /* collocated_ref_pic_index */ if is_idr { 0xff } else { 0 },
         /* last_picture */ 0,
-        cfg.initial_qp as u8,
+        cfg.initial_qp,
         /* diff_cu_qp_delta_depth */ 0,
         /* pps_cb_qp_offset */ 0,
         /* pps_cr_qp_offset */ 0,
@@ -860,9 +884,7 @@ fn build_slice_param(
 ) -> EncSliceParameterBufferHEVC {
     let ref_pic_list0: [PictureHEVC; 15] = std::array::from_fn(|i| {
         if i == 0 {
-            prev_ref
-                .map(clone_pic_hevc)
-                .unwrap_or_else(invalid_picture_hevc)
+            prev_ref.map_or_else(invalid_picture_hevc, clone_pic_hevc)
         } else {
             invalid_picture_hevc()
         }
@@ -873,7 +895,7 @@ fn build_slice_param(
         /* last_slice_of_pic_flag */ 1,
         /* dependent_slice_segment_flag */ 0,
         /* colour_plane_id */ 0,
-        /* slice_temporal_mvp_enabled_flag */ if is_idr { 0 } else { 1 },
+        /* slice_temporal_mvp_enabled_flag */ u32::from(!is_idr),
         /* slice_sao_luma_flag */ 1,
         /* slice_sao_chroma_flag */ 1,
         /* num_ref_idx_active_override_flag */ 0,
@@ -886,7 +908,7 @@ fn build_slice_param(
 
     // slice_type: 2 = I, 1 = P, 0 = B.
     let slice_type: u8 = if is_idr { 2 } else { 1 };
-    let num_ctu = (cfg.width_ctus as u32) * (cfg.height_ctus as u32);
+    let num_ctu = u32::from(cfg.width_ctus) * u32::from(cfg.height_ctus);
 
     EncSliceParameterBufferHEVC::new(
         /* slice_segment_address */ 0,
@@ -924,7 +946,7 @@ fn build_rate_control(cfg: &EncoderCfg) -> EncMiscParameterRateControl {
         cfg.bitrate_bps,
         /* target_percentage */ 100,
         /* window_size */ 1500,
-        cfg.initial_qp,
+        u32::from(cfg.initial_qp),
         /* min_qp */ 1,
         /* basic_unit_size */ 0,
         RcFlags::new(0, 0, 0, 0, 0, 0, 0, 0, 0),
@@ -936,7 +958,7 @@ fn build_rate_control(cfg: &EncoderCfg) -> EncMiscParameterRateControl {
 }
 
 fn invalid_picture_hevc() -> PictureHEVC {
-    PictureHEVC::new(VA_INVALID_ID, 0, 0x00000001) // VA_PICTURE_HEVC_INVALID
+    PictureHEVC::new(VA_INVALID_ID, 0, 0x0000_0001) // VA_PICTURE_HEVC_INVALID
 }
 
 /// `PictureHEVC` is `Copy` (`Default + Copy + Clone + PartialEq + Eq`
@@ -947,6 +969,13 @@ fn clone_pic_hevc(p: &PictureHEVC) -> PictureHEVC {
     *p
 }
 
+/// Bytes of the packed-header parameter buffer `vaCreateBuffer` copies.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a VA parameter struct is a few dozen bytes"
+)]
+const PARAM_SIZE: u32 = std::mem::size_of::<EncPackedHeaderParameter>() as u32;
+
 unsafe fn create_packed_header(
     context: &Rc<Context>,
     htype: EncPackedHeaderType,
@@ -955,17 +984,20 @@ unsafe fn create_packed_header(
     let dpy = context.display().handle();
     let ctx = context.id();
 
-    let mut params = EncPackedHeaderParameter::new(htype, (bytes.len() as u32) * 8, true);
+    let too_long = || FerricastError::Encoder(format!("packed header of {} bytes", bytes.len()));
+    let byte_len = u32::try_from(bytes.len()).map_err(|_| too_long())?;
+    let bit_len = byte_len.checked_mul(8).ok_or_else(too_long)?;
+    let mut params = EncPackedHeaderParameter::new(htype, bit_len, true);
     let mut p_id: VABufferID = 0;
     unsafe {
         check_status(vaCreateBuffer(
             dpy,
             ctx,
             VABufferType::VAEncPackedHeaderParameterBufferType,
-            std::mem::size_of::<EncPackedHeaderParameter>() as u32,
+            PARAM_SIZE,
             1,
-            &mut params as *mut _ as *mut c_void,
-            &mut p_id,
+            (&raw mut params).cast::<c_void>(),
+            &raw mut p_id,
         ))
         .map_err(|s| FerricastError::Encoder(format!("packed header param: {s:#x}")))?;
     }
@@ -976,10 +1008,10 @@ unsafe fn create_packed_header(
             dpy,
             ctx,
             VABufferType::VAEncPackedHeaderDataBufferType,
-            bytes.len() as u32,
+            byte_len,
             1,
             bytes.as_ptr() as *mut c_void,
-            &mut d_id,
+            &raw mut d_id,
         ))
     };
     if let Err(s) = st {

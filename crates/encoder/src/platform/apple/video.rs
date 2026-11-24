@@ -1,21 +1,21 @@
-//! H.264 / H.265 encode through VideoToolbox.
+//! H.264 / H.265 encode through `VideoToolbox`.
 //!
-//! VideoToolbox hands compressed frames to a callback. Each `encode`
+//! `VideoToolbox` hands compressed frames to a callback. Each `encode`
 //! submits one picture and then calls `VTCompressionSessionCompleteFrames`
 //! up to its timestamp, which delivers that picture's output before it
 //! returns (frame reordering is off, so nothing is held back): the
 //! [`VideoEncoder`] contract of one packet per frame holds.
 //!
-//! Output is Annex B. VideoToolbox emits length-prefixed NAL units and
+//! Output is Annex B. `VideoToolbox` emits length-prefixed NAL units and
 //! keeps the parameter sets in the sample's format description; they are
 //! copied in front of every keyframe, as x264 repeats them in-band.
 //!
 //! A native frame holding a [`PixelBuffer`] of the configured size and
-//! bit depth (a VideoToolbox decoder's output, say) is encoded as is,
+//! bit depth (a `VideoToolbox` decoder's output, say) is encoded as is,
 //! with no copy. [`BitDepth::Ten`] encodes HEVC Main10 from P010 buffers
 //! (P010 input is copied, NV12 and RGB input widened); the stream's HDR
 //! metadata goes into the mastering display and content light level
-//! properties, which VideoToolbox writes as SEI.
+//! properties, which `VideoToolbox` writes as SEI.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -73,12 +73,12 @@ use crate::nv12::{self, Nv12Layout};
 use crate::scale::{FrameScaler, FrameSize};
 
 const BACKEND: BackendId = BackendId::VideoToolbox;
-/// Timestamps cross VideoToolbox as microseconds.
+/// Timestamps cross `VideoToolbox` as microseconds.
 const MICROS: i32 = 1_000_000;
 /// `kVTPropertyNotSupportedErr`: an encoder without the property.
 const PROPERTY_NOT_SUPPORTED: i32 = -12_900;
 
-/// Adds the VideoToolbox H.264 / H.265 encoders.
+/// Adds the `VideoToolbox` H.264 / H.265 encoders.
 pub(crate) fn video(registry: VideoEncoderRegistry) -> VideoEncoderRegistry {
     if !matches!(
         registry.target().codec,
@@ -146,7 +146,11 @@ fn lock(outbox: &Outbox) -> MutexGuard<'_, Vec<Output>> {
     outbox.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// One VideoToolbox compression session and the shape it was built for.
+/// One `VideoToolbox` compression session and the shape it was built for.
+#[expect(
+    clippy::struct_field_names,
+    reason = "the wrapped VTCompressionSession is the session itself"
+)]
 struct Session {
     session: CFRetained<VTCompressionSession>,
     /// The callback's reference value; boxed so its address outlives
@@ -237,7 +241,7 @@ fn is_keyframe(data: &[u8], codec: Codec) -> bool {
 /// Reads one compressed sample.
 ///
 /// # Safety
-/// `sample` must be a live `CMSampleBuffer` VideoToolbox produced.
+/// `sample` must be a live `CMSampleBuffer` `VideoToolbox` produced.
 unsafe fn read_sample(sample: &CMSampleBuffer, codec: Codec) -> CodecResult<Output> {
     // SAFETY: `sample` is live (caller contract).
     let (block, description, pts) = unsafe {
@@ -350,7 +354,7 @@ fn profile_level(config: &EncoderConfig) -> CodecResult<&'static CFString> {
 /// A colour property: what it is, and its value (`None` to leave it unset).
 type ColourProperty = (&'static str, Option<CFRetained<CFString>>);
 
-/// The VideoToolbox colour property values of `colour`; `None` for an
+/// The `VideoToolbox` colour property values of `colour`; `None` for an
 /// unspecified field (left to the encoder).
 fn colour_properties(colour: ColourDescription) -> CodecResult<[ColourProperty; 3]> {
     let unsupported = |field: &str, code: u8| CodecError::UnsupportedConfig {
@@ -592,8 +596,8 @@ impl Session {
         self.require(key, CFNumber::new_i64(bits).as_ref(), "the average bitrate")
     }
 
-    /// A CoreVideo buffer holding `view`: BGRA as is when the stream
-    /// signals limited range (VideoToolbox converts it with the
+    /// A `CoreVideo` buffer holding `view`: BGRA as is when the stream
+    /// signals limited range (`VideoToolbox` converts it with the
     /// configured matrix in hardware), anything else as NV12 (P010 for a
     /// 10-bit stream) in the configured range.
     fn pixel_buffer(&mut self, view: &FrameView<'_>) -> CodecResult<CFRetained<CVPixelBuffer>> {
@@ -752,7 +756,7 @@ fn fill_bgra(buffer: &CVPixelBuffer, view: &FrameView<'_>) -> CodecResult<()> {
     Ok(())
 }
 
-/// A VideoToolbox H.264 / H.265 encoder.
+/// A `VideoToolbox` H.264 / H.265 encoder.
 pub(crate) struct VtEncoder {
     acceleration: Acceleration,
     session: Option<Session>,
@@ -967,7 +971,7 @@ impl VtEncoder {
                 }
                 Output::Frame { .. } => {}
                 Output::Dropped => {
-                    failure = failure.or(Some("the priming frame was dropped".to_owned()))
+                    failure = failure.or(Some("the priming frame was dropped".to_owned()));
                 }
                 Output::Failed(reason) => failure = Some(reason),
             }

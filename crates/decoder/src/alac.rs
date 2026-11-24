@@ -1,8 +1,8 @@
-//! Apple Lossless (ALAC) decoder over `symphonia`, for AirPlay audio
+//! Apple Lossless (ALAC) decoder over `symphonia`, for `AirPlay` audio
 //! streams set up with `ct = 2` (music playback from iOS / macOS).
 //!
 //! The ALAC "magic cookie" comes from `extra_data` when the container
-//! carries one; AirPlay never sends it, so otherwise it is the fixed
+//! carries one; `AirPlay` never sends it, so otherwise it is the fixed
 //! configuration of the RAOP `fmtp` line for the configured sample rate
 //! and channel count (see [`ferricast_codec::alac`]).
 
@@ -18,7 +18,7 @@ use symphonia::default::codecs::AlacDecoder as SymphoniaAlac;
 use crate::aac::interleave_s16;
 
 /// The cookie of `config`: its `extra_data` (normalised to the bare
-/// 24-byte config), or the AirPlay one.
+/// 24-byte config), or the `AirPlay` one.
 fn cookie(config: &AudioDecoderConfig, channels: u8) -> Result<[u8; AlacConfig::LEN]> {
     match &config.extra_data {
         Some(extra) => AlacConfig::parse(extra)
@@ -33,7 +33,7 @@ fn cookie(config: &AudioDecoderConfig, channels: u8) -> Result<[u8; AlacConfig::
     }
 }
 
-/// Decodes AirPlay ALAC frames into interleaved 16-bit PCM.
+/// Decodes `AirPlay` ALAC frames into interleaved 16-bit PCM.
 #[derive(Default)]
 pub struct SymphoniaAlacDecoder {
     decoder: Option<SymphoniaAlac>,
@@ -65,7 +65,7 @@ impl SymphoniaAlacDecoder {
         Ok(())
     }
 
-    fn try_decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
+    fn try_decode(&mut self, frame: &AudioFrame) -> Result<Option<DecodedAudio>> {
         let decoder = self.decoder.as_mut().ok_or_else(|| {
             FerricastError::Decode("SymphoniaAlacDecoder::decode before configure()".into())
         })?;
@@ -87,10 +87,6 @@ impl SymphoniaAlacDecoder {
             timestamp_us: frame.timestamp_us,
         }))
     }
-
-    fn try_flush(&mut self) -> Result<Vec<DecodedAudio>> {
-        Ok(Vec::new())
-    }
 }
 
 impl AudioDecoder for SymphoniaAlacDecoder {
@@ -104,17 +100,14 @@ impl AudioDecoder for SymphoniaAlacDecoder {
     }
 
     fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>> {
-        self.try_decode(frame).map_err(CodecError::from_backend(
+        self.try_decode(&frame).map_err(CodecError::from_backend(
             BackendId::Symphonia,
             Operation::Decode,
         ))
     }
 
     fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>> {
-        self.try_flush().map_err(CodecError::from_backend(
-            BackendId::Symphonia,
-            Operation::Flush,
-        ))
+        Ok(Vec::new())
     }
 }
 
@@ -153,10 +146,10 @@ mod tests {
         b.put(1, 1); // partial frame: sample count follows
         b.put(0, 2); // no shift
         b.put(1, 1); // uncompressed
-        b.put(samples.len() as u32, 32);
+        b.put(u32::try_from(samples.len()).unwrap(), 32);
         for (l, r) in samples {
-            b.put(u32::from(*l as u16), 16);
-            b.put(u32::from(*r as u16), 16);
+            b.put(u32::from(l.cast_unsigned()), 16);
+            b.put(u32::from(r.cast_unsigned()), 16);
         }
         b.put(7, 3); // end
         b.out

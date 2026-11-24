@@ -1,6 +1,10 @@
 //! Every decoder stamps a picture with the timestamp of the packet it was
 //! decoded from: reordered pictures come out in presentation order, and
 //! packets a decoder drops or rejects never shift the pictures after them.
+#![allow(
+    dead_code,
+    reason = "helpers for tests that each need a decoder feature; a build without them runs none"
+)]
 
 use std::path::PathBuf;
 
@@ -72,6 +76,7 @@ fn parameter_sets(packet: &EncodedFrame, is_slice: impl Fn(u8) -> bool) -> Encod
     }
 }
 
+#[cfg(feature = "openh264-decode")]
 #[test]
 fn openh264_puts_b_frames_out_in_presentation_order() {
     let packets = packets("h264.mp4");
@@ -85,6 +90,7 @@ fn openh264_puts_b_frames_out_in_presentation_order() {
     }
 }
 
+#[cfg(feature = "openh264-decode")]
 #[test]
 fn openh264_packets_rejected_before_the_first_idr_do_not_shift_later_pictures() {
     let packets = packets("h264.mp4");

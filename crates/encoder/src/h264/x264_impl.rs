@@ -168,7 +168,7 @@ impl X264Encoder {
         Ok(drained.into_iter().map(|out| self.finish(out, 0)).collect())
     }
 
-    fn try_get_headers(&mut self) -> Result<Vec<u8>> {
+    fn headers(&mut self) -> Vec<u8> {
         // Re-pull from the live encoder so any internal SPS/PPS
         // regeneration is reflected. Falls back to the cached copy when
         // the encoder isn't built yet or the call fails, so callers that
@@ -181,7 +181,7 @@ impl X264Encoder {
                 self.sps_pps = fresh;
             }
         }
-        Ok(self.sps_pps.clone())
+        self.sps_pps.clone()
     }
 
     fn try_set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
@@ -226,10 +226,7 @@ impl VideoEncoder for X264Encoder {
     }
 
     fn get_headers(&mut self) -> CodecResult<Vec<u8>> {
-        self.try_get_headers().map_err(CodecError::from_backend(
-            BackendId::X264,
-            Operation::Headers,
-        ))
+        Ok(self.headers())
     }
 
     fn set_bitrate_kbps(&mut self, kbps: u32) -> CodecResult<()> {
@@ -361,7 +358,7 @@ impl Session {
             )));
         }
 
-        params.i_csp = sys::X264_CSP_I420 as c_int;
+        params.i_csp = sys::X264_CSP_I420.cast_signed();
         params.i_width = to_c_int(config.width);
         params.i_height = to_c_int(config.height);
         params.i_fps_num = config.fps.max(1);
@@ -386,7 +383,7 @@ impl Session {
         // Presets default to CRF, which ignores `i_bitrate` entirely.
         // ABR with a VBV capped at the target makes the bitrate a real
         // ceiling (≈ CBR) so a weak receiver link isn't flooded.
-        params.rc.i_rc_method = sys::X264_RC_ABR as c_int;
+        params.rc.i_rc_method = sys::X264_RC_ABR.cast_signed();
         apply_bitrate(&mut params, config.bitrate_kbps);
 
         let profile = match config.max_h264_profile.unwrap_or(H264Profile::High) {
@@ -395,7 +392,7 @@ impl Session {
             H264Profile::High => c"high",
         };
         // SAFETY: `params` is initialised and `profile` NUL-terminated.
-        if unsafe { sys::x264_param_apply_profile(&mut params, profile.as_ptr()) } < 0 {
+        if unsafe { sys::x264_param_apply_profile(&raw mut params, profile.as_ptr()) } < 0 {
             return Err(FerricastError::Encoder(format!(
                 "x264: settings incompatible with profile {profile:?}"
             )));
@@ -403,7 +400,7 @@ impl Session {
 
         // SAFETY: `params` is initialised; libx264 copies it and returns
         // NULL when the parameters are invalid.
-        let raw = unsafe { sys::x264_encoder_open(&mut params) };
+        let raw = unsafe { sys::x264_encoder_open(&raw mut params) };
         let raw = NonNull::new(raw).ok_or_else(|| {
             FerricastError::Encoder(format!(
                 "x264: encoder rejected {}x{} @ {} fps",
@@ -422,7 +419,8 @@ impl Session {
         let mut nals: *mut sys::x264_nal_t = ptr::null_mut();
         let mut count: c_int = 0;
         // SAFETY: `raw` is a live encoder; out-pointers are valid.
-        let size = unsafe { sys::x264_encoder_headers(self.raw.as_ptr(), &mut nals, &mut count) };
+        let size =
+            unsafe { sys::x264_encoder_headers(self.raw.as_ptr(), &raw mut nals, &raw mut count) };
         // SAFETY: values come straight from the call above and the
         // handle hasn't been used since.
         let payload = unsafe { nal_payload(nals, count, size) }?;
@@ -442,10 +440,10 @@ impl Session {
         let size = unsafe {
             sys::x264_encoder_encode(
                 self.raw.as_ptr(),
-                &mut nals,
-                &mut count,
+                &raw mut nals,
+                &raw mut count,
                 pic_in,
-                &mut pic_out,
+                &raw mut pic_out,
             )
         };
         // SAFETY: values come straight from the call above.
@@ -475,7 +473,7 @@ impl Session {
         // SAFETY: `raw` is live and `params` initialised; libx264 only
         // applies the fields that may change mid-stream (VBV was enabled
         // at open, which bitrate reconfiguration requires).
-        if unsafe { sys::x264_encoder_reconfig(self.raw.as_ptr(), &mut params) } < 0 {
+        if unsafe { sys::x264_encoder_reconfig(self.raw.as_ptr(), &raw mut params) } < 0 {
             return Err(FerricastError::Encoder(format!(
                 "x264: reconfigure to {kbps} kbps rejected"
             )));
@@ -596,9 +594,10 @@ impl I420Scratch {
             sys::X264_TYPE_IDR
         } else {
             sys::X264_TYPE_AUTO
-        } as c_int;
+        }
+        .cast_signed();
         pic.i_pts = pts;
-        pic.img.i_csp = sys::X264_CSP_I420 as c_int;
+        pic.img.i_csp = sys::X264_CSP_I420.cast_signed();
         pic.img.i_plane = 3;
         let planes = [
             (self.0.y_plane.borrow(), self.0.y_stride),
@@ -769,7 +768,7 @@ mod tests {
     }
 
     /// Zero latency: the very first input comes straight back out as
-    /// an IDR carrying SPS/PPS (b_repeat_headers=1).
+    /// an IDR carrying SPS/PPS (`b_repeat_headers=1`).
     #[test]
     fn first_frame_is_immediate_idr_with_param_sets() {
         let mut enc = configured();

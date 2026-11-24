@@ -92,25 +92,22 @@ impl Session {
             backend: BackendId::MediaCodec,
             target: ferricast_core::CodecTarget::encode(config.codec),
         })?;
-        let (frame_samples, adts) = match config.codec {
-            AudioCodec::Opus => {
-                if !OPUS_RATES.contains(&config.sample_rate) || !matches!(config.channels, 1 | 2) {
-                    return Err(unsupported(format!(
-                        "Opus from {} Hz / {} channels (8-48 kHz Opus rates, mono or stereo)",
-                        config.sample_rate, config.channels
-                    )));
-                }
-                ((config.sample_rate / OPUS_FRAMES_PER_SECOND) as usize, None)
+        let (frame_samples, adts) = if config.codec == AudioCodec::Opus {
+            if !OPUS_RATES.contains(&config.sample_rate) || !matches!(config.channels, 1 | 2) {
+                return Err(unsupported(format!(
+                    "Opus from {} Hz / {} channels (8-48 kHz Opus rates, mono or stereo)",
+                    config.sample_rate, config.channels
+                )));
             }
-            _ => {
-                let shape = AacLc::new(config.sample_rate, config.channels).ok_or_else(|| {
-                    unsupported(format!(
-                        "AAC-LC at {} Hz / {} channels",
-                        config.sample_rate, config.channels
-                    ))
-                })?;
-                (AAC_FRAME_SAMPLES, Some(shape))
-            }
+            ((config.sample_rate / OPUS_FRAMES_PER_SECOND) as usize, None)
+        } else {
+            let shape = AacLc::new(config.sample_rate, config.channels).ok_or_else(|| {
+                unsupported(format!(
+                    "AAC-LC at {} Hz / {} channels",
+                    config.sample_rate, config.channels
+                ))
+            })?;
+            (AAC_FRAME_SAMPLES, Some(shape))
         };
         let int = |value: u32, what: &str| {
             i32::try_from(value).map_err(|_| unsupported(format!("a {what} of {value}")))

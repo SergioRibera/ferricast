@@ -1,15 +1,15 @@
-//! H.264 / H.265 / VP9 / AV1 decode through VideoToolbox.
+//! H.264 / H.265 / VP9 / AV1 decode through `VideoToolbox`.
 //!
 //! [`stream`] turns packets into samples and the format description they
 //! decode against; the session is recreated when it cannot take a new
 //! description, or when the bit depth changes (8-bit streams decode to
 //! NV12, deeper ones to P010). Samples are stamped with the packet
 //! timestamp; pictures come back through a callback carrying it. Outside
-//! low-latency mode temporal processing is on, so VideoToolbox emits
+//! low-latency mode temporal processing is on, so `VideoToolbox` emits
 //! them in display order.
 //!
 //! With [`FrameMemory::Native`] each picture is handed out as the
-//! IOSurface-backed `CVPixelBuffer` VideoToolbox decoded into
+//! IOSurface-backed `CVPixelBuffer` `VideoToolbox` decoded into
 //! ([`ferricast_codec::apple::PixelBuffer`]), with no copy; otherwise it
 //! is copied out in the configured pixel format.
 //!
@@ -55,13 +55,13 @@ use super::os_status;
 use crate::nv12::{self, OutputFormat};
 
 const BACKEND: BackendId = BackendId::VideoToolbox;
-/// Timestamps cross VideoToolbox as microseconds.
+/// Timestamps cross `VideoToolbox` as microseconds.
 const MICROS: i32 = 1_000_000;
 
 /// What a candidate opens.
 type Opened = Box<dyn ferricast_codec::VideoDecoderSession>;
 
-/// Adds the VideoToolbox decoders of the registry's codec.
+/// Adds the `VideoToolbox` decoders of the registry's codec.
 pub(crate) fn video(registry: VideoDecoderRegistry) -> VideoDecoderRegistry {
     let CodecKind::Video(codec) = registry.target().codec else {
         return registry;
@@ -229,6 +229,10 @@ unsafe extern "C-unwind" fn on_decoded(
 }
 
 /// One decompression session.
+#[expect(
+    clippy::struct_field_names,
+    reason = "the wrapped VTDecompressionSession is the session itself"
+)]
 struct Session {
     session: CFRetained<VTDecompressionSession>,
     /// The generation of the stream format the session decodes.
@@ -335,7 +339,7 @@ impl Session {
     }
 }
 
-/// A VideoToolbox decoder.
+/// A `VideoToolbox` decoder.
 pub(crate) struct VtDecoder {
     acceleration: Acceleration,
     stream: Stream,

@@ -38,6 +38,7 @@ pub struct OpusRsEncoder {
 }
 
 impl OpusRsEncoder {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -66,12 +67,15 @@ impl OpusRsEncoder {
         }
         let frame_samples = (config.sample_rate / FRAMES_PER_SECOND) as usize;
         let mut enc = RawEncoder::new(
-            config.sample_rate as i32,
+            i32::try_from(config.sample_rate).map_err(|_| {
+                FerricastError::Encoder(format!("opus-rs: {} Hz rate", config.sample_rate))
+            })?,
             config.channels as usize,
             Application::Audio,
         )
         .map_err(|e| FerricastError::Encoder(format!("opus-rs: new failed: {e}")))?;
-        enc.bitrate_bps = config.bitrate_kbps.saturating_mul(1000) as i32;
+        enc.bitrate_bps =
+            i32::try_from(config.bitrate_kbps.saturating_mul(1000)).unwrap_or(i32::MAX);
         tracing::info!(
             sample_rate = config.sample_rate,
             channels = config.channels,
@@ -131,7 +135,7 @@ impl OpusRsEncoder {
         let mut i = skipped_bytes;
         while i < usable {
             let s = i16::from_le_bytes([pcm_bytes[i], pcm_bytes[i + 1]]);
-            self.pcm_buf.push(s as f32 / 32768.0);
+            self.pcm_buf.push(f32::from(s) / 32768.0);
             i += 2;
         }
 
@@ -158,10 +162,6 @@ impl OpusRsEncoder {
         }
         Ok(())
     }
-
-    fn try_flush(mut self) -> Result<Vec<AudioFrame>> {
-        Ok(std::mem::take(&mut self.pending))
-    }
 }
 
 impl AudioEncoder for OpusRsEncoder {
@@ -180,10 +180,7 @@ impl AudioEncoder for OpusRsEncoder {
     }
 
     fn flush(self) -> CodecResult<Vec<AudioFrame>> {
-        self.try_flush().map_err(CodecError::from_backend(
-            BackendId::OpusRs,
-            Operation::Flush,
-        ))
+        Ok(self.pending)
     }
 
     fn take_output(&mut self) -> Vec<AudioFrame> {

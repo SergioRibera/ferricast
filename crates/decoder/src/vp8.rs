@@ -26,7 +26,7 @@ impl RustVp8Decoder {
         Ok(())
     }
 
-    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: &EncodedFrame) -> Result<Option<CapturedFrame>> {
         let decoder = self.decoder.as_mut().ok_or_else(|| {
             FerricastError::Decode("RustVp8Decoder::decode before configure()".into())
         })?;
@@ -61,10 +61,6 @@ impl RustVp8Decoder {
         .map(|raw| Some(CapturedFrame::Cpu(raw)))
         .ok_or_else(short)
     }
-
-    fn try_flush(&mut self) -> Result<Vec<CapturedFrame>> {
-        Ok(Vec::new())
-    }
 }
 
 impl VideoDecoder for RustVp8Decoder {
@@ -78,16 +74,13 @@ impl VideoDecoder for RustVp8Decoder {
     }
 
     fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
-        self.try_decode(frame).map_err(CodecError::from_backend(
+        self.try_decode(&frame).map_err(CodecError::from_backend(
             BackendId::RustVp8,
             Operation::Decode,
         ))
     }
 
     fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
-        self.try_flush().map_err(CodecError::from_backend(
-            BackendId::RustVp8,
-            Operation::Flush,
-        ))
+        Ok(Vec::new())
     }
 }

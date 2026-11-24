@@ -118,7 +118,7 @@ impl OpenH264Decoder {
         Ok(())
     }
 
-    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: &EncodedFrame) -> Result<Option<CapturedFrame>> {
         if self.low_latency
             && let Some(release) = Release::for_packet(&frame.data)
             && release != self.release
@@ -171,7 +171,7 @@ impl VideoDecoder for OpenH264Decoder {
     }
 
     fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
-        self.try_decode(frame).map_err(CodecError::from_backend(
+        self.try_decode(&frame).map_err(CodecError::from_backend(
             BackendId::OpenH264,
             Operation::Decode,
         ))

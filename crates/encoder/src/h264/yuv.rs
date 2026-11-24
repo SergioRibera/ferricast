@@ -28,7 +28,7 @@ use crate::frame_view::FrameView;
 /// Standard NV12 V4L2 / DRM fourcc reused across libva.
 const VA_FOURCC_NV12: u32 = 0x3231_564E; // 'N','V','1','2'
 
-/// `VAProcColorStandardType` (va_vpp.h) for the GPU colour conversion:
+/// `VAProcColorStandardType` (`va_vpp.h`) for the GPU colour conversion:
 /// the captured DMA-BUF is sRGB, the encoder input BT.709 — the same
 /// matrix the CPU path and the SPS VUI use.
 pub(crate) const VPP_INPUT_STANDARD: u8 = 8; // VAProcColorStandardSRGB
@@ -38,12 +38,20 @@ pub(crate) const VPP_OUTPUT_STANDARD: u8 = 2; // VAProcColorStandardBT709
 pub(crate) const VPP_BACKGROUND_BLACK: u32 = 0xff00_0000;
 
 /// Full-range RGB in.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "VA_SOURCE_RANGE_* are 1 and 2"
+)]
 pub(crate) fn vpp_input_colour() -> ProcColorProperties {
     ProcColorProperties::new(0, VA_SOURCE_RANGE_FULL as u8, 0, 0, 0)
 }
 
 /// Limited-range BT.709 out (H.273 code 1 for primaries / transfer /
 /// matrix), matching the VUI.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "VA_SOURCE_RANGE_* are 1 and 2"
+)]
 pub(crate) fn vpp_output_colour() -> ProcColorProperties {
     ProcColorProperties::new(0, VA_SOURCE_RANGE_REDUCED as u8, 1, 1, 1)
 }
@@ -53,7 +61,7 @@ const PAD_LUMA: u8 = 16;
 const PAD_CHROMA: u8 = 128;
 
 /// Driver-allocated NV12 destination planes (split-borrowed because
-/// the Y and UV regions live in the same mapped VAImage buffer).
+/// the Y and UV regions live in the same mapped `VAImage` buffer).
 ///
 /// * `y` / `y_stride` — destination luma plane.
 /// * `uv` / `uv_stride` — destination chroma plane (interleaved
@@ -317,7 +325,7 @@ mod tests {
             colour: None,
             width: w,
             height: h,
-            stride: stride as u32,
+            stride: u32::try_from(stride).unwrap(),
             format: PixelFormat::Bgra,
             data: Bytes::from(data),
             timestamp_us: 0,

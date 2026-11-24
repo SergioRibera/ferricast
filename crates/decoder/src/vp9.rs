@@ -34,21 +34,21 @@ impl RustVp9Decoder {
         Ok(())
     }
 
-    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: &EncodedFrame) -> Result<Option<CapturedFrame>> {
         let decoder = self.decoder.as_mut().ok_or_else(|| {
             FerricastError::Decode("RustVp9Decoder::decode before configure()".into())
         })?;
         decoder
-            .push(&frame.data, Some(frame.timestamp_us as i64))
+            .push(&frame.data, Some(frame.timestamp_us.cast_signed()))
             .map_err(|e| FerricastError::Decode(format!("vp9 decode: {e:?}")))?;
         // `Again` means "hidden frame decoded" as well as "queue empty",
         // and the two cannot be told apart, so every frame one superframe
         // can carry gets a turn; an empty queue answers instantly.
         for _ in 0..=SUPERFRAME_MAX_FRAMES {
             match decoder.next_frame() {
-                Ok(decoded) => {
+                Ok(output) => {
                     self.ready
-                        .push_back(picture(&decoded, self.format, self.container)?)
+                        .push_back(picture(&output, self.format, self.container)?);
                 }
                 Err(Vp9Error::Again) => {}
                 Err(Vp9Error::Eof) => break,
@@ -67,7 +67,7 @@ impl RustVp9Decoder {
                 match decoder.next_frame() {
                     Ok(decoded) => {
                         self.ready
-                            .push_back(picture(&decoded, self.format, self.container)?)
+                            .push_back(picture(&decoded, self.format, self.container)?);
                     }
                     Err(Vp9Error::Again) => {}
                     Err(Vp9Error::Eof) => break,
@@ -90,7 +90,7 @@ impl VideoDecoder for RustVp9Decoder {
     }
 
     fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
-        self.try_decode(frame).map_err(CodecError::from_backend(
+        self.try_decode(&frame).map_err(CodecError::from_backend(
             BackendId::RustVp9,
             Operation::Decode,
         ))

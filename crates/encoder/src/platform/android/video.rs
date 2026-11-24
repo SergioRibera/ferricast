@@ -246,6 +246,7 @@ fn format(config: &EncoderConfig, mime: &str, bitrate_mode: i32) -> CodecResult<
     // Whole seconds: an int32 is what every API level reads (a float is
     // only honoured from API 25, and not by every codec).
     // Clamped to 1..=3600 first, so the cast cannot truncate.
+    #[expect(clippy::cast_possible_truncation, reason = "clamped to 1..=3600 first")]
     let keyframe_interval = config.keyframe_interval_secs.ceil().clamp(1.0, 3600.0) as i32;
     format.set_i32(key::I_FRAME_INTERVAL, keyframe_interval);
     // Real-time priority, one picture of latency, no B-frames: the

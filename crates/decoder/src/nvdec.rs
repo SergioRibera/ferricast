@@ -181,6 +181,7 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
 }
 
 impl<C: NvdecCodec> NvdecDecoder<C> {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -188,6 +189,9 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
     /// Capability probe — fails when libcuda / libnvcuvid aren't on
     /// the runtime LD path, or the GPU doesn't support this codec.
     /// Cheap: no decoder session is created.
+    ///
+    /// # Errors
+    /// [`FerricastError::Decode`] naming what is missing.
     pub fn probe() -> Result<()> {
         let caps = NvDecoder::query_caps(C::NV_CODEC, /* device_id = */ 0)
             .map_err(|e| FerricastError::Decode(format!("NVDEC ({}): query_caps: {e}", C::NAME)))?;
@@ -251,7 +255,7 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
         Ok(())
     }
 
-    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: &EncodedFrame) -> Result<Option<CapturedFrame>> {
         let decoder = self.decoder.as_mut().ok_or_else(|| {
             FerricastError::Decode(format!("NVDEC ({}) decode before configure()", C::NAME))
         })?;
@@ -312,7 +316,7 @@ impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
                 ),
             });
         }
-        self.try_decode(frame).map_err(CodecError::from_backend(
+        self.try_decode(&frame).map_err(CodecError::from_backend(
             BackendId::Nvdec,
             Operation::Decode,
         ))
