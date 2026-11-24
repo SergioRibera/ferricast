@@ -997,6 +997,34 @@ fn first_mb_in_slice(nal: &[u8]) -> Result<u32> {
     slice::BitReader::new(&rbsp).read_ue()
 }
 
+/// The colour signalling of an SPS's VUI: unspecified when the SPS
+/// carries no video signal type, H.264's implied BT.601-era defaults
+/// (unspecified codes) when it has no colour description.
+fn sps_colour(sps: &SeqParameterSet) -> ColourDescription {
+    let vui = sps.vui_parameters.as_ref();
+    let Some(signal) = vui.and_then(|vui| vui.video_signal_type.as_ref()) else {
+        return ColourDescription::unspecified(ColourRange::Limited);
+    };
+    let unspecified = MatrixCoefficients::Unspecified.code();
+    let (primaries, transfer, matrix) = signal.colour_description.as_ref().map_or(
+        (unspecified, unspecified, unspecified),
+        |description| {
+            (
+                description.colour_primaries,
+                description.transfer_characteristics,
+                description.matrix_coefficients,
+            )
+        },
+    );
+    let colour =
+        ColourDescription::from_codes(primaries, transfer, matrix, signal.video_full_range_flag);
+    let location = vui
+        .and_then(|vui| vui.chroma_loc_info.as_ref())
+        .and_then(|info| u8::try_from(info.chroma_sample_loc_type_top_field).ok())
+        .and_then(|code| ChromaLocation::try_from(code).ok());
+    location.map_or(colour, |location| colour.with_chroma_location(location))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,32 +1161,4 @@ mod tests {
             );
         }
     }
-}
-
-/// The colour signalling of an SPS's VUI: unspecified when the SPS
-/// carries no video signal type, H.264's implied BT.601-era defaults
-/// (unspecified codes) when it has no colour description.
-fn sps_colour(sps: &SeqParameterSet) -> ColourDescription {
-    let vui = sps.vui_parameters.as_ref();
-    let Some(signal) = vui.and_then(|vui| vui.video_signal_type.as_ref()) else {
-        return ColourDescription::unspecified(ColourRange::Limited);
-    };
-    let unspecified = MatrixCoefficients::Unspecified.code();
-    let (primaries, transfer, matrix) = signal.colour_description.as_ref().map_or(
-        (unspecified, unspecified, unspecified),
-        |description| {
-            (
-                description.colour_primaries,
-                description.transfer_characteristics,
-                description.matrix_coefficients,
-            )
-        },
-    );
-    let colour =
-        ColourDescription::from_codes(primaries, transfer, matrix, signal.video_full_range_flag);
-    let location = vui
-        .and_then(|vui| vui.chroma_loc_info.as_ref())
-        .and_then(|info| u8::try_from(info.chroma_sample_loc_type_top_field).ok())
-        .and_then(|code| ChromaLocation::try_from(code).ok());
-    location.map_or(colour, |location| colour.with_chroma_location(location))
 }
