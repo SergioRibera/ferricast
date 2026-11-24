@@ -1,4 +1,4 @@
-//! PIN or password prompt shown when a receiver asks to pair (AirPlay
+//! PIN or password prompt shown when a receiver asks to pair (`AirPlay`
 //! displays a one-time PIN on the TV, or wants its access password).
 //!
 //! Opens in its own top-level window, like the source picker, so it
@@ -22,13 +22,12 @@ pub type PairingResponder = Arc<tokio::sync::Mutex<Option<oneshot::Sender<Pairin
 
 /// Answer `respond` without asking the user.
 pub fn answer(respond: &PairingResponder, response: PairingResponse) {
-    match respond.try_lock() {
-        Ok(mut slot) => {
-            if let Some(tx) = slot.take() {
-                let _ = tx.send(response);
-            }
+    if let Ok(mut slot) = respond.try_lock() {
+        if let Some(tx) = slot.take() {
+            let _ = tx.send(response);
         }
-        Err(_) => tracing::warn!("pairing answer slot busy; prompt left unanswered"),
+    } else {
+        tracing::warn!("pairing answer slot busy; prompt left unanswered");
     }
 }
 
@@ -117,7 +116,7 @@ pub fn open_pairing_dialog(
     });
 }
 
-/// Show `pin`, the code an AirPlay sender asks its user to type, in its
+/// Show `pin`, the code an `AirPlay` sender asks its user to type, in its
 /// own always-on-top window. The caller closes it.
 pub async fn open_pin_window(platform: &Platform, pin: String) -> freya::winit::window::WindowId {
     let config = WindowConfig::new_app(PinDisplay { pin })

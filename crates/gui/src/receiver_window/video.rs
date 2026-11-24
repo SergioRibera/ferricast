@@ -26,7 +26,7 @@ use skia_safe::{
 /// How a frame's bytes are laid out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Layout {
-    /// `stride`-pitched luma rows, then interleaved CbCr rows at half
+    /// `stride`-pitched luma rows, then interleaved `CbCr` rows at half
     /// resolution.
     Nv12(YuvColour),
     /// As NV12 with 16-bit little-endian samples holding 10 bits in their
@@ -275,6 +275,10 @@ pub struct VideoRenderer {
 impl VideoRenderer {
     /// Draws `slot`'s frame letterboxed into a `width` × `height` area
     /// at the canvas origin.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "frame sizes are far below 2^24, exact in f32"
+    )]
     pub fn draw(&mut self, canvas: &Canvas, slot: &FrameSlot, width: f32, height: f32) {
         let Some(frame) = &slot.frame else { return };
         let mut context = canvas.recording_context();

@@ -1,6 +1,9 @@
 use ferricast::prelude::*;
 use ferricast::{ManagerEvent, PairingChallenge, PairingResponse};
-use freya::{prelude::*, radio::*};
+use freya::{
+    prelude::*,
+    radio::{RadioChannel, RadioStation, use_radio},
+};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -310,6 +313,10 @@ pub struct FerricastApp {
 }
 
 impl App for FerricastApp {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the root view's layout reads top to bottom"
+    )]
     fn render(&self) -> impl IntoElement {
         let stream_manager = self.stream_manager.clone();
         use_provide_context(|| self.radio_station);

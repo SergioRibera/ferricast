@@ -104,3 +104,6 @@ ash = "0.38"
 tempfile = "3.27"
 # Paused-clock tests for the picker's daemon-call timeouts.
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
