@@ -28,7 +28,7 @@ use crate::manager::ManagerEvent;
 
 /// Upper bound for resolving a LOAD (playlist + first segment +
 /// decoder setup + sink). The puller's own retries end well before.
-const LOAD_TIMEOUT: Duration = Duration::from_secs(60);
+const LOAD_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Messages one session sends another.
 enum Notice {
@@ -73,7 +73,7 @@ enum MediaKind {
     Hls,
     Dash,
     SmoothStreaming,
-    /// A single progressive file (MP4, WebM, MKV, MP3, …).
+    /// A single progressive file (MP4, `WebM`, MKV, MP3, …).
     Progressive,
     /// Nothing to go by; HLS is tried.
     Unknown,
@@ -362,6 +362,10 @@ impl Session {
     }
 
     /// Handles one command; `Some` ends the session.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per media command; splitting would scatter the dispatch"
+    )]
     async fn on_command(&mut self, cmd: MediaCommand) -> Option<End> {
         match cmd {
             MediaCommand::Load {
@@ -418,13 +422,7 @@ impl Session {
                     self.seek_when_loaded = Some(position_us);
                 }
             }
-            MediaCommand::Stop => {
-                let had_media = self.loading.take().is_some() | self.stop_pump().await;
-                if had_media {
-                    self.report(PlaybackState::Idle).await;
-                }
-            }
-            MediaCommand::StopApp => {
+            MediaCommand::Stop | MediaCommand::StopApp => {
                 let had_media = self.loading.take().is_some() | self.stop_pump().await;
                 if had_media {
                     self.report(PlaybackState::Idle).await;

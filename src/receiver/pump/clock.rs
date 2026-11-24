@@ -91,12 +91,11 @@ impl Clock {
 
     /// Presentation instant of `pts_us`, re-anchoring on jumps.
     pub(super) fn due(&mut self, pts_us: u64, now: Instant) -> Instant {
-        let (t0, p0) = match self.anchor {
-            Some(anchor) => anchor,
-            None => {
-                self.anchor_at(pts_us, now);
-                (now + self.lead, pts_us)
-            }
+        let (t0, p0) = if let Some(anchor) = self.anchor {
+            anchor
+        } else {
+            self.anchor_at(pts_us, now);
+            (now + self.lead, pts_us)
         };
         let due = if pts_us >= p0 {
             t0.checked_add(Duration::from_micros(pts_us - p0))
@@ -189,6 +188,12 @@ mod tests {
     /// system clock. Returns the worst audio-vs-video error, the error at
     /// the end, and the largest single correction of the presentation
     /// time, all in milliseconds.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "the simulation spans an hour of positive microseconds, far inside f64's exact range"
+    )]
     fn simulate(ppm: f64, follow: bool) -> (f64, f64, f64) {
         let start = Instant::now();
         let at = |us: f64| start + Duration::from_secs_f64(us / 1e6);

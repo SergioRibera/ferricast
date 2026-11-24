@@ -192,14 +192,14 @@ impl Position {
     /// before it is actually seen or heard.
     fn presented(&mut self, pts_us: u64, behind: Duration) {
         if self.timeline == Timeline::MediaTime {
-            let at = pts_us.saturating_sub(behind.as_micros() as u64);
+            let at = pts_us.saturating_sub(u64::try_from(behind.as_micros()).unwrap_or(u64::MAX));
             self.shared.store(at, Ordering::Relaxed);
             return;
         }
         let first = *self.first_pts.get_or_insert(pts_us);
         let elapsed = pts_us
             .saturating_sub(first)
-            .saturating_sub(behind.as_micros() as u64);
+            .saturating_sub(u64::try_from(behind.as_micros()).unwrap_or(u64::MAX));
         self.shared
             .store(self.base_us.saturating_add(elapsed), Ordering::Relaxed);
     }
@@ -772,20 +772,16 @@ impl Pump {
             }
             return Some(pcm);
         }
-        let pcm = match due.checked_duration_since(now) {
-            Some(gap) => {
-                if !gap.is_zero() {
-                    self.push_audio(silence(&pcm, gap)).await;
-                }
-                Some(pcm)
+        let pcm = if let Some(gap) = due.checked_duration_since(now) {
+            if !gap.is_zero() {
+                self.push_audio(silence(&pcm, gap)).await;
             }
+            Some(pcm)
+        } else {
             // Already due: only the part still ahead is pushed.
-            None => {
-                let late_us =
-                    u64::try_from(now.duration_since(due).as_micros()).unwrap_or(u64::MAX);
-                let from_us = pcm.timestamp_us.saturating_add(late_us);
-                trim_audio(pcm, from_us)
-            }
+            let late_us = u64::try_from(now.duration_since(due).as_micros()).unwrap_or(u64::MAX);
+            let from_us = pcm.timestamp_us.saturating_add(late_us);
+            trim_audio(pcm, from_us)
         };
         let Some(pcm) = pcm else {
             if let Some(meter) = self.meter.as_mut() {
@@ -832,7 +828,9 @@ fn trim_audio(mut audio: DecodedAudio, from_us: u64) -> Option<DecodedAudio> {
 
 /// `duration` of silence in `like`'s format, timed just before it.
 fn silence(like: &DecodedAudio, duration: Duration) -> DecodedAudio {
-    let frames = u64::from(like.sample_rate) * duration.as_millis() as u64 / 1000;
+    let frames = u64::from(like.sample_rate)
+        * u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        / 1000;
     let samples = usize::try_from(frames).unwrap_or(0) * usize::from(like.channels);
     DecodedAudio {
         pcm: vec![0; samples],
@@ -840,7 +838,7 @@ fn silence(like: &DecodedAudio, duration: Duration) -> DecodedAudio {
         channels: like.channels,
         timestamp_us: like
             .timestamp_us
-            .saturating_sub(duration.as_micros() as u64),
+            .saturating_sub(u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)),
     }
 }
 

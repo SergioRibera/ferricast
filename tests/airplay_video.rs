@@ -11,6 +11,7 @@
 
 mod support;
 
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -178,7 +179,7 @@ impl Sender {
             body.len()
         );
         if let Some(ct) = content_type {
-            head.push_str(&format!("Content-Type: {ct}\r\n"));
+            write!(head, "Content-Type: {ct}\r\n").unwrap();
         }
         head.push_str("\r\n");
         self.stream.write_all(head.as_bytes()).await.unwrap();
@@ -379,6 +380,10 @@ async fn rig() -> Rig {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scripted session, step by step, as a sender drives it"
+)]
 async fn play_and_drive(rig: &mut Rig, url: &str, body: PlayBody) {
     // ── Discovery: /info and /server-info ──
     let mut info_conn = Sender::connect(rig.addr).await;
@@ -454,7 +459,10 @@ async fn play_and_drive(rig: &mut Rig, url: &str, body: PlayBody) {
         info.get("readyToPlay").and_then(Value::as_boolean),
         Some(true)
     );
-    assert_eq!(real(&info, "rate"), 1.0);
+    assert!(
+        (real(&info, "rate") - 1.0).abs() < f64::EPSILON,
+        "playing at rate 1"
+    );
     let duration = real(&info, "duration");
     assert!(
         (duration - f64::from(CLIP_SECS)).abs() < 0.6,
@@ -501,7 +509,10 @@ async fn play_and_drive(rig: &mut Rig, url: &str, body: PlayBody) {
     // The paused report re-bases the position on the pump's.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let paused = sender.playback_info().await.unwrap();
-    assert_eq!(real(&paused, "rate"), 0.0);
+    assert!(
+        real(&paused, "rate").abs() < f64::EPSILON,
+        "paused at rate 0"
+    );
     let held = real(&paused, "position");
     assert!(
         (3.0..4.5).contains(&held),
@@ -753,13 +764,16 @@ async fn mirror_until_dropped(
                 stride: W * 4,
                 format: PixelFormat::Bgra,
                 data: Bytes::from(vec![shade; (W * H * 4) as usize]),
-                timestamp_us: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64,
+                timestamp_us: u64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros(),
+                )
+                .unwrap(),
             });
-            let encoded = encoder.encode(frame).unwrap();
-            if session.send_frame(&encoded).await.is_err() || !session.is_alive() {
+            let packet = encoder.encode(frame).unwrap();
+            if session.send_frame(&packet).await.is_err() || !session.is_alive() {
                 break;
             }
             sent += 1;

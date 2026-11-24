@@ -508,10 +508,20 @@ impl StreamManager {
     /// Start every registered receiver protocol's advertiser and
     /// per-protocol accept supervisor. Requires
     /// [`Self::set_sink_factory`] to have been called.
+    ///
+    /// # Errors
+    /// [`ferricast_core::FerricastError::Receiver`] when no sink factory
+    /// is set. Protocols that fail to bind or advertise are reported as
+    /// [`ManagerEvent::ReceiverError`] instead.
     pub async fn start_receivers(&mut self) -> Result<()> {
         self.receiver.start_receivers(&self.event_tx).await
     }
 
+    /// Stop every receiver protocol's advertiser and accept loop.
+    ///
+    /// # Errors
+    /// None today: advertisers and accept loops that fail to stop are
+    /// logged; the `Result` is kept for protocols that may report it.
     pub async fn stop_receivers(&mut self) -> Result<()> {
         self.receiver.stop_receivers().await
     }
@@ -712,6 +722,7 @@ impl StreamManager {
     ///     .build_with_events();
     /// # drop((manager, events));
     /// ```
+    #[must_use]
     pub fn builder() -> StreamManagerBuilder {
         StreamManagerBuilder::default()
     }
@@ -730,6 +741,7 @@ pub struct StreamManagerBuilder {
 
 impl StreamManagerBuilder {
     /// Register an arbitrary protocol handler.
+    #[must_use]
     pub fn register<H>(mut self) -> Self
     where
         H: ProtocolHandler + Clone + Default + 'static,
@@ -738,13 +750,15 @@ impl StreamManagerBuilder {
         self
     }
 
-    /// Register the Chromecast (CASTv2) handler.
+    /// Register the Chromecast (`CASTv2`) handler.
     #[cfg(feature = "chromecast")]
+    #[must_use]
     pub fn with_chromecast(self) -> Self {
         self.register::<ferricast_chromecast::ChromecastHandler>()
     }
 
     #[cfg(feature = "airplay")]
+    #[must_use]
     pub fn with_airplay(self) -> Self {
         self.register::<ferricast_airplay::AirPlayHandler>()
     }
@@ -753,10 +767,11 @@ impl StreamManagerBuilder {
     ///
     /// Discovers MS-MICE sinks over mDNS and drives WFD M1-M7 + MPEG2-TS
     /// over RTP against them. On Linux the handler additionally runs
-    /// Wi-Fi Direct discovery via wpa_supplicant; on Windows it
+    /// Wi-Fi Direct discovery via `wpa_supplicant`; on Windows it
     /// enumerates `CastingDevice`s via WinRT. Runtime blockers
     /// (no P2P radio, IWD-managed wifi, missing WDI driver) surface
     /// through [`ProtocolHandler::availability`].
+    #[must_use]
     pub fn with_miracast(self) -> Self {
         self.register::<ferricast_miracast::MiracastHandler>()
     }
@@ -764,6 +779,7 @@ impl StreamManagerBuilder {
     /// Register a Miracast *receiver* — advertise this process as a
     /// `_display._tcp` MS-MICE sink and accept WFD M1-M7 from Windows
     /// "Cast to" / Android Smart View.
+    #[must_use]
     pub fn with_miracast_receiver(self, receiver: ferricast_miracast::MiracastReceiver) -> Self {
         let builder = self.with_receiver(receiver);
         builder.register_video_decoder::<ferricast_decoder::H264Decoder>()
@@ -773,6 +789,7 @@ impl StreamManagerBuilder {
     /// as a Cast target and accept LOAD / PLAY / PAUSE / SEEK from
     /// senders.
     #[cfg(feature = "chromecast")]
+    #[must_use]
     pub fn with_chromecast_receiver(self) -> Self {
         self.register_receiver::<ferricast_chromecast::ChromecastReceiver>()
     }
@@ -784,6 +801,7 @@ impl StreamManagerBuilder {
     /// receiver with [`ferricast_airplay::AirPlayReceiver::new`], which
     /// loads its persisted identity.
     #[cfg(feature = "airplay")]
+    #[must_use]
     pub fn with_airplay_receiver(self, receiver: ferricast_airplay::AirPlayReceiver) -> Self {
         let builder = self.with_receiver(receiver);
         #[cfg(feature = "fdk-aac")]
@@ -793,6 +811,7 @@ impl StreamManagerBuilder {
 
     /// Register the bundled H.264 video decoder facade
     /// ([`ferricast_decoder::H264Decoder`]).
+    #[must_use]
     pub fn with_h264_decoder(self) -> Self {
         self.register_video_decoder::<ferricast_decoder::H264Decoder>()
     }
@@ -800,11 +819,13 @@ impl StreamManagerBuilder {
     /// Register the bundled AAC audio decoder
     /// ([`ferricast_decoder::AacDecoder`]).
     #[cfg(feature = "aac")]
+    #[must_use]
     pub fn with_aac_decoder(self) -> Self {
         self.register_audio_decoder::<ferricast_decoder::AacDecoder>()
     }
 
     /// Register a receiver-side protocol handler.
+    #[must_use]
     pub fn register_receiver<P>(mut self) -> Self
     where
         P: ReceiverProtocol + Clone + Default + 'static,
@@ -815,6 +836,7 @@ impl StreamManagerBuilder {
 
     /// Register a configured receiver-side protocol instance (custom
     /// port, friendly name, …).
+    #[must_use]
     pub fn with_receiver<P>(mut self, protocol: P) -> Self
     where
         P: ReceiverProtocol + 'static,
@@ -825,6 +847,7 @@ impl StreamManagerBuilder {
 
     /// Register a video decoder factory. See
     /// [`StreamManager::register_video_decoder`] for ordering.
+    #[must_use]
     pub fn register_video_decoder<D>(mut self) -> Self
     where
         D: VideoDecoder + Default + 'static,
@@ -833,6 +856,7 @@ impl StreamManagerBuilder {
         self
     }
 
+    #[must_use]
     pub fn register_audio_decoder<D>(mut self) -> Self
     where
         D: AudioDecoder + Default + 'static,
@@ -844,6 +868,7 @@ impl StreamManagerBuilder {
     /// Set the sink factory the receiver pipeline asks for a
     /// destination whenever a new transmission arrives. The GUI
     /// typically opens a new window inside this callback.
+    #[must_use]
     pub fn set_sink_factory<F, Fut>(mut self, factory: F) -> Self
     where
         F: Fn(&RemoteSender, &MediaInfo) -> Fut + Send + Sync + 'static,
@@ -858,6 +883,7 @@ impl StreamManagerBuilder {
     /// (callers that explicitly set `StreamConfig::port_range` take
     /// precedence). Useful for firewall-managed hosts: open exactly
     /// this range and nothing else reaches the device.
+    #[must_use]
     pub fn with_port_range(mut self, start: u16, end: u16) -> Self {
         self.manager.port_range = Some((start, end));
         self
@@ -873,6 +899,9 @@ impl StreamManagerBuilder {
     /// Finalize and split out the event receiver in one step — the
     /// common shape for apps that wrap the manager in `Arc<Mutex<_>>`
     /// and need the rx accessible from a separate task.
+    ///
+    /// # Panics
+    /// Never: a freshly built manager still owns its event receiver.
     pub fn build_with_events(
         mut self,
     ) -> (StreamManager, tokio::sync::mpsc::Receiver<ManagerEvent>) {

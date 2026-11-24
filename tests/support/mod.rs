@@ -8,6 +8,7 @@
 #![allow(dead_code, reason = "each test binary uses a different subset")]
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -77,8 +78,8 @@ impl TestServer {
                         .map(|(_, v)| v.trim().to_string());
                     log.lock().unwrap().push(path.clone());
                     let response = match handler(&path) {
-                        Reply::Ok(body) => match range.as_deref().and_then(parse_range) {
-                            Some((start, end)) => {
+                        Reply::Ok(body) => {
+                            if let Some((start, end)) = range.as_deref().and_then(parse_range) {
                                 let end = end.min(body.len().saturating_sub(1));
                                 let part = &body[start.min(body.len())..=end];
                                 let mut r = format!(
@@ -91,8 +92,7 @@ impl TestServer {
                                 .into_bytes();
                                 r.extend_from_slice(part);
                                 r
-                            }
-                            None => {
+                            } else {
                                 let mut r = format!(
                                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
                                      Connection: close\r\n\r\n",
@@ -102,7 +102,7 @@ impl TestServer {
                                 r.extend_from_slice(&body);
                                 r
                             }
-                        },
+                        }
                         Reply::OkIgnoringRange(body) => {
                             let mut r = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
@@ -147,7 +147,7 @@ fn parse_range(v: &str) -> Option<(usize, usize)> {
 pub fn dir_handler(dir: &Path) -> Handler {
     let files: HashMap<String, Vec<u8>> = std::fs::read_dir(dir)
         .unwrap()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| {
             (
                 format!("/{}", e.file_name().to_string_lossy()),
@@ -246,16 +246,17 @@ impl LiveSim {
     pub fn playlist(&self) -> String {
         let elapsed = self.started.elapsed();
         let elapsed = match self.restart_at {
-            Some(at) if elapsed >= at => elapsed - at,
+            Some(at) if elapsed >= at => elapsed.saturating_sub(at),
             _ => elapsed,
         };
-        let head = (elapsed.as_secs() as usize).min(self.segments.len() - WINDOW);
+        let head = usize::try_from(elapsed.as_secs())
+            .unwrap_or(usize::MAX)
+            .min(self.segments.len() - WINDOW);
         let mut text = format!(
-            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:{}\n",
-            head
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:{head}\n"
         );
         for (d, name) in &self.segments[head..head + WINDOW] {
-            text.push_str(&format!("#EXTINF:{d:.3},\n{name}\n"));
+            writeln!(text, "#EXTINF:{d:.3},\n{name}").unwrap();
         }
         text
     }

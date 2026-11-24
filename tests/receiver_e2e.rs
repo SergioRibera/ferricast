@@ -105,7 +105,9 @@ impl FrameSink for HeadlessSink {
     }
     async fn push_audio(&mut self, audio: DecodedAudio) -> Result<()> {
         let frames = audio.pcm.len() / usize::from(audio.channels.max(1));
-        let duration = Duration::from_secs_f64(frames as f64 / f64::from(audio.sample_rate.max(1)));
+        let duration = Duration::from_secs_f64(
+            f64::from(u32::try_from(frames).unwrap()) / f64::from(audio.sample_rate.max(1)),
+        );
         let mut log = self.0.lock().unwrap();
         log.audio_chunks += 1;
         log.audio
@@ -436,7 +438,7 @@ async fn vod_plays_in_real_time_and_reports_finished() {
             let video_time = if *pts >= p0 {
                 t0 + Duration::from_micros(pts - p0)
             } else {
-                t0 - Duration::from_micros(p0 - pts)
+                t0.checked_sub(Duration::from_micros(p0 - pts)).unwrap()
             };
             (video_time.saturating_duration_since(*at).as_secs_f64()
                 - at.saturating_duration_since(video_time).as_secs_f64())
@@ -913,6 +915,11 @@ enum Origin {
 /// Seeks to 7.5 s into a 12 s clip with a keyframe every second: the
 /// first frame and audio shown are at the target, no stale audio is
 /// pushed after the flush, and the status reports the right position.
+#[expect(
+    clippy::too_many_lines,
+    clippy::cast_precision_loss,
+    reason = "one scripted seek scenario; microsecond positions print as seconds"
+)]
 async fn seek_lands_on_the_target(dir: &std::path::Path, name: &str, mime: &str, origin: Origin) {
     let server = TestServer::start(support::dir_handler(dir)).await;
     let mut rx = Receiver::start().await;
@@ -1155,6 +1162,11 @@ async fn audio_files_play_paced_and_report_duration() {
 /// `seconds` of stereo tones at 48 kHz encoded with libfdk-aac as ADTS
 /// HE-AAC (`v2`: with parametric stereo), the only HE-AAC encoder at
 /// hand (ffmpeg builds rarely include it).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "a few seconds of a 12000-peak test tone: every value fits"
+)]
 fn he_aac_adts(seconds: u32, v2: bool) -> Vec<u8> {
     use fdk_aac::enc::{AudioObjectType, BitRate, ChannelMode, Encoder, EncoderParams, Transport};
     let rate = 48_000u32;

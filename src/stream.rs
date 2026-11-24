@@ -45,7 +45,7 @@ const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 /// portal dialog) to report a fast failure first.
 const REACHABILITY_GRACE: Duration = Duration::from_millis(250);
 /// How long the user has to answer a pairing prompt.
-const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
+const PAIRING_TIMEOUT: Duration = Duration::from_mins(2);
 /// Password prompts per connection before a receiver that keeps
 /// rejecting the answer is given up on.
 const MAX_PASSWORD_PROMPTS: u32 = 3;
@@ -53,7 +53,7 @@ const MAX_PASSWORD_PROMPTS: u32 = 3;
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 /// A session that stayed up this long resets the failure counter: one
 /// transient after ten healthy minutes is not five drops in 20 s.
-const HEALTHY_RESET_AFTER: Duration = Duration::from_secs(60);
+const HEALTHY_RESET_AFTER: Duration = Duration::from_mins(1);
 /// Audio older than this is dropped instead of sent; it can only
 /// arrive after the matching video and would play out of sync.
 const MAX_AUDIO_AGE_US: u64 = 300_000;
@@ -1223,10 +1223,9 @@ mod tests {
         };
         let task = request.prepare().await.expect("prepare");
         let (_cancel_tx, cancel_rx) = mpsc::channel(1);
-        let end =
-            tokio::time::timeout(Duration::from_secs(600), task.run(CancelRx::new(cancel_rx)))
-                .await
-                .expect("stream ends");
+        let end = tokio::time::timeout(Duration::from_mins(10), task.run(CancelRx::new(cancel_rx)))
+            .await
+            .expect("stream ends");
         let mut events = Vec::new();
         while let Ok(e) = event_rx.try_recv() {
             events.push(e);
