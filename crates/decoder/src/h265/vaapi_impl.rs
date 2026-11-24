@@ -184,6 +184,20 @@ impl VideoDecoder for VaapiH265Decoder {
     }
 
     fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+        // The surface pool is NV12: 10-bit pictures need P010 surfaces this
+        // backend does not allocate, so the selection hands the stream over.
+        if let Some((luma, chroma)) =
+            ferricast_codec::bitstream::hevc::annex_b_bit_depth(&frame.data)
+            && luma.max(chroma) > 8
+        {
+            return Err(CodecError::UnsupportedStream {
+                backend: BackendId::Vaapi,
+                reason: format!(
+                    "{}-bit HEVC: this backend decodes into 8-bit NV12 surfaces only",
+                    luma.max(chroma)
+                ),
+            });
+        }
         self.try_decode(frame).map_err(CodecError::from_backend(
             BackendId::Vaapi,
             Operation::Decode,

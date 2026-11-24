@@ -93,7 +93,7 @@ pub(crate) fn crop(src: &Nv12Planes, rect: (usize, usize, usize, usize)) -> Opti
     )),
     allow(
         dead_code,
-        reason = "conditional: only the openh264, pure-Rust HEVC and VP9 decoders use it"
+        reason = "conditional: only the openh264, NVDEC, pure-Rust HEVC and VP9 decoders use it"
     )
 )]
 pub(crate) struct Container {
@@ -109,7 +109,7 @@ pub(crate) struct Container {
     )),
     allow(
         dead_code,
-        reason = "conditional: only the openh264, pure-Rust HEVC and VP9 decoders use it"
+        reason = "conditional: only the openh264, NVDEC, pure-Rust HEVC and VP9 decoders use it"
     )
 )]
 impl Container {
