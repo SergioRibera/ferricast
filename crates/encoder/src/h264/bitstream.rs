@@ -16,7 +16,10 @@
 //! bit / fixed-width / Exp-Golomb writes, RBSP-trailing-bits padding,
 //! emulation-prevention byte insertion (`0x000003`).
 
-#![allow(dead_code)] // referenced from the SPS/PPS builders
+#![allow(
+    dead_code,
+    reason = "conditional: the SPS/PPS builders use a different subset per encoder"
+)]
 
 use ferricast_codec::bitstream::bits::escape;
 
@@ -60,7 +63,7 @@ impl BitWriter {
 
     /// `u(1)` boolean flag.
     pub(super) fn write_flag(&mut self, flag: bool) {
-        self.write_bit(if flag { 1 } else { 0 });
+        self.write_bit(u8::from(flag));
     }
 
     /// Unsigned Exp-Golomb (§9.1, `ue(v)`).
@@ -68,10 +71,14 @@ impl BitWriter {
     /// Encoding: write `floor(log2(v+1))` zero bits, then `(v+1)`
     /// in binary. So `ue(0) = 1`, `ue(1) = 010`, `ue(2) = 011`,
     /// `ue(3) = 00100`, etc.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "leading is at most 32, and the Exp-Golomb fields written are far below u32::MAX, so v + 1 fits u32"
+    )]
     pub(super) fn write_ue(&mut self, value: u32) {
         // Number of leading zeros = floor(log2(value+1)).
-        let v_plus_1 = (value as u64) + 1;
-        let leading = 63 - v_plus_1.leading_zeros(); // for u64, equals floor(log2(v+1))
+        let v_plus_1 = u64::from(value) + 1;
+        let leading = v_plus_1.ilog2(); // for u64, equals floor(log2(v+1))
         for _ in 0..leading {
             self.write_bit(0);
         }
@@ -86,9 +93,9 @@ impl BitWriter {
     /// `2 -> 3`, `-2 -> 4`, ... and feeds the result to `ue(v)`.
     pub(super) fn write_se(&mut self, value: i32) {
         let mapped = if value <= 0 {
-            (-2 * value) as u32
+            (-2 * value).cast_unsigned()
         } else {
-            (2 * value - 1) as u32
+            (2 * value - 1).cast_unsigned()
         };
         self.write_ue(mapped);
     }

@@ -1,6 +1,6 @@
 //! AAC audio encoder facade.
 //!
-//! Backends: the platform encoders (Media Foundation, AudioToolbox,
+//! Backends: the platform encoders (Media Foundation, `AudioToolbox`,
 //! `MediaCodec`) where compiled in, then **`fdk-aac`** — Fraunhofer FDK AAC via
 //! the C library. Reference encoder for AAC; transparent quality
 //! above ~96 kbps stereo. Requires `libfdk-aac` on the link path

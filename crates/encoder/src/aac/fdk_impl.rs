@@ -56,6 +56,11 @@ pub struct FdkAacEncoder {
 }
 
 impl FdkAacEncoder {
+    /// Opens libfdk-aac for `config`.
+    ///
+    /// # Errors
+    /// [`FerricastError::Encoder`] for an unsupported channel count or a
+    /// library failure.
     pub fn new(config: &AudioEncoderConfig) -> Result<Self> {
         let channel_mode = match config.channels {
             1 => ChannelMode::Mono,
@@ -88,6 +93,10 @@ impl FdkAacEncoder {
         })
     }
 
+    /// Feeds one PCM chunk; finished frames are taken with `take_output`.
+    ///
+    /// # Errors
+    /// [`FerricastError::Encoder`] for non-PCM input or a library failure.
     pub fn encode(&mut self, frame: &AudioFrame) -> Result<()> {
         if frame.codec != AudioCodec::Pcm {
             return Err(FerricastError::Encoder(format!(
@@ -189,19 +198,23 @@ impl FdkAacEncoder {
     /// AAC has no out-of-band parameter sets when ADTS is the
     /// transport — every frame is self-describing. Return empty to
     /// keep the trait contract honest.
+    #[must_use]
     pub fn codec_config(&self) -> Vec<u8> {
         Vec::new()
     }
 
+    /// Drains the encoder.
+    ///
+    /// # Errors
+    /// Never in practice: a library failure while draining ends the drain.
     pub fn flush(mut self) -> Result<Vec<AudioFrame>> {
         // Drain any final encoder state. fdk-aac's "flush" pattern
         // is to call encode() with an empty input slice repeatedly
         // until output_size hits zero; we cap iterations so a buggy
         // library version can't hang us.
         for _ in 0..8 {
-            let info = match self.enc.encode(&[], &mut self.out_scratch) {
-                Ok(i) => i,
-                Err(_) => break,
+            let Ok(info) = self.enc.encode(&[], &mut self.out_scratch) else {
+                break;
             };
             if info.output_size == 0 {
                 break;

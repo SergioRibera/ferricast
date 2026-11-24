@@ -1,8 +1,8 @@
-//! AAC-ELD encoder (libfdk-aac) for AirPlay screen-mirroring audio.
+//! AAC-ELD encoder (libfdk-aac) for `AirPlay` screen-mirroring audio.
 //!
-//! AirPlay receivers decode mirroring audio as AAC-ELD, 44.1 kHz stereo,
-//! 480 samples per frame, no SBR, raw access units (UxPlay hands them to
-//! its decoder with the AudioSpecificConfig `f8 e8 50 00`). The `fdk-aac`
+//! `AirPlay` receivers decode mirroring audio as AAC-ELD, 44.1 kHz stereo,
+//! 480 samples per frame, no SBR, raw access units (`UxPlay` hands them to
+//! its decoder with the `AudioSpecificConfig` `f8 e8 50 00`). The `fdk-aac`
 //! crate's safe wrapper cannot set the 480-sample granule, so this talks
 //! to `fdk-aac-sys` directly.
 //!
@@ -24,12 +24,15 @@ use tracing::{debug, info};
 use super::resample::Resampler;
 use crate::audio_clock::{AudioClock, ClockEvent};
 
-/// Sample rate of every AirPlay audio format.
+/// Sample rate of every `AirPlay` audio format.
 pub const ELD_SAMPLE_RATE: u32 = 44_100;
 /// Samples per channel in one AAC-ELD frame.
 pub const ELD_FRAME_SAMPLES: usize = 480;
-/// AudioSpecificConfig of AAC-ELD 44.1 kHz stereo, 480-sample frames,
-/// no SBR: what AirPlay receivers configure their decoder with.
+/// [`ELD_FRAME_SAMPLES`] as fdk-aac's granule-length parameter.
+#[expect(clippy::cast_possible_truncation, reason = "480 fits u32")]
+const GRANULE_LENGTH: u32 = ELD_FRAME_SAMPLES as u32;
+/// `AudioSpecificConfig` of AAC-ELD 44.1 kHz stereo, 480-sample frames,
+/// no SBR: what `AirPlay` receivers configure their decoder with.
 pub const ELD_AUDIO_SPECIFIC_CONFIG: [u8; 4] = [0xf8, 0xe8, 0x50, 0x00];
 
 /// Scratch space for one encoded frame; a 480-sample frame at 256 kbps
@@ -122,7 +125,7 @@ impl Handle {
                 .map_err(|_| FerricastError::Encoder("fdk-aac ELD: buffer too large".into()))
         };
         let mut in_ptr = input.as_ptr().cast_mut().cast::<c_void>();
-        let mut in_id = sys::AACENC_BufferIdentifier_IN_AUDIO_DATA as c_int;
+        let mut in_id = sys::AACENC_BufferIdentifier_IN_AUDIO_DATA.cast_signed();
         let mut in_size = to_int(mem::size_of_val(input))?;
         let mut in_el = to_int(mem::size_of::<i16>())?;
         let in_desc = sys::AACENC_BufDesc {
@@ -133,7 +136,7 @@ impl Handle {
             bufElSizes: &raw mut in_el,
         };
         let mut out_ptr = output.as_mut_ptr().cast::<c_void>();
-        let mut out_id = sys::AACENC_BufferIdentifier_OUT_BITSTREAM_DATA as c_int;
+        let mut out_id = sys::AACENC_BufferIdentifier_OUT_BITSTREAM_DATA.cast_signed();
         let mut out_size = to_int(output.len())?;
         let mut out_el = 1;
         let out_desc = sys::AACENC_BufDesc {
@@ -232,7 +235,7 @@ impl FdkEldEncoder {
         handle.set(sys::AACENC_PARAM_AACENC_CHANNELMODE, mode, "channel mode")?;
         handle.set(
             sys::AACENC_PARAM_AACENC_GRANULE_LENGTH,
-            ELD_FRAME_SAMPLES as u32,
+            GRANULE_LENGTH,
             "granule length",
         )?;
         handle.set(sys::AACENC_PARAM_AACENC_BITRATEMODE, 0, "bitrate mode")?;
@@ -292,7 +295,14 @@ impl FdkEldEncoder {
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut hex, byte| {
+            // Writing into a `String` cannot fail.
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 impl Configured {
@@ -418,10 +428,6 @@ impl FdkEldEncoder {
         }
         state.push(frame, &mut self.pending)
     }
-
-    fn try_flush(self) -> Result<Vec<AudioFrame>> {
-        Ok(self.pending)
-    }
 }
 
 impl AudioEncoder for FdkEldEncoder {
@@ -440,10 +446,7 @@ impl AudioEncoder for FdkEldEncoder {
     }
 
     fn flush(self) -> CodecResult<Vec<AudioFrame>> {
-        self.try_flush().map_err(CodecError::from_backend(
-            BackendId::FdkAac,
-            Operation::Flush,
-        ))
+        Ok(self.pending)
     }
 
     fn take_output(&mut self) -> Vec<AudioFrame> {
@@ -455,6 +458,12 @@ impl AudioEncoder for FdkEldEncoder {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::items_after_statements,
+    reason = "test signal generation: sample values are bounded by construction"
+)]
 mod tests {
     use super::*;
 
@@ -528,7 +537,7 @@ mod tests {
         );
     }
 
-    /// First bytes UxPlay accepts for AAC-ELD frames.
+    /// First bytes `UxPlay` accepts for AAC-ELD frames.
     const ACCEPTED_FIRST_BYTES: [u8; 6] = [0x80, 0x81, 0x82, 0x8c, 0x8d, 0x8e];
 
     #[test]

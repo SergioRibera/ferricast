@@ -213,10 +213,18 @@ impl<C: NvencCodec> NvencEncoder<C> {
     /// Try to bring up NVENC at the default resolution. Mostly useful
     /// for capability probes from the factory; production code uses
     /// [`Self::probe_with`] with the caller's actual config.
+    ///
+    /// # Errors
+    /// As [`Self::probe_with`].
     pub fn probe() -> Result<Self> {
         Self::probe_with(EncoderConfig::default())
     }
 
+    /// Brings up NVENC for `cfg`.
+    ///
+    /// # Errors
+    /// [`FerricastError::Encoder`] for an input format other than BGRA / RGBA,
+    /// or naming the NVENC step that failed.
     pub fn probe_with(cfg: EncoderConfig) -> Result<Self> {
         if !matches!(cfg.pixel_format, PixelFormat::Bgra | PixelFormat::Rgba) {
             return Err(FerricastError::Encoder(format!(
@@ -431,7 +439,8 @@ impl<C: NvencCodec> NvencEncoder<C> {
                         self.encode_cpu(raw, &options)?;
                     }
                 }
-                CapturedFrame::Cpu(raw) => {
+                cpu @ (CapturedFrame::Cpu(_) | CapturedFrame::Native(_)) => {
+                    let raw = cpu.into_cpu()?;
                     self.encode_cpu(raw, &options)?;
                 }
             }
@@ -455,7 +464,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
             codec: C::FERRICAST_CODEC,
             data: Bytes::from(nv_frame.into_data()),
             timestamp_us,
-            duration_us: Some(1_000_000 / self.cfg.fps as u64),
+            duration_us: Some(1_000_000 / u64::from(self.cfg.fps)),
             is_keyframe,
             pts_dts: (pts, pts),
         })
@@ -490,12 +499,6 @@ impl<C: NvencCodec> NvencEncoder<C> {
         // never predicts across the gap.
         self.pending_keyframe = result.is_err();
         result
-    }
-
-    fn try_flush(self) -> Result<Vec<EncodedFrame>> {
-        // Without B-frames there's no reorder queue, so an end-of-
-        // stream flush wouldn't yield anything. Return empty.
-        Ok(Vec::new())
     }
 
     fn try_set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
@@ -552,8 +555,9 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
     }
 
     fn flush(self) -> CodecResult<Vec<EncodedFrame>> {
-        self.try_flush()
-            .map_err(CodecError::from_backend(BackendId::Nvenc, Operation::Flush))
+        // Without B-frames there's no reorder queue, so an end-of-
+        // stream flush wouldn't yield anything.
+        Ok(Vec::new())
     }
 
     fn set_bitrate_kbps(&mut self, kbps: u32) -> CodecResult<()> {

@@ -70,7 +70,7 @@ impl Nv12Layout {
 ///
 /// # Errors
 /// [`CodecError::UnsupportedConfig`] for a matrix that is not a YCbCr
-/// conversion of RGB this crate implements (identity, YCgCo, ICtCp,
+/// conversion of RGB this crate implements (identity, `YCgCo`, `ICtCp`,
 /// chroma-derived, ST 2085).
 pub(crate) fn conversion(
     colour: ColourDescription,
@@ -111,6 +111,10 @@ pub(crate) fn conversion(
 /// [`CodecError::UnsupportedConfig`] for a matrix [`conversion`] lacks;
 /// [`CodecError::Backend`] (naming `backend`) when `dst` is shorter than
 /// the layout or `src` does not match it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over the input formats, each arm a straight copy or conversion"
+)]
 pub(crate) fn write(
     src: &FrameView<'_>,
     colour: ColourDescription,

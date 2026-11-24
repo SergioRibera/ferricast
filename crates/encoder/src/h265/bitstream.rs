@@ -1,4 +1,4 @@
-//! HEVC bitstream helpers: BitWriter, Annex-B start codes,
+//! HEVC bitstream helpers: `BitWriter`, Annex-B start codes,
 //! emulation-prevention-byte insertion, and the codec-specific
 //! 2-byte NAL header (`forbidden_zero_bit` + `nal_unit_type[6]` +
 //! `nuh_layer_id[6]` + `nuh_temporal_id_plus1[3]`).
@@ -40,6 +40,10 @@ impl BitWriter {
     }
 
     /// Unsigned Exp-Golomb (ue(v)).
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a u32 has at most 31 leading zeros"
+    )]
     pub fn write_ue(&mut self, value: u32) {
         let v = value + 1;
         let leading_zeros = (32 - v.leading_zeros() - 1) as u8;
@@ -50,9 +54,9 @@ impl BitWriter {
     /// Signed Exp-Golomb (se(v)).
     pub fn write_se(&mut self, value: i32) {
         let mapped: u32 = if value <= 0 {
-            (-value as u32) * 2
+            (-value).cast_unsigned() * 2
         } else {
-            (value as u32) * 2 - 1
+            value.cast_unsigned() * 2 - 1
         };
         self.write_ue(mapped);
     }
@@ -73,19 +77,22 @@ impl BitWriter {
 
 /// HEVC NAL header (§7.3.1.2): 2 bytes
 /// `forbidden_zero_bit(1) | nal_unit_type(6) | nuh_layer_id(6) | nuh_temporal_id_plus1(3)`.
-/// Layer = 0 (base) and temporal_id_plus1 = 1 are the right values
+/// Layer = 0 (base) and `temporal_id_plus1` = 1 are the right values
 /// for every Annex-B IRAP / non-IRAP NAL we emit on the base layer.
 pub(super) fn nal_header(nal_unit_type: u8) -> [u8; 2] {
     let layer_id: u16 = 0;
     let temporal_id_plus1: u16 = 1;
-    let word: u16 = ((nal_unit_type as u16 & 0x3f) << 9)
+    let word: u16 = ((u16::from(nal_unit_type) & 0x3f) << 9)
         | ((layer_id & 0x3f) << 3)
         | (temporal_id_plus1 & 0x07);
     [(word >> 8) as u8, (word & 0xff) as u8]
 }
 
 /// HEVC NAL unit types we emit.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "the full NAL type table; the encoder emits a subset"
+)]
 pub(super) mod nal {
     pub const TRAIL_N: u8 = 0;
     pub const TRAIL_R: u8 = 1;
@@ -98,11 +105,11 @@ pub(super) mod nal {
 
 /// Wrap a finished RBSP into an Annex-B NAL: 4-byte start code +
 /// 2-byte NAL header + emulation-prevention-byte-escaped payload.
-pub(super) fn finalize_nal(nal_unit_type: u8, rbsp: Vec<u8>) -> Vec<u8> {
+pub(super) fn finalize_nal(nal_unit_type: u8, rbsp: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rbsp.len() + 8);
     out.extend_from_slice(&[0, 0, 0, 1]);
     let hdr = nal_header(nal_unit_type);
     out.extend_from_slice(&hdr);
-    out.extend(escape(&rbsp));
+    out.extend(escape(rbsp));
     out
 }

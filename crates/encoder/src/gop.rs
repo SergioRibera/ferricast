@@ -94,7 +94,7 @@ mod tests {
         assert_eq!(idr, [true, false, false, true, false, false, true]);
     }
 
-    /// A forced IDR mid-GOP restarts frame_num at 0 and the next
+    /// A forced IDR mid-GOP restarts `frame_num` at 0 and the next
     /// natural IDR is a full interval after it, not at the old multiple.
     #[test]
     fn forced_idr_restarts_numbering() {

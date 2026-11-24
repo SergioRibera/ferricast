@@ -18,14 +18,14 @@ pub(super) struct StreamParams {
     /// `general_profile_idc`: 1 = Main, 2 = Main10.
     pub profile_idc: u8,
     /// `general_level_idc`: Annex A levels times 30. 1080p60 = 4.0
-    /// (level_idc 120) or 4.1 (123). 4K30 = 5.0 (150). 4K60 = 5.1 (153).
+    /// (`level_idc` 120) or 4.1 (123). 4K30 = 5.0 (150). 4K60 = 5.1 (153).
     pub level_idc: u8,
     /// `general_tier_flag`: 0 = Main tier, 1 = High tier. We stay on
     /// Main tier — every decoder we care about supports it; High tier
     /// only unlocks higher bitrate caps we don't approach.
     pub tier_flag: u8,
     /// Coded picture size (`pic_width/height_in_luma_samples`); must be
-    /// a multiple of MinCbSizeY.
+    /// a multiple of `MinCbSizeY`.
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -37,7 +37,7 @@ pub(super) struct StreamParams {
 }
 
 /// Conformance cropping window (§7.4.3.2.1). Offsets count chroma
-/// samples: luma offset = SubWidthC (or SubHeightC) × value, i.e. ×2
+/// samples: luma offset = `SubWidthC` (or `SubHeightC`) × value, i.e. ×2
 /// in 4:2:0.
 #[derive(Clone, Copy)]
 pub(super) struct ConformanceWindow {
@@ -47,7 +47,7 @@ pub(super) struct ConformanceWindow {
     pub bottom: u32,
 }
 
-/// HEVC general profile_tier_level (§7.3.3) at sub-layer 0.
+/// HEVC general `profile_tier_level` (§7.3.3) at sub-layer 0.
 /// Most compatibility-flag bits are 0; we only set the
 /// `general_profile_compatibility_flag[profile_idc]` bit so old
 /// decoders that pattern-match by compatibility flag still accept us.
@@ -55,9 +55,9 @@ fn write_profile_tier_level(w: &mut BitWriter, p: &StreamParams, max_sub_layers_
     // general_profile_space u(2) = 0
     w.write_bits(0, 2);
     // general_tier_flag u(1)
-    w.write_bits(p.tier_flag as u32, 1);
+    w.write_bits(u32::from(p.tier_flag), 1);
     // general_profile_idc u(5)
-    w.write_bits(p.profile_idc as u32, 5);
+    w.write_bits(u32::from(p.profile_idc), 5);
     // general_profile_compatibility_flag[32] u(1) each
     let mut compat = 0u32;
     if (p.profile_idc as usize) < 32 {
@@ -79,7 +79,7 @@ fn write_profile_tier_level(w: &mut BitWriter, p: &StreamParams, max_sub_layers_
     // general_inbld_flag (or reserved_zero_bit for Main) = 0
     w.write_bits(0, 1);
     // general_level_idc u(8)
-    w.write_bits(p.level_idc as u32, 8);
+    w.write_bits(u32::from(p.level_idc), 8);
 
     // sub_layer_profile_present_flag / sub_layer_level_present_flag
     // pairs for each sub-layer below the top. With max_sub_layers_minus1
@@ -146,7 +146,7 @@ pub(super) fn build_vps(p: &StreamParams) -> Vec<u8> {
     w.write_bits(0, 1);
 
     w.rbsp_trailing();
-    finalize_nal(nal::VPS_NUT, w.into_inner())
+    finalize_nal(nal::VPS_NUT, &w.into_inner())
 }
 
 /// Build an SPS matching the encoder's surface dimensions, profile,
@@ -185,9 +185,9 @@ pub(super) fn build_sps(
         w.write_bits(0, 1);
     }
     // bit_depth_luma_minus8 ue(v)
-    w.write_ue(p.bit_depth_luma_minus8 as u32);
+    w.write_ue(u32::from(p.bit_depth_luma_minus8));
     // bit_depth_chroma_minus8 ue(v)
-    w.write_ue(p.bit_depth_chroma_minus8 as u32);
+    w.write_ue(u32::from(p.bit_depth_chroma_minus8));
     // log2_max_pic_order_cnt_lsb_minus4 ue(v) = 4
     w.write_ue(4);
     // sps_sub_layer_ordering_info_present_flag u(1) = 0
@@ -200,9 +200,9 @@ pub(super) fn build_sps(
     w.write_ue(0);
 
     // log2_min_luma_coding_block_size_minus3 ue(v)
-    w.write_ue(min_cb_log2_minus3 as u32);
+    w.write_ue(u32::from(min_cb_log2_minus3));
     // log2_diff_max_min_luma_coding_block_size ue(v)
-    w.write_ue(diff_max_min_cb_log2 as u32);
+    w.write_ue(u32::from(diff_max_min_cb_log2));
     // log2_min_luma_transform_block_size_minus2 ue(v) = 0 (4x4 TU min)
     w.write_ue(0);
     // log2_diff_max_min_luma_transform_block_size ue(v) = 3 (up to 32x32)
@@ -253,11 +253,11 @@ pub(super) fn build_sps(
     w.write_bits(0, 1);
 
     w.rbsp_trailing();
-    finalize_nal(nal::SPS_NUT, w.into_inner())
+    finalize_nal(nal::SPS_NUT, &w.into_inner())
 }
 
-/// VUI subset — just enough to publish timing info (num_units_in_tick /
-/// time_scale / fixed_frame_rate_flag) and aspect ratio = square. The
+/// VUI subset — just enough to publish timing info (`num_units_in_tick` /
+/// `time_scale` / `fixed_frame_rate_flag`) and aspect ratio = square. The
 /// HLS players downstream key off timing info to honour the encoder's
 /// clock; without VUI they fall back to guessing from PTS deltas.
 fn write_vui(w: &mut BitWriter, p: &StreamParams) {
@@ -363,5 +363,5 @@ pub(super) fn build_pps(init_qp_minus26: i32) -> Vec<u8> {
     w.write_bits(0, 1);
 
     w.rbsp_trailing();
-    finalize_nal(nal::PPS_NUT, w.into_inner())
+    finalize_nal(nal::PPS_NUT, &w.into_inner())
 }

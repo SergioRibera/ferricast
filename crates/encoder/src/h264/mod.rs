@@ -6,7 +6,7 @@
 //!
 //! 1. **NVENC** — NVIDIA. First because on the common laptop combo of
 //!    an NVIDIA dGPU and an AMD / Intel iGPU, VA-API would pick the
-//!    iGPU and move every captured frame across PCIe twice.
+//!    iGPU and move every captured frame across `PCIe` twice.
 //! 2. **VA-API** — Intel / AMD on Linux.
 //! 3. **x264** — software; works everywhere it is compiled in.
 //!
@@ -86,7 +86,7 @@ fn registry() -> VideoEncoderRegistry {
             BackendId::Vaapi,
             Acceleration::Hardware,
             |config: &EncoderConfig| {
-                VaapiH264Encoder::probe_with(config.clone())
+                VaapiH264Encoder::probe_with(config)
                     .map(|encoder| Box::new(encoder) as _)
                     .map_err(CodecError::from_backend(
                         BackendId::Vaapi,

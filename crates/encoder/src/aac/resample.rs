@@ -33,6 +33,14 @@ impl Resampler {
     }
 
     /// Resample `input` (interleaved) and append the result to `out`.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "frame counts of a PCM chunk are far below 2^52"
+    )]
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "the Hermite coefficients keep their textbook names"
+    )]
     pub(crate) fn process(&mut self, input: &[i16], out: &mut Vec<i16>) {
         self.history.extend(input.iter().map(|&s| f32::from(s)));
         let frames = self.history.len() / self.channels;
@@ -81,6 +89,11 @@ impl Resampler {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "test signal generation: sample values are bounded by construction"
+)]
 mod tests {
     use super::*;
 

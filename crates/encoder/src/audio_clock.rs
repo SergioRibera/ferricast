@@ -4,7 +4,7 @@
 //! output timestamps are derived from a sample count rather than copied
 //! from the input: `anchor + samples / sample_rate`. That keeps frame
 //! deltas exact, but on its own it never notices a hole in the input —
-//! after the capture source idles (PipeWire suspends a monitor source
+//! after the capture source idles (`PipeWire` suspends a monitor source
 //! whose sink went quiet) every later frame would carry a timestamp
 //! from before the gap, and the HLS segmenter drops frames that are
 //! more than 300 ms stale: permanent silence.
@@ -26,7 +26,7 @@
 ///
 /// Capture timestamps are themselves sample-count based, so in steady
 /// state they agree with ours to the microsecond and only a real gap
-/// moves them. 50 ms is above two 1024-sample PipeWire quanta at
+/// moves them. 50 ms is above two 1024-sample `PipeWire` quanta at
 /// 48 kHz (≈ 43 ms) — wall-clock jitter when the capture side
 /// re-anchors never trips it — and far below the segmenter's 300 ms
 /// staleness cut-off, so we resync long before frames would be dropped.

@@ -3,7 +3,7 @@
 //! Every capture producer sets `RawFrame::stride` to the number of
 //! bytes per row of the first plane *as laid out in `data`* — which
 //! may exceed `width × bytes_per_pixel` when the source pads rows
-//! (PipeWire SHM buffers, VA-API readback). Encoders must walk the
+//! (`PipeWire` SHM buffers, VA-API readback). Encoders must walk the
 //! buffer row by row with that stride; treating it as tightly packed
 //! shears the picture.
 //!

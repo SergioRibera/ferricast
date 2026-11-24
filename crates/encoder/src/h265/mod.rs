@@ -60,7 +60,7 @@ fn registry() -> VideoEncoderRegistry {
             BackendId::Vaapi,
             Acceleration::Hardware,
             |config: &EncoderConfig| {
-                VaapiH265Encoder::probe_with(config.clone())
+                VaapiH265Encoder::probe_with(config)
                     .map(|encoder| Box::new(encoder) as _)
                     .map_err(CodecError::from_backend(BackendId::Vaapi, Operation::Open))
             },
