@@ -326,6 +326,31 @@ impl LinuxP2pClient {
                     return;
                 }
             };
+            // Some supplicant builds skip `GroupStarted` and only emit
+            // `InterfaceAdded` on the root path when the new p2p-*
+            // virtual iface appears. Subscribe both so group formation
+            // is detected either way.
+            let root_proxy = match Proxy::new(
+                &conn,
+                SUPPLICANT_BUS,
+                SUPPLICANT_ROOT_PATH,
+                ROOT_IFACE,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sink: root proxy");
+                    return;
+                }
+            };
+            let mut iface_added = match root_proxy.receive_signal("InterfaceAdded").await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sink: subscribe InterfaceAdded");
+                    return;
+                }
+            };
             loop {
                 tokio::select! {
                     msg = prov_pin.next() => {
@@ -400,6 +425,37 @@ impl LinuxP2pClient {
                     msg = gon_ok.next() => {
                         let Some(sig) = msg else { break };
                         tracing::info!(?sig, "sink: GONegotiationSuccess");
+                    }
+                    msg = iface_added.next() => {
+                        let Some(sig) = msg else { break };
+                        // `InterfaceAdded(o, a{sv})`. When path contains
+                        // "p2p-" it's the virtual group iface the sink
+                        // needs — treat as GroupStarted fallback.
+                        if let Ok((path, props)) =
+                            sig.body().deserialize::<(OwnedObjectPath, HashMap<String, OwnedValue>)>()
+                        {
+                            let ifname = props
+                                .get("Ifname")
+                                .and_then(|v| v.downcast_ref::<&str>().ok())
+                                .map(str::to_string)
+                                .unwrap_or_default();
+                            if ifname.starts_with("p2p-") {
+                                tracing::info!(
+                                    iface = %path.as_str(),
+                                    ifname = %ifname,
+                                    "sink: InterfaceAdded (group iface) — synthesizing GroupStarted"
+                                );
+                                let group = GroupStarted {
+                                    interface_path: path.to_string(),
+                                    role: GroupRole::Client,
+                                };
+                                if tx.send(group).await.is_err() {
+                                    return;
+                                }
+                            } else {
+                                tracing::debug!(iface = %path.as_str(), ifname, "sink: InterfaceAdded (non-group)");
+                            }
+                        }
                     }
                     msg = gon.next() => {
                         let Some(sig) = msg else { break };
