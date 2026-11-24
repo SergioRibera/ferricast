@@ -155,6 +155,7 @@ impl Default for M3u8Writer {
 }
 
 impl M3u8Writer {
+    #[must_use]
     pub fn live(version: M3u8Version) -> Self {
         Self {
             version,
@@ -163,6 +164,7 @@ impl M3u8Writer {
         }
     }
 
+    #[must_use]
     pub fn vod(version: M3u8Version) -> Self {
         Self {
             version,
@@ -171,21 +173,25 @@ impl M3u8Writer {
         }
     }
 
+    #[must_use]
     pub fn with_target_duration(mut self, seconds: u8) -> Self {
         self.target_duration = seconds.max(1);
         self
     }
 
+    #[must_use]
     pub fn with_media_sequence(mut self, seq: u64) -> Self {
         self.media_sequence = seq;
         self
     }
 
+    #[must_use]
     pub fn with_discontinuity_sequence(mut self, seq: u32) -> Self {
         self.discontinuity_sequence = seq;
         self
     }
 
+    #[must_use]
     pub fn with_independent_segments(mut self, on: bool) -> Self {
         self.independent_segments = on;
         self
@@ -198,17 +204,20 @@ impl M3u8Writer {
     /// explicitly, the hold-back values default at render time to
     /// 3 × `TARGETDURATION` and 3 × `PART-TARGET`, so builder call
     /// order does not matter.
+    #[must_use]
     pub fn with_part_target(mut self, secs: f32) -> Self {
         self.part_target_secs = Some(secs);
         self.can_block_reload = true;
         self
     }
 
+    #[must_use]
     pub fn with_part_hold_back(mut self, secs: f32) -> Self {
         self.part_hold_back_secs = Some(secs);
         self
     }
 
+    #[must_use]
     pub fn with_hold_back(mut self, secs: f32) -> Self {
         self.hold_back_secs = Some(secs);
         self
@@ -216,6 +225,9 @@ impl M3u8Writer {
 
     /// Attach a list of parts to the most-recently-added segment.
     /// Call after `add_segment`. Empty lists are a no-op.
+    ///
+    /// # Errors
+    /// [`FerricastError::M3u8`] when no segment has been added yet.
     pub fn attach_parts(&mut self, parts: Vec<Part>) -> Result<(), FerricastError> {
         if self.segments.is_empty() {
             return Err(FerricastError::M3u8(
@@ -241,6 +253,10 @@ impl M3u8Writer {
     /// that `EXTINF` rounded to the nearest integer never exceeds
     /// `EXT-X-TARGETDURATION`; rejecting it here is friendlier than
     /// letting the player error out later.
+    ///
+    /// # Errors
+    /// [`FerricastError::M3u8`] for a negative or non-finite duration, one
+    /// that rounds above the target duration, or an invalid URI.
     pub fn add_segment(&mut self, segment: Segment) -> Result<(), FerricastError> {
         if !segment.duration.is_finite() || segment.duration < 0.0 {
             return Err(FerricastError::M3u8(format!(
@@ -248,8 +264,13 @@ impl M3u8Writer {
                 segment.duration
             )));
         }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "finite and non-negative (checked above); the float-to-int cast saturates"
+        )]
         let rounded = segment.duration.round().max(1.0) as u32;
-        if rounded > self.target_duration as u32 {
+        if rounded > u32::from(self.target_duration) {
             return Err(FerricastError::M3u8(format!(
                 "segment duration {:.3}s rounds to {}s, exceeds target-duration {}s",
                 segment.duration, rounded, self.target_duration
@@ -260,11 +281,16 @@ impl M3u8Writer {
         Ok(())
     }
 
+    #[must_use]
     pub fn segments(&self) -> &[Segment] {
         &self.segments
     }
 
     /// Serialise to a UTF-8 string. This is the form sent over HTTP.
+    ///
+    /// # Errors
+    /// [`FerricastError::M3u8`] for parts listed without a part target, with
+    /// an invalid duration or longer than the part target.
     pub fn to_string(&self) -> Result<String, FerricastError> {
         let mut s = String::with_capacity(128 + self.segments.len() * 64);
         self.write(&mut s)?;
@@ -349,7 +375,7 @@ impl M3u8Writer {
         // requests.
         let part_target = self.effective_part_target()?;
         if let Some(pt) = part_target {
-            writeln!(w, "#EXT-X-PART-INF:PART-TARGET={:.3}", pt).map_err(fmt_err)?;
+            writeln!(w, "#EXT-X-PART-INF:PART-TARGET={pt:.3}").map_err(fmt_err)?;
         }
         let hold_back = self
             .hold_back_secs
@@ -374,7 +400,7 @@ impl M3u8Writer {
                 w.push_str("#EXT-X-DISCONTINUITY\n");
             }
             if let Some(pdt) = &seg.program_date_time {
-                writeln!(w, "#EXT-X-PROGRAM-DATE-TIME:{}", pdt).map_err(fmt_err)?;
+                writeln!(w, "#EXT-X-PROGRAM-DATE-TIME:{pdt}").map_err(fmt_err)?;
             }
             // Per RFC 8216bis: when both EXT-X-PART entries and the
             // full segment line are present for the same media, the
@@ -439,8 +465,12 @@ fn check_uri(uri: &str) -> Result<(), FerricastError> {
 /// Seconds rounded to the millisecond precision durations are
 /// written with, so comparisons match what the client reads.
 fn millis(secs: f32) -> i64 {
-    // Saturating float→int cast; durations are a few seconds.
-    (f64::from(secs) * 1000.0).round() as i64
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "saturating float-to-int cast; durations are a few seconds"
+    )]
+    let millis = (f64::from(secs) * 1000.0).round() as i64;
+    millis
 }
 
 fn fmt_err(_: std::fmt::Error) -> FerricastError {
