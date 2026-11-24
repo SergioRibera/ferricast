@@ -39,6 +39,8 @@ pub(crate) mod key {
     pub(crate) const CHANNEL_COUNT: &str = "channel-count";
     pub(crate) const AAC_PROFILE: &str = "aac-profile";
     pub(crate) const MAX_INPUT_SIZE: &str = "max-input-size";
+    /// CTA-861.3 static HDR metadata (`MediaFormat.KEY_HDR_STATIC_INFO`).
+    pub(crate) const HDR_STATIC_INFO: &str = "hdr-static-info";
 }
 
 /// `AMediaCodec` buffer flags.
@@ -48,6 +50,9 @@ pub(crate) const FLAG_END_OF_STREAM: u32 = 4;
 
 /// `MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar`: NV12.
 pub(crate) const COLOR_FORMAT_NV12: i32 = 21;
+
+/// `MediaCodecInfo.CodecCapabilities.COLOR_FormatYUVP010`: P010.
+pub(crate) const COLOR_FORMAT_P010: i32 = 54;
 
 /// How long one wait on the codec may block.
 pub(crate) const WAIT: Duration = Duration::from_millis(20);
