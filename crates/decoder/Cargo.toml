@@ -68,17 +68,21 @@ istmo = ["ferricast-codec/istmo"]
 #   software codecs.
 media-foundation = ["dep:windows"]
 videotoolbox = [
+    "dep:objc2",
+    "dep:block2",
     "dep:objc2-core-foundation",
     "dep:objc2-core-video",
     "dep:objc2-core-media",
     "dep:objc2-video-toolbox",
 ]
 audiotoolbox = [
+    "dep:objc2",
+    "dep:block2",
     "dep:objc2-core-foundation",
     "dep:objc2-audio-toolbox",
     "dep:objc2-core-audio-types",
 ]
-mediacodec = ["dep:ndk"]
+mediacodec = ["dep:ndk", "dep:ndk-sys"]
 
 [dependencies]
 ferricast-core = { path = "../core", default-features = false }
@@ -126,11 +130,14 @@ tempfile = "3"
 
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", default-features = false, features = ["media", "api-level-28"], optional = true }
+ndk-sys = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Variant"], optional = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+block2 = { version = "0.6", optional = true }
+objc2 = { version = "0.6", optional = true }
 objc2-audio-toolbox = { version = "0.3", optional = true }
 objc2-core-audio-types = { version = "0.3", optional = true }
 objc2-core-foundation = { version = "0.3", optional = true }

@@ -2063,6 +2063,7 @@ dependencies = [
 name = "ferricast-decoder"
 version = "0.1.0"
 dependencies = [
+ "block2 0.6.2",
  "bytes",
  "cros-libva",
  "fdk-aac",
@@ -2073,6 +2074,8 @@ dependencies = [
  "h264-reader",
  "libc",
  "ndk 0.9.0",
+ "ndk-sys 0.6.0+11769913",
+ "objc2 0.6.4",
  "objc2-audio-toolbox",
  "objc2-core-audio-types",
  "objc2-core-foundation",
@@ -2111,6 +2114,7 @@ dependencies = [
 name = "ferricast-encoder"
 version = "0.1.0"
 dependencies = [
+ "block2 0.6.2",
  "bytes",
  "cros-libva",
  "fast_image_resize",
@@ -2119,6 +2123,8 @@ dependencies = [
  "ferricast-codec",
  "ferricast-core",
  "ndk 0.9.0",
+ "ndk-sys 0.6.0+11769913",
+ "objc2 0.6.4",
  "objc2-audio-toolbox",
  "objc2-core-audio-types",
  "objc2-core-foundation",
