@@ -47,6 +47,8 @@ mod nv12;
 pub mod nvdec;
 #[cfg(feature = "opus-decode")]
 mod opus;
+#[cfg(any(test, all(target_os = "windows", feature = "media-foundation")))]
+mod p010;
 mod pcm;
 mod platform;
 #[cfg(feature = "vp8-decode")]

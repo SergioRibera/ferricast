@@ -36,6 +36,7 @@ use super::mf::{
     colour_of, hdr_of, hns, media_type, micros, pack, unpack,
 };
 use crate::nv12;
+use crate::p010::downshift_p010;
 
 /// The open and probe functions of one (codec, kind) candidate.
 #[derive(Clone, Copy)]
@@ -248,17 +249,6 @@ fn select_nv12(mft: &IMFTransform) -> windows::core::Result<()> {
 /// P010 for 10-bit streams (an 8-bit stream offers no P010), else NV12.
 fn select_p010(mft: &IMFTransform) -> windows::core::Result<()> {
     select_output(mft, [MFVideoFormat_P010, MFVideoFormat_NV12])
-}
-
-/// The high byte of every 16-bit sample: P010 as NV12, rows packed.
-fn downshift_p010(data: &[u8], stride: usize, width: usize, height: usize) -> (Vec<u8>, usize) {
-    let row = width.div_ceil(2) * 2;
-    let rows = height + height.div_ceil(2);
-    let mut out = Vec::with_capacity(row * rows);
-    for line in data.chunks(stride).take(rows) {
-        out.extend(line.iter().skip(1).step_by(2).take(row));
-    }
-    (out, row)
 }
 
 /// A failed decode call: a stream the MFT does not implement can go to

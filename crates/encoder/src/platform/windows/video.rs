@@ -14,6 +14,19 @@
 //! up to do): when the MFT emits an IDR without them, the latest ones
 //! (from `MF_MT_MPEG_SEQUENCE_HEADER` or an earlier keyframe) are put
 //! in front.
+//!
+//! 10 bits: [`BitDepth::Ten`] encodes HEVC Main10 from P010 input (P010
+//! frames are copied, 8-bit NV12 / I420 ones widened). The colour and
+//! the static HDR metadata go on the media types (`MF_MT_VIDEO_PRIMARIES`,
+//! `MF_MT_TRANSFER_FUNCTION`, `MF_MT_MAX_MASTERING_LUMINANCE`, ...);
+//! whether they reach the bitstream (VUI, SEI) is up to the transform.
+//!
+//! Direct3D 11 input: a [`CapturedFrame::Native`] frame holding a
+//! [`D3d11Texture`] of the encoder's size and input format is encoded
+//! straight from the texture. The first one rebuilds the session on its
+//! device (`MFT_MESSAGE_SET_D3D_MANAGER`, then a forced IDR); a
+//! transform that is not Direct3D 11 aware, or a texture of another
+//! size or format, is read back to system memory instead.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -22,29 +35,32 @@ use bytes::Bytes;
 use ferricast_codec::bitstream::{self, NalSyntax, ParameterSets};
 use ferricast_codec::{OpenFn, ProbeFn, VideoEncoderSession};
 use ferricast_core::{
-    CapturedFrame, Codec, CodecError, CodecResult, CodecTarget, ColourDescription, EncodedFrame,
-    EncoderConfig, H264Profile, Operation,
+    BitDepth, CapturedFrame, Codec, CodecError, CodecResult, CodecTarget, ColourDescription,
+    ColourRange, EncodedFrame, EncoderConfig, H264Profile, NativeFrame, NativeSurface, Operation,
+    PixelFormat,
 };
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFMediaType,
-    MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    IMFSample, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAX_KEYFRAME_SPACING, MF_MT_MPEG_SEQUENCE_HEADER,
-    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MFMediaType_Video,
-    MFSampleExtension_CleanPoint, MFT_CATEGORY_VIDEO_ENCODER, MFT_INPUT_STREAM_INFO,
-    MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base, eAVEncH264VProfile_High,
-    eAVEncH264VProfile_Main, eAVEncH265VProfile_Main_420_8,
+    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MFCreateSample,
+    MFMediaType_Video, MFSampleExtension_CleanPoint, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_INPUT_STREAM_INFO, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
+    MFVideoFormat_P010, MFVideoInterlace_Progressive, eAVEncCommonRateControlMode_CBR,
+    eAVEncH264VProfile_Base, eAVEncH264VProfile_High, eAVEncH264VProfile_Main,
+    eAVEncH265VProfile_Main_420_8, eAVEncH265VProfile_Main_420_10,
 };
 use windows::core::GUID;
 
 use super::mf::{
-    self, BACKEND, Kind, MfResult, Output, Search, Transform, Worker, colour_attributes, hns,
-    media_type, micros, pack, set_codec_u32,
+    self, BACKEND, D3d11Texture, Device, Kind, MfResult, Output, Search, Transform, Worker,
+    colour_attributes, hns, media_type, micros, pack, set_codec_u32, set_hdr,
 };
 use crate::frame_view::FrameView;
 use crate::nv12::{self, Nv12Layout};
+use crate::p010::{fill_u16, write_p010};
 use crate::scale::{FrameScaler, FrameSize};
 
 /// How long `encode` lets a hardware MFT finish the frame it was given.
@@ -74,11 +90,13 @@ pub(super) const H265_SOFTWARE: Opener = Opener {
     probe: probe::<true, false>,
 };
 
-fn search(hevc: bool, hardware: bool) -> Search {
-    let (subtype, job) = if hevc {
-        (MFVideoFormat_HEVC, "H.265 encoder")
-    } else {
-        (MFVideoFormat_H264, "H.264 encoder")
+/// The transforms for `hevc` / `hardware` taking `input` (NV12 for
+/// 8-bit streams, P010 for 10-bit ones).
+fn search(hevc: bool, hardware: bool, input: PixelFormat) -> Search {
+    let (subtype, job) = match (hevc, input) {
+        (true, PixelFormat::P010) => (MFVideoFormat_HEVC, "H.265 Main10 encoder"),
+        (true, _) => (MFVideoFormat_HEVC, "H.265 encoder"),
+        (false, _) => (MFVideoFormat_H264, "H.264 encoder"),
     };
     Search {
         category: MFT_CATEGORY_VIDEO_ENCODER,
@@ -87,14 +105,22 @@ fn search(hevc: bool, hardware: bool) -> Search {
         } else {
             Kind::Software
         },
-        input: Some((MFMediaType_Video, MFVideoFormat_NV12)),
+        input: Some((MFMediaType_Video, input_subtype(input))),
         output: Some((MFMediaType_Video, subtype)),
         job,
     }
 }
 
+fn input_subtype(input: PixelFormat) -> GUID {
+    if input == PixelFormat::P010 {
+        MFVideoFormat_P010
+    } else {
+        MFVideoFormat_NV12
+    }
+}
+
 fn probe<const HEVC: bool, const HARDWARE: bool>() -> CodecResult<()> {
-    search(HEVC, HARDWARE).probe()
+    search(HEVC, HARDWARE, PixelFormat::Nv12).probe()
 }
 
 fn open<const HEVC: bool, const HARDWARE: bool>(
@@ -107,8 +133,18 @@ fn open<const HEVC: bool, const HARDWARE: bool>(
             target: CodecTarget::encode(config.codec),
         });
     }
+    let input = match config.bit_depth {
+        BitDepth::Eight => PixelFormat::Nv12,
+        BitDepth::Ten if HEVC => PixelFormat::P010,
+        BitDepth::Ten => {
+            return Err(CodecError::UnsupportedConfig {
+                backend: BACKEND,
+                what: "10-bit H.264 (Media Foundation encodes 10 bits as HEVC Main10 only)".into(),
+            });
+        }
+    };
     Ok(Box::new(MfVideoEncoder::open(
-        search(HEVC, HARDWARE),
+        search(HEVC, HARDWARE, input),
         config,
     )?))
 }
@@ -123,7 +159,7 @@ impl MfVideoEncoder {
     fn open(search: Search, config: &EncoderConfig) -> CodecResult<Self> {
         let config = config.clone();
         let worker = Worker::spawn("ferricast-mf-video-encoder", move || {
-            Session::open(search, &config)
+            Session::open(search, &config, None)
         })?;
         Ok(Self { search, worker })
     }
@@ -172,6 +208,7 @@ impl VideoEncoderSession for MfVideoEncoder {
 
     fn set_bitrate_kbps(&mut self, kbps: u32) -> CodecResult<()> {
         self.worker.run(Operation::SetBitrate, move |session| {
+            session.config.bitrate_kbps = kbps;
             let Some(api) = &session.codec_api else {
                 tracing::debug!(transform = session.transform.name(), "no ICodecAPI: bitrate stays");
                 return Ok(());
@@ -186,16 +223,32 @@ impl VideoEncoderSession for MfVideoEncoder {
     }
 }
 
+/// Whether the session encodes from a Direct3D 11 device.
+enum Gpu {
+    /// System-memory input only (no texture seen yet).
+    None,
+    /// Bound to this device: its textures go in as they are.
+    Bound(Device),
+    /// Rebinding to this device failed or its transform is not Direct3D
+    /// aware: its textures are read back, without retrying.
+    Refused(Device),
+}
+
 /// The encoder state on its worker thread.
 struct Session {
+    search: Search,
+    config: EncoderConfig,
     transform: Transform,
     codec_api: Option<ICodecAPI>,
     codec: Codec,
+    /// `Nv12`, or `P010` for a 10-bit stream.
+    input: PixelFormat,
     size: FrameSize,
     fps: u32,
     colour: ColourDescription,
     layout: Nv12Layout,
     alignment: u32,
+    gpu: Gpu,
     scaler: FrameScaler,
     keyframe_requested: bool,
     parameter_sets: ParameterSets,
@@ -208,7 +261,7 @@ struct Session {
 }
 
 impl Session {
-    fn open(search: Search, config: &EncoderConfig) -> CodecResult<Self> {
+    fn open(search: Search, config: &EncoderConfig, device: Option<Device>) -> CodecResult<Self> {
         if config.width == 0
             || config.height == 0
             || !config.width.is_multiple_of(2)
@@ -217,25 +270,44 @@ impl Session {
             return Err(CodecError::UnsupportedConfig {
                 backend: BACKEND,
                 what: format!(
-                    "a {}x{} picture (NV12 input needs even, non-zero dimensions)",
+                    "a {}x{} picture (4:2:0 input needs even, non-zero dimensions)",
                     config.width, config.height
                 ),
             });
         }
         let colour = colour_attributes(config.colour)?;
-        search.open(|transform| Self::setup(transform, config, &colour))
+        let mut device = device;
+        search.open(|transform| Self::setup(search, transform, config, &colour, &mut device))
     }
 
+    /// Sets `transform` up; a `device` it takes moves into the session.
     fn setup(
+        search: Search,
         mut transform: Transform,
         config: &EncoderConfig,
         colour: &[(GUID, Option<u32>)],
+        device: &mut Option<Device>,
     ) -> CodecResult<Self> {
         let op = Operation::Open;
         let hevc = config.codec == Codec::H265;
+        let input_format = if config.bit_depth == BitDepth::Ten {
+            PixelFormat::P010
+        } else {
+            PixelFormat::Nv12
+        };
+        let bytes_per_sample = if input_format == PixelFormat::P010 {
+            2
+        } else {
+            1
+        };
         let fps = config.fps.max(1);
         let gop = config.keyframe_interval_frames();
         let bitrate = config.bitrate_kbps.saturating_mul(1000);
+        // The device manager goes in before any media type.
+        let bound = match device.as_ref() {
+            Some(gpu) => transform.attach_d3d11(gpu)?,
+            None => false,
+        };
         let codec_api = transform.codec_api();
         // Rate control has to be chosen before the media types are set.
         if let Some(api) = &codec_api {
@@ -261,14 +333,14 @@ impl Session {
         } else {
             MFVideoFormat_H264
         };
-        let profile = if hevc {
-            mf::flag(eAVEncH265VProfile_Main_420_8.0)
-        } else {
-            match config.max_h264_profile {
+        let profile = match (hevc, input_format) {
+            (true, PixelFormat::P010) => mf::flag(eAVEncH265VProfile_Main_420_10.0),
+            (true, _) => mf::flag(eAVEncH265VProfile_Main_420_8.0),
+            (false, _) => match config.max_h264_profile {
                 Some(H264Profile::Baseline) => mf::flag(eAVEncH264VProfile_Base.0),
                 Some(H264Profile::Main) => mf::flag(eAVEncH264VProfile_Main.0),
                 Some(H264Profile::High) | None => mf::flag(eAVEncH264VProfile_High.0),
-            }
+            },
         };
         let output = media_type(&MFMediaType_Video, &subtype, op)?;
         let picture = |media: &IMFMediaType| -> CodecResult<()> {
@@ -297,6 +369,9 @@ impl Session {
                     }
                 }
             }
+            if let Some(hdr) = config.hdr {
+                set_hdr(media, hdr, op)?;
+            }
             Ok(())
         };
         picture(&output)?;
@@ -316,17 +391,19 @@ impl Session {
                 .SetOutputType(0, &output, 0)
                 .mf(op, "IMFTransform::SetOutputType")?;
         }
-        let input = media_type(&MFMediaType_Video, &MFVideoFormat_NV12, op)?;
+        let input_subtype = input_subtype(input_format);
+        let input = media_type(&MFMediaType_Video, &input_subtype, op)?;
         picture(&input)?;
         // SAFETY: plain COM call on the live transform.
         if let Err(error) = unsafe { transform.mft().SetInputType(0, &input, 0) } {
             // Some MFTs only take a type they offer themselves.
-            let offered = Self::offered_nv12(&transform, &picture)
-                .ok_or_else(|| mf::failure(op, "IMFTransform::SetInputType(NV12)", &error))?;
+            let offered = Self::offered_input(&transform, input_subtype, &picture)
+                .ok_or_else(|| mf::failure(op, "IMFTransform::SetInputType", &error))?;
             // SAFETY: as above.
             unsafe { transform.mft().SetInputType(0, &offered, 0) }
-                .mf(op, "IMFTransform::SetInputType(NV12)")?;
+                .mf(op, "IMFTransform::SetInputType")?;
         }
+        let row_bytes = config.width as usize * bytes_per_sample;
         // SAFETY: plain COM calls on the live transform.
         let (stride, alignment) = unsafe {
             let current = transform
@@ -337,8 +414,8 @@ impl Session {
                 .GetUINT32(&MF_MT_DEFAULT_STRIDE)
                 .ok()
                 .and_then(|stride| usize::try_from(stride).ok())
-                .filter(|&stride| stride >= config.width as usize)
-                .unwrap_or(config.width as usize);
+                .filter(|&stride| stride >= row_bytes)
+                .unwrap_or(row_bytes);
             let mut info = MFT_INPUT_STREAM_INFO::default();
             transform
                 .mft()
@@ -367,15 +444,24 @@ impl Session {
             stride,
             chroma_offset: stride * config.height as usize,
         };
+        let gpu = match device.take() {
+            Some(gpu) if bound => Gpu::Bound(gpu),
+            Some(gpu) => Gpu::Refused(gpu),
+            None => Gpu::None,
+        };
         let mut session = Self {
+            search,
+            config: config.clone(),
             transform,
             codec_api,
             codec: config.codec,
+            input: input_format,
             size: FrameSize::new(config.width, config.height),
             fps,
             colour: config.colour,
             layout,
             alignment,
+            gpu,
             scaler: FrameScaler::default(),
             keyframe_requested: false,
             parameter_sets,
@@ -397,18 +483,20 @@ impl Session {
         }
         let op = Operation::Open;
         let layout = self.layout;
-        let (black, neutral) = (
-            if self.colour.range == ferricast_core::ColourRange::Full {
-                0
-            } else {
-                16
-            },
-            128,
-        );
+        let limited = self.colour.range == ColourRange::Limited;
+        let input = self.input;
         let sample = mf::sample_with(layout.len(), self.alignment, op, |dst| {
             let (luma, chroma) = dst.split_at_mut(layout.chroma_offset);
-            luma.fill(black);
-            chroma.fill(neutral);
+            if input == PixelFormat::P010 {
+                // 10-bit codes in the high bits: black 64 (limited) or 0,
+                // neutral chroma 512.
+                let black: u16 = if limited { 64 << 6 } else { 0 };
+                fill_u16(luma, black);
+                fill_u16(chroma, 512 << 6);
+            } else {
+                luma.fill(if limited { 16 } else { 0 });
+                chroma.fill(128);
+            }
             Ok(())
         })?;
         // SAFETY: plain attribute writes on the new sample.
@@ -447,23 +535,110 @@ impl Session {
         Ok(())
     }
 
-    /// An NV12 input type the MFT offers, completed with the picture.
-    fn offered_nv12(
+    /// An input type of `subtype` the MFT offers, completed with the
+    /// picture.
+    fn offered_input(
         transform: &Transform,
+        subtype: GUID,
         picture: &dyn Fn(&IMFMediaType) -> CodecResult<()>,
     ) -> Option<IMFMediaType> {
         (0..64).find_map(|index| {
             // SAFETY: plain COM calls on the live transform.
             let offered = unsafe { transform.mft().GetInputAvailableType(0, index) }.ok()?;
             // SAFETY: plain attribute read.
-            let subtype = unsafe { offered.GetGUID(&MF_MT_SUBTYPE) }.ok()?;
-            (subtype == MFVideoFormat_NV12 && picture(&offered).is_ok()).then_some(offered)
+            let offered_subtype = unsafe { offered.GetGUID(&MF_MT_SUBTYPE) }.ok()?;
+            (offered_subtype == subtype && picture(&offered).is_ok()).then_some(offered)
         })
     }
 
-    fn encode(&mut self, frame: CapturedFrame) -> CodecResult<EncodedFrame> {
+    /// Whether `texture` can go in as it is: the encoder's input format
+    /// and size, the whole texture visible.
+    fn takes_texture(&self, texture: &D3d11Texture) -> bool {
+        let visible = texture.visible();
+        NativeSurface::format(texture) == self.input
+            && texture.size() == (self.size.width, self.size.height)
+            && (visible.x, visible.y, visible.width, visible.height)
+                == (0, 0, self.size.width, self.size.height)
+    }
+
+    /// A sample around `frame`'s texture, rebinding the session to its
+    /// device first when needed; `None` when it has to be read back.
+    fn texture_sample(&mut self, frame: &NativeFrame) -> CodecResult<Option<IMFSample>> {
+        let Some(texture) = frame.surface::<D3d11Texture>() else {
+            return Ok(None);
+        };
+        if !self.takes_texture(texture) {
+            return Ok(None);
+        }
+        let on_device = match &self.gpu {
+            Gpu::Bound(device) => device.holds(texture),
+            Gpu::Refused(device) if device.holds(texture) => return Ok(None),
+            Gpu::Refused(_) | Gpu::None => false,
+        };
+        if !on_device && !self.rebind(texture)? {
+            return Ok(None);
+        }
         let op = Operation::Encode;
-        let timestamp_us = frame.timestamp_us();
+        let buffer = texture.media_buffer()?;
+        // SAFETY: plain MF calls on a new sample.
+        let sample = unsafe {
+            let sample = MFCreateSample().mf(op, "MFCreateSample")?;
+            sample.AddBuffer(&buffer).mf(op, "IMFSample::AddBuffer")?;
+            sample
+        };
+        Ok(Some(sample))
+    }
+
+    /// Rebuilds the session on `texture`'s device, keeping the packets
+    /// already finished; `false` (textures of that device are then read
+    /// back) when the device or its transform cannot take them.
+    fn rebind(&mut self, texture: &D3d11Texture) -> CodecResult<bool> {
+        let device = Device::of_texture(texture)?;
+        let finished = self.flush()?;
+        let rebuilt = Self::open(self.search, &self.config, Some(device));
+        match rebuilt {
+            Ok(mut session) if matches!(session.gpu, Gpu::Bound(_)) => {
+                tracing::info!(
+                    transform = session.transform.name(),
+                    "encoding from Direct3D 11 textures"
+                );
+                session.packets = self.packets;
+                session.ready = finished.into();
+                session.ready.extend(self.ready.drain(..));
+                *self = session;
+                Ok(true)
+            }
+            Ok(session) => {
+                tracing::info!(
+                    transform = session.transform.name(),
+                    "the transform is not Direct3D 11 aware; textures are read back"
+                );
+                self.refuse(session.gpu, finished);
+                Ok(false)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "rebinding to the texture's device failed; textures are read back");
+                self.refuse(Gpu::Refused(Device::of_texture(texture)?), finished);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Keeps this session after a refused rebind, never retrying that
+    /// device.
+    fn refuse(&mut self, gpu: Gpu, finished: Vec<EncodedFrame>) {
+        self.gpu = match gpu {
+            Gpu::Bound(device) | Gpu::Refused(device) => Gpu::Refused(device),
+            Gpu::None => Gpu::None,
+        };
+        for packet in finished.into_iter().rev() {
+            self.ready.push_front(packet);
+        }
+    }
+
+    /// A system-memory sample holding `frame` in the input layout.
+    fn memory_sample(&mut self, frame: CapturedFrame) -> CodecResult<IMFSample> {
+        let op = Operation::Encode;
         let raw = frame
             .into_cpu()
             .map_err(|error| CodecError::backend(BACKEND, op, error))?;
@@ -473,6 +648,27 @@ impl Session {
             .map_err(CodecError::from_backend(BACKEND, op))?;
         let view = FrameView::new(&raw, self.size.width, self.size.height)
             .map_err(CodecError::from_backend(BACKEND, op))?;
+        let (colour, layout, input) = (self.colour, self.layout, self.input);
+        mf::sample_with(layout.len(), self.alignment, op, |dst| {
+            if input == PixelFormat::P010 {
+                write_p010(&view, layout, dst, BACKEND)
+            } else {
+                nv12::write(&view, colour, layout, dst, BACKEND)
+            }
+        })
+    }
+
+    fn encode(&mut self, frame: CapturedFrame) -> CodecResult<EncodedFrame> {
+        let op = Operation::Encode;
+        let timestamp_us = frame.timestamp_us();
+        let texture = match &frame {
+            CapturedFrame::Native(native) => self.texture_sample(native)?,
+            CapturedFrame::Cpu(_) => None,
+        };
+        let sample = match texture {
+            Some(sample) => sample,
+            None => self.memory_sample(frame)?,
+        };
         if self.keyframe_requested {
             self.keyframe_requested = false;
             match &self.codec_api {
@@ -487,10 +683,6 @@ impl Session {
                 ),
             }
         }
-        let (colour, layout) = (self.colour, self.layout);
-        let sample = mf::sample_with(layout.len(), self.alignment, op, |dst| {
-            nv12::write(&view, colour, layout, dst, BACKEND)
-        })?;
         let duration_us = 1_000_000 / u64::from(self.fps);
         // SAFETY: plain attribute writes on the new sample.
         unsafe {
