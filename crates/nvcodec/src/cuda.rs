@@ -795,6 +795,66 @@ pub struct HostImageMut<'a> {
     pub pitch: usize,
 }
 
+/// A CUDA array owned elsewhere (an EGL image of a DMA-BUF mapped through
+/// graphics interop), lent for `'a`: the owner keeps it mapped, and its
+/// context alive, at least that long. NVENC takes one as input
+/// (`NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY`).
+#[derive(Debug, Clone, Copy)]
+pub struct ArrayView<'a> {
+    raw: sys::CUarray,
+    context: &'a Arc<Context>,
+    width: u32,
+    height: u32,
+}
+
+impl<'a> ArrayView<'a> {
+    /// Lends `raw`.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be a CUDA array of `context`, at least `width` × `height`
+    /// elements, that stays allocated (and, for an interop array, mapped)
+    /// for all of `'a`.
+    #[must_use]
+    pub const unsafe fn from_raw(
+        raw: sys::CUarray,
+        context: &'a Arc<Context>,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            raw,
+            context,
+            width,
+            height,
+        }
+    }
+
+    /// The raw handle, valid for `'a`.
+    #[must_use]
+    pub const fn raw(self) -> sys::CUarray {
+        self.raw
+    }
+
+    /// The context the array belongs to.
+    #[must_use]
+    pub const fn context(self) -> &'a Arc<Context> {
+        self.context
+    }
+
+    /// Width in elements (pixels).
+    #[must_use]
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    /// Height in rows.
+    #[must_use]
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+}
+
 /// A pitched 2D allocation in device memory (`cuMemAllocPitch`): `rows` rows
 /// of `width_bytes`, each starting `pitch` bytes after the previous one, the
 /// pitch chosen by the driver for coalesced access. Freed on drop, with its
