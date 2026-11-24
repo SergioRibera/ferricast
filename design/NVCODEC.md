@@ -295,3 +295,81 @@ header sits at a different offset in the newest one. Findings for
   each fills the function list and opens + destroys a session; forcing
   13.1 fails with "NVENC API 13.1 was requested by FERRICAST_NVENC_API, but
   the driver supports 13.0 at most: install driver 610.0 or newer".
+
+## DMA-BUF interop decisions
+
+Verified on an RTX 3060, Linux driver 595.71.05, glvnd libEGL 1.7, mesa
+libgbm 26 with the NVIDIA GBM backend, `/dev/dri/renderD128`.
+
+### Chosen: EGL image → `cuGraphicsEGLRegisterImage` (no GL context)
+
+- `eglQueryDevicesEXT` lists three devices for one GPU: the NVIDIA one
+  (`EGL_NV_device_cuda`, `EGL_EXT_device_drm_render_node`), a mesa view of
+  the same DRM node, and mesa's software device. The importer picks the
+  device whose `EGL_CUDA_DEVICE_NV` is the CUDA device, opens it with
+  `EGL_PLATFORM_DEVICE_EXT` and checks the producer's DRM node (`dev_t`
+  from `linux-dmabuf` feedback / PipeWire) against the device's card and
+  render nodes, or by PCI address from sysfs. Another GPU →
+  `Error::DeviceMismatch` (the caller falls back to the CPU path).
+- `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` with
+  `EGL_DMA_BUF_PLANE0_MODIFIER_{LO,HI}_EXT`, then
+  `cuGraphicsEGLRegisterImage(READ_ONLY)` works without any EGL/GL context
+  current. The registration is an alias of the DMA-BUF: content written
+  after registration is read through the same registration (tested), so
+  there is no copy at all. Tiled (block-linear, `0x03000000_00606010`…)
+  buffers come back as a CUDA array (`CU_EGL_FRAME_TYPE_ARRAY`, 4 × u8),
+  LINEAR as pitched device memory (`CU_EGL_FRAME_TYPE_PITCH`).
+- EGL resources are always mapped: `cuGraphicsMapResources` on them fails
+  with `CUDA_ERROR_UNKNOWN`. `map` is therefore a fence wait plus
+  `cuGraphicsResourceGetMappedEglFrame` (a lookup, ~0.2 µs).
+- CUDA refuses `XRGB8888` / `XBGR8888` images (`CUDA_ERROR_INVALID_VALUE`)
+  but takes `ARGB8888` / `ABGR8888`; the importer tells EGL the alpha
+  variant of the same layout. All four formats read back bit-exact, LINEAR
+  and tiled.
+- `eglQueryDmaBufModifiersEXT` offers 12 block-linear modifiers + LINEAR
+  for all four formats; LINEAR is `external_only` (GL can only sample it as
+  `GL_TEXTURE_EXTERNAL_OES`), which does not concern CUDA's EGL interop.
+- Displays are initialised once and never terminated (process-wide
+  singletons; `EGL_KHR_display_reference` is not offered).
+- Each registration owns a dup of the DMA-BUF fd, the EGL image and the
+  CUDA resource; it waits for the context before unregistering (pool
+  changes only), so work queued on the array cannot outlive it. The
+  producer may free its buffer while it is registered.
+- Costs at 1920×1080: import (EGL image + register) 0.1–0.2 ms, once per
+  pool buffer; `map` ≈ 0.5 µs; map + array→pitched device copy + stream
+  sync ≈ 57–60 µs.
+
+### Synchronisation
+
+- Producer → CUDA: CUDA ignores implicit fences and cannot import a
+  `sync_file` (no SYNC_FD semaphore type), so `map` waits on the CPU with
+  `poll(POLLIN)` on the DMA-BUF (waits for its write fences; same as
+  `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` + poll without the extra fd), bounded by
+  a timeout. Explicit-sync callers pass `FenceWait::AlreadySignalled`.
+- CUDA → producer: CUDA attaches no fence to the DMA-BUF either. The
+  consumer must keep the capture buffer's lease until the GPU work reading
+  it (NVENC encode, the device copy's stream) has completed.
+
+### Rejected
+
+- **Vulkan import + copy into OPAQUE_FD memory + `cuImportExternalMemory`**:
+  costs a GPU copy per frame plus a Vulkan device, command buffers and
+  semaphores, to obtain what the EGL path gives for free. Its one advantage
+  (GPU-side wait on the producer's sync file through a Vulkan semaphore)
+  would still need a Vulkan→CUDA semaphore. Not prototyped; the EGL path
+  was measured zero-copy, so there was nothing to win.
+- **CUDA importing the DMA-BUF directly**: `cuImportExternalMemory` with
+  `OPAQUE_FD` on a DMA-BUF fd returns `CUDA_ERROR_UNKNOWN`; CUDA has no
+  DMA-BUF import handle type (DMA-BUF is export-only, through
+  `cuMemGetHandleForAddressRange`).
+- **EGL image → GL texture → `cuGraphicsGLRegisterImage`**: works for tiled
+  buffers (bit-exact), fails for LINEAR (`GL_TEXTURE_EXTERNAL_OES` →
+  `CUDA_ERROR_INVALID_VALUE`, and GL cannot render to it, so LINEAR would
+  need a shader copy), and needs a GL context per thread. Strictly worse.
+
+### Observed hazard (not on this path)
+
+- CPU `mmap` of a 1080p LINEAR NVIDIA GBM buffer does not show the GPU's
+  view past the first 64 KiB–4 MiB (zeros or unrelated pages), even with
+  `DMA_BUF_IOCTL_SYNC`; GPU views (CUDA, GL) agree with each other. CPU
+  readback of LINEAR buffers on NVIDIA should be treated as suspect.
