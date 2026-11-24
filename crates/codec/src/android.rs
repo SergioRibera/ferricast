@@ -415,11 +415,13 @@ impl ImageOutput {
 
     /// The next picture the codec rendered, waiting up to `timeout`
     /// (rendering is asynchronous), with its presentation time in µs.
+    /// `None` when none came, or while the consumer holds every image the
+    /// reader has: the picture waits in the reader until one is dropped
+    /// (back-pressure, logged), and the codec stalls once its own
+    /// buffers are full.
     ///
     /// # Errors
-    /// [`CodecError::Backend`] when the consumer holds every image the
-    /// reader has (pictures must be dropped for decoding to go on) or
-    /// the reader fails.
+    /// [`CodecError::Backend`] when the reader fails.
     pub fn next(&self, timeout: Duration) -> CodecResult<Option<(HardwareBuffer, u64)>> {
         let fail =
             |reason: String| CodecError::backend(BackendId::MediaCodec, Operation::Decode, reason);
@@ -434,17 +436,20 @@ impl ImageOutput {
                 .map_err(|error| fail(format!("AImageReader_acquireNextImage: {error}")))?;
             match acquired {
                 AcquireResult::Image(image) => return self.wrap(image).map(Some),
-                AcquireResult::MaxImagesAcquired => {
-                    return Err(fail(format!(
-                        "the consumer holds all {} decoded pictures; drop them sooner or \
-                         decode to CPU memory",
-                        self.max_images
-                    )));
+                AcquireResult::MaxImagesAcquired if Instant::now() >= deadline => {
+                    tracing::warn!(
+                        max_images = self.max_images,
+                        "the consumer holds every decoded picture; drop them sooner or \
+                         decode to CPU memory"
+                    );
+                    return Ok(None);
                 }
                 AcquireResult::NoBufferAvailable if Instant::now() >= deadline => {
                     return Ok(None);
                 }
-                AcquireResult::NoBufferAvailable => std::thread::sleep(POLL),
+                AcquireResult::NoBufferAvailable | AcquireResult::MaxImagesAcquired => {
+                    std::thread::sleep(POLL);
+                }
             }
         }
     }
