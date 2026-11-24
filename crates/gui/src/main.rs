@@ -111,8 +111,16 @@ async fn start() -> anyhow::Result<Option<Daemon>> {
     let manager_builder = manager_builder.with_chromecast();
     #[cfg(feature = "airplay")]
     let manager_builder = manager_builder.with_airplay();
+    let manager_builder = manager_builder.with_miracast();
     #[cfg(feature = "chromecast")]
     let manager_builder = manager_builder.with_chromecast_receiver();
+    let manager_builder = {
+        let miracast_sink = ferricast::miracast::MiracastReceiver::new(
+            args.receiver_name.clone(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        manager_builder.with_miracast_receiver(miracast_sink)
+    };
     #[cfg(feature = "airplay")]
     let manager_builder = if args.no_airplay_receiver {
         manager_builder
