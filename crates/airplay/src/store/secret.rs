@@ -15,7 +15,7 @@ use tracing::{debug, warn};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bound for one keyring request. Generous because unlocking a
 /// locked collection waits for the user to answer the unlock prompt.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Attributes identifying a keyring item.
 type Attributes = Vec<(&'static str, String)>;

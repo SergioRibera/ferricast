@@ -87,7 +87,12 @@ impl<D: Digest> SrpClient<D> {
     }
 
     fn n_len(&self) -> usize {
-        self.n.bits().div_ceil(8) as usize
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the SRP groups are 2048 and 3072 bits"
+        )]
+        let len = self.n.bits().div_ceil(8) as usize;
+        len
     }
 
     fn pad(&self, v: &BigUint) -> Vec<u8> {
@@ -138,6 +143,10 @@ impl<D: Digest> SrpClient<D> {
         }
     }
 
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "the RFC 5054 names: N, g, k, x, u, S"
+    )]
     fn process_with(
         &self,
         username: &str,
@@ -312,6 +321,7 @@ mod tests {
     }
 
     /// Server side of SRP-6a, used only to check the client end to end.
+    #[expect(clippy::many_single_char_names, reason = "the RFC 5054 names")]
     fn server<D: Digest>(
         group: SrpGroup,
         user: &str,
@@ -328,6 +338,7 @@ mod tests {
         (b, big_b, v.to_bytes_be())
     }
 
+    #[expect(clippy::many_single_char_names, reason = "the RFC 5054 names")]
     fn round_trip<D: Digest>(group: SrpGroup, user: &str) {
         let salt = [7_u8; 16];
         let (b, big_b, v) = server::<D>(group, user, "1234", &salt);

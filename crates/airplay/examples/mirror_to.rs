@@ -35,12 +35,12 @@ const TONE_HZ: f64 = 440.0;
 const MAX_PASSWORDS: u32 = 3;
 
 fn pattern(frame: u32) -> Bytes {
-    let mut data = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
-    for (i, px) in data.chunks_exact_mut(4).enumerate() {
-        let x = (i as u32) % WIDTH;
-        let y = (i as u32) / WIDTH;
-        px[0] = ((x + frame * 4) % 256) as u8;
-        px[1] = ((y + frame * 2) % 256) as u8;
+    let mut data = vec![0_u8; usize::try_from(WIDTH * HEIGHT * 4).unwrap()];
+    for (i, px) in (0_u32..).zip(data.chunks_exact_mut(4)) {
+        let x = i % WIDTH;
+        let y = i / WIDTH;
+        px[0] = u8::try_from((x + frame * 4) % 256).unwrap();
+        px[1] = u8::try_from((y + frame * 2) % 256).unwrap();
         px[2] = if (x / 80 + y / 80 + frame / 15).is_multiple_of(2) {
             220
         } else {
@@ -52,6 +52,11 @@ fn pattern(frame: u32) -> Bytes {
 }
 
 /// `count` stereo S16LE samples of the test tone, starting at sample `start`.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "a test tone: sample indices stay far below 2^52 and samples within i16"
+)]
 fn tone(start: u64, count: u64) -> Bytes {
     let mut out = Vec::with_capacity(count as usize * 4);
     for n in start..start + count {
@@ -67,7 +72,9 @@ fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_micros() as u64
+        .as_micros()
+        .try_into()
+        .unwrap()
 }
 
 fn next_password(
@@ -89,6 +96,7 @@ fn read_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 #[tokio::main]
+#[expect(clippy::too_many_lines, reason = "the whole demo, step by step")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -228,8 +236,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             data: pattern(n),
             timestamp_us: now,
         });
-        let encoded = encoder.encode(frame)?;
-        session.send_frame(&encoded).await?;
+        let packet = encoder.encode(frame)?;
+        session.send_frame(&packet).await?;
 
         if audio {
             // Feed the tone up to the current time, stamped like capture.

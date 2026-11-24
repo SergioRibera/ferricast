@@ -40,6 +40,7 @@ impl StartPosition {
             #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
+                clippy::cast_precision_loss,
                 reason = "clamped to 0..=u64::MAX microseconds"
             )]
             let us = (s.max(0.0) * 1_000_000.0).min(u64::MAX as f64) as u64;
@@ -116,7 +117,14 @@ impl PlayRequest {
         let real = |key: &str| {
             dict.get(key).and_then(|v| {
                 v.as_real()
-                    .or_else(|| v.as_signed_integer().map(|i| i as f64))
+                    .or_else(|| {
+                        #[expect(
+                            clippy::cast_precision_loss,
+                            reason = "positions in seconds, far below 2^52"
+                        )]
+                        let seconds = v.as_signed_integer().map(|i| i as f64);
+                        seconds
+                    })
                     .or_else(|| v.as_string().and_then(|s| s.trim().parse().ok()))
             })
         };

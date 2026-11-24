@@ -62,16 +62,15 @@ impl ReverseHub {
     /// reverse connection. Never waits: a stalled sender loses events.
     pub fn send(&self, key: &str, event: Event) {
         let channels = self.channels.lock().unwrap_or_else(PoisonError::into_inner);
-        match channels.get(key) {
-            Some(tx) => {
-                if tx.try_send(event).is_err() {
-                    debug!(
-                        key,
-                        "AirPlay event dropped: reverse connection busy or gone"
-                    );
-                }
+        if let Some(tx) = channels.get(key) {
+            if tx.try_send(event).is_err() {
+                debug!(
+                    key,
+                    "AirPlay event dropped: reverse connection busy or gone"
+                );
             }
-            None => debug!(key, ?event, "no reverse connection for the AirPlay event"),
+        } else {
+            debug!(key, ?event, "no reverse connection for the AirPlay event");
         }
     }
 

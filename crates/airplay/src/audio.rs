@@ -306,9 +306,9 @@ mod tests {
 
         // Reference: CBC by hand with the raw block cipher.
         let aes = Aes128::new(GenericArray::from_slice(&key));
-        let mut b0: [u8; 16] = std::array::from_fn(|i| i as u8 ^ iv[i]);
+        let mut b0: [u8; 16] = std::array::from_fn(|i| u8::try_from(i).unwrap() ^ iv[i]);
         aes.encrypt_block(GenericArray::from_mut_slice(&mut b0));
-        let mut b1: [u8; 16] = std::array::from_fn(|i| (i as u8 + 16) ^ b0[i]);
+        let mut b1: [u8; 16] = std::array::from_fn(|i| (u8::try_from(i).unwrap() + 16) ^ b0[i]);
         aes.encrypt_block(GenericArray::from_mut_slice(&mut b1));
         assert_eq!(&payload[..16], &b0);
         assert_eq!(&payload[16..32], &b1);
@@ -333,7 +333,7 @@ mod tests {
         // Encoder timestamps: origin + floor(n * 480 / 44100 s).
         for n in 0..2000_u64 {
             let ts = 1_000_000 + n * 480 * 1_000_000 / 44_100;
-            let expected = (u32::MAX - 100).wrapping_add((n * 480) as u32);
+            let expected = (u32::MAX - 100).wrapping_add(u32::try_from(n * 480).unwrap());
             assert_eq!(clock.rtp(ts), expected, "frame {n}");
         }
     }
@@ -354,13 +354,11 @@ mod tests {
     #[test]
     fn history_drops_the_oldest_packets() {
         let mut h = History::default();
-        for seq in 0..(HISTORY_LEN as u16 + 10) {
-            h.push(seq, vec![seq as u8]);
+        let len = u16::try_from(HISTORY_LEN).unwrap();
+        for seq in 0..(len + 10) {
+            h.push(seq, vec![seq.to_le_bytes()[0]]);
         }
         assert!(h.get(5).is_none());
-        assert_eq!(
-            h.get(HISTORY_LEN as u16 + 9),
-            Some(&[(HISTORY_LEN as u16 + 9) as u8][..])
-        );
+        assert_eq!(h.get(len + 9), Some(&[(len + 9).to_le_bytes()[0]][..]));
     }
 }

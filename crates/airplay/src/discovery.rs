@@ -66,8 +66,7 @@ fn device_from_service(
         .and_then(|v| {
             u32::from_str_radix(v.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()
         })
-        .map(Flags::from_bits_retain)
-        .unwrap_or_else(Flags::empty);
+        .map_or_else(Flags::empty, Flags::from_bits_retain);
     // UxPlay / RPiPlay signal "PIN or password required" only via `pw`.
     if txt
         .get("pw")
@@ -203,10 +202,10 @@ impl Discovery for AirPlayDiscovery {
                                     device.capabilities.max_fps = Some(fps);
                                 }
                                 Ok(Err(e)) => {
-                                    debug!(name = %device.name, error = %e, "AirPlay /info probe failed")
+                                    debug!(name = %device.name, error = %e, "AirPlay /info probe failed");
                                 }
                                 Err(_) => {
-                                    debug!(name = %device.name, "AirPlay /info probe timed out")
+                                    debug!(name = %device.name, "AirPlay /info probe timed out");
                                 }
                             }
                             info!(name = %device.name, addresses = ?device.addresses.as_slice(), "discovered AirPlay receiver");

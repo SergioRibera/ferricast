@@ -351,13 +351,14 @@ impl CredentialStore {
             return PasswordState::Required(Some(password));
         }
         match self.secrets.load(entry).await {
-            Ok(Some(bytes)) => match String::from_utf8(bytes) {
-                Ok(password) => PasswordState::Required(Some(password)),
-                Err(_) => {
+            Ok(Some(bytes)) => {
+                if let Ok(password) = String::from_utf8(bytes) {
+                    PasswordState::Required(Some(password))
+                } else {
                     warn!("ignoring a corrupt AirPlay password in the keyring");
                     PasswordState::Required(None)
                 }
-            },
+            }
             Ok(None) => PasswordState::Required(None),
             Err(e) => {
                 debug!(error = %e, "no stored AirPlay password");

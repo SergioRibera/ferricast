@@ -22,10 +22,7 @@ pub(crate) struct DigestChallenge {
 }
 
 fn md5_hex(input: &str) -> String {
-    Md5::digest(input.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex::encode(Md5::digest(input.as_bytes()))
 }
 
 /// Value of `key="…"` in a comma-separated parameter list.
