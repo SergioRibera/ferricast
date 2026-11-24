@@ -86,10 +86,14 @@ pub(crate) fn crop(src: &Nv12Planes, rect: (usize, usize, usize, usize)) -> Opti
 /// parser does not expose the colour description or HDR metadata.
 #[derive(Debug, Clone, Copy, Default)]
 #[cfg_attr(
-    not(any(feature = "hevc-decode", feature = "vp9-decode")),
+    not(any(
+        feature = "hevc-decode",
+        feature = "vp9-decode",
+        feature = "openh264-decode"
+    )),
     allow(
         dead_code,
-        reason = "conditional: only the pure-Rust HEVC and VP9 decoders use it"
+        reason = "conditional: only the openh264, pure-Rust HEVC and VP9 decoders use it"
     )
 )]
 pub(crate) struct Container {
@@ -98,10 +102,14 @@ pub(crate) struct Container {
 }
 
 #[cfg_attr(
-    not(any(feature = "hevc-decode", feature = "vp9-decode")),
+    not(any(
+        feature = "hevc-decode",
+        feature = "vp9-decode",
+        feature = "openh264-decode"
+    )),
     allow(
         dead_code,
-        reason = "conditional: only the pure-Rust HEVC and VP9 decoders use it"
+        reason = "conditional: only the openh264, pure-Rust HEVC and VP9 decoders use it"
     )
 )]
 impl Container {
