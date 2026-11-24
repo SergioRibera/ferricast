@@ -63,6 +63,15 @@ pub(crate) fn software_name(codec: Codec) -> Option<&'static str> {
     }
 }
 
+/// A real picture handed to the codec.
+#[derive(Debug, Clone, Copy)]
+struct Submitted {
+    /// Its capture timestamp.
+    capture_us: u64,
+    /// Its input-order index.
+    index: u64,
+}
+
 struct Session {
     codec: MediaCodec,
     kind: Codec,
@@ -75,7 +84,9 @@ struct Session {
     headers: Vec<u8>,
     /// Presentation time handed to the codec → capture timestamp of the
     /// picture (`None` for a priming picture, whose output is dropped).
-    in_flight: HashMap<u64, Option<u64>>,
+    in_flight: HashMap<u64, Option<Submitted>>,
+    /// Input-order index of the next real picture: `pts_dts` units.
+    next_index: u64,
     next_pts: u64,
     finished: VecDeque<EncodedFrame>,
     /// A priming picture came out: the pipeline is full.
@@ -176,10 +187,11 @@ fn format(config: &EncoderConfig, mime: &str, bitrate_mode: i32) -> CodecResult<
     );
     format.set_i32(key::BITRATE_MODE, bitrate_mode);
     format.set_i32(key::FRAME_RATE, dimension(config.fps.max(1), "frame rate")?);
-    format.set_f32(
-        key::I_FRAME_INTERVAL,
-        config.keyframe_interval_secs.max(0.0),
-    );
+    // Whole seconds: an int32 is what every API level reads (a float is
+    // only honoured from API 25, and not by every codec).
+    // Clamped to 1..=3600 first, so the cast cannot truncate.
+    let keyframe_interval = config.keyframe_interval_secs.ceil().clamp(1.0, 3600.0) as i32;
+    format.set_i32(key::I_FRAME_INTERVAL, keyframe_interval);
     // Real-time priority, one picture of latency, no B-frames: the
     // keys a codec does not know are ignored.
     format.set_i32(key::PRIORITY, 0);
@@ -201,14 +213,63 @@ fn format(config: &EncoderConfig, mime: &str, bitrate_mode: i32) -> CodecResult<
 }
 
 /// Whether an Annex B access unit starts with a parameter set.
-fn has_parameter_sets(kind: Codec, data: &[u8]) -> bool {
-    ferricast_codec::bitstream::split_annex_b(data)
-        .first()
-        .and_then(|nal| nal.first())
-        .is_some_and(|&header| match kind {
-            Codec::H265 => matches!((header >> 1) & 0x3f, 32..=34),
-            Codec::H264 | Codec::Vp8 | Codec::Vp9 | Codec::Av1 => header & 0x1f == 7,
+/// NAL kinds of an access unit that matter for in-band parameter sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Nal {
+    ParameterSet,
+    AccessUnitDelimiter,
+    Sei,
+    Other,
+}
+
+fn nal_kind(kind: Codec, header: u8) -> Nal {
+    match kind {
+        Codec::H265 => match (header >> 1) & 0x3f {
+            32..=34 => Nal::ParameterSet,
+            35 => Nal::AccessUnitDelimiter,
+            39 | 40 => Nal::Sei,
+            _ => Nal::Other,
+        },
+        Codec::H264 | Codec::Vp8 | Codec::Vp9 | Codec::Av1 => match header & 0x1f {
+            7 | 8 => Nal::ParameterSet,
+            9 => Nal::AccessUnitDelimiter,
+            6 => Nal::Sei,
+            _ => Nal::Other,
+        },
+    }
+}
+
+/// `data` (an Annex B keyframe) with `headers` in front of its first
+/// slice unless it already carries parameter sets before it; a leading
+/// access unit delimiter stays first, as both standards require.
+fn with_parameter_sets(kind: Codec, data: Vec<u8>, headers: &[u8]) -> Vec<u8> {
+    let units = ferricast_codec::bitstream::split_annex_b(&data);
+    let mut leading = units
+        .iter()
+        .map(|nal| {
+            nal.first()
+                .map_or(Nal::Other, |&header| nal_kind(kind, header))
         })
+        .take_while(|nal| *nal != Nal::Other);
+    if leading.any(|nal| nal == Nal::ParameterSet) {
+        return data;
+    }
+    // After a leading delimiter: the byte offset where the unit after it
+    // (with its start code) begins.
+    let split = units
+        .first()
+        .filter(|nal| {
+            nal.first()
+                .is_some_and(|&h| nal_kind(kind, h) == Nal::AccessUnitDelimiter)
+        })
+        .map_or(0, |aud| {
+            aud.as_ptr() as usize - data.as_ptr() as usize + aud.len()
+        });
+    let mut out = Vec::with_capacity(headers.len() + data.len());
+    out.extend_from_slice(&data[..split]);
+    out.extend_from_slice(headers);
+    out.extend_from_slice(&data[split..]);
+    out
 }
 
 impl Session {
@@ -275,6 +336,7 @@ impl Session {
             },
             headers: Vec::new(),
             in_flight: HashMap::new(),
+            next_index: 0,
             next_pts: 0,
             finished: VecDeque::new(),
             primed: false,
@@ -330,7 +392,12 @@ impl Session {
     fn alloc_pts(&mut self, capture_us: Option<u64>) -> u64 {
         let pts = self.next_pts;
         self.next_pts += 1_000_000 / u64::from(self.fps);
-        self.in_flight.insert(pts, capture_us);
+        let submitted = capture_us.map(|capture_us| {
+            let index = self.next_index;
+            self.next_index += 1;
+            Submitted { capture_us, index }
+        });
+        self.in_flight.insert(pts, submitted);
         pts
     }
 
@@ -351,16 +418,17 @@ impl Session {
             );
             return;
         };
-        let Some(timestamp_us) = capture else {
+        let Some(Submitted {
+            capture_us: timestamp_us,
+            index,
+        }) = capture
+        else {
             self.primed = true;
             return;
         };
         let is_keyframe = output.is(FLAG_KEY_FRAME);
-        let data = if is_keyframe && !has_parameter_sets(self.kind, &output.data) {
-            let mut data = Vec::with_capacity(self.headers.len() + output.data.len());
-            data.extend_from_slice(&self.headers);
-            data.extend_from_slice(&output.data);
-            data
+        let data = if is_keyframe {
+            with_parameter_sets(self.kind, output.data, &self.headers)
         } else {
             output.data
         };
@@ -370,7 +438,9 @@ impl Session {
             timestamp_us,
             is_keyframe,
             duration_us: Some(1_000_000 / u64::from(self.fps)),
-            pts_dts: (output.pts_us, output.pts_us),
+            // Frame indices; with B-frames off the codec keeps input order,
+            // so presentation and decode index are the same.
+            pts_dts: (index, index),
         });
     }
 

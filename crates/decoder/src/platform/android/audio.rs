@@ -8,7 +8,7 @@
 //! reports the doubled rate, which the PCM is labelled with.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ferricast_codec::aac::AacLc;
 use ferricast_core::{
@@ -16,7 +16,7 @@ use ferricast_core::{
     DecodedAudio, Operation,
 };
 use ndk::media::media_codec::MediaFormat;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::codec::{
     Codec as MediaCodec, FLAG_CODEC_CONFIG, FLAG_END_OF_STREAM, Output, Pick, WAIT, copy_into,
@@ -30,6 +30,8 @@ const AAC_FRAME_SAMPLES: u64 = 1024;
 const OPUS_RATE: u32 = 48_000;
 /// Opus seek pre-roll the codec is told about (RFC 7845 §4.6), in ns.
 const OPUS_SEEK_PREROLL_NS: u64 = 80_000_000;
+/// How long draining to the end of the stream waits at most.
+const FLUSH_DEADLINE: Duration = Duration::from_secs(1);
 
 /// The MIME type of `codec`, when `MediaCodec` decodes it.
 pub(crate) fn mime(codec: AudioCodec) -> Option<&'static str> {
@@ -164,26 +166,9 @@ impl MediaCodecAudioDecoder {
         let (sample_rate, channels) = match open.output {
             Some(shape) => shape,
             None => {
-                let format = open.codec.output_format();
-                let rate = format
-                    .i32(key::SAMPLE_RATE)
-                    .and_then(|r| u32::try_from(r).ok())
-                    .unwrap_or(OPUS_RATE);
-                let channels = format
-                    .i32(key::CHANNEL_COUNT)
-                    .and_then(|c| u16::try_from(c).ok())
-                    .unwrap_or(2);
-                // PCM 16-bit is the default; anything else is unreadable here.
-                if let Some(encoding) = format.i32(key::PCM_ENCODING)
-                    && encoding != 2
-                {
-                    return Err(fail(
-                        Operation::Decode,
-                        format!("decoder outputs PCM encoding {encoding}, not 16-bit"),
-                    ));
-                }
-                open.output = Some((rate, channels));
-                (rate, channels)
+                let shape = output_shape(&open.codec)?;
+                open.output = Some(shape);
+                shape
             }
         };
         let pcm = output
@@ -228,27 +213,61 @@ impl MediaCodecAudioDecoder {
             .open
             .as_mut()
             .ok_or_else(|| fail(Operation::Decode, "the decoder is not configured"))?;
+        // PCM drained while waiting for an input buffer keeps the output
+        // shape current when it was dequeued: a format change part-way
+        // through the batch only relabels the buffers after it.
         let mut early = Vec::new();
-        let mut changed = false;
+        let mut shape = open.output;
         open.codec.queue(
             Operation::Decode,
             pts_us,
             0,
             |buffer| copy_into(buffer, payload, Operation::Decode),
-            |codec| {
-                while let Some(output) =
-                    codec.next_output(Operation::Decode, Duration::ZERO, || changed = true)?
-                {
-                    early.push(output);
+            |codec| loop {
+                let mut changed = false;
+                let output =
+                    codec.next_output(Operation::Decode, Duration::ZERO, || changed = true)?;
+                if changed {
+                    shape = Some(output_shape(codec)?);
                 }
-                Ok(())
+                let Some(output) = output else {
+                    return Ok(());
+                };
+                early.push((output, shape));
             },
         )?;
-        if changed {
-            open.output = None;
-        }
-        for output in early {
+        for (output, snapshot) in early {
+            if let Some(open) = self.open.as_mut() {
+                open.output = snapshot;
+            }
             self.accept(output)?;
+        }
+        if let Some(open) = self.open.as_mut() {
+            open.output = shape;
+        }
+        Ok(())
+    }
+
+    /// Signals the end of the stream to the open codec and files every
+    /// frame it still holds; the deadline only guards against a codec
+    /// that never signals the end.
+    fn drain_to_end(&mut self) -> CodecResult<()> {
+        let Some(open) = &self.open else {
+            return Ok(());
+        };
+        open.codec.queue(
+            Operation::Flush,
+            0,
+            FLAG_END_OF_STREAM,
+            |_| Ok(0),
+            |_| Ok(()),
+        )?;
+        let deadline = Instant::now() + FLUSH_DEADLINE;
+        while !self.drain(WAIT)? {
+            if Instant::now() >= deadline {
+                warn!("MediaCodec audio decoder did not signal the end of the stream within 1 s");
+                break;
+            }
         }
         Ok(())
     }
@@ -268,7 +287,9 @@ impl MediaCodecAudioDecoder {
                 .as_ref()
                 .is_none_or(|open| open.shape != Some(shape))
             {
-                // Drop the previous instance before opening the next.
+                // Finish the previous instance (its last frames are good
+                // audio), then drop it before opening the next.
+                self.drain_to_end()?;
                 self.open = None;
                 self.open = Some(self.start(Some(shape))?);
             }
@@ -342,4 +363,27 @@ impl AudioDecoder for MediaCodecAudioDecoder {
         }
         Ok(self.ready.drain(..).collect())
     }
+}
+
+/// The PCM shape `codec`'s current output format describes.
+fn output_shape(codec: &MediaCodec) -> CodecResult<(u32, u16)> {
+    let format = codec.output_format();
+    let rate = format
+        .i32(key::SAMPLE_RATE)
+        .and_then(|r| u32::try_from(r).ok())
+        .unwrap_or(OPUS_RATE);
+    let channels = format
+        .i32(key::CHANNEL_COUNT)
+        .and_then(|c| u16::try_from(c).ok())
+        .unwrap_or(2);
+    // PCM 16-bit is the default; anything else is unreadable here.
+    if let Some(encoding) = format.i32(key::PCM_ENCODING)
+        && encoding != 2
+    {
+        return Err(fail(
+            Operation::Decode,
+            format!("decoder outputs PCM encoding {encoding}, not 16-bit"),
+        ));
+    }
+    Ok((rate, channels))
 }

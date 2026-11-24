@@ -9,7 +9,7 @@
 //! aligned NV12, or I420), cropped to the visible rectangle.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ferricast_core::{
@@ -29,6 +29,9 @@ use crate::nv12;
 /// hardware decoder finishes a 1080p picture well within it, so the
 /// picture leaves with its packet instead of one packet later.
 const LOW_LATENCY_WAIT: Duration = Duration::from_millis(8);
+
+/// How long `flush` waits for the end of the stream at most.
+const FLUSH_DEADLINE: Duration = Duration::from_secs(2);
 
 /// The MIME type of `codec`.
 pub(crate) fn mime(codec: Codec) -> &'static str {
@@ -188,7 +191,18 @@ impl Session {
 
     /// Reads the output layout from the codec's current output format.
     fn read_layout(&mut self) -> CodecResult<Layout> {
-        let format = self.codec.output_format();
+        let layout = Self::layout_of(&self.codec, self.kind, self.container_colour)?;
+        self.layout = Some(layout);
+        Ok(layout)
+    }
+
+    /// The layout `codec`'s current output format describes.
+    fn layout_of(
+        codec: &MediaCodec,
+        kind: Codec,
+        container_colour: Option<ColourDescription>,
+    ) -> CodecResult<Layout> {
+        let format = codec.output_format();
         let width = int(&format, key::WIDTH).unwrap_or(0);
         let height = int(&format, key::HEIGHT).unwrap_or(0);
         let colour_format = format.i32(key::COLOR_FORMAT).unwrap_or(color_format::NV12);
@@ -204,7 +218,7 @@ impl Session {
                     backend: BackendId::MediaCodec,
                     reason: format!(
                         "{} writes pictures in colour format {other:#x}, which this backend cannot read",
-                        self.codec.label()
+                        codec.label()
                     ),
                 });
             }
@@ -228,11 +242,10 @@ impl Session {
             }
             _ => (0, 0, width, height),
         };
-        let fallback = self
-            .container_colour
+        let fallback = container_colour
             .unwrap_or_else(|| ColourDescription::unspecified(ColourRange::Limited));
         let mut colour = signalled_colour(&format, fallback);
-        if colour.chroma_location.is_none() && matches!(self.kind, Codec::H264 | Codec::H265) {
+        if colour.chroma_location.is_none() && matches!(kind, Codec::H264 | Codec::H265) {
             colour = colour.with_chroma_location(ChromaLocation::Left);
         }
         let layout = Layout {
@@ -248,7 +261,6 @@ impl Session {
                 format!("output format has no picture size: {layout:?}"),
             ));
         }
-        self.layout = Some(layout);
         Ok(layout)
     }
 
@@ -364,8 +376,13 @@ impl Session {
     }
 
     fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+        // Output drained while waiting for an input buffer is filed after
+        // the queue; each buffer keeps the layout current when it was
+        // dequeued, so a format change part-way through the batch only
+        // applies to the buffers after it.
         let mut early = Vec::new();
-        let mut format_changed = false;
+        let mut layout = self.layout;
+        let (kind, container_colour) = (self.kind, self.container_colour);
         self.codec
             .queue(
                 Operation::Decode,
@@ -373,23 +390,28 @@ impl Session {
                 0,
                 |buffer| copy_into(buffer, &frame.data, Operation::Decode),
                 |codec| {
-                    while let Some(output) =
-                        codec.next_output(Operation::Decode, Duration::ZERO, || {
-                            format_changed = true
-                        })?
-                    {
-                        early.push(output);
+                    loop {
+                        let mut changed = false;
+                        let output =
+                            codec.next_output(Operation::Decode, Duration::ZERO, || {
+                                changed = true
+                            })?;
+                        if changed {
+                            layout = Some(Self::layout_of(codec, kind, container_colour)?);
+                        }
+                        let Some(output) = output else {
+                            return Ok(());
+                        };
+                        early.push((output, layout));
                     }
-                    Ok(())
                 },
             )
             .map_err(|error| self.stream_error(error))?;
-        if format_changed {
-            self.layout = None;
-        }
-        for output in early {
+        for (output, snapshot) in early {
+            self.layout = snapshot;
             self.accept(output)?;
         }
+        self.layout = layout;
         let wait = if self.low_latency && self.ready.is_empty() {
             LOW_LATENCY_WAIT
         } else {
@@ -421,8 +443,12 @@ impl Session {
             |_| Ok(0),
             |_| Ok(()),
         )?;
-        for _ in 0..50 {
-            if self.drain(WAIT)? {
+        // Drain until the end-of-stream buffer; the deadline only guards
+        // against a codec that never signals it.
+        let deadline = Instant::now() + FLUSH_DEADLINE;
+        while !self.drain(WAIT)? {
+            if Instant::now() >= deadline {
+                warn!("MediaCodec decoder did not signal the end of the stream within 2 s");
                 break;
             }
         }
