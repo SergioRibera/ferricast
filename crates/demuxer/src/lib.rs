@@ -313,7 +313,8 @@ pub fn demux_segment(init: &[u8], segment: &[u8]) -> Result<Segment> {
 const UNRECOGNISED: &str = "unrecognised container";
 
 pub(crate) fn micros(ticks: i64, timescale: u32) -> u64 {
-    (i128::from(ticks.max(0)) * 1_000_000 / i128::from(timescale.max(1))) as u64
+    u64::try_from(i128::from(ticks.max(0)) * 1_000_000 / i128::from(timescale.max(1)))
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

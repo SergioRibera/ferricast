@@ -23,10 +23,10 @@ const CUE_POINT: u32 = 0xBB;
 const CUE_TRACK_POSITIONS: u32 = 0xB7;
 const CUE_RELATIVE_POSITION: u8 = 0xF0;
 const VOID: u8 = 0xEC;
-/// Largest Cues element walked. An hour of video with a cue per second
+/// Largest `Cues` element walked. An hour of video with a cue per second
 /// takes well under a megabyte.
 const MAX_CUES: u64 = 32 << 20;
-/// Largest SeekHead walked; real ones list a handful of elements.
+/// Largest `SeekHead` walked; real ones list a handful of elements.
 const MAX_SEEK_HEAD: u64 = 64 << 10;
 
 /// The source, with every `CueRelativePosition` ID byte read as `Void`.
@@ -38,8 +38,8 @@ pub(super) struct CueMask {
 }
 
 impl CueMask {
-    /// Locates the Cues through the first SeekHead and records the
-    /// relative positions to mask. A file whose Cues cannot be found or
+    /// Locates the `Cues` through the first `SeekHead` and records the
+    /// relative positions to mask. A file whose `Cues` cannot be found or
     /// parsed is passed through unchanged.
     pub(super) fn new(mut inner: BoxedSource) -> io::Result<Self> {
         let masked = relative_positions(&mut inner).unwrap_or_default();
@@ -238,7 +238,7 @@ mod tests {
         out
     }
 
-    /// EBML header, then a Segment whose SeekHead points at Cues with
+    /// EBML header, then a `Segment` whose `SeekHead` points at `Cues` with
     /// one cue point carrying a relative position.
     fn file() -> (Vec<u8>, usize) {
         let ebml = element(&[0x1A, 0x45, 0xDF, 0xA3], &element(&[0x42, 0x86], &[1]));

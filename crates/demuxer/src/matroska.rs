@@ -225,12 +225,17 @@ impl AudioTrack {
                 )
             }
             id if id.starts_with("A_AAC") => {
-                let config = match entry.codec_private() {
-                    Some(asc) => AacConfig::from_asc(asc),
+                let config = if let Some(asc) = entry.codec_private() {
+                    AacConfig::from_asc(asc)
+                } else {
                     // Legacy `A_AAC/MPEG4/LC`-style ids carry no config.
-                    None => {
-                        AacConfig::low_complexity(settings.sampling_frequency() as u32, channels)
-                    }
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "sampling rates are small positive integers; the cast saturates"
+                    )]
+                    let rate = settings.sampling_frequency() as u32;
+                    AacConfig::low_complexity(rate, channels)
                 }
                 .ok()?;
                 (AudioFormat::Aac(config), config.stream(None))
@@ -289,7 +294,7 @@ impl MatroskaDemuxer {
         let duration_us = file
             .info()
             .duration()
-            .map(|ticks| (ticks * scale_ns as f64 / 1000.0) as u64);
+            .map(|ticks| duration_micros(ticks, scale_ns));
         let mut video = None;
         for entry in file.tracks() {
             if let Some(track) = VideoTrack::open(entry)? {
@@ -473,11 +478,11 @@ const OBU_FRAME_HEADER: u8 = 3;
 const OBU_FRAME: u8 = 6;
 
 /// An AV1 temporal unit is a keyframe (AV1-in-Matroska §4.4) when it
-/// carries a sequence header and its first frame header is a KEY_FRAME
-/// that is decoded rather than shown from a reference: show_existing_frame
-/// (1 bit) and frame_type (2 bits, 0 = KEY_FRAME) open the uncompressed
-/// header (§5.9.2), unless reduced_still_picture_header (bit 4 of the
-/// sequence header, after seq_profile and still_picture) makes every
+/// carries a sequence header and its first frame header is a `KEY_FRAME`
+/// that is decoded rather than shown from a reference: `show_existing_frame`
+/// (1 bit) and `frame_type` (2 bits, 0 = `KEY_FRAME`) open the uncompressed
+/// header (§5.9.2), unless `reduced_still_picture_header` (bit 4 of the
+/// sequence header, after `seq_profile` and `still_picture`) makes every
 /// frame a key frame with neither field coded.
 fn av1_is_keyframe(data: &[u8]) -> bool {
     let mut reduced_still_picture = None;
@@ -509,9 +514,9 @@ struct Obu<'a> {
 struct Obus<'a>(&'a [u8]);
 
 impl<'a> Obus<'a> {
-    /// Splits the leading OBU off `data`: obu_header (forbidden bit,
-    /// obu_type, extension flag, has_size_field, reserved bit), the
-    /// optional extension byte, then a leb128 obu_size or, without a size
+    /// Splits the leading OBU off `data`: `obu_header` (forbidden bit,
+    /// `obu_type`, extension flag, `has_size_field`, reserved bit), the
+    /// optional extension byte, then a leb128 `obu_size` or, without a size
     /// field, everything that is left.
     fn split(data: &'a [u8]) -> Option<(Obu<'a>, &'a [u8])> {
         let (&header, rest) = data.split_first()?;
@@ -559,9 +564,9 @@ fn leb128(data: &[u8]) -> Option<(u64, &[u8])> {
     None
 }
 
-/// VP9 uncompressed header (bitstream spec §6.2): frame_marker (2 bits, = 2),
-/// profile_low_bit, profile_high_bit, a reserved zero bit for profile 3, then
-/// show_existing_frame and frame_type (0 = KEY_FRAME).
+/// VP9 uncompressed header (bitstream spec §6.2): `frame_marker` (2 bits, = 2),
+/// `profile_low_bit`, `profile_high_bit`, a reserved zero bit for profile 3, then
+/// `show_existing_frame` and `frame_type` (0 = `KEY_FRAME`).
 fn vp9_is_keyframe(data: &[u8]) -> bool {
     let Some(&byte) = data.first() else {
         return false;
@@ -586,6 +591,22 @@ fn scaled_micros(ticks: u64, scale_ns: u64) -> Result<u64> {
     })
 }
 
+/// A segment duration (ticks of `scale_ns`, stored as a float) in µs.
+fn duration_micros(ticks: f64, scale_ns: u64) -> u64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "an approximate duration for display; the float-to-int cast saturates"
+    )]
+    let micros = (ticks * scale_ns as f64 / 1000.0) as u64;
+    micros
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "shaped for `map_err`, which hands the error over by value"
+)]
 fn demux(error: matroska_demuxer::DemuxError) -> FerricastError {
     FerricastError::Demux(error.to_string())
 }
@@ -679,7 +700,7 @@ impl FloatMastering {
                 return None;
             }
             // Non-negative and below 2^53 (NaN fails the range): exact as u64.
-            #[allow(
+            #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
                 reason = "range checked above"

@@ -85,6 +85,10 @@ pub(super) fn parse_moof(
         .collect()
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one walk over the `traf` children; splitting it scatters the box state"
+)]
 fn parse_traf(
     traf: &[u8],
     moof_offset: u64,
@@ -142,7 +146,7 @@ fn parse_traf(
         let mut at = 8;
         let mut offset = data_end;
         if flags & DATA_OFFSET != 0 {
-            let delta = i64::from(be32(trun, at)? as i32);
+            let delta = i64::from(be32(trun, at)?.cast_signed());
             offset = base.checked_add_signed(delta)?;
             at += 4;
         }
@@ -182,7 +186,7 @@ fn parse_traf(
                 if version == 0 {
                     i32::try_from(raw).unwrap_or(i32::MAX)
                 } else {
-                    raw as i32
+                    raw.cast_signed()
                 }
             } else {
                 0
@@ -255,7 +259,10 @@ pub(super) fn parse_sidx(sidx: &[u8], end: u64, timescale: u32) -> Option<Sidx> 
         sidx.get(at + 2..at + 4)?.try_into().ok()?,
     ));
     at += 4;
-    let convert = |t: u64| (u128::from(t) * u128::from(timescale) / u128::from(sidx_scale)) as u64;
+    let convert = |t: u64| {
+        u64::try_from(u128::from(t) * u128::from(timescale) / u128::from(sidx_scale))
+            .unwrap_or(u64::MAX)
+    };
     let mut offset = end.checked_add(first_offset)?;
     let mut refs = Vec::with_capacity(count.min(MAX_INDEX));
     let mut total = 0u64;
@@ -321,8 +328,14 @@ pub(super) fn parse_mfra(mfra: &[u8], track_id: u32) -> Option<Vec<IndexEntry>> 
 mod tests {
     use super::*;
 
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "box kinds are written as byte-string literals"
+    )]
     fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
-        let mut out = (body.len() as u32 + 8).to_be_bytes().to_vec();
+        let mut out = (u32::try_from(body.len()).unwrap() + 8)
+            .to_be_bytes()
+            .to_vec();
         out.extend_from_slice(kind);
         out.extend_from_slice(body);
         out
@@ -418,7 +431,7 @@ mod tests {
         // version 1, EPT 500, first offset 20; one reference to a sidx.
         let mut body = words(&[1 << 24, 1, 1000, 0, 500, 0, 20]);
         body.extend_from_slice(&[0, 0, 0, 1]);
-        body.extend(words(&[0x8000_0000 | 900, 3000, 0x9000_0000]));
+        body.extend(words(&[0x8000_0000 | 0x384, 3000, 0x9000_0000]));
         let sidx = parse_sidx(&body, 100, 1000).unwrap();
         assert_eq!(
             sidx.refs,

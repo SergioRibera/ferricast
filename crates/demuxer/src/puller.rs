@@ -1,4 +1,4 @@
-//! [`ProgressivePuller`]: plays a single media file (MP4, MOV, MKV, WebM or audio) over HTTP
+//! [`ProgressivePuller`]: plays a single media file (MP4, MOV, MKV, `WebM` or audio) over HTTP
 //! as a [`MediaPuller`].
 //!
 //! The demuxer is synchronous, so it runs on a worker thread over an
@@ -33,7 +33,7 @@ enum Cmd {
     },
 }
 
-/// Pulls one progressive media file (MP4, MOV, Matroska, WebM) over
+/// Pulls one progressive media file (MP4, MOV, Matroska, `WebM`) over
 /// HTTP(S), with range requests when the server supports them.
 #[derive(Default)]
 pub struct ProgressivePuller {

@@ -113,7 +113,7 @@ impl AacConfig {
         let mut bits = Bits::new(asc);
         let mut object_type = bits.object_type().ok_or_else(malformed)?;
         let (mut rate_index, mut sample_rate) = bits.rate().ok_or_else(malformed)?;
-        let code = bits.read(4).ok_or_else(malformed)? as u8;
+        let code = bits.read_u8(4).ok_or_else(malformed)?;
         let channel_config = AacChannelConfig::new(code).ok_or_else(|| {
             FerricastError::Demux(format!("AAC channel configuration {code} is not supported"))
         })?;
@@ -183,6 +183,10 @@ impl AacConfig {
     }
 
     /// Prefixes one raw access unit with its ADTS header.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the frame length is checked against the 13-bit maximum and masked per field"
+    )]
     fn adts(self, payload: &[u8]) -> Result<Bytes> {
         let len = payload.len() + ADTS_HEADER;
         if len > ADTS_MAX_FRAME {
@@ -270,15 +274,20 @@ impl<'a> Bits<'a> {
         Some(value)
     }
 
+    /// [`Self::read`] of at most 8 bits.
+    fn read_u8(&mut self, count: usize) -> Option<u8> {
+        u8::try_from(self.read(count)?).ok()
+    }
+
     fn object_type(&mut self) -> Option<u8> {
-        match self.read(5)? as u8 {
-            31 => Some(32 + self.read(6)? as u8),
+        match self.read_u8(5)? {
+            31 => Some(32 + self.read_u8(6)?),
             aot => Some(aot),
         }
     }
 
     fn rate(&mut self) -> Option<(u8, u32)> {
-        let index = self.read(4)? as u8;
+        let index = self.read_u8(4)?;
         if index == AAC_EXPLICIT_RATE {
             return Some((index, self.read(24)?));
         }

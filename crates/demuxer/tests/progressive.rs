@@ -37,28 +37,25 @@ async fn serve(body: Vec<u8>) -> String {
                     .find(|(k, _)| k.eq_ignore_ascii_case("range"))
                     .and_then(|(_, v)| v.trim().strip_prefix("bytes=")?.split_once('-'))
                     .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)));
-                let out = match range {
-                    Some((start, end)) => {
-                        let end = end.min(body.len() - 1);
-                        let mut r = format!(
-                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
-                             Content-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
-                            end + 1 - start,
-                            body.len()
-                        )
-                        .into_bytes();
-                        r.extend_from_slice(&body[start..=end]);
-                        r
-                    }
-                    None => {
-                        let mut r = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        )
-                        .into_bytes();
-                        r.extend_from_slice(&body);
-                        r
-                    }
+                let out = if let Some((start, end)) = range {
+                    let end = end.min(body.len() - 1);
+                    let mut r = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
+                         Content-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
+                        end + 1 - start,
+                        body.len()
+                    )
+                    .into_bytes();
+                    r.extend_from_slice(&body[start..=end]);
+                    r
+                } else {
+                    let mut r = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    r.extend_from_slice(&body);
+                    r
                 };
                 let _ = sock.write_all(&out).await;
                 let _ = sock.shutdown().await;
@@ -78,7 +75,7 @@ async fn plays_and_seeks_on_a_current_thread_runtime() {
         let info = puller
             .open(PullSpec {
                 url,
-                headers: Default::default(),
+                headers: std::collections::HashMap::default(),
             })
             .await
             .unwrap();
