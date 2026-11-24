@@ -14,7 +14,14 @@ description = "Receiver-side decoders for ferricast (CPU H.264 + AAC; GPU paths 
 # - `aac` — pure-Rust AAC-LC decoder via symphonia. Audio decode is
 #   CPU-bound across the board (no consumer driver exposes hardware
 #   AAC decode), so one backend covers the receiver pipeline.
-default = ["openh264-decode", "aac"]
+default = [
+    "openh264-decode",
+    "aac",
+    "media-foundation",
+    "videotoolbox",
+    "audiotoolbox",
+    "mediacodec",
+]
 openh264-decode = ["dep:openh264", "dep:openh264-sys2", "dep:h264-reader"]
 aac = ["dep:symphonia"]
 # AAC decode through libfdk-aac (bundled C++ source, built by
@@ -50,6 +57,28 @@ nvdec-decode = ["dep:shiguredo_nvcodec", "dep:h264-reader"]
 nvdec-hevc-decode = ["nvdec-decode", "dep:rust_h265"]
 # The decoders in the istmo codec plugin (`ferricast_codec::plugin`).
 istmo = ["ferricast-codec/istmo"]
+# Platform codecs. Each compiles only on its own OS (its dependency is
+# target-gated), so all of them stay in the defaults: a Linux build
+# ignores them, a Windows / Apple / Android build picks up its own.
+# - `media-foundation`: Windows Media Foundation transforms (hardware
+#   MFTs first, then Microsoft's software ones).
+# - `videotoolbox`: Apple VideoToolbox (macOS, iOS) H.264 / H.265.
+# - `audiotoolbox`: Apple AudioToolbox `AudioConverter`, AAC.
+# - `mediacodec`: Android NDK `AMediaCodec` (API 28+), hardware and
+#   software codecs.
+media-foundation = ["dep:windows"]
+videotoolbox = [
+    "dep:objc2-core-foundation",
+    "dep:objc2-core-video",
+    "dep:objc2-core-media",
+    "dep:objc2-video-toolbox",
+]
+audiotoolbox = [
+    "dep:objc2-core-foundation",
+    "dep:objc2-audio-toolbox",
+    "dep:objc2-core-audio-types",
+]
+mediacodec = ["dep:ndk"]
 
 [dependencies]
 ferricast-core = { path = "../core", default-features = false }
@@ -94,3 +123,17 @@ ferricast-demuxer = { path = "../demuxer" }
 # HE-AAC test streams: libfdk-aac is the only HE-AAC encoder available.
 fdk-aac = "0.8"
 tempfile = "3"
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = { version = "0.9", default-features = false, features = ["media", "api-level-28"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Variant"], optional = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2-audio-toolbox = { version = "0.3", optional = true }
+objc2-core-audio-types = { version = "0.3", optional = true }
+objc2-core-foundation = { version = "0.3", optional = true }
+objc2-core-media = { version = "0.3", optional = true }
+objc2-core-video = { version = "0.3", optional = true }
+objc2-video-toolbox = { version = "0.3", optional = true }

@@ -21,6 +21,7 @@ ferricast_codec::audio_encoder_facade! {
 /// The Opus encode backends of this build.
 fn registry() -> AudioEncoderRegistry {
     let registry = AudioEncoderRegistry::new(CodecTarget::encode(AudioCodec::Opus));
+    let registry = crate::platform::audio(registry);
     #[cfg(feature = "opus-rs")]
     let registry = registry.candidate(Candidate::new(
         BackendId::OpusRs,

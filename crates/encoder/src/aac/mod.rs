@@ -44,6 +44,7 @@ ferricast_codec::audio_encoder_facade! {
 /// The AAC-ELD encode backends of this build.
 fn eld_registry() -> AudioEncoderRegistry {
     let registry = AudioEncoderRegistry::new(CodecTarget::encode(AudioCodec::AacEld));
+    let registry = crate::platform::audio(registry);
     #[cfg(feature = "fdk-aac")]
     let registry = registry.candidate(Candidate::new(
         BackendId::FdkAac,
@@ -63,7 +64,7 @@ ferricast_codec::audio_encoder_facade! {
 /// The AAC-LC encode backends of this build, in automatic order.
 fn registry() -> AudioEncoderRegistry {
     let registry = AudioEncoderRegistry::new(CodecTarget::encode(AudioCodec::Aac));
-    let registry = crate::platform::aac(registry);
+    let registry = crate::platform::audio(registry);
     #[cfg(feature = "fdk-aac")]
     let registry = registry.candidate(Candidate::new(
         BackendId::FdkAac,

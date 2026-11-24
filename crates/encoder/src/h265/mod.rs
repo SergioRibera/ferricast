@@ -73,5 +73,5 @@ fn registry() -> VideoEncoderRegistry {
     );
     #[cfg(not(feature = "vaapi-hevc"))]
     let registry = registry.missing(BackendId::Vaapi, "ferricast-encoder/vaapi-hevc");
-    crate::platform::h265(registry)
+    crate::platform::video(registry)
 }

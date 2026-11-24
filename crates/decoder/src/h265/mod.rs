@@ -79,7 +79,7 @@ fn registry() -> VideoDecoderRegistry {
     );
     #[cfg(not(feature = "vaapi-hevc-decode"))]
     let registry = registry.missing(BackendId::Vaapi, "ferricast-decoder/vaapi-hevc-decode");
-    let registry = crate::platform::h265(registry);
+    let registry = crate::platform::video(registry);
     #[cfg(feature = "hevc-decode")]
     let registry = registry.candidate(Candidate::new(
         BackendId::RustHevc,

@@ -1,62 +1,125 @@
 //! Encoders that come with an operating system: Media Foundation on
 //! Windows, VideoToolbox / AudioToolbox on Apple platforms, the NDK
-//! `AMediaCodec` on Android. Each registry function appends this
-//! platform's backends for a job (or records the ones that only exist
-//! elsewhere), so a selection naming a foreign backend says where it
-//! runs.
+//! `AMediaCodec` on Android.
+//!
+//! [`video`] and [`audio`] append this platform's backends for the job
+//! a registry is for ([`ferricast_codec::Registry::target`]), in front
+//! of the software fallbacks. A platform backend whose cargo feature is
+//! off is recorded as missing (naming the feature), and one for another
+//! operating system as elsewhere, so a selection naming it fails saying
+//! why.
 
-use ferricast_codec::{AudioEncoderRegistry, VideoEncoderRegistry};
+#[cfg(all(target_os = "android", feature = "mediacodec"))]
+mod android;
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    any(feature = "videotoolbox", feature = "audiotoolbox")
+))]
+mod apple;
+#[cfg(all(target_os = "windows", feature = "media-foundation"))]
+mod windows;
+
+use ferricast_codec::{AudioEncoderRegistry, Registry, VideoEncoderRegistry};
 use ferricast_core::BackendId;
 
+/// Records `backend` as absent: missing its feature on its own platform,
+/// elsewhere on any other.
+fn absent<C, S: ?Sized>(
+    registry: Registry<C, S>,
+    backend: BackendId,
+    feature: &'static str,
+    on_its_platform: bool,
+    platform: &'static str,
+) -> Registry<C, S> {
+    if on_its_platform {
+        registry.missing(backend, feature)
+    } else {
+        registry.elsewhere(backend, feature, platform)
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "conditional: unused on the OS it names once its feature is on"
+)]
 const WINDOWS: &str = "only on Windows";
+#[allow(
+    dead_code,
+    reason = "conditional: unused on the OS it names once its feature is on"
+)]
 const APPLE: &str = "only on macOS and iOS";
+#[allow(
+    dead_code,
+    reason = "conditional: unused on the OS it names once its feature is on"
+)]
 const ANDROID: &str = "only on Android";
 
-/// Adds the platform H.264 encoders.
-pub(crate) fn h264(registry: VideoEncoderRegistry) -> VideoEncoderRegistry {
-    video(registry)
-}
-
-/// Adds the platform H.265 encoders.
-pub(crate) fn h265(registry: VideoEncoderRegistry) -> VideoEncoderRegistry {
-    video(registry)
-}
-
-/// Adds the platform AAC-LC encoders.
-pub(crate) fn aac(registry: AudioEncoderRegistry) -> AudioEncoderRegistry {
+/// Adds the platform backends of a video job.
+pub(crate) fn video(registry: VideoEncoderRegistry) -> VideoEncoderRegistry {
+    #[cfg(all(target_os = "windows", feature = "media-foundation"))]
+    let registry = windows::video(registry);
+    #[cfg(not(all(target_os = "windows", feature = "media-foundation")))]
+    let registry = absent(
+        registry,
+        BackendId::MediaFoundation,
+        "ferricast-encoder/media-foundation",
+        cfg!(target_os = "windows"),
+        WINDOWS,
+    );
+    #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox"))]
+    let registry = apple::video(registry);
+    #[cfg(not(all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")))]
+    let registry = absent(
+        registry,
+        BackendId::VideoToolbox,
+        "ferricast-encoder/videotoolbox",
+        cfg!(any(target_os = "macos", target_os = "ios")),
+        APPLE,
+    );
+    #[cfg(all(target_os = "android", feature = "mediacodec"))]
+    let registry = android::video(registry);
+    #[cfg(not(all(target_os = "android", feature = "mediacodec")))]
+    let registry = absent(
+        registry,
+        BackendId::MediaCodec,
+        "ferricast-encoder/mediacodec",
+        cfg!(target_os = "android"),
+        ANDROID,
+    );
     registry
-        .elsewhere(
-            BackendId::MediaFoundation,
-            "ferricast-encoder/media-foundation",
-            WINDOWS,
-        )
-        .elsewhere(
-            BackendId::AudioToolbox,
-            "ferricast-encoder/audiotoolbox",
-            APPLE,
-        )
-        .elsewhere(
-            BackendId::MediaCodec,
-            "ferricast-encoder/mediacodec",
-            ANDROID,
-        )
 }
 
-fn video(registry: VideoEncoderRegistry) -> VideoEncoderRegistry {
+/// Adds the platform backends of an audio job.
+pub(crate) fn audio(registry: AudioEncoderRegistry) -> AudioEncoderRegistry {
+    #[cfg(all(target_os = "windows", feature = "media-foundation"))]
+    let registry = windows::audio(registry);
+    #[cfg(not(all(target_os = "windows", feature = "media-foundation")))]
+    let registry = absent(
+        registry,
+        BackendId::MediaFoundation,
+        "ferricast-encoder/media-foundation",
+        cfg!(target_os = "windows"),
+        WINDOWS,
+    );
+    #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "audiotoolbox"))]
+    let registry = apple::audio(registry);
+    #[cfg(not(all(any(target_os = "macos", target_os = "ios"), feature = "audiotoolbox")))]
+    let registry = absent(
+        registry,
+        BackendId::AudioToolbox,
+        "ferricast-encoder/audiotoolbox",
+        cfg!(any(target_os = "macos", target_os = "ios")),
+        APPLE,
+    );
+    #[cfg(all(target_os = "android", feature = "mediacodec"))]
+    let registry = android::audio(registry);
+    #[cfg(not(all(target_os = "android", feature = "mediacodec")))]
+    let registry = absent(
+        registry,
+        BackendId::MediaCodec,
+        "ferricast-encoder/mediacodec",
+        cfg!(target_os = "android"),
+        ANDROID,
+    );
     registry
-        .elsewhere(
-            BackendId::MediaFoundation,
-            "ferricast-encoder/media-foundation",
-            WINDOWS,
-        )
-        .elsewhere(
-            BackendId::VideoToolbox,
-            "ferricast-encoder/videotoolbox",
-            APPLE,
-        )
-        .elsewhere(
-            BackendId::MediaCodec,
-            "ferricast-encoder/mediacodec",
-            ANDROID,
-        )
 }

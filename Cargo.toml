@@ -80,6 +80,10 @@ default = [
     "vp9-decode",
     "av1-decode",
     "opus-decode",
+    "media-foundation",
+    "videotoolbox",
+    "audiotoolbox",
+    "mediacodec",
 ]
 chromecast = ["dep:ferricast-chromecast"]
 # AirPlay sender. Also enables FairPlay `fp-setup` support, which links the
@@ -155,6 +159,12 @@ wayland-direct = ["ferricast-capture/wayland-direct", "wlroots"]
 miracast = ["dep:ferricast-miracast"]
 miracast-linux-p2p = ["miracast", "ferricast-miracast/linux-p2p"]
 miracast-windows-native = ["miracast", "ferricast-miracast/windows-native"]
+# Platform codecs (see crates/encoder/Cargo.toml). Target-gated, so they
+# are inert off their own OS and stay in the defaults.
+media-foundation = ["ferricast-encoder/media-foundation", "ferricast-decoder/media-foundation"]
+videotoolbox = ["ferricast-encoder/videotoolbox", "ferricast-decoder/videotoolbox"]
+audiotoolbox = ["ferricast-encoder/audiotoolbox", "ferricast-decoder/audiotoolbox"]
+mediacodec = ["ferricast-encoder/mediacodec", "ferricast-decoder/mediacodec"]
 # The codecs as the istmo plugin `ferricast.codec` (see `codec_service`).
 # istmo is pre-1.0: its API and wire format may change between releases.
 istmo = [

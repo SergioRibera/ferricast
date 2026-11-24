@@ -32,11 +32,13 @@ mod x264_impl;
 #[cfg(any(feature = "nvenc", feature = "vaapi", feature = "x264"))]
 use ferricast_codec::Candidate;
 use ferricast_codec::VideoEncoderRegistry;
+#[cfg(any(feature = "nvenc", feature = "vaapi", feature = "x264"))]
+use ferricast_core::Acceleration;
 #[cfg(any(feature = "nvenc", feature = "vaapi"))]
 use ferricast_core::CodecError;
 #[cfg(any(feature = "nvenc", feature = "vaapi"))]
 use ferricast_core::EncoderConfig;
-use ferricast_core::{Acceleration, BackendId, Codec, CodecTarget};
+use ferricast_core::{BackendId, Codec, CodecTarget};
 
 #[cfg(feature = "nvenc")]
 pub use crate::nvenc::NvencH264Encoder;
@@ -103,7 +105,7 @@ fn registry() -> VideoEncoderRegistry {
     );
     #[cfg(not(feature = "vaapi"))]
     let registry = registry.missing(BackendId::Vaapi, "ferricast-encoder/vaapi");
-    let registry = crate::platform::h264(registry);
+    let registry = crate::platform::video(registry);
     #[cfg(feature = "x264")]
     let registry = registry.candidate(Candidate::new(
         BackendId::X264,
