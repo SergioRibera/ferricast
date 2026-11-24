@@ -470,9 +470,38 @@ impl LinuxP2pClient {
                         // Record BEFORE Connect so dedupe fires even
                         // when Connect itself errored out.
                         last_connect_at = Some((peer.clone(), now));
-                        if let Err(e) = p2p_owned.call_method("Connect", &(args,)).await {
-                            tracing::warn!(error = %e, "sink: Connect");
+                        match p2p_owned.call_method("Connect", &(args,)).await {
+                            Ok(reply) => {
+                                // Connect returns the PIN supplicant
+                                // actually armed for the subsequent
+                                // GO-Negotiation-Response. Compare with
+                                // what we passed — mismatch is a sure
+                                // sign the WPS handshake will fail.
+                                let armed: String = reply
+                                    .body()
+                                    .deserialize()
+                                    .unwrap_or_else(|_| "<no-reply>".to_string());
+                                tracing::info!(armed_pin = %armed, "sink: Connect accepted, awaiting GON completion");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "sink: Connect");
+                            }
                         }
+                        // Watchdog: if neither GroupStarted nor any
+                        // failure signal arrives within 15 s, the peer
+                        // bailed silently. Log + reset state so the
+                        // next attempt starts clean.
+                        let watchdog_peer = peer.clone();
+                        let watchdog_proxy = p2p_owned.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                            tracing::warn!(
+                                peer = %watchdog_peer.as_str(),
+                                "sink: 15s after Connect — no GroupStarted/Failure signal. \
+                                 Peer probably timed out. Issuing P2PDevice.Cancel() to reset."
+                            );
+                            let _ = watchdog_proxy.call_method("Cancel", &()).await;
+                        });
                     }
                     msg = started.next() => {
                         let Some(sig) = msg else { break };
