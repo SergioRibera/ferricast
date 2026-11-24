@@ -337,6 +337,10 @@ impl LinuxP2pClient {
             // retransmits PD-Req and the phone displays the LAST pin
             // supplicant generated, so dedup would stale the state.
             let mut last_prov_pin: Option<(OwnedObjectPath, String)> = None;
+            // Set true once we get GroupStarted or synthesise one from
+            // InterfaceAdded, so the Connect watchdog can distinguish
+            // "peer stalled" from "group already up".
+            let group_formed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             // When set, a background branch logs the PIN after an
             // 800 ms quiet period so phone retries collapse to one
             // display event.
@@ -477,6 +481,7 @@ impl LinuxP2pClient {
                                     interface_path: path.to_string(),
                                     role: GroupRole::Client,
                                 };
+                                group_formed.store(true, std::sync::atomic::Ordering::Release);
                                 if tx.send(group).await.is_err() {
                                     return;
                                 }
@@ -597,15 +602,18 @@ impl LinuxP2pClient {
                         }
                         // Watchdog: if neither GroupStarted nor any
                         // failure signal arrives within 15 s, the peer
-                        // bailed silently. Log + reset state so the
-                        // next attempt starts clean. Guarded against
-                        // panics so a stray zbus error can't tear down
-                        // the whole GUI process.
+                        // bailed silently. Skip when the group has
+                        // already formed in the meantime (false-positive
+                        // after successful connect).
                         let watchdog_peer = peer.clone();
                         let watchdog_conn = conn.clone();
                         let watchdog_iface = interface_path.clone();
+                        let group_ready_flag = group_formed.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                            if group_ready_flag.load(std::sync::atomic::Ordering::Acquire) {
+                                return;
+                            }
                             tracing::warn!(
                                 peer = %watchdog_peer.as_str(),
                                 "sink: 15s after Connect — no GroupStarted/Failure signal. \
@@ -633,6 +641,7 @@ impl LinuxP2pClient {
                         if let Ok(dict) = sig.body().deserialize::<HashMap<String, OwnedValue>>() {
                             if let Some(group) = parse_group_started(&dict) {
                                 tracing::info!(iface = %group.interface_path, role = ?group.role, "sink: group started");
+                                group_formed.store(true, std::sync::atomic::Ordering::Release);
                                 if tx.send(group).await.is_err() {
                                     return;
                                 }
