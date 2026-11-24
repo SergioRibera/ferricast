@@ -403,8 +403,13 @@ impl<C, S: ?Sized> Registry<C, S> {
     /// Probes (once per process) then opens `candidate`. A failed open
     /// forgets the probe verdict, so the next selection probes again.
     fn try_open(&self, candidate: &Candidate<C, S>, config: &C) -> CodecResult<Box<S>> {
-        if let Some(probe) = candidate.probe {
-            cache::probe_once(candidate.backend, self.target, probe)?;
+        // A probe initialises the device (CUDA, VA-API) just as opening
+        // does, so running one here would pay that start-up twice; only a
+        // verdict already known to be negative skips the open.
+        if candidate.probe.is_some()
+            && let Some(error) = cache::known_unavailable(candidate.backend, self.target)
+        {
+            return Err(error);
         }
         candidate
             .open(config)
@@ -809,20 +814,21 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_probe_skips_the_open_and_is_remembered() {
+    fn opening_never_probes_but_honours_a_failed_probe_verdict() {
         static PROBED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         // A job no other test uses: probe verdicts are process-wide.
         let registry = TestRegistry::new(CodecTarget::encode(Codec::Vp8))
             .with_cache(Arc::new(cache::NoCache))
             .candidate(
-                Candidate::new(BackendId::Nvenc, Acceleration::Hardware, counted_refusal)
-                    .with_probe(|| {
+                Candidate::new(BackendId::Nvenc, Acceleration::Hardware, refuses).with_probe(
+                    || {
                         PROBED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         Err(CodecError::BackendUnavailable {
                             backend: BackendId::Nvenc,
                             reason: "no NVIDIA driver".into(),
                         })
-                    }),
+                    },
+                ),
             )
             .candidate(Candidate::new(
                 BackendId::X264,
@@ -830,6 +836,13 @@ mod tests {
                 opens,
             ));
         let plan = registry.plan(&BackendSelection::default()).unwrap();
+        // Opening is the test: no probe runs, nvenc is tried and refuses.
+        let opened = registry.open(&plan, 0, &720).unwrap();
+        assert!(!opened.attempts[0].reason.contains("no NVIDIA driver"));
+        assert_eq!(PROBED.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // A capability report probes once; its negative verdict then skips
+        // the open.
+        assert_eq!(registry.report().len(), 2);
         for _ in 0..3 {
             let opened = registry.open(&plan, 0, &720).unwrap();
             assert!(opened.attempts[0].reason.contains("no NVIDIA driver"));

@@ -295,6 +295,10 @@ impl LinuxP2pClient {
             // retransmits PD-Req and the phone displays the LAST pin
             // supplicant generated, so dedup would stale the state.
             let mut last_prov_pin: Option<(OwnedObjectPath, String)> = None;
+            // When set, a background branch logs the PIN after an
+            // 800 ms quiet period so phone retries collapse to one
+            // display event.
+            let mut pending_pin_display: Option<std::time::Instant> = None;
             // De-dup Connect calls: supplicant sometimes emits GON
             // signal twice (once per ProvDisc completion, once per
             // peer re-request). Calling Connect twice on the same peer
@@ -313,23 +317,29 @@ impl LinuxP2pClient {
                     msg = prov_pin.next() => {
                         let Some(sig) = msg else { break };
                         // `ProvisionDiscoveryRequestDisplayPin(peer: o, pin: s)`.
-                        // Android Smart View retransmits PD-Req and
-                        // supplicant regenerates the PIN each time; the
-                        // phone displays the LAST one it received. We
-                        // always cache the latest so Connect uses it.
+                        // Android Smart View retransmits PD-Req; each
+                        // retry makes supplicant regenerate a fresh PIN.
+                        // The phone screen displays whichever one was
+                        // ACK'd LAST. We silently cache every emission;
+                        // a debounce ticker below surfaces only the
+                        // final value so the user sees one PIN.
                         let Ok((peer, pin)): Result<(OwnedObjectPath, String), _>
                             = sig.body().deserialize() else { continue };
-                        let updated = last_prov_pin
-                            .as_ref()
-                            .is_some_and(|(p, pp)| p == &peer && pp != &pin);
-                        if updated {
-                            tracing::warn!(
-                                peer = %peer.as_str(),
-                                pin = %pin,
-                                "miracast sink: PIN UPDATED, type on phone → **{}** ← (use this one)",
-                                pin,
-                            );
-                        } else {
+                        last_prov_pin = Some((peer, pin));
+                        pending_pin_display = Some(std::time::Instant::now());
+                    }
+                    _ = async {
+                        match pending_pin_display {
+                            Some(t) => {
+                                let elapsed = t.elapsed();
+                                let wait = std::time::Duration::from_millis(800)
+                                    .saturating_sub(elapsed);
+                                tokio::time::sleep(wait).await;
+                            }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        if let Some((peer, pin)) = last_prov_pin.as_ref() {
                             tracing::warn!(
                                 peer = %peer.as_str(),
                                 pin = %pin,
@@ -337,7 +347,7 @@ impl LinuxP2pClient {
                                 pin,
                             );
                         }
-                        last_prov_pin = Some((peer, pin));
+                        pending_pin_display = None;
                     }
                     msg = prov_pbc.next() => {
                         let Some(sig) = msg else { break };
@@ -446,10 +456,17 @@ impl LinuxP2pClient {
                         if let Some(pin) = maybe_pin {
                             args.insert("pin", Value::from(pin));
                         }
-                        // Sink = Group Owner (runs DHCP + RTSP server).
-                        // WFD 2.1 §4.5.1 recommends go_intent=15 (max).
-                        // Type is DBUS_TYPE_INT32 (`i`), not u32.
-                        args.insert("go_intent", Value::from(15i32));
+                        // GO intent trade-off:
+                        //   15 = spec-recommended for sink (WFD 2.1 §4.5.1)
+                        //        but phones like Xiaomi Smart View also
+                        //        send 15 → P2P status 9 "both indicated
+                        //        Intent 15" → GON aborts.
+                        //   14 = still high (beats default 7), no tie
+                        //        against phones that hard-code 15.
+                        // We lose GO role when phone wins; works anyway
+                        // because RTSP listens on 0.0.0.0:7236 and the
+                        // P2P client iface still hosts that port.
+                        args.insert("go_intent", Value::from(14i32));
                         // Record BEFORE Connect so dedupe fires even
                         // when Connect itself errored out.
                         last_connect_at = Some((peer.clone(), now));

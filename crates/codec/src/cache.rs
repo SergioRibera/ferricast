@@ -423,6 +423,16 @@ pub(crate) fn probe_once(
     verdict
 }
 
+/// The memoized verdict of a probe of `backend` on `target` that failed,
+/// without running one: opening is the definitive test, so the open path
+/// only skips a backend a capability report already found missing.
+pub(crate) fn known_unavailable(backend: BackendId, target: CodecTarget) -> Option<CodecError> {
+    match lock(&PROBES).get(&(backend, target)) {
+        Some(Err(error)) => Some(error.clone()),
+        Some(Ok(())) | None => None,
+    }
+}
+
 /// Forgets the probe verdict of `backend` on `target`.
 pub(crate) fn forget_probe(backend: BackendId, target: CodecTarget) {
     lock(&PROBES).remove(&(backend, target));
