@@ -69,6 +69,7 @@ impl ScreenCapture for FakeCapture {
         let (w, h) = self.current;
         self.ts += 5_000;
         Ok(CapturedFrame::Cpu(RawFrame {
+            hdr: None,
             colour: None,
             width: w,
             height: h,

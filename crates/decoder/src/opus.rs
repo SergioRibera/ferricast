@@ -143,6 +143,7 @@ mod tests {
 
     fn config(channels: u16) -> AudioDecoderConfig {
         AudioDecoderConfig {
+            extra_data: None,
             codec: AudioCodec::Opus,
             sample_rate: RATE,
             channels,

@@ -165,6 +165,7 @@ mod tests {
     fn decodes_an_uncompressed_stereo_frame() {
         let mut d = SymphoniaAlacDecoder::default();
         d.configure(&AudioDecoderConfig {
+            extra_data: None,
             codec: AudioCodec::Alac,
             sample_rate: 44_100,
             channels: 2,

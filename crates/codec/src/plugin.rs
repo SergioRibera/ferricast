@@ -650,6 +650,7 @@ mod tests {
 
     fn frame(timestamp_us: u64) -> CapturedFrame {
         CapturedFrame::Cpu(RawFrame {
+            hdr: None,
             width: 2,
             height: 2,
             stride: 8,

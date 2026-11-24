@@ -143,7 +143,11 @@ pub(crate) fn deliver(
 ) -> Option<RawFrame> {
     let yuv = colour.yuv(height);
     let (data, stride, format, colour) = match format {
-        PixelFormat::Nv12 | PixelFormat::I420 => (data, stride, PixelFormat::Nv12, Some(colour)),
+        // 8-bit pictures stay NV12 when P010 is asked for: P010 is the
+        // preference for 10-bit streams, not an up-conversion.
+        PixelFormat::Nv12 | PixelFormat::I420 | PixelFormat::P010 => {
+            (data, stride, PixelFormat::Nv12, Some(colour))
+        }
         PixelFormat::Bgra => {
             let bgra = yuv.nv12_to_bgra(&data, stride, width, height)?;
             (Bytes::from(bgra), width * 4, PixelFormat::Bgra, None)
@@ -157,6 +161,7 @@ pub(crate) fn deliver(
         }
     };
     Some(RawFrame {
+        hdr: None,
         width: u32::try_from(width).ok()?,
         height: u32::try_from(height).ok()?,
         stride: u32::try_from(stride).ok()?,

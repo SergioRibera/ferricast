@@ -638,6 +638,9 @@ impl I420Scratch {
                 );
                 Ok(())
             }
+            PixelFormat::P010 => Err(FerricastError::Encoder(
+                "x264: 10-bit P010 input is not supported by this 8-bit build".into(),
+            )),
         }
     }
 }
@@ -664,6 +667,7 @@ mod tests {
             }
         }
         CapturedFrame::Cpu(RawFrame {
+            hdr: None,
             colour: None,
             width,
             height,
@@ -782,6 +786,7 @@ mod tests {
             })
             .collect();
         CapturedFrame::Cpu(RawFrame {
+            hdr: None,
             colour: None,
             width: 320,
             height: 240,

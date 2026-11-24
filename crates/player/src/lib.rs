@@ -139,10 +139,7 @@ impl Player {
         let Some(shown_at) = self.presentation.admit(frame.timestamp_us()) else {
             return;
         };
-        match &mut frame {
-            CapturedFrame::Cpu(raw) => raw.timestamp_us = shown_at,
-            CapturedFrame::Gpu(gpu) => gpu.timestamp_us = shown_at,
-        }
+        frame.set_timestamp_us(shown_at);
         self.ready.push_back(frame);
     }
 }

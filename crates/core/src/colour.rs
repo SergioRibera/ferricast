@@ -1,13 +1,16 @@
 //! Colour: what a picture's samples mean ([`ColourDescription`], the
 //! H.273 signalling a stream carries) and how to turn its YCbCr samples
-//! into RGB ([`YuvColour`], the conversion a renderer applies).
+//! into RGB ([`YuvColour`], the conversion a renderer applies), and the
+//! static HDR metadata of a stream ([`HdrMetadata`]).
 
 mod description;
+mod hdr;
 
 pub use description::{
     ChromaLocation, ColourDescription, ColourPrimaries, ColourRange, MatrixCoefficients,
     ReservedColourCode, TransferCharacteristics,
 };
+pub use hdr::{Chromaticity, ContentLightLevel, HdrMetadata, MasteringDisplay};
 
 /// The YCbCr → RGB matrices a renderer implements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

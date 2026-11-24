@@ -22,6 +22,8 @@ fn configured<D: VideoDecoder + Default>(low_latency: bool) -> D {
     let mut decoder = D::default();
     decoder
         .configure(&DecoderConfig {
+            hdr: None,
+            memory: ferricast_core::FrameMemory::Cpu,
             codec: D::CODEC,
             width: WIDTH,
             height: HEIGHT,

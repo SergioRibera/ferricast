@@ -621,6 +621,7 @@ fn handle_process(
                 return;
             };
             CapturedFrame::Cpu(RawFrame {
+                hdr: None,
                 colour: None,
                 width: neg.width,
                 height: neg.height,
@@ -635,6 +636,7 @@ fn handle_process(
                 return;
             };
             CapturedFrame::Cpu(RawFrame {
+                hdr: None,
                 colour: None,
                 width: neg.width,
                 height: neg.height,
@@ -771,6 +773,7 @@ fn handle_process(
             kind = match &captured {
                 CapturedFrame::Cpu(_) => "cpu",
                 CapturedFrame::Gpu(_) => "gpu",
+                CapturedFrame::Native(_) => "native",
             },
             "first frame ready, forwarding to consumer"
         );

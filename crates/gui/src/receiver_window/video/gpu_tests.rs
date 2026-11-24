@@ -305,6 +305,8 @@ fn receiver_video_cost(format: PixelFormat) {
     let mut decoder = H264Decoder::new();
     decoder
         .configure(&DecoderConfig {
+            hdr: None,
+            memory: ferricast::FrameMemory::Cpu,
             codec: Codec::H264,
             width: 1920,
             height: 1080,

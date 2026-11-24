@@ -155,6 +155,7 @@ impl MediaPuller for ProgressivePuller {
 fn media_info(demuxer: &Demuxer) -> MediaInfo {
     MediaInfo {
         video: demuxer.video().map(|v| VideoStreamInfo {
+            hdr: None,
             codec: v.codec,
             width: v.width,
             height: v.height,

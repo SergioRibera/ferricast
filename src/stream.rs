@@ -575,21 +575,13 @@ impl FramePacer {
     fn retime(&mut self) {
         let now = now_us();
         for frame in self.seed.iter_mut().chain(self.last.iter_mut()) {
-            set_timestamp(frame, now);
+            frame.set_timestamp_us(now);
         }
     }
 }
 
 fn bump_timestamp(frame: &mut CapturedFrame, delta_us: u64) {
-    let ts = frame.timestamp_us().saturating_add(delta_us);
-    set_timestamp(frame, ts);
-}
-
-fn set_timestamp(frame: &mut CapturedFrame, ts: u64) {
-    match frame {
-        CapturedFrame::Cpu(r) => r.timestamp_us = ts,
-        CapturedFrame::Gpu(g) => g.timestamp_us = ts,
-    }
+    frame.set_timestamp_us(frame.timestamp_us().saturating_add(delta_us));
 }
 
 fn now_us() -> u64 {

@@ -10,7 +10,7 @@
 
 use crate::codec::Codec;
 use crate::codec::{BackendSelection, CodecResult};
-use crate::colour::ColourDescription;
+use crate::colour::{ColourDescription, HdrMetadata};
 use crate::frame::{AudioCodec, AudioFrame, CapturedFrame, EncodedFrame, PixelFormat};
 
 #[derive(Debug, Clone)]
@@ -30,8 +30,27 @@ pub struct DecoderConfig {
     /// The colour signalling of the container, used for pictures whose
     /// bitstream carries none (or whose backend cannot read it).
     pub colour: Option<ColourDescription>,
+    /// The container's static HDR metadata, for pictures whose bitstream
+    /// carries none.
+    pub hdr: Option<HdrMetadata>,
+    /// Where decoded pictures are handed out; see [`FrameMemory`].
+    pub memory: FrameMemory,
     /// Which backend decodes; see [`BackendSelection`].
     pub backend: BackendSelection,
+}
+
+/// Where a video decoder hands out its pictures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
+pub enum FrameMemory {
+    /// CPU memory ([`CapturedFrame::Cpu`]): every sink can take it.
+    #[default]
+    Cpu,
+    /// The backend's own media surface when it has one
+    /// ([`CapturedFrame::Native`]: `CVPixelBuffer`, `AHardwareBuffer`,
+    /// D3D11 texture; [`CapturedFrame::Gpu`] for VA-API), skipping the copy
+    /// to CPU memory; CPU memory from backends without one.
+    Native,
 }
 
 /// Decode an [`EncodedFrame`] stream to [`CapturedFrame`].
@@ -59,6 +78,11 @@ pub struct AudioDecoderConfig {
     pub codec: AudioCodec,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Out-of-band codec configuration from the container or session:
+    /// the `AudioSpecificConfig` for AAC / AAC-ELD, the `ALACSpecificConfig`
+    /// (magic cookie) for ALAC. `None` derives it from the other fields
+    /// (ADTS headers for AAC, the AirPlay defaults for AAC-ELD and ALAC).
+    pub extra_data: Option<Vec<u8>>,
     /// Which backend decodes; see [`BackendSelection`].
     pub backend: BackendSelection,
 }

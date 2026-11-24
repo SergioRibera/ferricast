@@ -194,6 +194,7 @@ impl FrameScaler {
         canvas.truncate(out_row * out.height as usize);
 
         Ok(RawFrame {
+            hdr: None,
             colour: None,
             width: out.width,
             height: out.height,
@@ -277,6 +278,7 @@ mod tests {
             }
         }
         RawFrame {
+            hdr: None,
             colour: None,
             width,
             height,
@@ -325,6 +327,7 @@ mod tests {
     fn scaler_rejects_planar_input_that_needs_scaling() {
         let mut s = FrameScaler::default();
         let raw = RawFrame {
+            hdr: None,
             colour: None,
             width: 4,
             height: 4,

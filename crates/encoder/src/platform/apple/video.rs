@@ -829,6 +829,7 @@ impl VtEncoder {
         let mut black = vec![16u8; layout.len()];
         black[layout.chroma_offset..].fill(128);
         let raw = RawFrame {
+            hdr: None,
             width,
             height,
             stride: width,

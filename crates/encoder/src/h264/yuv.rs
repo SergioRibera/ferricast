@@ -100,7 +100,7 @@ impl Nv12Planes<'_> {
                 YuvStandardMatrix::Bt709,
                 YuvConversionMode::Balanced,
             ),
-            other @ (PixelFormat::Nv12 | PixelFormat::I420) => {
+            other @ (PixelFormat::Nv12 | PixelFormat::I420 | PixelFormat::P010) => {
                 return Err(FerricastError::Encoder(format!(
                     "VA-API: cannot upload {other:?} frames (need Bgra/Rgba)"
                 )));
@@ -237,6 +237,7 @@ mod tests {
 
     fn frame(format: PixelFormat, w: u32, h: u32, stride: u32, fill: u8) -> RawFrame {
         RawFrame {
+            hdr: None,
             colour: None,
             width: w,
             height: h,
@@ -312,6 +313,7 @@ mod tests {
             row[..(w * 4) as usize].fill(0xFF);
         }
         let raw = RawFrame {
+            hdr: None,
             colour: None,
             width: w,
             height: h,

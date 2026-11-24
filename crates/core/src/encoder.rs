@@ -1,7 +1,7 @@
 use crate::codec::{BackendSelection, CodecResult};
-use crate::colour::ColourDescription;
+use crate::colour::{ColourDescription, HdrMetadata};
 use crate::frame::{AudioCodec, AudioFrame, CapturedFrame, EncodedFrame};
-use crate::{Codec, H264Profile, H265Profile, PixelFormat};
+use crate::{BitDepth, Codec, H264Profile, H265Profile, PixelFormat};
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
@@ -34,6 +34,14 @@ pub struct EncoderConfig {
     /// input is converted with. A backend that cannot produce it fails
     /// `configure` with [`crate::CodecError::UnsupportedConfig`].
     pub colour: ColourDescription,
+    /// Bits per sample of the coded stream. [`BitDepth::Ten`] needs a
+    /// 10-bit profile (HEVC Main10) and P010 input or a 10-bit native
+    /// surface; a backend that cannot encode it fails `configure` with
+    /// [`crate::CodecError::UnsupportedConfig`].
+    pub bit_depth: BitDepth,
+    /// The static HDR metadata the stream signals (H.265 SEI, VUI-adjacent
+    /// container boxes). `None` writes none.
+    pub hdr: Option<HdrMetadata>,
     /// Which backend encodes; see [`BackendSelection`].
     pub backend: BackendSelection,
 }
@@ -65,6 +73,8 @@ impl Default for EncoderConfig {
             max_h264_profile: None,
             max_h265_profile: None,
             colour: ColourDescription::BT709_LIMITED,
+            bit_depth: BitDepth::Eight,
+            hdr: None,
             backend: BackendSelection::default(),
         }
     }

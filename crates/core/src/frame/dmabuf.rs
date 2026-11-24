@@ -73,6 +73,7 @@ impl GpuFrame {
                 reason: error.to_string(),
             })?;
         Ok(RawFrame {
+            hdr: None,
             colour: None,
             width: self.width,
             height: self.height,

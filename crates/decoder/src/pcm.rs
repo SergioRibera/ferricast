@@ -82,6 +82,7 @@ mod tests {
         let mut decoder = PcmPassthrough::default();
         decoder
             .configure(&AudioDecoderConfig {
+                extra_data: None,
                 codec: AudioCodec::Pcm,
                 sample_rate: 44_100,
                 channels: 2,

@@ -311,10 +311,7 @@ where
 }
 
 fn bump_timestamp_us(frame: &mut CapturedFrame, delta_us: u64) {
-    match frame {
-        CapturedFrame::Cpu(r) => r.timestamp_us = r.timestamp_us.saturating_add(delta_us),
-        CapturedFrame::Gpu(g) => g.timestamp_us = g.timestamp_us.saturating_add(delta_us),
-    }
+    frame.set_timestamp_us(frame.timestamp_us().saturating_add(delta_us));
 }
 
 /// Records inter-frame wallclock spacing tagged with whether the

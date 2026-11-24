@@ -338,6 +338,7 @@ mod tests {
 
     fn picture(tag: u8) -> CapturedFrame {
         CapturedFrame::Cpu(RawFrame {
+            hdr: None,
             width: 1,
             height: 1,
             stride: 1,
@@ -413,6 +414,8 @@ mod tests {
 
     fn config(backend: BackendSelection) -> DecoderConfig {
         DecoderConfig {
+            hdr: None,
+            memory: ferricast_core::FrameMemory::Cpu,
             codec: Codec::H264,
             width: 1,
             height: 1,

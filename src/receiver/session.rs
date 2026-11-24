@@ -699,6 +699,7 @@ async fn prepare(
             Some(factory) => {
                 let mut d = factory();
                 d.configure(&AudioDecoderConfig {
+                    extra_data: None,
                     codec: a.codec,
                     sample_rate: a.sample_rate,
                     channels: a.channels,
@@ -729,6 +730,8 @@ async fn prepare(
     let video_dec = match video_dec {
         Some((mut d, v)) => {
             let config = DecoderConfig {
+                hdr: None,
+                memory: ferricast_core::FrameMemory::Cpu,
                 codec: v.codec,
                 width: v.width,
                 height: v.height,

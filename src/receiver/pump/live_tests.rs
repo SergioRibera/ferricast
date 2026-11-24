@@ -40,6 +40,7 @@ impl VideoDecoder for PassVideo {
         frame: EncodedFrame,
     ) -> ferricast_core::CodecResult<Option<CapturedFrame>> {
         Ok(Some(CapturedFrame::Cpu(RawFrame {
+            hdr: None,
             width: 2,
             height: 2,
             stride: 8,
@@ -125,6 +126,7 @@ impl FrameSink for RecordingSink {
 fn info(audio: bool) -> MediaInfo {
     MediaInfo {
         video: Some(VideoStreamInfo {
+            hdr: None,
             codec: Codec::H264,
             width: 2,
             height: 2,

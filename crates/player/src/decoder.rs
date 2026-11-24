@@ -35,6 +35,8 @@ impl Decoder {
                 .into()
         };
         let config = DecoderConfig {
+            hdr: None,
+            memory: ferricast_core::FrameMemory::Cpu,
             codec,
             width,
             height,

@@ -116,6 +116,7 @@ impl Assembler {
                 height,
             } => {
                 self.video = Some(VideoStreamInfo {
+                    hdr: None,
                     codec,
                     width,
                     height,

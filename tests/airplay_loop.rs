@@ -337,6 +337,7 @@ impl Loop {
             tick.tick().await;
             let now = now_us();
             let frame = CapturedFrame::Cpu(RawFrame {
+                hdr: None,
                 colour: None,
                 width: WIDTH,
                 height: HEIGHT,

@@ -127,6 +127,7 @@ mod tests {
 
     fn config(codec: AudioCodec, sample_rate: u32) -> AudioDecoderConfig {
         AudioDecoderConfig {
+            extra_data: None,
             codec,
             sample_rate,
             channels: 2,

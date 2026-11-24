@@ -54,6 +54,9 @@ pub struct VideoStreamInfo {
     /// The colour signalling of the container, when it has any;
     /// decoders use it for pictures whose bitstream carries none.
     pub colour: Option<crate::ColourDescription>,
+    /// The container's static HDR metadata (MP4 `mdcv` / `clli`,
+    /// Matroska `MasteringMetadata`), when it has any.
+    pub hdr: Option<crate::HdrMetadata>,
 }
 
 #[derive(Debug, Clone)]

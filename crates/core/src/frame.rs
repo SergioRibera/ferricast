@@ -2,13 +2,15 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::colour::ColourDescription;
+use crate::colour::{ColourDescription, HdrMetadata};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod dmabuf;
+mod native;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use dmabuf::{DmaBufFd, DmaBufId, DmaBufImporter, DmaBufPlane, GpuFrame};
+pub use native::{NativeFrame, NativeSurface, SurfaceKind, SurfacePixels};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
@@ -17,6 +19,10 @@ pub enum PixelFormat {
     Rgba,
     Nv12,
     I420,
+    /// 10-bit 4:2:0, semi-planar like NV12: little-endian 16-bit samples
+    /// with the value in the high 10 bits (what `VideoToolbox`, Media
+    /// Foundation, `MediaCodec` and VA-API produce for Main10 / AV1 10-bit).
+    P010,
 }
 
 impl PixelFormat {
@@ -28,6 +34,37 @@ impl PixelFormat {
         match self {
             PixelFormat::Bgra | PixelFormat::Rgba => width.saturating_mul(4),
             PixelFormat::Nv12 | PixelFormat::I420 => width,
+            PixelFormat::P010 => width.saturating_mul(2),
+        }
+    }
+
+    /// Bits per sample.
+    #[must_use]
+    pub const fn bit_depth(self) -> BitDepth {
+        match self {
+            PixelFormat::Bgra | PixelFormat::Rgba | PixelFormat::Nv12 | PixelFormat::I420 => {
+                BitDepth::Eight
+            }
+            PixelFormat::P010 => BitDepth::Ten,
+        }
+    }
+}
+
+/// Bits per sample of a picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
+pub enum BitDepth {
+    #[default]
+    Eight,
+    Ten,
+}
+
+impl BitDepth {
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        match self {
+            Self::Eight => 8,
+            Self::Ten => 10,
         }
     }
 }
@@ -43,6 +80,8 @@ pub struct RawFrame {
     /// The colour signalling of a YCbCr picture, when the
     /// producer knows; `None` for RGB formats or an undescribed picture.
     pub colour: Option<ColourDescription>,
+    /// The static HDR metadata the picture carries, when it has any.
+    pub hdr: Option<HdrMetadata>,
 }
 
 /// Holds a producer's buffer out of its pool while a consumer may
@@ -79,12 +118,14 @@ impl std::fmt::Debug for BufferLease {
 /// when needed); VA-API and NVENC consume the `Gpu` variant directly.
 ///
 /// `Gpu` frames are DMA-BUFs, so the variant only exists on Linux and
-/// Android.
+/// Android. `Native` frames are platform media surfaces
+/// (`CVPixelBuffer`, `AHardwareBuffer`, D3D11 texture); see [`NativeFrame`].
 #[derive(Debug, Clone)]
 pub enum CapturedFrame {
     Cpu(RawFrame),
     #[cfg(any(target_os = "linux", target_os = "android"))]
     Gpu(GpuFrame),
+    Native(NativeFrame),
 }
 
 impl CapturedFrame {
@@ -94,6 +135,7 @@ impl CapturedFrame {
             CapturedFrame::Cpu(r) => r.width,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             CapturedFrame::Gpu(g) => g.width,
+            CapturedFrame::Native(n) => n.width,
         }
     }
 
@@ -103,6 +145,7 @@ impl CapturedFrame {
             CapturedFrame::Cpu(r) => r.height,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             CapturedFrame::Gpu(g) => g.height,
+            CapturedFrame::Native(n) => n.height,
         }
     }
 
@@ -112,6 +155,17 @@ impl CapturedFrame {
             CapturedFrame::Cpu(r) => r.timestamp_us,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             CapturedFrame::Gpu(g) => g.timestamp_us,
+            CapturedFrame::Native(n) => n.timestamp_us,
+        }
+    }
+
+    /// Re-stamps the picture, keeping it in whichever memory it is in.
+    pub fn set_timestamp_us(&mut self, timestamp_us: u64) {
+        match self {
+            CapturedFrame::Cpu(r) => r.timestamp_us = timestamp_us,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            CapturedFrame::Gpu(g) => g.timestamp_us = timestamp_us,
+            CapturedFrame::Native(n) => n.timestamp_us = timestamp_us,
         }
     }
 
@@ -121,12 +175,13 @@ impl CapturedFrame {
             CapturedFrame::Cpu(r) => r.format,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             CapturedFrame::Gpu(g) => g.format,
+            CapturedFrame::Native(n) => n.format(),
         }
     }
 
     /// Force the frame into a CPU-resident `RawFrame`. No-op for
     /// `Cpu`; performs a readback through the carried importer for
-    /// `Gpu` (see [`GpuFrame::into_cpu`]).
+    /// `Gpu` (see [`GpuFrame::into_cpu`]) and `Native` ([`NativeFrame::into_cpu`]).
     ///
     /// # Errors
     /// [`FrameError::NoImporter`] when a GPU frame carries no importer,
@@ -136,6 +191,7 @@ impl CapturedFrame {
             CapturedFrame::Cpu(r) => Ok(r),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             CapturedFrame::Gpu(g) => g.into_cpu(),
+            CapturedFrame::Native(n) => n.into_cpu(),
         }
     }
 }
@@ -143,6 +199,12 @@ impl CapturedFrame {
 impl From<RawFrame> for CapturedFrame {
     fn from(r: RawFrame) -> Self {
         CapturedFrame::Cpu(r)
+    }
+}
+
+impl From<NativeFrame> for CapturedFrame {
+    fn from(n: NativeFrame) -> Self {
+        CapturedFrame::Native(n)
     }
 }
 

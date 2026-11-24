@@ -63,6 +63,7 @@ fn decode(bytes: Vec<u8>) -> (u16, u32, u16, Vec<i16>) {
     let mut decoder = AacDecoder::default();
     decoder
         .configure(&AudioDecoderConfig {
+            extra_data: None,
             codec: stream.codec,
             sample_rate: stream.sample_rate,
             channels: stream.channels,

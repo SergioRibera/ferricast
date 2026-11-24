@@ -450,6 +450,7 @@ async fn drive_sink_m1_m7(
     // --- Push bridge + RTP pump.
     let info = MediaInfo {
         video: Some(VideoStreamInfo {
+            hdr: None,
             codec: Codec::H264,
             width: 1280,
             height: 720,

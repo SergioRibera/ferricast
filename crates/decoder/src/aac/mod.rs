@@ -296,6 +296,7 @@ mod tests {
 
     fn config(sample_rate: u32, channels: u16) -> AudioDecoderConfig {
         AudioDecoderConfig {
+            extra_data: None,
             codec: AudioCodec::Aac,
             sample_rate,
             channels,

@@ -53,7 +53,7 @@ impl TryFrom<RawFrame> for VideoFrame {
                 |colour| colour.yuv(raw.height as usize),
             )),
             PixelFormat::Bgra => Layout::Bgra,
-            PixelFormat::Rgba | PixelFormat::I420 => {
+            PixelFormat::Rgba | PixelFormat::I420 | PixelFormat::P010 => {
                 return Err(FerricastError::Decode(format!(
                     "receiver window: cannot show {:?} frames",
                     raw.format
@@ -257,6 +257,7 @@ mod tests {
 
     fn nv12(colour: Option<ColourDescription>) -> RawFrame {
         RawFrame {
+            hdr: None,
             width: 2,
             height: 2,
             stride: 2,

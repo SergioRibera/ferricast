@@ -15,9 +15,9 @@ pub(super) fn pixel_format_to_vk(p: PixelFormat) -> Option<vk::Format> {
     Some(match p {
         PixelFormat::Bgra => vk::Format::B8G8R8A8_UNORM,
         PixelFormat::Rgba => vk::Format::R8G8B8A8_UNORM,
-        // NV12 / I420 are multi-plane and currently routed through
+        // NV12 / I420 / P010 are multi-plane and currently routed through
         // the SHM path; we don't import those via Vulkan.
-        PixelFormat::Nv12 | PixelFormat::I420 => return None,
+        PixelFormat::Nv12 | PixelFormat::I420 | PixelFormat::P010 => return None,
     })
 }
 
@@ -27,6 +27,6 @@ pub(super) fn pixel_format_to_vk(p: PixelFormat) -> Option<vk::Format> {
 pub(super) fn bytes_per_pixel(p: PixelFormat) -> Option<u32> {
     Some(match p {
         PixelFormat::Bgra | PixelFormat::Rgba => 4,
-        PixelFormat::Nv12 | PixelFormat::I420 => return None,
+        PixelFormat::Nv12 | PixelFormat::I420 | PixelFormat::P010 => return None,
     })
 }

@@ -54,6 +54,7 @@ fn decode(frames: &[Vec<u8>]) -> (u32, u16, usize) {
     let mut decoder = AacDecoder::default();
     decoder
         .configure(&AudioDecoderConfig {
+            extra_data: None,
             codec: AudioCodec::Aac,
             sample_rate: 0,
             channels: 0,

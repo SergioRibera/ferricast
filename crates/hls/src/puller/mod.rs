@@ -426,6 +426,7 @@ impl Worker {
                 let ts_info = worker.demuxer.info();
                 (
                     ts_info.video_codec.map(|codec| VideoStreamInfo {
+                        hdr: None,
                         codec,
                         // Not carried in the PMT; decoders read the real
                         // dimensions from the SPS.
@@ -679,6 +680,7 @@ impl Worker {
             .map_err(|e| FerricastError::Pull(format!("fragmented MP4 segment: {e}")))?;
         self.fmp4_streams = Some((
             segment.video.as_ref().map(|v| VideoStreamInfo {
+                hdr: None,
                 codec: v.codec,
                 width: v.width,
                 height: v.height,

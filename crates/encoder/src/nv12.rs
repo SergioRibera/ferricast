@@ -209,6 +209,9 @@ pub(crate) fn write(
             }
             Ok(())
         }
+        PixelFormat::P010 => Err(fail(
+            "10-bit P010 input into an 8-bit NV12 buffer; configure BitDepth::Ten".into(),
+        )),
     }
 }
 
@@ -239,6 +242,7 @@ mod tests {
 
     fn raw(format: PixelFormat, data: Vec<u8>, stride: u32) -> RawFrame {
         RawFrame {
+            hdr: None,
             width: 2,
             height: 2,
             stride,

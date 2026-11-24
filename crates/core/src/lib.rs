@@ -36,14 +36,17 @@ pub use codec::{
     UnknownBackend,
 };
 pub use colour::{
-    ChromaLocation, ColourDescription, ColourPrimaries, ColourRange, MatrixCoefficients,
-    ReservedColourCode, TransferCharacteristics, YuvColour, YuvMatrix,
+    ChromaLocation, Chromaticity, ColourDescription, ColourPrimaries, ColourRange,
+    ContentLightLevel, HdrMetadata, MasteringDisplay, MatrixCoefficients, ReservedColourCode,
+    TransferCharacteristics, YuvColour, YuvMatrix,
 };
 pub use control::{
     ControlSession, MediaCommand, PlaybackState, PlaybackStatus, QueueItem, RemoteSender,
     RepeatMode, TrackSelection,
 };
-pub use decoder::{AudioDecoder, AudioDecoderConfig, DecodedAudio, DecoderConfig, VideoDecoder};
+pub use decoder::{
+    AudioDecoder, AudioDecoderConfig, DecodedAudio, DecoderConfig, FrameMemory, VideoDecoder,
+};
 pub use device::{
     AirPlayPairing, Device, DeviceAddresses, DeviceCapabilities, DiscoveryEvent, H264Profile,
     H265Profile, Ipv4Subnet,
@@ -53,8 +56,9 @@ pub use discovery::{Discovery, MdnsDiscovery};
 pub use encoder::{AudioEncoder, AudioEncoderConfig, EncoderConfig, VideoEncoder};
 pub use error::{FerricastError, Result};
 pub use frame::{
-    AacChannelConfig, AudioCodec, AudioFrame, BufferLease, CapturedFrame, EncodedFrame, FrameError,
-    PixelFormat, RawFrame, SourceAudioFormat,
+    AacChannelConfig, AudioCodec, AudioFrame, BitDepth, BufferLease, CapturedFrame, EncodedFrame,
+    FrameError, NativeFrame, NativeSurface, PixelFormat, RawFrame, SourceAudioFormat, SurfaceKind,
+    SurfacePixels,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use frame::{DmaBufFd, DmaBufId, DmaBufImporter, DmaBufPlane, GpuFrame};

@@ -983,6 +983,7 @@ fn run_worker(
             }
             Transport::Shm(shm_buf) => CapturedFrame::Cpu(orient_raw_frame(
                 RawFrame {
+                    hdr: None,
                     colour: None,
                     width: shm_buf.width,
                     height: shm_buf.height,
@@ -1085,7 +1086,7 @@ impl GpuPath {
         let modifiers = match format {
             PixelFormat::Bgra => &self.bgra_modifiers,
             PixelFormat::Rgba => &self.rgba_modifiers,
-            PixelFormat::Nv12 | PixelFormat::I420 => return false,
+            PixelFormat::Nv12 | PixelFormat::I420 | PixelFormat::P010 => return false,
         };
         modifiers.contains(&modifier)
     }
@@ -1359,6 +1360,7 @@ fn mmap_bo_to_raw(alloc: &AllocatedBuffer) -> std::result::Result<RawFrame, Ferr
     let _ = dma_buf_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
 
     Ok(RawFrame {
+        hdr: None,
         colour: None,
         width: alloc.width,
         height: alloc.height,
@@ -2022,6 +2024,7 @@ mod tests {
 
     fn raw(width: u32, height: u32, stride: u32, data: Vec<u8>) -> RawFrame {
         RawFrame {
+            hdr: None,
             colour: None,
             width,
             height,

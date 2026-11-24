@@ -9,6 +9,7 @@
 //!
 //! Planar layouts follow the convention the decoders emit:
 //! * **NV12** — UV plane starts at `stride × height`, same stride.
+//! * **P010** — as NV12 with 16-bit samples (rows of `2 × width` bytes).
 //! * **I420** — U plane starts at `stride × height`, V right after it;
 //!   both chroma planes use `stride / 2`.
 
@@ -113,13 +114,16 @@ impl<'a> FrameView<'a> {
         match self.format {
             PixelFormat::Bgra | PixelFormat::Rgba => self.width as usize * 4,
             PixelFormat::Nv12 | PixelFormat::I420 => self.width as usize,
+            PixelFormat::P010 => self.width as usize * 2,
         }
     }
 
     /// Stride of the chroma plane(s); see the module docs for the layout.
     pub(crate) fn chroma_stride(&self) -> usize {
         match self.format {
-            PixelFormat::Bgra | PixelFormat::Rgba | PixelFormat::Nv12 => self.stride,
+            PixelFormat::Bgra | PixelFormat::Rgba | PixelFormat::Nv12 | PixelFormat::P010 => {
+                self.stride
+            }
             PixelFormat::I420 => self.stride / 2,
         }
     }
@@ -165,6 +169,7 @@ impl<'a> FrameView<'a> {
             // `ceil(width / 2)` samples; NV12 chroma rows interleave
             // `ceil(width / 2)` pairs, one byte more than an odd width.
             PixelFormat::I420 | PixelFormat::Nv12 => self.width.div_ceil(2) as usize * 2,
+            PixelFormat::P010 => self.width.div_ceil(2) as usize * 4,
             PixelFormat::Bgra | PixelFormat::Rgba => self.row_bytes(),
         }
     }
@@ -179,8 +184,8 @@ impl<'a> FrameView<'a> {
             .checked_add(self.row_bytes())?;
         match self.format {
             PixelFormat::Bgra | PixelFormat::Rgba => Some(luma),
-            PixelFormat::Nv12 => {
-                let uv_row = self.width.div_ceil(2) as usize * 2;
+            PixelFormat::Nv12 | PixelFormat::P010 => {
+                let uv_row = self.min_stride();
                 let uv = self
                     .chroma_stride()
                     .checked_mul(self.chroma_rows() - 1)?
@@ -207,6 +212,7 @@ mod tests {
 
     fn raw(format: PixelFormat, width: u32, height: u32, stride: u32, len: usize) -> RawFrame {
         RawFrame {
+            hdr: None,
             colour: None,
             width,
             height,
@@ -254,6 +260,7 @@ mod tests {
             data.extend_from_slice(&[0xEE; 4]); // padding
         }
         let f = RawFrame {
+            hdr: None,
             colour: None,
             width: 2,
             height: 3,
