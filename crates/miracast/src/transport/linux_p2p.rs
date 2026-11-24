@@ -247,15 +247,13 @@ impl LinuxP2pClient {
             );
         }
 
-        // `Find({Timeout: 0})` cycles scan + listen states internally,
-        // keeping the sink discoverable in the phone's picker. `Listen`
-        // alone parks the radio for at most `max_remain_on_chan` (5 s
-        // default) and then supplicant goes idle; `Connect` also clears
-        // `p2p_long_listen`, so after a single GON attempt the radio
-        // would go dark and Android's picker would lose us. MiracleCast
-        // (`wifid-supplicant.c:2019-2062`) and gnome-network-displays
-        // (`nd-wfd-p2p-provider.c:195-208`) both re-issue `Find` on a
-        // timer for this reason.
+        // Enter continuous Listen mode. Sink stays parked on the
+        // Listen channel broadcasting probe responses — this is what
+        // the phone sees in its picker. `Find` would also work but
+        // its scan bursts take the radio off-channel long enough that
+        // Android's picker blinks the entry in and out. `Connect`
+        // clears `p2p_long_listen`, so we re-issue Listen on every
+        // terminal signal below.
         arm_find(&p2p).await?;
 
         let (tx, rx) = mpsc::channel(4);
@@ -812,30 +810,30 @@ mod pin_tests {
     }
 }
 
-/// Issue `P2PDevice.Find({Timeout: 0})`. Idempotent — supplicant drops
-/// a duplicate with `AlreadyExists` which we log at debug level.
+/// Put the radio into continuous Listen mode. A sink does NOT need
+/// Find (which alternates scan + listen and takes the radio off the
+/// listen channel during each scan burst, making the device blink
+/// in/out of the peer's picker). Listen keeps us parked on the
+/// Listen channel responding to probes. The `0` timeout maps to
+/// `p2p_long_listen=1` internally, which supplicant re-arms on its
+/// own — but `Connect` clears it, so we must re-issue on every
+/// terminal signal.
 async fn arm_find(p2p: &Proxy<'_>) -> Result<(), TransportError> {
-    let args: HashMap<&str, Value> = HashMap::new();
-    match p2p.call_method("Find", &(args,)).await {
+    match p2p.call_method("Listen", &(0i32,)).await {
         Ok(_) => Ok(()),
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("AlreadyExists") || msg.contains("in progress") {
-                tracing::debug!(error = %e, "sink: Find already active, skipping");
-                Ok(())
-            } else {
-                tracing::warn!(error = %e, "sink: Find rearm failed");
-                Err(TransportError::LinuxP2p(format!("Find: {e}")))
-            }
+            tracing::warn!(error = %e, "sink: Listen rearm failed");
+            Err(TransportError::LinuxP2p(format!("Listen: {e}")))
         }
     }
 }
 
-/// Re-arm Find from inside the task loop. Logs on failure but doesn't
-/// propagate — losing re-arm once is better than killing the loop.
+/// Re-arm Listen from inside the task loop. Logs on failure but
+/// doesn't propagate — losing one re-arm is better than killing the
+/// whole state machine.
 async fn rearm_find_from_task(p2p: &Proxy<'_>) {
     if let Err(e) = arm_find(p2p).await {
-        tracing::debug!(error = %e, "sink: re-arm Find deferred to next ticker");
+        tracing::debug!(error = %e, "sink: re-arm Listen deferred");
     }
 }
 
