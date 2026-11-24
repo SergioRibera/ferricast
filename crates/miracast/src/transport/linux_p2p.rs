@@ -496,7 +496,18 @@ impl LinuxP2pClient {
                         tracing::info!(?sig, "sink: GONegotiationSuccess");
                     }
                     _ = rearm.tick() => {
-                        gon_in_flight.store(false, std::sync::atomic::Ordering::Release);
+                        // Skip while a session is being negotiated OR
+                        // already live. Issuing Find during either
+                        // kills the state machine from supplicant's
+                        // side and the phone drops.
+                        if gon_in_flight.load(std::sync::atomic::Ordering::Acquire) {
+                            tracing::debug!("sink: re-arm skipped (GON in flight)");
+                            continue;
+                        }
+                        if group_formed.load(std::sync::atomic::Ordering::Acquire) {
+                            tracing::debug!("sink: re-arm skipped (group active)");
+                            continue;
+                        }
                         rearm_find_from_task(&p2p_owned).await;
                     }
                     msg = group_finished.next() => {
