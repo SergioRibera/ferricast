@@ -38,7 +38,9 @@ impl Decoder {
             codec,
             width: stream.width,
             height: stream.height,
-            pixel_format: PixelFormat::Nv12,
+            // 10-bit streams keep their samples (and HDR signalling) as P010;
+            // 8-bit ones are handed out as NV12.
+            pixel_format: PixelFormat::P010,
             low_latency: false,
             colour: stream.colour,
             backend,
