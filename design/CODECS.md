@@ -265,6 +265,13 @@ ferricast           umbrella: re-exports, `codec_service()` (feature `istmo`)
 - `ferricast-gui` does not build from a clean target dir with the lock
   as it was: `bindgen 0.73` resolved to `syn 3` with `prettyplease 0.2`.
   Fixed by locking `prettyplease 0.3`.
-- Workspace lints are not enabled crate-wide (the existing crates would
-  emit thousands of pedantic warnings); `ferricast-codec` carries its own
-  `[lints]` table.
+- Workspace lints (`[workspace.lints.clippy]`: pedantic, `dbg_macro`,
+  `todo`, `allow_attributes_without_reason`) are on in every member but
+  `ferricast-miracast`, which was being written in parallel; it still has
+  to opt in. `ferricast-codec` keeps its own, stricter table. Product names
+  allowed in docs live in `clippy.toml` (`doc-valid-idents`).
+- `nvenc-zero-copy` does not build against the `shiguredo_nvcodec` in the
+  lock (no `register_external_dmabuf` / `encode_external`); it is left out
+  of every feature set that is checked.
+- `tests/airplay_loop.rs` ("only N of M frames shown") is timing-bound and
+  fails under heavy machine load; it passes run alone.
