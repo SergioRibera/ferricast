@@ -179,9 +179,9 @@ impl<'a> RtpMp2tPacket<'a> {
         let mut payload_end = bytes.len();
         if padding {
             let pad = *bytes.last().ok_or(RtpError::Truncated { got: 0 })? as usize;
-            payload_end = payload_end.checked_sub(pad).ok_or(RtpError::Truncated {
-                got: bytes.len(),
-            })?;
+            payload_end = payload_end
+                .checked_sub(pad)
+                .ok_or(RtpError::Truncated { got: bytes.len() })?;
         }
         if payload_end < header_end {
             return Err(RtpError::Truncated { got: bytes.len() });

@@ -42,7 +42,10 @@ pub enum SubelementId {
 pub enum IeError {
     #[error("truncated WFD IE (needed {needed} more bytes)")]
     Truncated { needed: usize },
-    #[error("wrong vendor OUI: got {got:02x?}, expected {:02x?}", WIFI_ALLIANCE_OUI)]
+    #[error(
+        "wrong vendor OUI: got {got:02x?}, expected {:02x?}",
+        WIFI_ALLIANCE_OUI
+    )]
     WrongOui { got: [u8; 3] },
     #[error("wrong OUI type: got {got:02x}, expected {:02x}", WFD_OUI_TYPE)]
     WrongOuiType { got: u8 },
@@ -242,7 +245,9 @@ impl WfdIe {
         let mut out = Self::default();
         while !rest.is_empty() {
             if rest.len() < 3 {
-                return Err(IeError::Truncated { needed: 3 - rest.len() });
+                return Err(IeError::Truncated {
+                    needed: 3 - rest.len(),
+                });
             }
             let id = rest[0];
             let len = u16::from_be_bytes([rest[1], rest[2]]) as usize;

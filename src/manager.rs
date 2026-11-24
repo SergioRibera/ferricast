@@ -764,10 +764,7 @@ impl StreamManagerBuilder {
     /// Register a Miracast *receiver* — advertise this process as a
     /// `_display._tcp` MS-MICE sink and accept WFD M1-M7 from Windows
     /// "Cast to" / Android Smart View.
-    pub fn with_miracast_receiver(
-        self,
-        receiver: ferricast_miracast::MiracastReceiver,
-    ) -> Self {
+    pub fn with_miracast_receiver(self, receiver: ferricast_miracast::MiracastReceiver) -> Self {
         let builder = self.with_receiver(receiver);
         builder.register_video_decoder::<ferricast_decoder::H264Decoder>()
     }

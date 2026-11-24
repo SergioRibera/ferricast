@@ -189,7 +189,8 @@ impl Request {
     pub fn with_body_params(mut self, body: impl Into<String>) -> Self {
         let bytes = body.into().into_bytes();
         self.headers.insert("content-type", PARAM_CONTENT_TYPE);
-        self.headers.insert("content-length", bytes.len().to_string());
+        self.headers
+            .insert("content-length", bytes.len().to_string());
         self.body = Bytes::from(bytes);
         self
     }
@@ -246,7 +247,8 @@ impl Response {
     pub fn with_body_params(mut self, body: impl Into<String>) -> Self {
         let bytes = body.into().into_bytes();
         self.headers.insert("content-type", PARAM_CONTENT_TYPE);
-        self.headers.insert("content-length", bytes.len().to_string());
+        self.headers
+            .insert("content-length", bytes.len().to_string());
         self.body = Bytes::from(bytes);
         self
     }

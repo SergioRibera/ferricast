@@ -33,9 +33,7 @@ pub enum ProtocolAvailability {
         reason: Cow<'static, str>,
     },
     /// The protocol cannot run at all here.
-    Unavailable {
-        reason: Cow<'static, str>,
-    },
+    Unavailable { reason: Cow<'static, str> },
 }
 
 impl ProtocolAvailability {
