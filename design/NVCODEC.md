@@ -133,3 +133,165 @@ back to the CPU path.
   the caller of `cuvidParseVideoData` holds.
 - `Send` / `Sync` are implemented only with a written argument; the CUDA
   context is made current around every call.
+
+## Decisions (foundation: bindings, loader, CUDA layer, version plumbing)
+
+### Bindings (`crates/nvcodec/scripts/bindings.sh`)
+
+- The script clones nv-codec-headers, checks that every tag still resolves
+  to its pinned commit, extracts each tag with `git archive` and runs
+  bindgen 0.72 (`nix shell nixpkgs#rust-bindgen` when bindgen is not on
+  PATH; run it from the devshell so rustfmt matches `cargo fmt`):
+  `nix develop -c crates/nvcodec/scripts/bindings.sh`.
+- Enums are bindgen *newtypes* (`struct CUresult(pub u32)` with associated
+  constants), never Rust enums: a driver returning a value the header does
+  not list must not be undefined behaviour.
+- The dynlink typedefs (`tcuInit`, `PNVENC*`) are function types; bindgen
+  turns them into `Option<unsafe extern "C" fn ..>`. The loader stores the
+  bare pointer for required symbols (`loader::Required<T>` projects it out
+  of the `Option`) and `Option<fn>` for optional ones. `CUDAAPI` / `NVENCAPI`
+  are `__stdcall` on Windows, the C convention on 64-bit targets; 32-bit
+  Windows is a `compile_error!`.
+- `--clang-macro-fallback` evaluates the function-like `*_VER` macros, so
+  every NVENC struct version constant comes from its own header
+  (`NV_ENC_CONFIG_VER` etc. are plain `u32` constants per module).
+- NVENC GUIDs are `static const` objects in the header, not exported
+  symbols; bindgen would emit them as `extern` statics that do not link.
+  The script blocklists them and emits `pub const NAME: GUID` from the
+  header text instead (and fails if it parsed fewer than the header has).
+  `GUID` derives `PartialEq, Eq, Hash`.
+- `NvEncodeAPICreateInstance` / `NvEncodeAPIGetMaxSupportedVersion` are
+  plain declarations; the script declares function types for them
+  (`tNvEncodeAPI*`, like FFmpeg's `dynlink_loader.h`).
+- `scripts/cuda_extra.h` adds what `dynlink_cuda.h` lacks, from NVIDIA's
+  `cuda.h` / `cudaEGL.h`: `cuGraphicsEGLRegisterImage`,
+  `cuGraphicsResourceGetMappedEglFrame`, `cuGraphicsResourceSetMapFlags_v2`,
+  `cuCtxSetCurrent`, `cuMemGetInfo_v2`, `cuDeviceTotalMem_v2`, synchronous
+  `cuMemsetD8_v2` / `cuMemsetD2D{8,16,32}_v2`, `cuEventElapsedTime`.
+  `CUresult` and `CUdevice_attribute` stay the header's subsets: newtypes
+  accept any value, and `error::CudaStatus` names every code of `cuda.h`.
+- Layout tests: kept for `cuda.rs` (no `long` in those structs, so they also
+  hold on Windows and the Windows clippy run compiles them). Off for
+  `cuvid.rs`: `tcu_ulong` is `unsigned long`, generated as `c_ulong`, which
+  is 8 bytes on Linux and 4 on Windows; the Rust type follows the target
+  like the C one does, but generated layout tests would pin Linux sizes.
+  Off for NVENC: ~4 MB of tests for six versions, and these structs are
+  `uint32_t` bitfields, pointers and fixed-width integers only.
+- The video-source part of nvcuvid (`cuvidCreateVideoSource*`, file
+  demuxing, `wchar_t` paths) is not generated.
+
+### NVDEC layout across SDKs (checked by the script on every run)
+
+One cuvid binding (n13.1.15.0) serves every driver. The script generates
+layouts for all six tags and fails if any non-reserved field of an older
+header sits at a different offset in the newest one. Findings for
+11.1 → 13.1:
+
+- No field moved. New fields only took reserved space
+  (`CUVIDDECODECAPS::reserved3`, `CUVIDDECODECREATEINFO::Reserved2`,
+  `CUVIDH264PICPARAMS::Reserved`, `CUVIDHEVCPICPARAMS::reserved1`,
+  `CUVIDPICPARAMS::Reserved`, `CUVIDPROCPARAMS::Reserved2` all start later
+  or shrink).
+- Every top-level struct keeps its size (`CUVIDDECODECREATEINFO` 176,
+  `CUVIDPICPARAMS` 4280, `CUVIDPROCPARAMS` 264, `CUVIDPARSERPARAMS` 136,
+  `CUVIDEOFORMAT` 64, `CUVIDEOFORMATEX` 1088, `CUVIDPARSERDISPINFO` 24,
+  `CUVIDSOURCEDATAPACKET` 32 on Linux x86_64).
+- `CUVIDJPEGPICPARAMS` grew from a 4-byte stub to 2736 bytes (13.1); it
+  lives in `CUVIDPICPARAMS`'s codec union next to `CodecReserved[1024]`
+  (4096 bytes), so the outer struct does not change.
+- `CUVIDAV1SEQHDR` gained the struct tag `_CUVIDAV1SEQHDR` in 13.1: a
+  rename, same fields and offsets.
+- `CUVIDSEIMESSAGEINFO` and the SEI callback (`pfnGetSEIMsg`) appear in
+  12.0; on an 11.1-era driver the parser ignores the field (it sits in what
+  was reserved space), so the SEI callback must be treated as optional.
+- Enum values are identical across tags; only `NVDECAPI_VERSION` differs.
+- Newer entry points (`cuvidDecodePictureAsync`,
+  `cuvidRegisterDecodeSurfaces`, 13.1) are optional in the loader, as are
+  `cuvidGetDecodeStatus`, `cuvidReconfigureDecoder`, `cuvidCtxLock/Unlock`.
+
+### Loader
+
+- `CudaLibrary`, `CuvidLibrary`, `NvencLibrary`: one table of function
+  pointers per library, built by a macro from (field, typedef, symbol
+  names); `_v2` names are tried first, then the legacy name
+  (`cuDevicePrimaryCtxRelease_v2` → `cuDevicePrimaryCtxRelease`,
+  `cuDeviceGetUuid_v2` → `cuDeviceGetUuid`).
+- Each table lives in a `OnceLock<Result<_>>` static and is never dropped,
+  so the library stays mapped and the copied function pointers stay valid.
+  The outcome is cached including the error (hence `Error: Clone`): a
+  machine without the driver pays one failed `dlopen`.
+- `CudaLibrary::get` calls `cuInit(0)` once, inside the `OnceLock`.
+- Windows loads with `LOAD_LIBRARY_SEARCH_SYSTEM32` so a DLL planted next
+  to the executable or in the working directory is never picked up.
+- Required CUDA symbols are the ones every R470+ driver exports; interop
+  (external memory / semaphores, graphics map/unmap, EGL, D3D11, LUID,
+  `cuArrayGetPlane`) is optional because WSL and platform builds lack parts
+  of it.
+- `NvencLibrary` uses the newest header's typedefs for its two exports:
+  `GetMaxSupportedVersion` has one signature in every version, and
+  `CreateInstance` takes a pointer whose pointee the driver interprets by
+  its `version` field, so each version passes its own list through a cast.
+
+### Errors
+
+- `Error` names the failing call and the status by enumerator name:
+  `CudaStatus` (table of `cuda.h`'s `CUresult` names, since
+  `dynlink_cuda.h` declares five), `NvencStatus` (names matched against the
+  generated `NVENCSTATUS` constants, identical in every version), plus the
+  session's `nvEncGetLastErrorString` when there is a session.
+  `Error::Cuvid` exists for NVDEC calls (they return `CUresult`).
+- `DriverTooOld { found, minimum, driver }` and
+  `ApiNotSupportedByDriver { requested, origin, driver_max, driver }` name
+  the driver release to install for the OS the build targets.
+
+### CUDA layer (`cuda.rs`)
+
+- Only the device's primary context is used (`Context::primary`, retained
+  in an `Arc`, released on drop), shared with every other CUDA user in the
+  process. `Context` stores the handle as `NonNull`.
+- `ContextGuard` (`!Send`) pushes the context around every driver call and
+  pops it on drop, warning if the popped context is not the one pushed
+  (unbalanced push/pop elsewhere on the thread). Objects therefore carry no
+  thread affinity; `Send`/`Sync` impls each carry their argument.
+- `Stream`s are created `CU_STREAM_NON_BLOCKING` (no implicit sync with the
+  legacy default stream other libraries use); `Event`s without timing.
+- `DeviceBuffer::pitched` asks for 16-byte elements (widest vector access;
+  gives the ≥256-byte row alignment NVENC / NVDEC surfaces want). Copies
+  take a `Region` (origin `Point` + bytes per row + rows), validated against
+  both sides with checked arithmetic before the driver sees them.
+- Asynchronous copies that touch host memory are `unsafe fn`: the driver
+  stages pageable memory before returning but reads / writes page-locked
+  memory later, and any CUDA user in the process may have pinned the slice
+  passed in. A borrow-holding guard that synchronises on drop cannot make
+  this safe (it can be `mem::forget`-ed). Device↔device async copies and
+  fills are safe: `cuMemFree` is not stream-ordered and waits for work
+  using the memory, so a buffer cannot be freed under a queued copy.
+
+### NVENC version plumbing (`version.rs`, `encode.rs`)
+
+- `NvencVersion` is any version a driver may report (`(major << 4) | minor`
+  decoded); `ApiVersion` is the closed set this build supports, with
+  `minimum_driver()` per OS. `ApiVersion::select(driver_max, requested)`
+  is pure and unit-tested; `negotiate()` adds the driver query and
+  `FERRICAST_NVENC_API` (empty = unset) and is not cached (one cheap call).
+- `NvencApi` (sealed) is implemented by uninhabited marker types
+  `version::api::V11_1 … V13_1`, one per generated module, by a macro: the
+  `*_VER` constants and `NVENCAPI_VERSION` from that module, its function
+  list type, and the calls whose argument structs differ between versions
+  (`create_function_list`, `open_encode_session`, `destroy_encoder`,
+  `last_error`). New per-version calls are added to the trait the same way,
+  so every field is compile-checked against each version's bindings.
+- Runtime dispatch is `ApiVersion::dispatch(visitor)` (an `ApiVisitor` with
+  a generic `visit::<A>()`) or the `AnyApi` enum of `Api<A>` (a loaded
+  function list); no `dyn`.
+- `Api::<A>::load` checks the driver's maximum before
+  `NvEncodeAPICreateInstance`, so a too-new version fails with
+  `ApiNotSupportedByDriver` rather than a bare `NV_ENC_ERR_INVALID_VERSION`.
+- `encode::Session<A>` is the bare RAII session (open on a CUDA context,
+  destroy on drop with the context pushed, destroy a half-open session on
+  failure as NVENC requires). `Send`, not `Sync`.
+- Verified on an RTX 3060 with Linux driver 595.71.05 (CUDA 13.2, NVENC API
+  13.0): negotiation picks 13.0; forcing 11.1, 12.0, 12.1, 12.2 and 13.0
+  each fills the function list and opens + destroys a session; forcing
+  13.1 fails with "NVENC API 13.1 was requested by FERRICAST_NVENC_API, but
+  the driver supports 13.0 at most: install driver 610.0 or newer".
