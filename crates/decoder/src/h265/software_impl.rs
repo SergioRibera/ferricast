@@ -2,13 +2,14 @@ use std::collections::VecDeque;
 
 use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
-    CapturedFrame, Codec, ColourDescription, ColourRange, DecoderConfig, EncodedFrame,
-    FerricastError, Result, VideoDecoder,
+    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
 };
 use rust_h265::{Decoder, Frame, PixelData, parse_annex_b};
 
 use super::timestamps::Timestamps;
-use crate::nv12::{self, OutputFormat, Planar};
+use crate::nv12::{self, Container, OutputFormat, Planar, WidePicture, WidePlane, WideSamples};
+use ferricast_codec::bitstream::NalSyntax;
+use ferricast_codec::bitstream::hdr::HdrTracker;
 
 const MAX_THREADS: usize = 4;
 
@@ -18,6 +19,7 @@ pub struct SoftwareH265Decoder {
     ready: VecDeque<CapturedFrame>,
     format: OutputFormat,
     timestamps: Timestamps,
+    signalling: Signalling,
 }
 
 impl SoftwareH265Decoder {
@@ -33,6 +35,10 @@ impl SoftwareH265Decoder {
         self.ready.clear();
         self.timestamps = Timestamps::default();
         self.format = OutputFormat(config.pixel_format);
+        self.signalling = Signalling {
+            container: Container::of(config),
+            hdr: HdrTracker::default(),
+        };
         Ok(())
     }
 
@@ -42,6 +48,9 @@ impl SoftwareH265Decoder {
         })?;
         let nals = parse_annex_b(&frame.data);
         self.timestamps.observe(&nals, frame.timestamp_us);
+        self.signalling
+            .hdr
+            .observe_annex_b(&frame.data, NalSyntax::H265);
         for nal in &nals {
             decoder
                 .decode_nal(nal)
@@ -54,8 +63,12 @@ impl SoftwareH265Decoder {
                 .timestamps
                 .claim(decoded.pic_order_cnt)
                 .unwrap_or(frame.timestamp_us);
-            self.ready
-                .push_back(picture(&decoded, timestamp_us, self.format)?);
+            self.ready.push_back(picture(
+                &decoded,
+                timestamp_us,
+                self.format,
+                &self.signalling,
+            )?);
         }
         Ok(self.ready.pop_front())
     }
@@ -65,7 +78,8 @@ impl SoftwareH265Decoder {
             let mut last = 0;
             while let Some(decoded) = decoder.flush() {
                 last = self.timestamps.claim(decoded.pic_order_cnt).unwrap_or(last);
-                self.ready.push_back(picture(&decoded, last, self.format)?);
+                self.ready
+                    .push_back(picture(&decoded, last, self.format, &self.signalling)?);
             }
             self.timestamps = Timestamps::default();
         }
@@ -98,7 +112,20 @@ impl VideoDecoder for SoftwareH265Decoder {
     }
 }
 
-fn picture(decoded: &Frame, timestamp_us: u64, format: OutputFormat) -> Result<CapturedFrame> {
+/// Signalling the decoder does not expose, kept by the facade around it:
+/// the container's colour, and HDR metadata read from the SEI messages.
+#[derive(Debug, Clone, Default)]
+struct Signalling {
+    container: Container,
+    hdr: HdrTracker,
+}
+
+fn picture(
+    decoded: &Frame,
+    timestamp_us: u64,
+    format: OutputFormat,
+    signalling: &Signalling,
+) -> Result<CapturedFrame> {
     let short = || FerricastError::Decode("h265 returned short planes".into());
     if decoded.chroma_format_idc != 1 {
         return Err(FerricastError::Decode(format!(
@@ -107,36 +134,54 @@ fn picture(decoded: &Frame, timestamp_us: u64, format: OutputFormat) -> Result<C
         )));
     }
     let (width, height) = (decoded.width as usize, decoded.height as usize);
-    let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
-    let depth = u32::from(decoded.bit_depth);
-    let plane = |plane: &PixelData, w: usize, h: usize| match plane {
-        PixelData::U8(samples) => Some(samples.clone()),
-        PixelData::U16(samples) => nv12::narrow_u16(samples, w, w, h, depth),
-    };
-    let (y, u, v) = (
-        plane(&decoded.y, width, height).ok_or_else(short)?,
-        plane(&decoded.u, chroma_width, chroma_height).ok_or_else(short)?,
-        plane(&decoded.v, chroma_width, chroma_height).ok_or_else(short)?,
-    );
-    let (data, stride) = nv12::from_i420(&Planar {
-        width,
-        height,
-        y: &y,
-        y_stride: width,
-        u: &u,
-        v: &v,
-        uv_stride: chroma_width,
-    })
-    .ok_or_else(short)?;
+    let chroma_width = width.div_ceil(2);
     // rust_h265 does not expose the VUI colour description.
-    nv12::deliver(
-        data,
-        stride,
-        (width, height),
-        timestamp_us,
-        format.0,
-        ColourDescription::unspecified(ColourRange::Limited),
-    )
-    .map(CapturedFrame::Cpu)
-    .ok_or_else(short)
+    let colour = signalling.container.colour();
+    let raw = match (&decoded.y, &decoded.u, &decoded.v) {
+        (PixelData::U8(y), PixelData::U8(u), PixelData::U8(v)) => {
+            let (data, stride) = nv12::from_i420(&Planar {
+                width,
+                height,
+                y,
+                y_stride: width,
+                u,
+                v,
+                uv_stride: chroma_width,
+            })
+            .ok_or_else(short)?;
+            nv12::deliver(
+                data,
+                stride,
+                (width, height),
+                timestamp_us,
+                format.0,
+                colour,
+            )
+        }
+        (PixelData::U16(y), PixelData::U16(u), PixelData::U16(v)) => {
+            fn plane(samples: &[u16], stride: usize) -> WidePlane<'_> {
+                WidePlane {
+                    samples: WideSamples::Words(samples),
+                    stride,
+                }
+            }
+            WidePicture {
+                width,
+                height,
+                depth: u32::from(decoded.bit_depth),
+                y: plane(y, width),
+                u: plane(u, chroma_width),
+                v: plane(v, chroma_width),
+            }
+            .deliver(timestamp_us, format.0, colour)
+        }
+        _ => {
+            return Err(FerricastError::Decode(
+                "h265 returned planes of mixed sample widths".into(),
+            ));
+        }
+    };
+    let mut raw = raw.ok_or_else(short)?;
+    raw.hdr = signalling.hdr.current_or(signalling.container.hdr);
+    Ok(CapturedFrame::Cpu(raw))
 }

@@ -2,12 +2,11 @@ use std::collections::VecDeque;
 
 use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
-    CapturedFrame, Codec, ColourDescription, ColourRange, DecoderConfig, EncodedFrame,
-    FerricastError, Result, VideoDecoder,
+    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
 };
 use rusty_vp9::{DecodedFrame, Error as Vp9Error};
 
-use crate::nv12::{self, OutputFormat, Planar};
+use crate::nv12::{self, Container, OutputFormat, Planar, WidePicture, WidePlane, WideSamples};
 
 /// A VP9 superframe index holds at most eight frames (Annex B.3).
 const SUPERFRAME_MAX_FRAMES: usize = 8;
@@ -17,6 +16,7 @@ pub struct RustVp9Decoder {
     decoder: Option<rusty_vp9::Vp9Decoder>,
     ready: VecDeque<CapturedFrame>,
     format: OutputFormat,
+    container: Container,
 }
 
 impl RustVp9Decoder {
@@ -30,6 +30,7 @@ impl RustVp9Decoder {
         self.decoder = Some(rusty_vp9::Vp9Decoder::new());
         self.ready.clear();
         self.format = OutputFormat(config.pixel_format);
+        self.container = Container::of(config);
         Ok(())
     }
 
@@ -45,7 +46,10 @@ impl RustVp9Decoder {
         // can carry gets a turn; an empty queue answers instantly.
         for _ in 0..=SUPERFRAME_MAX_FRAMES {
             match decoder.next_frame() {
-                Ok(decoded) => self.ready.push_back(picture(&decoded, self.format)?),
+                Ok(decoded) => {
+                    self.ready
+                        .push_back(picture(&decoded, self.format, self.container)?)
+                }
                 Err(Vp9Error::Again) => {}
                 Err(Vp9Error::Eof) => break,
                 Err(e) => return Err(FerricastError::Decode(format!("vp9 decode: {e:?}"))),
@@ -61,7 +65,10 @@ impl RustVp9Decoder {
             // even when some frames fail.
             loop {
                 match decoder.next_frame() {
-                    Ok(decoded) => self.ready.push_back(picture(&decoded, self.format)?),
+                    Ok(decoded) => {
+                        self.ready
+                            .push_back(picture(&decoded, self.format, self.container)?)
+                    }
                     Err(Vp9Error::Again) => {}
                     Err(Vp9Error::Eof) => break,
                     Err(e) => tracing::warn!(error = ?e, "vp9 frame failed while flushing"),
@@ -97,7 +104,11 @@ impl VideoDecoder for RustVp9Decoder {
     }
 }
 
-fn picture(decoded: &DecodedFrame, format: OutputFormat) -> Result<CapturedFrame> {
+fn picture(
+    decoded: &DecodedFrame,
+    format: OutputFormat,
+    container: Container,
+) -> Result<CapturedFrame> {
     let short = || FerricastError::Decode("vp9 returned short planes".into());
     if (decoded.subsampling_x, decoded.subsampling_y) != (1, 1) {
         return Err(FerricastError::Decode(format!(
@@ -106,55 +117,49 @@ fn picture(decoded: &DecodedFrame, format: OutputFormat) -> Result<CapturedFrame
         )));
     }
     let (width, height) = (decoded.width as usize, decoded.height as usize);
-    let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
-    let (data, stride) = if decoded.bit_depth == 8 {
-        nv12::from_i420(&Planar {
+    let timestamp_us = decoded.pts.map_or(0, |pts| u64::try_from(pts).unwrap_or(0));
+    // rusty_vp9 does not expose the header's color_space: the container's
+    // colour (vpcC / Matroska Colour) is all there is.
+    let colour = container.colour();
+    let plane = |index: usize| decoded.planes.get(index).map(Vec::as_slice);
+    let stride = |index: usize| decoded.strides.get(index).copied();
+    let raw = if decoded.bit_depth == 8 {
+        let (data, nv12_stride) = nv12::from_i420(&Planar {
             width,
             height,
-            y: decoded.planes.first().ok_or_else(short)?,
-            y_stride: decoded.strides[0],
-            u: decoded.planes.get(1).ok_or_else(short)?,
-            v: decoded.planes.get(2).ok_or_else(short)?,
-            uv_stride: decoded.strides[1],
+            y: plane(0).ok_or_else(short)?,
+            y_stride: stride(0).ok_or_else(short)?,
+            u: plane(1).ok_or_else(short)?,
+            v: plane(2).ok_or_else(short)?,
+            uv_stride: stride(1).ok_or_else(short)?,
         })
+        .ok_or_else(short)?;
+        nv12::deliver(
+            data,
+            nv12_stride,
+            (width, height),
+            timestamp_us,
+            format.0,
+            colour,
+        )
     } else {
-        let narrowed = |plane: usize, w: usize, h: usize| {
-            nv12::narrow_le_bytes(
-                decoded.planes.get(plane)?,
-                *decoded.strides.get(plane)?,
-                w,
-                h,
-                decoded.bit_depth,
-            )
+        let wide = |index: usize| {
+            Some(WidePlane {
+                samples: WideSamples::LeBytes(plane(index)?),
+                stride: stride(index)?,
+            })
         };
-        let (y, u, v) = (
-            narrowed(0, width, height),
-            narrowed(1, chroma_width, chroma_height),
-            narrowed(2, chroma_width, chroma_height),
-        );
-        match (y, u, v) {
-            (Some(y), Some(u), Some(v)) => nv12::from_i420(&Planar {
-                width,
-                height,
-                y: &y,
-                y_stride: width,
-                u: &u,
-                v: &v,
-                uv_stride: chroma_width,
-            }),
-            _ => None,
+        WidePicture {
+            width,
+            height,
+            depth: decoded.bit_depth,
+            y: wide(0).ok_or_else(short)?,
+            u: wide(1).ok_or_else(short)?,
+            v: wide(2).ok_or_else(short)?,
         }
-    }
-    .ok_or_else(short)?;
-    // rusty_vp9 does not expose the header's color_space.
-    nv12::deliver(
-        data,
-        stride,
-        (width, height),
-        decoded.pts.map_or(0, |pts| pts as u64),
-        format.0,
-        ColourDescription::unspecified(ColourRange::Limited),
-    )
-    .map(CapturedFrame::Cpu)
-    .ok_or_else(short)
+        .deliver(timestamp_us, format.0, colour)
+    };
+    let mut raw = raw.ok_or_else(short)?;
+    raw.hdr = container.hdr;
+    Ok(CapturedFrame::Cpu(raw))
 }

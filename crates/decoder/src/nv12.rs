@@ -1,5 +1,7 @@
 use bytes::Bytes;
-use ferricast_core::{ColourDescription, PixelFormat, RawFrame};
+use ferricast_core::{
+    ColourDescription, ColourRange, DecoderConfig, HdrMetadata, PixelFormat, RawFrame,
+};
 
 pub(crate) struct Planar<'a> {
     pub width: usize,
@@ -50,45 +52,6 @@ pub(crate) fn from_i420(planes: &Planar) -> Option<(Bytes, usize)> {
     Some((Bytes::from(out), stride))
 }
 
-#[cfg(feature = "hevc-decode")]
-pub(crate) fn narrow_u16(
-    plane: &[u16],
-    stride: usize,
-    width: usize,
-    height: usize,
-    depth: u32,
-) -> Option<Vec<u8>> {
-    let shift = depth.saturating_sub(8);
-    let mut out = Vec::with_capacity(width * height);
-    for row in 0..height {
-        let line = plane.get(row * stride..)?.get(..width)?;
-        out.extend(line.iter().map(|&sample| (sample >> shift) as u8));
-    }
-    Some(out)
-}
-
-#[cfg(any(feature = "vp9-decode", feature = "av1-decode"))]
-pub(crate) fn narrow_le_bytes(
-    plane: &[u8],
-    stride: usize,
-    width: usize,
-    height: usize,
-    depth: u32,
-) -> Option<Vec<u8>> {
-    let shift = depth.saturating_sub(8);
-    let mut out = Vec::with_capacity(width * height);
-    for row in 0..height {
-        let line = plane.get(row * stride..)?.get(..width * 2)?;
-        let (pairs, _) = line.as_chunks::<2>();
-        out.extend(
-            pairs
-                .iter()
-                .map(|pair| (u16::from_le_bytes(*pair) >> shift) as u8),
-        );
-    }
-    Some(out)
-}
-
 #[cfg(feature = "vaapi-decode")]
 pub(crate) struct Nv12Planes<'a> {
     pub y: &'a [u8],
@@ -117,6 +80,43 @@ pub(crate) fn crop(src: &Nv12Planes, rect: (usize, usize, usize, usize)) -> Opti
         out.extend_from_slice(src.uv.get(start..start + stride)?);
     }
     Some((Bytes::from(out), stride))
+}
+
+/// What the container signals for a stream, for decoders whose bitstream
+/// parser does not expose the colour description or HDR metadata.
+#[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(
+    not(any(feature = "hevc-decode", feature = "vp9-decode")),
+    allow(
+        dead_code,
+        reason = "conditional: only the pure-Rust HEVC and VP9 decoders use it"
+    )
+)]
+pub(crate) struct Container {
+    pub colour: Option<ColourDescription>,
+    pub hdr: Option<HdrMetadata>,
+}
+
+#[cfg_attr(
+    not(any(feature = "hevc-decode", feature = "vp9-decode")),
+    allow(
+        dead_code,
+        reason = "conditional: only the pure-Rust HEVC and VP9 decoders use it"
+    )
+)]
+impl Container {
+    pub(crate) fn of(config: &DecoderConfig) -> Self {
+        Self {
+            colour: config.colour,
+            hdr: config.hdr,
+        }
+    }
+
+    /// The container's colour, unspecified (limited range) without one.
+    pub(crate) fn colour(self) -> ColourDescription {
+        self.colour
+            .unwrap_or(ColourDescription::unspecified(ColourRange::Limited))
+    }
 }
 
 /// The pixel format a decoder was configured to hand out; NV12, the
@@ -172,40 +172,267 @@ pub(crate) fn deliver(
     })
 }
 
+/// The samples of a plane of a high-bit-depth (9 to 16-bit) picture,
+/// in the shape the decoders hand them out.
+#[cfg(any(
+    feature = "hevc-decode",
+    feature = "vp9-decode",
+    feature = "av1-decode"
+))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WideSamples<'a> {
+    /// Little-endian 16-bit words (dav1d, `rusty_vp9`); stride in bytes.
+    LeBytes(&'a [u8]),
+    /// Native 16-bit samples (`rust_h265`); stride in samples.
+    Words(&'a [u16]),
+}
+
+/// One plane of a [`WidePicture`].
+#[cfg(any(
+    feature = "hevc-decode",
+    feature = "vp9-decode",
+    feature = "av1-decode"
+))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WidePlane<'a> {
+    pub samples: WideSamples<'a>,
+    /// Row pitch, in the unit [`WideSamples`] documents.
+    pub stride: usize,
+}
+
+#[cfg(any(
+    feature = "hevc-decode",
+    feature = "vp9-decode",
+    feature = "av1-decode"
+))]
+impl WidePlane<'_> {
+    /// Copies the first `out.len()` samples of row `row` into `out`;
+    /// `None` when the plane is shorter than that.
+    fn row_into(&self, row: usize, out: &mut [u16]) -> Option<()> {
+        match self.samples {
+            WideSamples::LeBytes(bytes) => {
+                let line = bytes.get(row * self.stride..)?.get(..out.len() * 2)?;
+                for (sample, pair) in out.iter_mut().zip(line.as_chunks::<2>().0) {
+                    *sample = u16::from_le_bytes(*pair);
+                }
+            }
+            WideSamples::Words(words) => {
+                out.copy_from_slice(words.get(row * self.stride..)?.get(..out.len())?);
+            }
+        }
+        Some(())
+    }
+}
+
+/// A decoded 4:2:0 picture with `depth`-bit samples in three planes.
+#[cfg(any(
+    feature = "hevc-decode",
+    feature = "vp9-decode",
+    feature = "av1-decode"
+))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WidePicture<'a> {
+    pub width: usize,
+    pub height: usize,
+    pub depth: u32,
+    pub y: WidePlane<'a>,
+    pub u: WidePlane<'a>,
+    pub v: WidePlane<'a>,
+}
+
+#[cfg(any(
+    feature = "hevc-decode",
+    feature = "vp9-decode",
+    feature = "av1-decode"
+))]
+impl WidePicture<'_> {
+    /// Hands the picture out in the requested format: P010 keeps every
+    /// bit (samples moved to the high bits); any other request gets the
+    /// top eight bits as NV12, then [`deliver`]'s conversion. `None` for
+    /// short planes or a depth outside 8..=16.
+    pub(crate) fn deliver(
+        &self,
+        timestamp_us: u64,
+        format: PixelFormat,
+        colour: ColourDescription,
+    ) -> Option<RawFrame> {
+        if !(8..=16).contains(&self.depth) || self.width == 0 || self.height == 0 {
+            return None;
+        }
+        if format == PixelFormat::P010 {
+            let (data, stride) = self.pack(16 - self.depth, 2)?;
+            return Some(RawFrame {
+                width: u32::try_from(self.width).ok()?,
+                height: u32::try_from(self.height).ok()?,
+                stride: u32::try_from(stride).ok()?,
+                format: PixelFormat::P010,
+                data,
+                timestamp_us,
+                colour: Some(colour),
+                hdr: None,
+            });
+        }
+        let (data, stride) = self.pack(self.depth - 8, 1)?;
+        deliver(
+            data,
+            stride,
+            (self.width, self.height),
+            timestamp_us,
+            format,
+            colour,
+        )
+    }
+
+    /// Semi-planar output with `bytes` per sample: luma rows, then
+    /// interleaved chroma rows, one stride for both (`ceil(width / 2)`
+    /// pairs). `bytes == 2` writes little-endian words shifted left by
+    /// `shift`; `bytes == 1` writes each sample shifted right by `shift`.
+    fn pack(&self, shift: u32, bytes: usize) -> Option<(Bytes, usize)> {
+        let (chroma_width, chroma_height) = (self.width.div_ceil(2), self.height.div_ceil(2));
+        let stride = chroma_width * 2 * bytes;
+        let mut out = vec![0; stride * (self.height + chroma_height)];
+        let put = |line: &mut [u8], samples: &mut dyn Iterator<Item = u16>| {
+            if bytes == 2 {
+                for (pair, sample) in line.as_chunks_mut::<2>().0.iter_mut().zip(samples) {
+                    *pair = (sample << shift).to_le_bytes();
+                }
+            } else {
+                for (byte, sample) in line.iter_mut().zip(samples) {
+                    *byte = u8::try_from(sample >> shift).unwrap_or(u8::MAX);
+                }
+            }
+        };
+        let (luma, chroma) = out.split_at_mut(stride * self.height);
+        let mut row = vec![0; self.width];
+        for (index, line) in luma.chunks_exact_mut(stride).enumerate() {
+            self.y.row_into(index, &mut row)?;
+            put(line, &mut row.iter().copied());
+        }
+        let (mut u, mut v) = (vec![0; chroma_width], vec![0; chroma_width]);
+        for (index, line) in chroma.chunks_exact_mut(stride).enumerate() {
+            self.u.row_into(index, &mut u)?;
+            self.v.row_into(index, &mut v)?;
+            put(line, &mut u.iter().zip(&v).flat_map(|(&u, &v)| [u, v]));
+        }
+        Some((Bytes::from(out), stride))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "hevc-decode")]
-    #[test]
-    fn ten_bit_samples_keep_their_top_eight_bits() {
-        let plane = [0u16, 1023, 512, 4, 9, 9];
-        assert_eq!(narrow_u16(&plane, 3, 2, 2, 10).unwrap(), [0, 255, 1, 2]);
+    #[cfg(any(
+        feature = "hevc-decode",
+        feature = "vp9-decode",
+        feature = "av1-decode"
+    ))]
+    fn wide_picture<'a>(
+        y: WideSamples<'a>,
+        u: WideSamples<'a>,
+        v: WideSamples<'a>,
+        strides: (usize, usize),
+    ) -> WidePicture<'a> {
+        WidePicture {
+            width: 2,
+            height: 2,
+            depth: 10,
+            y: WidePlane {
+                samples: y,
+                stride: strides.0,
+            },
+            u: WidePlane {
+                samples: u,
+                stride: strides.1,
+            },
+            v: WidePlane {
+                samples: v,
+                stride: strides.1,
+            },
+        }
     }
 
-    #[cfg(feature = "hevc-decode")]
+    #[cfg(any(
+        feature = "hevc-decode",
+        feature = "vp9-decode",
+        feature = "av1-decode"
+    ))]
     #[test]
-    fn eight_bit_samples_are_left_alone() {
-        assert_eq!(narrow_u16(&[7, 200], 2, 2, 1, 8).unwrap(), [7, 200]);
+    fn ten_bit_pictures_become_p010_with_samples_in_the_high_bits() {
+        let colour = ColourDescription::BT709_LIMITED;
+        let picture = wide_picture(
+            WideSamples::Words(&[0, 1023, 9, 512, 4, 9]),
+            WideSamples::Words(&[64]),
+            WideSamples::Words(&[960]),
+            (3, 1),
+        );
+        let frame = picture.deliver(5, PixelFormat::P010, colour).unwrap();
+        assert_eq!(
+            (frame.format, frame.stride, frame.colour),
+            (PixelFormat::P010, 4, Some(colour))
+        );
+        let words: Vec<u16> = frame
+            .data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| u16::from_le_bytes(*p))
+            .collect();
+        assert_eq!(words, [0, 1023 << 6, 512 << 6, 4 << 6, 64 << 6, 960 << 6]);
     }
 
-    #[cfg(feature = "hevc-decode")]
+    #[cfg(any(
+        feature = "hevc-decode",
+        feature = "vp9-decode",
+        feature = "av1-decode"
+    ))]
     #[test]
-    fn a_sample_plane_shorter_than_its_rows_is_rejected() {
-        assert!(narrow_u16(&[1, 2, 3], 2, 2, 2, 8).is_none());
+    fn ten_bit_pictures_keep_their_top_eight_bits_as_nv12() {
+        let le = [0xFF, 0x03, 0x00, 0x02, 9, 9, 0x04, 0x00, 0x10, 0x00, 9, 9];
+        let picture = wide_picture(
+            WideSamples::LeBytes(&le),
+            WideSamples::LeBytes(&[0x00, 0x01]),
+            WideSamples::LeBytes(&[0xFC, 0x03]),
+            (6, 2),
+        );
+        let frame = picture
+            .deliver(5, PixelFormat::Nv12, ColourDescription::BT709_LIMITED)
+            .unwrap();
+        assert_eq!((frame.format, frame.stride), (PixelFormat::Nv12, 2));
+        assert_eq!(&frame.data[..], &[255, 128, 1, 4, 64, 255]);
     }
 
-    #[cfg(any(feature = "vp9-decode", feature = "av1-decode"))]
+    #[cfg(any(
+        feature = "hevc-decode",
+        feature = "vp9-decode",
+        feature = "av1-decode"
+    ))]
     #[test]
-    fn little_endian_bytes_are_narrowed_like_samples() {
-        let plane = [0xFF, 0x03, 0x00, 0x02, 9, 9, 9, 9];
-        assert_eq!(narrow_le_bytes(&plane, 4, 2, 1, 10).unwrap(), [255, 128]);
-    }
-
-    #[cfg(any(feature = "vp9-decode", feature = "av1-decode"))]
-    #[test]
-    fn a_byte_plane_shorter_than_its_rows_is_rejected() {
-        assert!(narrow_le_bytes(&[1, 2, 3], 2, 2, 1, 10).is_none());
+    fn short_planes_or_odd_depths_are_rejected() {
+        let short = wide_picture(
+            WideSamples::Words(&[1, 2, 3]),
+            WideSamples::Words(&[1]),
+            WideSamples::Words(&[1]),
+            (2, 1),
+        );
+        assert!(
+            short
+                .deliver(0, PixelFormat::P010, ColourDescription::BT709_LIMITED)
+                .is_none()
+        );
+        let deep = WidePicture {
+            depth: 17,
+            ..wide_picture(
+                WideSamples::Words(&[0; 4]),
+                WideSamples::Words(&[0]),
+                WideSamples::Words(&[0]),
+                (2, 1),
+            )
+        };
+        assert!(
+            deep.deliver(0, PixelFormat::Nv12, ColourDescription::BT709_LIMITED)
+                .is_none()
+        );
     }
 
     #[test]
