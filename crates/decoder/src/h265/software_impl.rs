@@ -7,9 +7,9 @@ use ferricast_core::{
 use rust_h265::{Decoder, Frame, PixelData, parse_annex_b};
 
 use super::timestamps::Timestamps;
-use crate::nv12::{self, Container, OutputFormat, Planar, WidePicture, WidePlane, WideSamples};
+use crate::nv12::{self, OutputFormat, Planar, WidePicture, WidePlane, WideSamples};
+use crate::signalling::NalSignalling;
 use ferricast_codec::bitstream::NalSyntax;
-use ferricast_codec::bitstream::hdr::HdrTracker;
 
 const MAX_THREADS: usize = 4;
 
@@ -19,7 +19,8 @@ pub struct SoftwareH265Decoder {
     ready: VecDeque<CapturedFrame>,
     format: OutputFormat,
     timestamps: Timestamps,
-    signalling: Signalling,
+    /// `rust_h265` reports neither the VUI colour nor SEI messages.
+    signalling: NalSignalling,
 }
 
 impl SoftwareH265Decoder {
@@ -35,10 +36,7 @@ impl SoftwareH265Decoder {
         self.ready.clear();
         self.timestamps = Timestamps::default();
         self.format = OutputFormat(config.pixel_format);
-        self.signalling = Signalling {
-            container: Container::of(config),
-            hdr: HdrTracker::default(),
-        };
+        self.signalling = NalSignalling::of(config);
         Ok(())
     }
 
@@ -48,9 +46,7 @@ impl SoftwareH265Decoder {
         })?;
         let nals = parse_annex_b(&frame.data);
         self.timestamps.observe(&nals, frame.timestamp_us);
-        self.signalling
-            .hdr
-            .observe_annex_b(&frame.data, NalSyntax::H265);
+        self.signalling.observe(&frame.data, NalSyntax::H265);
         for nal in &nals {
             decoder
                 .decode_nal(nal)
@@ -112,19 +108,11 @@ impl VideoDecoder for SoftwareH265Decoder {
     }
 }
 
-/// Signalling the decoder does not expose, kept by the facade around it:
-/// the container's colour, and HDR metadata read from the SEI messages.
-#[derive(Debug, Clone, Default)]
-struct Signalling {
-    container: Container,
-    hdr: HdrTracker,
-}
-
 fn picture(
     decoded: &Frame,
     timestamp_us: u64,
     format: OutputFormat,
-    signalling: &Signalling,
+    signalling: &NalSignalling,
 ) -> Result<CapturedFrame> {
     let short = || FerricastError::Decode("h265 returned short planes".into());
     if decoded.chroma_format_idc != 1 {
@@ -135,8 +123,7 @@ fn picture(
     }
     let (width, height) = (decoded.width as usize, decoded.height as usize);
     let chroma_width = width.div_ceil(2);
-    // rust_h265 does not expose the VUI colour description.
-    let colour = signalling.container.colour();
+    let colour = signalling.colour();
     let raw = match (&decoded.y, &decoded.u, &decoded.v) {
         (PixelData::U8(y), PixelData::U8(u), PixelData::U8(v)) => {
             let (data, stride) = nv12::from_i420(&Planar {
@@ -182,6 +169,6 @@ fn picture(
         }
     };
     let mut raw = raw.ok_or_else(short)?;
-    raw.hdr = signalling.hdr.current_or(signalling.container.hdr);
+    raw.hdr = signalling.hdr();
     Ok(CapturedFrame::Cpu(raw))
 }

@@ -50,6 +50,12 @@ pub mod nvdec;
 mod opus;
 mod pcm;
 mod platform;
+#[cfg(any(
+    feature = "openh264-decode",
+    feature = "nvdec-decode",
+    feature = "hevc-decode"
+))]
+mod signalling;
 #[cfg(feature = "vp8-decode")]
 mod vp8;
 #[cfg(feature = "vp9-decode")]

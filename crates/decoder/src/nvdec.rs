@@ -35,10 +35,10 @@ use shiguredo_nvcodec::{
 use tracing::{debug, info};
 
 use self::sealed::Headers as _;
-use ferricast_codec::bitstream::hdr::HdrTracker;
 use ferricast_codec::bitstream::{NalSyntax, hevc};
 
-use crate::nv12::{self, Container, OutputFormat};
+use crate::nv12::{self, OutputFormat};
+use crate::signalling::NalSignalling;
 use timestamps::{Picture, Timestamps};
 
 /// Sealed marker pinning a [`NvdecDecoder`] to one bitstream codec.
@@ -125,8 +125,7 @@ pub struct NvdecDecoder<C: NvdecCodec> {
     timestamps: Timestamps,
     format: OutputFormat,
     /// The binding exposes neither the VUI colour nor SEI messages.
-    container: Container,
-    hdr: HdrTracker,
+    signalling: NalSignalling,
     _codec: PhantomData<C>,
 }
 
@@ -138,8 +137,7 @@ impl<C: NvdecCodec> Default for NvdecDecoder<C> {
             headers: C::Headers::default(),
             timestamps: Timestamps::default(),
             format: OutputFormat::default(),
-            container: Container::default(),
-            hdr: HdrTracker::default(),
+            signalling: NalSignalling::default(),
             _codec: PhantomData,
         }
     }
@@ -168,12 +166,12 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
                 (width, height),
                 self.timestamps.claim(),
                 self.format.0,
-                self.container.colour(),
+                self.signalling.colour(),
             )
             .ok_or_else(|| {
                 FerricastError::Decode(format!("NVDEC ({}) returned short planes", C::NAME))
             })?;
-            frame.hdr = self.hdr.current_or(self.container.hdr);
+            frame.hdr = self.signalling.hdr();
             self.ready.push_back(CapturedFrame::Cpu(frame));
         }
         Ok(())
@@ -249,8 +247,7 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
         self.ready.clear();
         self.format = OutputFormat(config.pixel_format);
         self.headers = C::Headers::default();
-        self.container = Container::of(config);
-        self.hdr = HdrTracker::default();
+        self.signalling = NalSignalling::of(config);
         self.timestamps = Timestamps::default();
         Ok(())
     }
@@ -263,7 +260,7 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
         // Read before NVDEC sees the packet so its parameter sets are
         // known whatever happens to the decode.
         let pictures = self.headers.shown(&frame.data);
-        self.hdr.observe_annex_b(&frame.data, C::SYNTAX);
+        self.signalling.observe(&frame.data, C::SYNTAX);
         // NVDEC's parser owns picture-boundary detection; one packet may
         // release 0, 1 or N pictures depending on the GOP structure.
         decoder

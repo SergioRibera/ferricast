@@ -13,6 +13,7 @@ doc-valid-idents = [
     "BubbleUPnP",
     "CASTv2",
     "CoreUtils",
+    "FFmpeg",
     "FairPlay",
     "GnuTLS",
     "HomeKit",

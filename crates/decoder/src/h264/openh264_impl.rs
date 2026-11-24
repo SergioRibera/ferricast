@@ -19,9 +19,9 @@ use openh264_sys2::{
 };
 
 use ferricast_codec::bitstream::NalSyntax;
-use ferricast_codec::bitstream::hdr::HdrTracker;
 
-use crate::nv12::{self, Container, OutputFormat, Planar};
+use crate::nv12::{self, OutputFormat, Planar};
+use crate::signalling::NalSignalling;
 
 /// `profile_idc` of Baseline and Constrained Baseline, which have no B
 /// slices and so never reorder pictures.
@@ -33,10 +33,8 @@ pub struct OpenH264Decoder {
     format: OutputFormat,
     low_latency: bool,
     release: Release,
-    /// What openh264 does not expose: the container colour, and HDR
-    /// metadata from the SEI messages.
-    container: Container,
-    hdr: HdrTracker,
+    /// openh264 reports neither the VUI colour nor SEI messages.
+    signalling: NalSignalling,
 }
 
 /// When openh264 hands a decoded picture over.
@@ -106,8 +104,7 @@ impl OpenH264Decoder {
         self.session = Some(Session::open()?);
         self.format = OutputFormat(config.pixel_format);
         self.low_latency = config.low_latency;
-        self.container = Container::of(config);
-        self.hdr = HdrTracker::default();
+        self.signalling = NalSignalling::of(config);
         // Low latency releases pictures at once until an SPS says the
         // stream may reorder.
         self.release = if config.low_latency {
@@ -126,9 +123,9 @@ impl OpenH264Decoder {
             tracing::debug!(?release, "openh264 picture release follows the new SPS");
             self.release = release;
         }
-        self.hdr.observe_annex_b(&frame.data, NalSyntax::H264);
-        let (format, colour) = (self.format.0, self.container.colour());
-        let hdr = self.hdr.current_or(self.container.hdr);
+        self.signalling.observe(&frame.data, NalSyntax::H264);
+        let (format, colour) = (self.format.0, self.signalling.colour());
+        let hdr = self.signalling.hdr();
         let release = self.release;
         let session = self.session.as_mut().ok_or_else(|| {
             FerricastError::Decode("OpenH264Decoder::decode before configure()".into())
@@ -145,8 +142,8 @@ impl OpenH264Decoder {
     }
 
     fn try_flush(&mut self) -> Result<Vec<CapturedFrame>> {
-        let (format, colour) = (self.format.0, self.container.colour());
-        let hdr = self.hdr.current_or(self.container.hdr);
+        let (format, colour) = (self.format.0, self.signalling.colour());
+        let hdr = self.signalling.hdr();
         let Some(session) = self.session.as_mut() else {
             return Ok(Vec::new());
         };

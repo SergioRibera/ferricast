@@ -1,13 +1,18 @@
 //! Real 10-bit streams decode to the exact P010 pictures a reference
-//! decoder produces, and carry their HDR signalling.
+//! decoder produces, and keep their colour and HDR signalling.
 //!
-//! The fixtures are 128x72, 30 frames, encoded by FFmpeg from its
-//! `testsrc2` source: HEVC Main10 (x265, with HDR10 mastering display
-//! and content light level SEI), AV1 Main 10-bit (SVT-AV1) and VP9
-//! profile 2 (libvpx). Each `*.p010.fnv` lists the FNV-1a 64 hash of
-//! every picture FFmpeg decodes from it, as packed P010, in
-//! presentation order. Hardware backends skip when the machine has no
-//! device for them.
+//! The fixtures are 256x144 (NVDEC decodes no smaller HEVC), 30 frames,
+//! encoded by FFmpeg from its `testsrc2` source, BT.2020 PQ:
+//! - HEVC Main10 (x265, B-frames), with HDR10 mastering display and
+//!   content light level SEI and no MP4 `colr` box: the colour is only
+//!   in the SPS VUI;
+//! - AV1 Main 10-bit (SVT-AV1), with HDR metadata OBUs;
+//! - VP9 profile 2 (libvpx) in WebM, whose transfer only the Matroska
+//!   `Colour` element carries.
+//!
+//! Each `*.p010.fnv` lists the FNV-1a 64 hash of every picture FFmpeg
+//! decodes from its clip, as packed P010, in presentation order.
+//! Hardware backends skip when the machine has no device for them.
 #![allow(
     dead_code,
     reason = "helpers for tests that each need a decoder feature; a build without them runs none"
@@ -16,13 +21,14 @@
 use std::path::PathBuf;
 
 use ferricast_core::{
-    BackendSelection, CapturedFrame, CodecError, ColourDescription, DecoderConfig, EncodedFrame,
-    FrameMemory, HdrMetadata, PixelFormat, RawFrame, TransferCharacteristics, VideoDecoder,
+    BackendSelection, CapturedFrame, CodecError, ColourDescription, ColourPrimaries, DecoderConfig,
+    EncodedFrame, FrameMemory, HdrMetadata, PixelFormat, RawFrame, TransferCharacteristics,
+    VideoDecoder,
 };
 use ferricast_demuxer::Demuxer;
 
-const WIDTH: u32 = 128;
-const HEIGHT: u32 = 72;
+const WIDTH: u32 = 256;
+const HEIGHT: u32 = 144;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -37,36 +43,71 @@ struct Clip {
     expected: Vec<String>,
 }
 
-fn clip(name: &str) -> Clip {
-    let mut demuxer = Demuxer::open(&fixture(name)).unwrap();
-    let stream = demuxer.video().unwrap();
-    let (colour, hdr) = (stream.colour, stream.hdr);
-    let packets = std::iter::from_fn(|| demuxer.next_frame().unwrap()).collect();
-    let stem = name.split('.').next().unwrap();
-    let expected = std::fs::read_to_string(fixture(&format!("{stem}.p010.fnv")))
-        .unwrap()
-        .lines()
-        .map(str::to_owned)
-        .collect();
-    Clip {
-        packets,
-        colour,
-        hdr,
-        expected,
+impl Clip {
+    fn open(name: &str) -> Self {
+        let mut demuxer = Demuxer::open(&fixture(name)).unwrap();
+        let stream = demuxer.video().unwrap();
+        let (colour, hdr) = (stream.colour, stream.hdr);
+        let packets = std::iter::from_fn(|| demuxer.next_frame().unwrap()).collect();
+        let stem = name.split('.').next().unwrap();
+        let expected = std::fs::read_to_string(fixture(&format!("{stem}.p010.fnv")))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        Self {
+            packets,
+            colour,
+            hdr,
+            expected,
+        }
     }
-}
 
-fn config<D: VideoDecoder>(clip: &Clip) -> DecoderConfig {
-    DecoderConfig {
-        codec: D::CODEC,
-        width: WIDTH,
-        height: HEIGHT,
-        pixel_format: PixelFormat::P010,
-        low_latency: false,
-        colour: clip.colour,
-        hdr: clip.hdr,
-        memory: FrameMemory::Cpu,
-        backend: BackendSelection::default(),
+    /// The clip as an Annex B transport (MPEG-TS, RTP) delivers it:
+    /// whatever the decoder knows of its colour and HDR metadata, it
+    /// reads from the bitstream.
+    fn without_container_signalling(self) -> Self {
+        Self {
+            colour: None,
+            hdr: None,
+            ..self
+        }
+    }
+
+    fn config<D: VideoDecoder>(&self) -> DecoderConfig {
+        DecoderConfig {
+            codec: D::CODEC,
+            width: WIDTH,
+            height: HEIGHT,
+            pixel_format: PixelFormat::P010,
+            low_latency: false,
+            colour: self.colour,
+            hdr: self.hdr,
+            memory: FrameMemory::Cpu,
+            backend: BackendSelection::default(),
+        }
+    }
+
+    /// Every picture `decoder` produces, flush included.
+    fn decode<D: VideoDecoder>(&self, mut decoder: D) -> Vec<RawFrame> {
+        let mut frames: Vec<CapturedFrame> = self
+            .packets
+            .iter()
+            .filter_map(|packet| decoder.decode(packet.clone()).unwrap())
+            .collect();
+        frames.extend(decoder.flush().unwrap());
+        frames.into_iter().map(|f| f.into_cpu().unwrap()).collect()
+    }
+
+    fn assert_matches_reference(&self, name: &str, frames: &[RawFrame]) {
+        let hashes: Vec<String> = frames.iter().map(packed_hash).collect();
+        assert_eq!(hashes.len(), self.expected.len(), "{name}: picture count");
+        for (index, (got, want)) in hashes.iter().zip(&self.expected).enumerate() {
+            assert_eq!(
+                got, want,
+                "{name}: picture {index} differs from the reference"
+            );
+        }
     }
 }
 
@@ -87,31 +128,16 @@ fn packed_hash(frame: &RawFrame) -> String {
     format!("{hash:016x}")
 }
 
-/// Every picture `decoder` produces from `clip`, flush included.
-fn decode_all<D: VideoDecoder>(mut decoder: D, clip: &Clip) -> Vec<RawFrame> {
-    let mut frames: Vec<CapturedFrame> = clip
-        .packets
-        .iter()
-        .filter_map(|packet| decoder.decode(packet.clone()).unwrap())
-        .collect();
-    frames.extend(decoder.flush().unwrap());
-    frames.into_iter().map(|f| f.into_cpu().unwrap()).collect()
-}
-
-fn assert_matches_reference(name: &str, frames: &[RawFrame], clip: &Clip) {
-    let hashes: Vec<String> = frames.iter().map(packed_hash).collect();
-    assert_eq!(hashes.len(), clip.expected.len(), "{name}: picture count");
-    for (index, (got, want)) in hashes.iter().zip(&clip.expected).enumerate() {
-        assert_eq!(
-            got, want,
-            "{name}: picture {index} differs from the reference"
-        );
-    }
-}
-
-fn assert_hdr10(name: &str, frame: &RawFrame) {
+fn assert_pq(name: &str, frame: &RawFrame) {
     let colour = frame.colour.unwrap_or_else(|| panic!("{name}: no colour"));
+    assert_eq!(colour.primaries, ColourPrimaries::Bt2020, "{name}");
     assert_eq!(colour.transfer, TransferCharacteristics::Pq, "{name}");
+}
+
+/// The mastering display peak (1000 cd/m²) and black level
+/// (0.0001 cd/m²), and the content light levels, of every HDR fixture.
+fn assert_hdr10(name: &str, frame: &RawFrame) {
+    assert_pq(name, frame);
     let hdr = frame
         .hdr
         .unwrap_or_else(|| panic!("{name}: no HDR metadata"));
@@ -122,14 +148,10 @@ fn assert_hdr10(name: &str, frame: &RawFrame) {
     assert_eq!((light.max_cll, light.max_fall), (1000, 400), "{name}");
 }
 
-/// Opens `D` for `clip`, or `None` (and a note) when this machine has
-/// no device for it.
-fn open<D: VideoDecoder + Default>(name: &str, clip: &Clip) -> Option<D> {
-    open_with(name, clip, D::default())
-}
-
-fn open_with<D: VideoDecoder>(name: &str, clip: &Clip, mut decoder: D) -> Option<D> {
-    match decoder.configure(&config::<D>(clip)) {
+/// `decoder` configured for `clip`, or `None` (and a note) when this
+/// machine has no device for it.
+fn configured<D: VideoDecoder>(name: &str, clip: &Clip, mut decoder: D) -> Option<D> {
+    match decoder.configure(&clip.config::<D>()) {
         Ok(()) => Some(decoder),
         Err(error @ CodecError::BackendUnavailable { .. }) => {
             eprintln!("{name}: skipped, {error}");
@@ -139,52 +161,62 @@ fn open_with<D: VideoDecoder>(name: &str, clip: &Clip, mut decoder: D) -> Option
     }
 }
 
-fn check_hevc<D: VideoDecoder>(name: &str, make: impl FnOnce(&DecoderConfig) -> D) {
-    let clip = clip("hevc_main10.mp4");
-    let Some(decoder) = open_with(name, &clip, make(&config::<D>(&clip))) else {
+fn check_hevc<D: VideoDecoder>(name: &str, decoder: D) {
+    let clip = Clip::open("hevc_main10.mp4").without_container_signalling();
+    let Some(decoder) = configured(name, &clip, decoder) else {
         return;
     };
-    let frames = decode_all(decoder, &clip);
-    assert_matches_reference(name, &frames, &clip);
-    assert_hdr10(name, &frames[0]);
+    let frames = clip.decode(decoder);
+    clip.assert_matches_reference(name, &frames);
+    for frame in &frames {
+        assert_hdr10(name, frame);
+    }
 }
 
 #[cfg(feature = "hevc-decode")]
 #[test]
 fn software_hevc_decodes_main10_bit_exact() {
-    check_hevc("software HEVC", |_| {
-        ferricast_decoder::h265::SoftwareH265Decoder::default()
-    });
+    check_hevc(
+        "software HEVC",
+        ferricast_decoder::h265::SoftwareH265Decoder::default(),
+    );
 }
 
 #[cfg(feature = "nvdec-hevc-decode")]
 #[test]
 fn nvdec_hevc_decodes_main10_bit_exact() {
-    check_hevc("NVDEC HEVC", |_| {
-        ferricast_decoder::h265::NvdecH265Decoder::default()
-    });
+    check_hevc(
+        "NVDEC HEVC",
+        ferricast_decoder::h265::NvdecH265Decoder::default(),
+    );
 }
 
-#[cfg(feature = "vaapi-hevc-decode")]
+#[cfg(any(feature = "hevc-decode", feature = "nvdec-hevc-decode"))]
 #[test]
-fn vaapi_hevc_decodes_main10_bit_exact() {
-    check_hevc("VA-API HEVC", |config| {
-        ferricast_decoder::h265::VaapiH265Decoder::probe_with(config).unwrap()
-    });
+fn automatic_hevc_selection_keeps_main10() {
+    check_hevc("H.265 facade", ferricast_decoder::H265Decoder::default());
 }
 
 #[cfg(feature = "av1-decode")]
 #[test]
 fn av1_decodes_ten_bit_bit_exact() {
-    let clip = clip("av1_10bit.mp4");
-    let decoder = open::<ferricast_decoder::Av1Decoder>("AV1", &clip).unwrap();
-    assert_matches_reference("AV1", &decode_all(decoder, &clip), &clip);
+    let clip = Clip::open("av1_10bit.mp4").without_container_signalling();
+    let decoder = configured("AV1", &clip, ferricast_decoder::Av1Decoder::default()).unwrap();
+    let frames = clip.decode(decoder);
+    clip.assert_matches_reference("AV1", &frames);
+    for frame in &frames {
+        assert_hdr10("AV1", frame);
+    }
 }
 
 #[cfg(feature = "vp9-decode")]
 #[test]
 fn vp9_decodes_profile_2_bit_exact() {
-    let clip = clip("vp9_profile2.webm");
-    let decoder = open::<ferricast_decoder::Vp9Decoder>("VP9", &clip).unwrap();
-    assert_matches_reference("VP9", &decode_all(decoder, &clip), &clip);
+    let clip = Clip::open("vp9_profile2.webm");
+    let decoder = configured("VP9", &clip, ferricast_decoder::Vp9Decoder::default()).unwrap();
+    let frames = clip.decode(decoder);
+    clip.assert_matches_reference("VP9", &frames);
+    for frame in &frames {
+        assert_pq("VP9", frame);
+    }
 }
