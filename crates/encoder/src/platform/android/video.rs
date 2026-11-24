@@ -1,4 +1,11 @@
-//! H.264 / H.265 encode through `AMediaCodec` with byte-buffer NV12 input.
+//! H.264 / H.265 encode through `AMediaCodec` with byte-buffer NV12
+//! input, or P010 for HEVC Main10 ([`BitDepth::Ten`]).
+//!
+//! A [`HardwareBuffer`] picture (`CapturedFrame::Native`, e.g. from the
+//! `MediaCodec` decoder) is locked and copied straight into the input
+//! buffer, with no colour conversion and no intermediate frame. True
+//! zero-copy input would go through `AMediaCodec_createInputSurface`,
+//! which needs an EGL renderer to put buffers into it; that is not done.
 //!
 //! `MediaCodec` only produces the stream's parameter sets (one
 //! `BUFFER_FLAG_CODEC_CONFIG` buffer) after its first input, and many
@@ -18,17 +25,19 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use bytes::Bytes;
+use ferricast_codec::android::HardwareBuffer;
+use ferricast_codec::yuv420::{self, Crop, SemiPlanar};
 use ferricast_core::{
-    CapturedFrame, Codec, CodecError, CodecResult, ColourDescription, ColourPrimaries, ColourRange,
-    EncodedFrame, EncoderConfig, H264Profile, H265Profile, MatrixCoefficients, Operation,
-    TransferCharacteristics, VideoEncoder,
+    BackendId, BitDepth, CapturedFrame, Codec, CodecError, CodecResult, ColourDescription,
+    ColourPrimaries, ColourRange, EncodedFrame, EncoderConfig, H264Profile, H265Profile,
+    HdrMetadata, MatrixCoefficients, Operation, PixelFormat, TransferCharacteristics, VideoEncoder,
 };
 use ndk::media::media_codec::MediaFormat;
 use tracing::{info, warn};
 
 use super::codec::{
-    self, COLOR_FORMAT_NV12, Codec as MediaCodec, FLAG_CODEC_CONFIG, FLAG_END_OF_STREAM,
-    FLAG_KEY_FRAME, Output, Pick, fail, key, media,
+    self, COLOR_FORMAT_NV12, COLOR_FORMAT_P010, Codec as MediaCodec, FLAG_CODEC_CONFIG,
+    FLAG_END_OF_STREAM, FLAG_KEY_FRAME, Output, Pick, fail, key, media,
 };
 use crate::frame_view::FrameView;
 use crate::nv12::{self, Nv12Layout};
@@ -79,7 +88,14 @@ struct Session {
     height: u32,
     fps: u32,
     colour: ColourDescription,
+    depth: BitDepth,
+    hdr: Option<HdrMetadata>,
+    /// The codec's input buffer layout, at `depth`.
+    input: SemiPlanar,
+    /// `input` for the 8-bit NV12 writer (equal strides).
     layout: Nv12Layout,
+    /// NV12 staging for RGB input to a 10-bit session.
+    narrow: Vec<u8>,
     /// Parameter sets, Annex B.
     headers: Vec<u8>,
     /// Presentation time handed to the codec → capture timestamp of the
@@ -153,19 +169,59 @@ fn colour_keys(colour: ColourDescription) -> (Option<i32>, i32, Option<i32>) {
     (standard, range, transfer)
 }
 
-/// `MediaCodecInfo.CodecProfileLevel` of the configured profile cap.
-fn profile(config: &EncoderConfig) -> Option<i32> {
-    match config.codec {
-        Codec::H264 => config.max_h264_profile.map(|profile| match profile {
+/// `MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10`.
+const HEVC_MAIN10: i32 = 2;
+/// `MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10`.
+const HEVC_MAIN10_HDR10: i32 = 0x1000;
+
+/// `MediaCodecInfo.CodecProfileLevel` of the configured profile cap and
+/// bit depth.
+///
+/// # Errors
+/// [`CodecError::UnsupportedConfig`] for 10-bit H.264, or 10-bit HEVC
+/// with the profile capped at Main.
+fn profile(config: &EncoderConfig) -> CodecResult<Option<i32>> {
+    let unsupported = |what: String| CodecError::UnsupportedConfig {
+        backend: BackendId::MediaCodec,
+        what,
+    };
+    Ok(match (config.codec, config.bit_depth) {
+        (Codec::H265, BitDepth::Ten) => {
+            if config.max_h265_profile == Some(H265Profile::Main) {
+                return Err(unsupported(
+                    "10-bit HEVC with the profile capped at Main (8-bit)".into(),
+                ));
+            }
+            // HDR10 is Main10 with static metadata in the stream.
+            Some(if config.hdr.is_some() {
+                HEVC_MAIN10_HDR10
+            } else {
+                HEVC_MAIN10
+            })
+        }
+        (codec @ (Codec::H264 | Codec::Vp8 | Codec::Vp9 | Codec::Av1), BitDepth::Ten) => {
+            return Err(unsupported(format!(
+                "10-bit {codec} encode (MediaCodec encodes 10 bits as HEVC Main10 only)"
+            )));
+        }
+        (Codec::H264, BitDepth::Eight) => config.max_h264_profile.map(|profile| match profile {
             H264Profile::Baseline => 1,
             H264Profile::Main => 2,
             H264Profile::High => 8,
         }),
-        Codec::H265 => config.max_h265_profile.map(|profile| match profile {
+        (Codec::H265, BitDepth::Eight) => config.max_h265_profile.map(|profile| match profile {
             H265Profile::Main => 1,
-            H265Profile::Main10 => 2,
+            H265Profile::Main10 => HEVC_MAIN10,
         }),
-        Codec::Vp8 | Codec::Vp9 | Codec::Av1 => None,
+        (Codec::Vp8 | Codec::Vp9 | Codec::Av1, BitDepth::Eight) => None,
+    })
+}
+
+/// The `MediaCodec` input colour format of `depth`.
+fn colour_format(depth: BitDepth) -> i32 {
+    match depth {
+        BitDepth::Eight => COLOR_FORMAT_NV12,
+        BitDepth::Ten => COLOR_FORMAT_P010,
     }
 }
 
@@ -180,7 +236,7 @@ fn format(config: &EncoderConfig, mime: &str, bitrate_mode: i32) -> CodecResult<
     format.set_str(key::MIME, mime);
     format.set_i32(key::WIDTH, dimension(config.width, "width")?);
     format.set_i32(key::HEIGHT, dimension(config.height, "height")?);
-    format.set_i32(key::COLOR_FORMAT, COLOR_FORMAT_NV12);
+    format.set_i32(key::COLOR_FORMAT, colour_format(config.bit_depth));
     format.set_i32(
         key::BIT_RATE,
         dimension(config.bitrate_kbps.saturating_mul(1000), "bitrate")?,
@@ -198,8 +254,11 @@ fn format(config: &EncoderConfig, mime: &str, bitrate_mode: i32) -> CodecResult<
     format.set_i32(key::LATENCY, 1);
     format.set_i32(key::MAX_B_FRAMES, 0);
     format.set_i32(key::PREPEND_HEADERS_TO_SYNC_FRAMES, 1);
-    if let Some(profile) = profile(config) {
+    if let Some(profile) = profile(config)? {
         format.set_i32(key::PROFILE, profile);
+    }
+    if let Some(hdr) = config.hdr.filter(|hdr| !hdr.is_empty()) {
+        format.set_buffer(key::HDR_STATIC_INFO, &hdr.to_cta861());
     }
     let (standard, range, transfer) = colour_keys(config.colour);
     if let Some(standard) = standard {
@@ -281,6 +340,7 @@ impl Session {
         // Rejecting a colour this crate cannot convert to now beats
         // failing on the first frame.
         nv12::conversion(config.colour, ferricast_core::BackendId::MediaCodec)?;
+        profile(config)?;
         let codec = MediaCodec::create(mime, pick)?;
         // Constant bitrate suits a live link; a codec without it gets VBR.
         let started = codec
@@ -290,37 +350,48 @@ impl Session {
             return Err(CodecError::UnsupportedConfig {
                 backend: ferricast_core::BackendId::MediaCodec,
                 what: format!(
-                    "{}x{} @ {} fps NV12 on {} ({error})",
+                    "{}x{} @ {} fps {}-bit on {} ({error})",
                     config.width,
                     config.height,
                     config.fps,
+                    config.bit_depth.bits(),
                     codec.label()
                 ),
             });
         }
         let input = codec.input_format();
+        let width = config.width as usize;
         let stride = input
             .i32(key::STRIDE)
             .and_then(|s| usize::try_from(s).ok())
-            .filter(|&s| s >= config.width as usize)
-            .unwrap_or(config.width as usize);
+            .filter(|&s| s >= width)
+            .unwrap_or(width);
         let slice_height = input
             .i32(key::SLICE_HEIGHT)
             .and_then(|h| usize::try_from(h).ok())
             .filter(|&h| h >= config.height as usize)
             .unwrap_or(config.height as usize);
+        let depth = config.bit_depth;
+        let wanted = colour_format(depth);
         if let Some(color_format) = input.i32(key::COLOR_FORMAT)
-            && color_format != COLOR_FORMAT_NV12
+            && color_format != wanted
         {
             return Err(CodecError::UnsupportedConfig {
                 backend: ferricast_core::BackendId::MediaCodec,
                 what: format!(
-                    "{} input colour format {color_format:#x} (only NV12 input is written)",
+                    "{} input colour format {color_format:#x} (only {wanted:#x} input is written)",
                     codec.label()
                 ),
             });
         }
-        info!(codec = %codec.label(), width = config.width, height = config.height, "MediaCodec encoder opened");
+        // A P010 `stride` is a sample count by `KEY_STRIDE`'s definition;
+        // one at least two rows of samples wide is already in bytes.
+        let stride_bytes = match depth {
+            BitDepth::Eight => stride,
+            BitDepth::Ten if stride >= 2 * width => stride,
+            BitDepth::Ten => stride * 2,
+        };
+        info!(codec = %codec.label(), width = config.width, height = config.height, bits = depth.bits(), "MediaCodec encoder opened");
         let mut session = Self {
             codec,
             kind: config.codec,
@@ -328,12 +399,19 @@ impl Session {
             height: config.height,
             fps: config.fps.max(1),
             colour: config.colour,
+            depth,
+            hdr: config.hdr,
+            input: SemiPlanar {
+                stride: stride_bytes,
+                chroma_offset: stride_bytes * slice_height,
+            },
             layout: Nv12Layout {
                 width: config.width,
                 height: config.height,
                 stride,
                 chroma_offset: stride * slice_height,
             },
+            narrow: Vec::new(),
             headers: Vec::new(),
             in_flight: HashMap::new(),
             next_index: 0,
@@ -349,8 +427,7 @@ impl Session {
     /// Feeds black pictures until the parameter sets and a first picture
     /// came out, then drops that output and asks for a sync frame.
     fn prime(&mut self) -> CodecResult<()> {
-        let mut black = vec![16; self.layout.len()];
-        black[self.layout.chroma_offset..].fill(128);
+        let black = self.black();
         for _ in 0..MAX_PRIMING_FRAMES {
             let pts = self.alloc_pts(None);
             let codec = &self.codec;
@@ -387,6 +464,133 @@ impl Session {
         self.finished.clear();
         self.request_sync_frame();
         Ok(())
+    }
+
+    /// Bytes of one input picture.
+    fn input_len(&self) -> usize {
+        self.input.len(self.height as usize)
+    }
+
+    /// A black picture in the input layout: 8-bit 16 / 128 (limited
+    /// range), the same values in the high byte of each P010 sample.
+    fn black(&self) -> Vec<u8> {
+        let mut black = vec![0; self.input_len()];
+        let (luma, chroma) = black.split_at_mut(self.input.chroma_offset);
+        match self.depth {
+            BitDepth::Eight => {
+                luma.fill(16);
+                chroma.fill(128);
+            }
+            BitDepth::Ten => {
+                for sample in luma.chunks_exact_mut(2) {
+                    sample[1] = 16;
+                }
+                for sample in chroma.chunks_exact_mut(2) {
+                    sample[1] = 128;
+                }
+            }
+        }
+        black
+    }
+
+    /// Writes `frame` into the scratch input picture: a matching
+    /// [`HardwareBuffer`] is copied straight from its locked planes,
+    /// anything else goes through CPU memory (and the scaler).
+    fn fill(&mut self, frame: CapturedFrame, scaler: &mut FrameScaler) -> CodecResult<()> {
+        self.scratch.resize(self.input_len(), 0);
+        if let CapturedFrame::Native(native) = &frame
+            && native.width == self.width
+            && native.height == self.height
+            && let Some(buffer) = native.surface::<HardwareBuffer>()
+        {
+            return buffer
+                .write_to(self.depth, self.input, &mut self.scratch)
+                .map_err(|error| fail(Operation::Encode, error));
+        }
+        let raw = frame
+            .into_cpu()
+            .map_err(|error| fail(Operation::Encode, error))?;
+        let raw = scaler
+            .fit(raw, FrameSize::new(self.width, self.height))
+            .map_err(|error| fail(Operation::Encode, error))?;
+        let view = FrameView::new(&raw, self.width, self.height)
+            .map_err(|error| fail(Operation::Encode, error))?;
+        let crop = Crop::full(self.width as usize, self.height as usize);
+        let pack = |planes, from, dst: &mut [u8], to, layout| {
+            yuv420::pack(planes, crop, from, to, layout, dst)
+                .map_err(|error| fail(Operation::Encode, error))
+        };
+        let semi = |data, depth| {
+            yuv420::semi_planar(data, view.stride(), view.chroma_offset(), depth)
+                .map_err(|error| fail(Operation::Encode, error))
+        };
+        match (self.depth, view.format()) {
+            (BitDepth::Eight, PixelFormat::P010) => pack(
+                semi(view.data(), BitDepth::Ten)?,
+                BitDepth::Ten,
+                &mut self.scratch,
+                BitDepth::Eight,
+                self.input,
+            ),
+            (
+                BitDepth::Eight,
+                PixelFormat::Bgra | PixelFormat::Rgba | PixelFormat::Nv12 | PixelFormat::I420,
+            ) => nv12::write(
+                &view,
+                self.colour,
+                self.layout,
+                &mut self.scratch,
+                BackendId::MediaCodec,
+            ),
+            (BitDepth::Ten, PixelFormat::P010 | PixelFormat::Nv12) => {
+                let from = view.format().bit_depth();
+                pack(
+                    semi(view.data(), from)?,
+                    from,
+                    &mut self.scratch,
+                    BitDepth::Ten,
+                    self.input,
+                )
+            }
+            (BitDepth::Ten, PixelFormat::I420) => {
+                let planes = yuv420::planar(view.data(), view.stride(), self.height as usize)
+                    .map_err(|error| fail(Operation::Encode, error))?;
+                pack(
+                    planes,
+                    BitDepth::Eight,
+                    &mut self.scratch,
+                    BitDepth::Ten,
+                    self.input,
+                )
+            }
+            (BitDepth::Ten, PixelFormat::Bgra | PixelFormat::Rgba) => {
+                // RGB converts to 8-bit NV12 with the configured matrix,
+                // then widens: 8-bit precision in a 10-bit stream.
+                let narrow = Nv12Layout::packed(self.width, self.height);
+                self.narrow.resize(narrow.len(), 0);
+                nv12::write(
+                    &view,
+                    self.colour,
+                    narrow,
+                    &mut self.narrow,
+                    BackendId::MediaCodec,
+                )?;
+                let planes = yuv420::semi_planar(
+                    &self.narrow,
+                    narrow.stride,
+                    narrow.chroma_offset,
+                    BitDepth::Eight,
+                )
+                .map_err(|error| fail(Operation::Encode, error))?;
+                pack(
+                    planes,
+                    BitDepth::Eight,
+                    &mut self.scratch,
+                    BitDepth::Ten,
+                    self.input,
+                )
+            }
+        }
     }
 
     fn alloc_pts(&mut self, capture_us: Option<u64>) -> u64 {
@@ -458,22 +662,7 @@ impl Session {
         scaler: &mut FrameScaler,
     ) -> CodecResult<EncodedFrame> {
         let timestamp_us = frame.timestamp_us();
-        let raw = frame
-            .into_cpu()
-            .map_err(|error| fail(Operation::Encode, error))?;
-        let raw = scaler
-            .fit(raw, FrameSize::new(self.width, self.height))
-            .map_err(|error| fail(Operation::Encode, error))?;
-        let view = FrameView::new(&raw, self.width, self.height)
-            .map_err(|error| fail(Operation::Encode, error))?;
-        self.scratch.resize(self.layout.len(), 0);
-        nv12::write(
-            &view,
-            self.colour,
-            self.layout,
-            &mut self.scratch,
-            ferricast_core::BackendId::MediaCodec,
-        )?;
+        self.fill(frame, scaler)?;
         let pts = self.alloc_pts(Some(timestamp_us));
         let mut drained = Vec::new();
         let scratch = &self.scratch;
@@ -546,6 +735,8 @@ impl VideoEncoder for MediaCodecVideoEncoder {
             && session.height == config.height
             && session.fps == config.fps.max(1)
             && session.colour == config.colour
+            && session.depth == config.bit_depth
+            && session.hdr == config.hdr
         {
             // Only the bitrate can change on a running session.
             return self.set_bitrate_kbps(config.bitrate_kbps);

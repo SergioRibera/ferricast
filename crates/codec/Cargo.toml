@@ -20,6 +20,10 @@ istmo = [
 # The Media Foundation plumbing (`mf`) the Windows encoders and decoders
 # share. Windows-only dependency; inert elsewhere.
 media-foundation = ["dep:windows"]
+# The `AMediaCodec` media surfaces (`android`: `AHardwareBuffer` pictures,
+# `AImageReader` outputs) the Android encoders and decoders share.
+# Android-only dependencies; inert elsewhere.
+mediacodec = ["dep:ndk", "dep:ndk-sys", "dep:libc"]
 
 [dependencies]
 ferricast-core = { path = "../core", default-features = false }
@@ -31,6 +35,7 @@ istmo-core = { version = "=0.1.1-alpha.6", optional = true }
 istmo-macros = { version = "=0.1.1-alpha.6", optional = true }
 # The channel istmo hosted streams read from (the version istmo-core uses).
 flume = { version = "0.11", default-features = false, optional = true }
+thiserror.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [
@@ -41,6 +46,12 @@ windows = { version = "0.62", features = [
     "Win32_System_Ole",
     "Win32_System_Variant",
 ], optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# `dlsym` for `AHardwareBuffer_lockPlanes`, which only exists from API 29.
+libc = { version = "0.2", optional = true }
+ndk = { version = "0.9", default-features = false, features = ["media", "api-level-28"], optional = true }
+ndk-sys = { version = "0.6", optional = true }
 
 [lints.rust]
 # `deny`, not `forbid`: the Windows `mf` module opts in locally.

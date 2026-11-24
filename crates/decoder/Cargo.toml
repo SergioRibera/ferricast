@@ -82,7 +82,7 @@ audiotoolbox = [
     "dep:objc2-audio-toolbox",
     "dep:objc2-core-audio-types",
 ]
-mediacodec = ["dep:ndk", "dep:ndk-sys"]
+mediacodec = ["dep:ndk", "dep:ndk-sys", "ferricast-codec/mediacodec"]
 
 [dependencies]
 ferricast-core = { path = "../core", default-features = false }

@@ -141,7 +141,7 @@ impl MediaCodecAudioDecoder {
         format.set_i32(key::MAX_INPUT_SIZE, 8192);
         let codec = MediaCodec::create(mime, self.pick)?;
         codec
-            .start_decoder(&format)
+            .start_decoder(&format, None)
             .map_err(|error| CodecError::UnsupportedConfig {
                 backend: BackendId::MediaCodec,
                 what: format!("{} decode on {} ({error})", self.kind, codec.label()),
@@ -191,9 +191,9 @@ impl MediaCodecAudioDecoder {
                 return Ok(false);
             };
             let mut changed = false;
-            let output = open
-                .codec
-                .next_output(Operation::Decode, timeout, || changed = true)?;
+            let output =
+                open.codec
+                    .next_output(Operation::Decode, timeout, || changed = true, false)?;
             if changed {
                 open.output = None;
             }
@@ -225,8 +225,12 @@ impl MediaCodecAudioDecoder {
             |buffer| copy_into(buffer, payload, Operation::Decode),
             |codec| loop {
                 let mut changed = false;
-                let output =
-                    codec.next_output(Operation::Decode, Duration::ZERO, || changed = true)?;
+                let output = codec.next_output(
+                    Operation::Decode,
+                    Duration::ZERO,
+                    || changed = true,
+                    false,
+                )?;
                 if changed {
                     shape = Some(output_shape(codec)?);
                 }
