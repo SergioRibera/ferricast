@@ -537,6 +537,7 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
     const CODEC: Codec = C::FERRICAST_CODEC;
 
     fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+        crate::frame_view::eight_bit_sdr_only(config, BackendId::Nvenc)?;
         self.try_configure(config).map_err(CodecError::from_backend(
             BackendId::Nvenc,
             Operation::Configure,

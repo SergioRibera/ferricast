@@ -13,6 +13,8 @@
 //! * **I420** — U plane starts at `stride × height`, V right after it;
 //!   both chroma planes use `stride / 2`.
 
+#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+use ferricast_core::{BackendId, BitDepth, CodecError, CodecResult, EncoderConfig};
 use ferricast_core::{FerricastError, PixelFormat, RawFrame, Result};
 
 /// A [`RawFrame`] whose dimensions match the encoder configuration
@@ -262,6 +264,29 @@ pub(crate) fn eight_bit(raw: RawFrame, width: u32, height: u32) -> Result<RawFra
         data: data.into(),
         ..raw
     })
+}
+
+/// Refuses what an 8-bit backend without HDR signalling cannot encode:
+/// a 10-bit stream, or static HDR metadata it would silently drop.
+///
+/// # Errors
+///
+/// [`CodecError::UnsupportedConfig`] naming `backend` and what it lacks.
+#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+pub(crate) fn eight_bit_sdr_only(config: &EncoderConfig, backend: BackendId) -> CodecResult<()> {
+    if config.bit_depth != BitDepth::Eight {
+        return Err(CodecError::UnsupportedConfig {
+            backend,
+            what: format!("{}-bit {}", config.bit_depth.bits(), config.codec),
+        });
+    }
+    if config.hdr.is_some_and(|hdr| !hdr.is_empty()) {
+        return Err(CodecError::UnsupportedConfig {
+            backend,
+            what: "static HDR metadata (mastering display / content light level)".into(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
