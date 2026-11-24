@@ -162,7 +162,99 @@ impl LinuxP2pClient {
         Ok(rx)
     }
 
-    /// Stop the P2P discovery scan (`StopFind`). Idempotent.
+    /// Advertise the local host as a Wi-Fi Direct *Miracast sink*:
+    /// set the P2P device name + Primary Device Type to Display/TV so
+    /// phones' Smart View / Cast UIs classify us correctly, enter
+    /// continuous `Listen` mode, and auto-accept inbound
+    /// `GONegotiationRequest`s via WPS PBC. Every successful
+    /// `GroupStarted` is pushed on the returned channel so the caller
+    /// can bind RTSP on the new virtual interface.
+    pub async fn listen_as_sink(
+        &self,
+        device_name: &str,
+    ) -> Result<mpsc::Receiver<GroupStarted>, TransportError> {
+        // Primary Device Type: Category 0x0005 Display, OUI 50:6F:9A
+        // (Wi-Fi Alliance), Subcategory 0x0001 Television.
+        const PRIMARY_DEVICE_TYPE_DISPLAY_TV: [u8; 8] =
+            [0x00, 0x05, 0x50, 0x6F, 0x9A, 0x02, 0x00, 0x01];
+
+        let p2p = self.p2p_proxy().await?;
+        // Push P2PDeviceConfig (DeviceName + PrimaryDeviceType). supplicant
+        // merges with the existing config so this is non-destructive for
+        // other keys (`GOIntent`, `SsidPostfix`, …).
+        let name_val = Value::from(device_name.to_string());
+        let pdt_val = Value::from(PRIMARY_DEVICE_TYPE_DISPLAY_TV.to_vec());
+        let mut cfg: HashMap<&str, Value> = HashMap::new();
+        cfg.insert("DeviceName", name_val);
+        cfg.insert("PrimaryDeviceType", pdt_val);
+        if let Err(e) = p2p.set_property("P2PDeviceConfig", Value::from(cfg)).await {
+            tracing::warn!(error = %e, "miracast sink: P2PDeviceConfig set failed");
+        }
+
+        // `Listen(timeout)` with 0 = until explicitly stopped.
+        p2p.call_method("Listen", &(0i32,))
+            .await
+            .map_err(|e| TransportError::LinuxP2p(format!("Listen: {e}")))?;
+
+        let (tx, rx) = mpsc::channel(4);
+        let conn = self.conn.clone();
+        let interface_path = self.interface_path.clone();
+        tokio::spawn(async move {
+            let p2p_owned =
+                match Proxy::new(&conn, SUPPLICANT_BUS, interface_path.clone(), P2P_IFACE).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sink: p2p proxy");
+                        return;
+                    }
+                };
+            let mut gon = match p2p_owned.receive_signal("GONegotiationRequest").await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sink: subscribe GONegotiationRequest");
+                    return;
+                }
+            };
+            let mut started = match p2p_owned.receive_signal("GroupStarted").await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sink: subscribe GroupStarted");
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    msg = gon.next() => {
+                        let Some(sig) = msg else { break };
+                        let Ok((peer, _pwd_id, _dev_passwd)): Result<(OwnedObjectPath, u16, u8), _>
+                            = sig.body().deserialize() else { continue };
+                        tracing::info!(peer = %peer.as_str(), "sink: auto-accepting GON request");
+                        let mut args: HashMap<&str, Value> = HashMap::new();
+                        args.insert("peer", Value::from(peer.as_ref().to_owned()));
+                        args.insert("wps_method", Value::from("pbc"));
+                        if let Err(e) = p2p_owned.call_method("Connect", &(args,)).await {
+                            tracing::warn!(error = %e, "sink: Connect");
+                        }
+                    }
+                    msg = started.next() => {
+                        let Some(sig) = msg else { break };
+                        if let Ok(dict) = sig.body().deserialize::<HashMap<String, OwnedValue>>() {
+                            if let Some(group) = parse_group_started(&dict) {
+                                tracing::info!(iface = %group.interface_path, role = ?group.role, "sink: group started");
+                                if tx.send(group).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
+    /// Stop P2P discovery / listen. Idempotent.
     pub async fn stop_discovery(&self) -> Result<(), TransportError> {
         let p2p = self.p2p_proxy().await?;
         let _ = p2p.call_method("StopFind", &()).await;
@@ -216,6 +308,27 @@ impl LinuxP2pClient {
             .await
             .map_err(|_| TransportError::LinuxP2p("GO negotiation timed out".into()))?
     }
+}
+
+fn parse_group_started(dict: &HashMap<String, OwnedValue>) -> Option<GroupStarted> {
+    let iface_val = dict.get("interface_object")?;
+    let path = iface_val.try_clone().ok().and_then(|v| ObjectPath::try_from(v).ok())?;
+    let role = dict
+        .get("role")
+        .and_then(|v| v.downcast_ref::<&str>().ok())
+        .unwrap_or("client")
+        .to_string();
+    Some(GroupStarted {
+        interface_path: path.to_string(),
+        role: if role == "GO" {
+            GroupRole::Owner
+        } else {
+            GroupRole::Client
+        },
+    })
+}
+
+impl LinuxP2pClient {
 
     async fn p2p_proxy(&self) -> Result<Proxy<'_>, TransportError> {
         Proxy::new(

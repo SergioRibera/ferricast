@@ -124,6 +124,8 @@ impl ReceiverProtocol for MiracastReceiver {
 pub struct MiracastReceiverAdvertiser {
     daemon: Option<mdns_sd::ServiceDaemon>,
     fullname: Option<String>,
+    #[cfg(target_os = "linux")]
+    p2p_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Advertiser for MiracastReceiverAdvertiser {
@@ -149,6 +151,17 @@ impl Advertiser for MiracastReceiverAdvertiser {
             .map_err(|e| FerricastError::Receiver(format!("mdns register: {e}")))?;
         self.daemon = Some(daemon);
         self.fullname = Some(fullname);
+
+        #[cfg(target_os = "linux")]
+        {
+            match start_linux_p2p_sink(info.friendly_name.clone()).await {
+                Ok(handle) => self.p2p_task = Some(handle),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "miracast sink: Wi-Fi Direct advertise disabled (will still accept MICE)"
+                ),
+            }
+        }
         Ok(())
     }
 
@@ -156,12 +169,49 @@ impl Advertiser for MiracastReceiverAdvertiser {
         if let (Some(daemon), Some(fullname)) = (self.daemon.take(), self.fullname.take()) {
             let _ = daemon.unregister(&fullname);
         }
+        #[cfg(target_os = "linux")]
+        if let Some(task) = self.p2p_task.take() {
+            task.abort();
+        }
         Ok(())
     }
 
     fn is_running(&self) -> bool {
         self.daemon.is_some()
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn start_linux_p2p_sink(
+    device_name: String,
+) -> Result<tokio::task::JoinHandle<()>> {
+    use crate::ie::{DeviceInformation, WfdIe};
+    use crate::transport::linux_p2p::LinuxP2pClient;
+
+    let wfd_ie = WfdIe::new(DeviceInformation::primary_sink());
+    let client = LinuxP2pClient::connect(&wfd_ie)
+        .await
+        .map_err(|e| FerricastError::Receiver(format!("wpa_supplicant: {e}")))?;
+    let mut groups = client
+        .listen_as_sink(&device_name)
+        .await
+        .map_err(|e| FerricastError::Receiver(format!("Listen: {e}")))?;
+
+    let handle = tokio::spawn(async move {
+        let _client = client; // keep WFDIEs live for the session
+        while let Some(group) = groups.recv().await {
+            tracing::info!(
+                iface = %group.interface_path,
+                role = ?group.role,
+                "miracast sink: Wi-Fi Direct group formed; RTSP listener on 7236"
+            );
+            // The existing `MiracastReceiverControl` listens on
+            // `0.0.0.0:7236`, so the new group iface (which the kernel
+            // already owns) picks up inbound WFD RTSP automatically.
+            // Nothing extra to do per group; log for diagnostics.
+        }
+    });
+    Ok(handle)
 }
 
 impl MdnsAdvertiser for MiracastReceiverAdvertiser {
