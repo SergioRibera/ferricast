@@ -39,8 +39,8 @@ pub(super) fn sap_hash(block: &[u8; 64]) -> [u8; 16] {
             key[i].wrapping_add(garbled.buffer3[pick * 4])
         };
     }
-    let buffers: [&[u8]; 3] = [&garbled.buffer0, &garbled.buffer2, &garbled.buffer1];
-    for buffer in buffers {
+    let sources: [&[u8]; 3] = [&garbled.buffer0, &garbled.buffer2, &garbled.buffer1];
+    for buffer in sources {
         for (byte, slot) in buffer.iter().zip((0..16).cycle()) {
             key[slot] ^= byte;
         }

@@ -234,9 +234,9 @@ fn session_key(keymsg: &[u8; FP_SETUP2_LEN], mode: Mode) -> Block {
         }
     }
     for index in 0..4 {
-        // Swap each word's byte order, then mask with 121.
+        // Swap each word's byte order, then mask with 121 (0x79).
         let swapped = word(&key, index).swap_bytes();
         set_word(&mut key, index, swapped);
     }
-    key.map(|byte| byte ^ 121)
+    key.map(|byte| byte ^ 0x79)
 }

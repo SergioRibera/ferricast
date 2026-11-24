@@ -8,6 +8,12 @@
 //! values that are non-negative, so unsigned arithmetic matches it there
 //! too.
 
+#![expect(
+    clippy::many_single_char_names,
+    clippy::too_many_lines,
+    reason = "mirrors the C function statement by statement, with its names"
+)]
+
 use std::num::Wrapping;
 
 type W = Wrapping<u32>;
