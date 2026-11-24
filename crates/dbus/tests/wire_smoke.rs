@@ -3,7 +3,12 @@
 //! pattern used by the daemon and the CLI client is reproduced here
 //! against the same proxy macro that ships in the crate.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    clippy::unused_async,
+    clippy::used_underscore_binding,
+    reason = "the stub mirrors the daemon's async zbus surface; `#[zbus::interface]` reads the `_`-named arguments"
+)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
