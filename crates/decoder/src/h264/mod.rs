@@ -64,11 +64,13 @@ fn registry() -> VideoDecoderRegistry {
     let registry = VideoDecoderRegistry::new(CodecTarget::decode(Codec::H264));
     #[cfg(feature = "nvdec-decode")]
     let registry = registry.candidate(
-        Candidate::new(
-            BackendId::Nvdec,
-            Acceleration::Hardware,
-            ferricast_codec::open_video_decoder::<NvdecH264Decoder>,
-        )
+        Candidate::new(BackendId::Nvdec, Acceleration::Hardware, |config| {
+            // Capability query first: cheap, and it names a missing driver
+            // or codec instead of failing later on the first packet.
+            NvdecH264Decoder::probe()
+                .map_err(CodecError::from_backend(BackendId::Nvdec, Operation::Probe))?;
+            ferricast_codec::open_video_decoder::<NvdecH264Decoder>(config)
+        })
         .with_probe(|| {
             NvdecH264Decoder::probe()
                 .map_err(CodecError::from_backend(BackendId::Nvdec, Operation::Probe))

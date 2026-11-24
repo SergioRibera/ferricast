@@ -288,6 +288,27 @@ mod tests {
     }
 
     #[test]
+    fn the_environment_replaces_automatic_selection() {
+        let target = CodecTarget::decode(crate::AudioCodec::Pcm);
+        let var = target.env_var();
+        // SAFETY: no other test reads or writes FERRICAST_PCM_DECODE_BACKEND,
+        // and the process spawns no thread that reads the environment.
+        unsafe { std::env::set_var(&var, "pcm") };
+        let resolved = BackendSelection::default().resolve_env(target);
+        // SAFETY: as above.
+        unsafe { std::env::set_var(&var, "ffmpeg") };
+        let invalid = BackendSelection::default().resolve_env(target);
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(&var) };
+        assert_eq!(resolved, Ok(BackendSelection::Fixed(BackendId::Pcm)));
+        assert!(matches!(
+            invalid,
+            Err(CodecError::InvalidSelection { origin, value, .. })
+                if origin.contains("FERRICAST_PCM_DECODE_BACKEND") && value == "ffmpeg"
+        ));
+    }
+
+    #[test]
     fn a_pinned_selection_ignores_the_environment() {
         let fixed = BackendSelection::Fixed(BackendId::X264);
         assert_eq!(
