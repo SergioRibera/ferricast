@@ -373,3 +373,69 @@ libgbm 26 with the NVIDIA GBM backend, `/dev/dri/renderD128`.
   view past the first 64 KiB–4 MiB (zeros or unrelated pages), even with
   `DMA_BUF_IOCTL_SYNC`; GPU views (CUDA, GL) agree with each other. CPU
   readback of LINEAR buffers on NVIDIA should be treated as suspect.
+## NVDEC decisions
+
+- `decode::Decoder<M>` with `M = Host | Device` (sealed): the frame type is
+  known statically (`HostFrame` / `DeviceFrame`), no runtime enum for
+  callers. One `Packet` = one access unit (Annex B, parameter sets in band)
+  / VP8-VP9 frame (superframes whole) / AV1 temporal unit (Section 5 OBUs,
+  not Annex B). `whole_pictures` (default on) sets `CUVID_PKT_ENDOFPICTURE`
+  so a picture decodes without waiting for the next packet; off for
+  arbitrary chunks.
+- State reachable by the callbacks lives behind a raw `NonNull` (not a
+  `Box`, whose moves assert uniqueness against the parser's copy of the
+  pointer). `decode` holds no reference into it while
+  `cuvidParseVideoData` runs, so callbacks own it without any lock. Every
+  callback body runs under `catch_unwind`; errors are stored and returned by
+  the `decode` call. Field order of `Decoder` is drop order: state (NVDEC
+  decoder, stream, queued frames) → parser → ctx lock → context.
+- Decoder creation: `ulNumDecodeSurfaces = min_num_decode_surfaces +
+  max_display_delay` (20 when the driver reports 0), returned from the
+  sequence callback to size the parser's DPB. `ulTargetWidth/Height` = coded
+  size with a whole-picture `display_area`: VPP is an identity copy and the
+  crop happens in our 2D copy, which keeps output bit-exact. A new sequence
+  reuses the decoder when codec / chroma / depth / format match, the size is
+  within `ulMaxWidth/Height` and the surfaces suffice (resized with
+  `cuvidReconfigureDecoder`); otherwise it is destroyed first, then
+  recreated. `max_coded_size` reserves headroom.
+- Output format: NV12 ≤ 8 bits, P016 above (10-bit P016 = P010); NV16/P216
+  and YUV444/YUV444_16Bit where the caps mask allows (HEVC 4:4:4 verified on
+  Ampere). Everything is checked against `cuvidGetDecoderCaps` with an
+  `Error::Unsupported` naming the exceeded limit.
+- Every picture is mapped with `output_stream` = the decoder's stream,
+  copied out plane by plane (`cuMemcpy2DAsync`), unmapped right away. Host
+  mode syncs that stream (pageable destination); device mode records the
+  slot's `ready` event and unmaps without waiting, which is safe because
+  the next map of an output surface post-processes on the same stream.
+  Device consumers that read asynchronously call
+  `DeviceFrame::release_after(stream)`; the decoder's stream waits for that
+  event before reusing the buffer.
+- Pools (host `Vec`s, device `DeviceBuffer` + 2 events, SEI buffers) are
+  bounded by `max_frames` (default 32, `Error::FramesInFlight` beyond),
+  start a new generation on a geometry change, and free stale items when
+  they come back. Steady state allocates nothing per picture.
+- Driver findings (595.71.05, RTX 3060):
+  - `CUVIDEOFORMAT::display_area` always has `left = top = 0` (H.264
+    `frame_crop_left/top_offset`, HEVC `conf_win_left/top_offset` only
+    shrink right/bottom). The decoder reads the cropping window of each SPS
+    it is fed (NAL units before the first slice only; `decode/crop.rs`) and
+    applies left/top only when the SPS's right/bottom agree with the
+    parser's.
+  - SEI payloads 137 / 144 arrive decoded into NVIDIA's structs
+    (little-endian, `display_primaries_x[3]` then `_y[3]`), not as SEI
+    bytes; other types arrive raw. SEI comes per decode surface and is moved
+    into the frame at display, so it never leaks to a later picture.
+  - `CUVID_PKT_DISCONTINUITY` on a packet with data drops that data (an
+    H.264 IDR and its parameter sets, losing the GOP): the flag is sent on an
+    empty packet of its own, which outputs what the parser held, then the
+    data. `CUVID_PKT_ENDOFSTREAM` (flush) leaves the parser reusable.
+  - A truncated AV1 temporal unit (last OBU size past the packet) makes
+    `cuvidDecodePicture` fault (SIGBUS) inside the driver. Packets are
+    checked for OBU framing (headers and sizes only) and refused with
+    `Error::InvalidPacket`. Bit flips / random data inside well-framed OBUs
+    did not crash in the tests, but the driver is the trust boundary there.
+- `cuvidGetDecodeStatus` (optional) gives `DecodeStatus` per frame;
+  `Unknown` without the symbol.
+- Tests: `tests/decode.rs` on clips from `scripts/decode_fixtures.sh`, each
+  picture compared by FNV-1a 64 with FFmpeg's `rawvideo` decode
+  (`-flags unaligned` so FFmpeg honours left crops).
