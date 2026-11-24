@@ -10,7 +10,7 @@
 //! ([`crate::version`]): the session logic is written once and instantiated
 //! for every version this crate carries (`raw.rs`), and [`Encoder`] is an
 //! enum over those instantiations. A feature the negotiated version lacks
-//! ([`ApiFeature`]) is refused with [`Error::Unsupported`](crate::Error::Unsupported)
+//! ([`ApiFeature`]) is refused with [`Error::Unsupported`]
 //! naming the version that adds it; what the GPU lacks is refused the same
 //! way, from [`Capabilities`].
 //!
@@ -64,7 +64,7 @@ use self::engine::Engine;
 pub use self::raw::ApiFeature;
 use self::raw::EncodeApi;
 use crate::cuda::{ArrayView, Context, DeviceBuffer, Event, HostImage};
-use crate::error::{Error, NvencStatus, Result};
+use crate::error::{Error, Result};
 use crate::version::{AnyApi, Api, ApiVersion, DeviceType, NvencApi, api};
 
 /// An NVENC encoder session on a CUDA context, destroyed on drop.
@@ -88,8 +88,8 @@ impl<A: NvencApi> Session<A> {
     ///
     /// # Errors
     ///
-    /// [`Error::Cuda`](crate::Error::Cuda) if the context cannot be made current,
-    /// [`Error::Nvenc`](crate::Error::Nvenc) if the driver refuses the session (no NVENC on this
+    /// [`Error::Cuda`] if the context cannot be made current,
+    /// [`Error::Nvenc`] if the driver refuses the session (no NVENC on this
     /// GPU, session limit reached, version mismatch).
     pub fn open(api: Api<A>, context: &Arc<Context>) -> Result<Self> {
         let device = context.as_non_null();
@@ -124,7 +124,7 @@ impl<A: NvencApi> Session<A> {
     }
 
     /// The driver's explanation of the session's last failure
-    /// (`nvEncGetLastErrorString`), to attach to an [`Error::Nvenc`](crate::Error::Nvenc).
+    /// (`nvEncGetLastErrorString`), to attach to an [`Error::Nvenc`].
     #[must_use]
     pub fn last_error(&self) -> Option<String> {
         // SAFETY: the session is live and opened with this list.
@@ -155,18 +155,20 @@ impl<A: NvencApi> fmt::Debug for Session<A> {
     }
 }
 
-/// `NV_ENC_ERR_OUT_OF_MEMORY`: what `nvEncOpenEncodeSessionEx` answers when
-/// the GPU's concurrent session limit is reached.
-const OUT_OF_MEMORY: u32 = 10;
+/// `NV_ENC_ERR_OUT_OF_MEMORY` and `NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY`: what
+/// `nvEncOpenEncodeSessionEx` answers when the GPU's concurrent session limit
+/// is reached (driver 595 answers the latter after 12 sessions on an RTX
+/// 3060; older drivers the former).
+const SESSION_LIMIT: [u32; 2] = [10, 21];
 
 /// Opens a session, telling the session limit apart from other failures.
 fn open_session<A: NvencApi>(api: Api<A>, context: &Arc<Context>) -> Result<Session<A>> {
     Session::open(api, context).map_err(|error| match error {
         Error::Nvenc {
             call: call @ "nvEncOpenEncodeSessionEx",
-            status: status @ NvencStatus(OUT_OF_MEMORY),
+            status,
             detail,
-        } => Error::NvencSessionLimit {
+        } if SESSION_LIMIT.contains(&status.0) => Error::NvencSessionLimit {
             call,
             status,
             detail,

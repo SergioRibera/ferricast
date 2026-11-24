@@ -630,7 +630,12 @@ impl<A: EncodeApi> Engine<A> {
         self.submitted += 1;
         self.next_slot = (slot + 1) % self.slots.len();
         if submitted == Submitted::OutputReady {
-            self.ready = self.pending.len();
+            // B frames make NVENC answer "need more input" until it can
+            // output; lookahead does not: it answers success while the last
+            // `depth` pictures are still being analysed, and locking those
+            // fails. Their packets come with later pictures or the flush.
+            let lookahead = usize::from(self.config.lookahead.unwrap_or(0));
+            self.ready = self.ready.max(self.pending.len().saturating_sub(lookahead));
         }
         self.drain(usize::from(self.config.frames_in_flight))
     }
