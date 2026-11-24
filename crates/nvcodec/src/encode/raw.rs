@@ -1125,3 +1125,29 @@ encode_api! {
     V13_0 => v13_0 { av1: yes, typed_vui: yes, bit_depth_enum: yes, native_hdr: yes, chroma_offset_in: yes, uhq: yes };
     V13_1 => v13_1 { av1: yes, typed_vui: yes, bit_depth_enum: yes, native_hdr: yes, chroma_offset_in: yes, uhq: yes };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokens_match<A: EncodeApi>() {
+        for feature in ApiFeature::ALL {
+            assert_eq!(
+                A::has(feature),
+                feature.available_in(A::VERSION),
+                "{feature:?} in {}",
+                A::VERSION
+            );
+        }
+    }
+
+    #[test]
+    fn version_tokens_match_added_in() {
+        tokens_match::<api::V11_1>();
+        tokens_match::<api::V12_0>();
+        tokens_match::<api::V12_1>();
+        tokens_match::<api::V12_2>();
+        tokens_match::<api::V13_0>();
+        tokens_match::<api::V13_1>();
+    }
+}
