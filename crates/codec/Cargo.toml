@@ -5,10 +5,22 @@ edition = "2024"
 rust-version = "1.88"
 description = "Backend selection, runtime fallback and the istmo plugin surface shared by the ferricast encoders and decoders"
 
+[features]
+default = []
+# The codecs as an istmo plugin (`ferricast.codec`, see `plugin`):
+# capability reports, backend resolution and session control callable
+# from any istmo client (Rust, Kotlin, Swift). Frames never cross the
+# istmo wire; a session handle opens a direct Rust data path.
+istmo = ["dep:istmo-core", "dep:istmo-macros", "ferricast-core/wire"]
+
 [dependencies]
 ferricast-core = { path = "../core", default-features = false }
 bytes.workspace = true
 tracing.workspace = true
+
+# Pre-release: an exact pin, since `0.1` would not match `0.1.1-alpha.6`.
+istmo-core = { version = "=0.1.1-alpha.6", optional = true }
+istmo-macros = { version = "=0.1.1-alpha.6", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -23,3 +35,6 @@ unwrap_used = "deny"
 dbg_macro = "deny"
 todo = "warn"
 allow_attributes_without_reason = "deny"
+
+[dev-dependencies]
+pollster = "0.4"

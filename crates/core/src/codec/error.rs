@@ -149,6 +149,14 @@ pub enum CodecError {
         operation: Operation,
     },
 
+    /// A session handle names no open session of the kind asked for.
+    #[error("no open {kind} session has the handle {session}; it was closed or is another kind")]
+    NoSuchSession { session: u64, kind: String },
+
+    /// The codec service cannot open sessions (its host runtime is gone).
+    #[error("the codec service cannot host sessions: {reason}")]
+    SessionsUnavailable { reason: String },
+
     /// The backend failed while doing its job.
     #[error("the {backend} backend failed to {operation}: {reason}")]
     Backend {
@@ -197,6 +205,8 @@ impl CodecError {
             | Self::NoBackendOpened { .. }
             | Self::NoBackendMatchesPolicy { .. }
             | Self::InvalidSelection { .. }
+            | Self::NoSuchSession { .. }
+            | Self::SessionsUnavailable { .. }
             | Self::NotConfigured { .. } => None,
         }
     }

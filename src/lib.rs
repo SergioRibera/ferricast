@@ -59,23 +59,37 @@ pub mod capture {
     pub use ferricast_capture::*;
 }
 
-/// Video encoders.
+/// Encoders.
 ///
-/// The default H.264 entry point is [`encoder::h264::H264Encoder`].
-/// At runtime it negotiates NVENC → VA-API → openh264 in order, so the
-/// same handle works across hardware without any caller changes.
+/// One facade per codec ([`encoder::h264::H264Encoder`], ...). Each
+/// picks its backend from its configuration's [`BackendSelection`]:
+/// automatically (hardware first, then software) or exactly the one
+/// named. `Facade::backends()` reports what this build has.
 pub mod encoder {
     pub use ferricast_encoder::*;
 }
 
-/// Receiver-side decoders.
-///
-/// Today's facade exposes a CPU H.264 path via openh264 and an AAC-LC
-/// audio path via symphonia. The facade type ([`decoder::H264Decoder`])
-/// is shaped to absorb VA-API + NVDEC variants once those land
-/// without changing the call sites.
+/// Receiver-side decoders, one facade per codec
+/// ([`decoder::H264Decoder`], ...), selecting backends like the encoders.
 pub mod decoder {
     pub use ferricast_decoder::*;
+}
+
+/// Codec backend selection and, with the `istmo` feature, the istmo
+/// plugin `ferricast.codec` ([`codec::plugin`]).
+pub mod codec {
+    pub use ferricast_codec::*;
+}
+
+/// A [`codec::plugin::CodecService`] over every encoder and decoder of
+/// this build: register it with `runtime.register_host(
+/// codec::plugin::CodecsHost::new(service.clone()))` and keep the
+/// clone for the data plane.
+#[cfg(feature = "istmo")]
+#[must_use]
+pub fn codec_service() -> codec::plugin::CodecService {
+    let catalog = ferricast_encoder::catalog(codec::plugin::Catalog::default());
+    codec::plugin::CodecService::new(ferricast_decoder::catalog(catalog))
 }
 
 /// HLS server primitives — exposed mainly so protocols outside this

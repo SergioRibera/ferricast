@@ -20,3 +20,16 @@ mod platform;
 pub mod scale;
 
 pub use ferricast_codec::{Availability, BackendReport};
+
+/// Adds every encode job of this crate to an istmo codec catalog.
+#[cfg(feature = "istmo")]
+#[must_use]
+pub fn catalog(catalog: ferricast_codec::plugin::Catalog) -> ferricast_codec::plugin::Catalog {
+    use ferricast_core::{AudioCodec, Codec};
+    catalog
+        .video_encoder(Codec::H264, h264::H264Encoder::registry)
+        .video_encoder(Codec::H265, h265::H265Encoder::registry)
+        .audio_encoder(AudioCodec::Aac, aac::AacEncoder::registry)
+        .audio_encoder(AudioCodec::AacEld, aac::AacEldEncoder::registry)
+        .audio_encoder(AudioCodec::Opus, opus::OpusEncoder::registry)
+}

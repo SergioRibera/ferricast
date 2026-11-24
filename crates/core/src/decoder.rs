@@ -14,6 +14,7 @@ use crate::colour::ColourDescription;
 use crate::frame::{AudioCodec, AudioFrame, CapturedFrame, EncodedFrame, PixelFormat};
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
 pub struct DecoderConfig {
     pub codec: Codec,
     /// Width hint from the stream metadata. Decoder MAY override
@@ -53,6 +54,7 @@ pub trait VideoDecoder: Send {
 /// stream's audio header; impls MAY validate against their supported
 /// set in `configure`.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
 pub struct AudioDecoderConfig {
     pub codec: AudioCodec,
     pub sample_rate: u32,

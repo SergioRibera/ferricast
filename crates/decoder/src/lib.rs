@@ -47,3 +47,22 @@ pub use facades::{
 pub use ferricast_codec::{Availability, BackendReport};
 pub use h264::H264Decoder;
 pub use h265::H265Decoder;
+
+/// Adds every decode job of this crate to an istmo codec catalog.
+#[cfg(feature = "istmo")]
+#[must_use]
+pub fn catalog(catalog: ferricast_codec::plugin::Catalog) -> ferricast_codec::plugin::Catalog {
+    use ferricast_codec::bitstream::NalSyntax;
+    use ferricast_core::{AudioCodec, Codec};
+    catalog
+        .video_decoder(Codec::H264, H264Decoder::registry, Some(NalSyntax::H264))
+        .video_decoder(Codec::H265, H265Decoder::registry, Some(NalSyntax::H265))
+        .video_decoder(Codec::Vp8, Vp8Decoder::registry, None)
+        .video_decoder(Codec::Vp9, Vp9Decoder::registry, None)
+        .video_decoder(Codec::Av1, Av1Decoder::registry, None)
+        .audio_decoder(AudioCodec::Aac, AacDecoder::registry)
+        .audio_decoder(AudioCodec::AacEld, AacEldDecoder::registry)
+        .audio_decoder(AudioCodec::Alac, AlacDecoder::registry)
+        .audio_decoder(AudioCodec::Opus, OpusDecoder::registry)
+        .audio_decoder(AudioCodec::Pcm, PcmDecoder::registry)
+}

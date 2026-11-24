@@ -9,6 +9,9 @@
 //! [`ferricast_core::BackendSelection`] from the codec configuration,
 //! open the backend it resolves to, and fall back to the next backend
 //! when the selection allows it.
+//!
+//! With the `istmo` feature, [`plugin`] serves the same machinery as
+//! the istmo plugin `ferricast.codec`.
 
 pub mod audio;
 pub mod bitstream;
@@ -17,6 +20,9 @@ pub mod registry;
 pub mod session;
 pub mod video_decoder;
 pub mod video_encoder;
+
+#[cfg(feature = "istmo")]
+pub mod plugin;
 
 pub use audio::{
     AudioDecoderRegistry, AudioEncoderRegistry, SelectingAudioDecoder, SelectingAudioEncoder,

@@ -311,7 +311,7 @@ impl SelectingVideoDecoder {
                 // The next backend would have skipped it decoding from
                 // the start, e.g. a P slice before the first IDR.
                 Err(skip) => {
-                    warn!(backend = %active.backend, error = %skip, "replayed packet skipped")
+                    warn!(backend = %active.backend, error = %skip, "replayed packet skipped");
                 }
             }
         }

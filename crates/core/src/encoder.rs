@@ -4,6 +4,7 @@ use crate::frame::{AudioCodec, AudioFrame, CapturedFrame, EncodedFrame};
 use crate::{Codec, H264Profile, H265Profile, PixelFormat};
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
 pub struct EncoderConfig {
     pub codec: Codec,
     pub width: u32,
@@ -121,6 +122,7 @@ pub trait VideoEncoder: Send {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
 pub struct AudioEncoderConfig {
     /// Output codec. Only [`AudioCodec::Aac`] is wired through the
     /// chromecast HLS pipeline today; the field stays so future

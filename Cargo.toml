@@ -155,6 +155,13 @@ wayland-direct = ["ferricast-capture/wayland-direct", "wlroots"]
 miracast = ["dep:ferricast-miracast"]
 miracast-linux-p2p = ["miracast", "ferricast-miracast/linux-p2p"]
 miracast-windows-native = ["miracast", "ferricast-miracast/windows-native"]
+# The codecs as the istmo plugin `ferricast.codec` (see `codec_service`).
+# istmo is pre-1.0: its API and wire format may change between releases.
+istmo = [
+    "ferricast-codec/istmo",
+    "ferricast-encoder/istmo",
+    "ferricast-decoder/istmo",
+]
 
 [dependencies]
 ferricast-core.workspace = true
@@ -166,6 +173,7 @@ ferricast-core.workspace = true
 ferricast-capture.workspace = true
 ferricast-encoder.workspace = true
 ferricast-decoder.workspace = true
+ferricast-codec.workspace = true
 # Progressive (MP4/WebM/MKV over HTTP) playback for receivers.
 ferricast-demuxer = { workspace = true, features = ["http"] }
 ferricast-hls.workspace = true

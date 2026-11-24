@@ -1913,6 +1913,7 @@ dependencies = [
  "ferricast-airplay",
  "ferricast-capture",
  "ferricast-chromecast",
+ "ferricast-codec",
  "ferricast-core",
  "ferricast-decoder",
  "ferricast-demuxer",
@@ -2023,9 +2024,9 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "ferricast-core",
- "flume 0.11.1",
  "istmo-core",
  "istmo-macros",
+ "pollster",
  "tracing",
 ]
 

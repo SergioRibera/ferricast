@@ -56,6 +56,8 @@ fdk-aac = ["dep:fdk-aac", "dep:fdk-aac-sys"]
 # methods.
 nvenc-zero-copy = ["nvenc"]
 opus-rs = ["dep:opus-rs"]
+# The encoders in the istmo codec plugin (`ferricast_codec::plugin`).
+istmo = ["ferricast-codec/istmo"]
 
 [dependencies]
 ferricast-core.workspace = true
