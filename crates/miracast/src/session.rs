@@ -11,8 +11,8 @@
 //! sets the flag when the sink sends the SET_PARAMETER mid-session.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::net::{TcpStream, UdpSocket};
@@ -27,10 +27,10 @@ use crate::parameters::{
 };
 use crate::rtp::{MpegTsRtpPacker, RTP_TIMESTAMP_HZ};
 use crate::rtsp::{
-    build_options, options_response, Message, Method, Request, Response, RtspFramed,
-    WFD_REQUIRE_TAG,
+    Message, Method, Request, Response, RtspFramed, WFD_REQUIRE_TAG, build_options,
+    options_response,
 };
-use crate::transport::mice::{mice_probe, MICE_CONTROL_PORT, WFD_RTSP_PORT};
+use crate::transport::mice::{MICE_CONTROL_PORT, WFD_RTSP_PORT, mice_probe};
 use crate::ts::{MpegTsMuxer, VideoAccessUnit};
 
 /// Timeouts tuned to the interop gotchas:
@@ -124,8 +124,15 @@ impl MiracastSession {
             )));
         }
         let cseq = req.headers.cseq().unwrap_or(1).to_string();
-        let resp = options_response(&["SETUP", "PLAY", "PAUSE", "TEARDOWN", "GET_PARAMETER", "SET_PARAMETER"])
-            .with_header("cseq", cseq);
+        let resp = options_response(&[
+            "SETUP",
+            "PLAY",
+            "PAUSE",
+            "TEARDOWN",
+            "GET_PARAMETER",
+            "SET_PARAMETER",
+        ])
+        .with_header("cseq", cseq);
         framed.send_response(resp).await.map_err(rtsp_err)?;
         Ok(())
     }
@@ -158,7 +165,8 @@ impl MiracastSession {
     async fn do_m4_push_params(&mut self, local_ip: &str) -> Result<()> {
         self.rtsp_url = format!("rtsp://{local_ip}/wfd1.0/streamid=0");
         let video = VideoFormat::baseline_720p30();
-        let audio = crate::parameters::AudioFormats(vec![crate::parameters::AudioFormat::aac_mandatory()]);
+        let audio =
+            crate::parameters::AudioFormats(vec![crate::parameters::AudioFormat::aac_mandatory()]);
         let rtp_ports = ClientRtpPorts::primary(19000);
         let url = PresentationUrl::primary(self.rtsp_url.clone());
         let body = format!(
@@ -256,12 +264,7 @@ impl MiracastSession {
         let cseq = play.headers.cseq().unwrap_or(2).to_string();
         let resp = Response::ok()
             .with_header("cseq", cseq)
-            .with_header(
-                "session",
-                self.session_token
-                    .clone()
-                    .unwrap_or_default(),
-            );
+            .with_header("session", self.session_token.clone().unwrap_or_default());
         framed.send_response(resp).await.map_err(rtsp_err)?;
 
         let peer_ip = self
@@ -357,7 +360,7 @@ impl CastSession for MiracastSession {
             .rtp_peer
             .ok_or_else(|| FerricastError::Streaming("RTP peer not negotiated".into()))?;
 
-        let pts_90khz = u64::from(frame.timestamp_us) * u64::from(RTP_TIMESTAMP_HZ) / 1_000_000;
+        let pts_90khz = frame.timestamp_us * u64::from(RTP_TIMESTAMP_HZ) / 1_000_000;
         let au = VideoAccessUnit {
             nalus: &frame.data,
             pts_90khz,
@@ -365,9 +368,10 @@ impl CastSession for MiracastSession {
             carry_pcr: true,
         };
         for ts_packet in self.muxer.pack_video(&au) {
-            let completed = self
-                .packer
-                .push_ts(&ts_packet, u32::try_from(pts_90khz & 0xFFFF_FFFF).unwrap_or(0));
+            let completed = self.packer.push_ts(
+                &ts_packet,
+                u32::try_from(pts_90khz & 0xFFFF_FFFF).unwrap_or(0),
+            );
             for rtp_pkt in completed {
                 rtp.send_to(&rtp_pkt, peer)
                     .await
@@ -427,9 +431,7 @@ fn local_ip_string(_rtsp: &Option<RtspFramed>) -> Result<String> {
     // by the OS. Miracast requires the source's actual IP in the
     // presentation URL — localhost breaks on real sinks.
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(FerricastError::Io)?;
-    socket
-        .connect("8.8.8.8:80")
-        .map_err(FerricastError::Io)?;
+    socket.connect("8.8.8.8:80").map_err(FerricastError::Io)?;
     Ok(socket
         .local_addr()
         .map_err(FerricastError::Io)?

@@ -438,11 +438,11 @@ impl MpegTsDemuxer {
         });
 
         // Continuity check — on jump, drop the in-flight PES.
-        if let Some(prev) = entry.expected_cc {
-            if cc != prev {
-                entry.buf.clear();
-                entry.in_pes = false;
-            }
+        if let Some(prev) = entry.expected_cc
+            && cc != prev
+        {
+            entry.buf.clear();
+            entry.in_pes = false;
         }
         entry.expected_cc = Some((cc + 1) & 0x0F);
 
@@ -515,7 +515,11 @@ fn decode_pts(b: &[u8]) -> u64 {
     let b2 = u64::from(b[2]);
     let b3 = u64::from(b[3]);
     let b4 = u64::from(b[4]);
-    (((b0 >> 1) & 0x07) << 30) | (b1 << 22) | (((b2 >> 1) & 0x7F) << 15) | (b3 << 7) | ((b4 >> 1) & 0x7F)
+    (((b0 >> 1) & 0x07) << 30)
+        | (b1 << 22)
+        | (((b2 >> 1) & 0x7F) << 15)
+        | (b3 << 7)
+        | ((b4 >> 1) & 0x7F)
 }
 
 #[cfg(test)]
@@ -582,12 +586,13 @@ mod tests {
         }
         units.extend(demux.finish());
 
-        let video: Vec<_> = units
-            .into_iter()
-            .filter(|u| u.pid == VIDEO_PID)
-            .collect();
+        let video: Vec<_> = units.into_iter().filter(|u| u.pid == VIDEO_PID).collect();
         assert_eq!(video.len(), 1);
         assert_eq!(video[0].pts_90khz, Some(123_456));
-        assert!(video[0].payload.ends_with(&nalus[nalus.len().saturating_sub(16)..]));
+        assert!(
+            video[0]
+                .payload
+                .ends_with(&nalus[nalus.len().saturating_sub(16)..])
+        );
     }
 }

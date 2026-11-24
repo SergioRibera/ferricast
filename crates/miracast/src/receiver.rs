@@ -22,12 +22,12 @@ use crate::parameters::{
     AudioFormat, AudioFormats, ClientRtpPorts, ContentProtection, PresentationUrl, TriggerMethod,
     VideoFormat,
 };
-use crate::rtp::{RtpMp2tPacket, RTP_PACKET_SIZE};
+use crate::rtp::{RTP_PACKET_SIZE, RtpMp2tPacket};
 use crate::rtsp::{
-    options_response, Headers, Message, Method, Request, Response, RtspFramed, WFD_REQUIRE_TAG,
+    Headers, Message, Method, Request, Response, RtspFramed, WFD_REQUIRE_TAG, options_response,
 };
 use crate::transport::mice::{MICE_SERVICE_TYPE, WFD_RTSP_PORT};
-use crate::ts::{MpegTsDemuxer, AUDIO_PID, VIDEO_PID};
+use crate::ts::{AUDIO_PID, MpegTsDemuxer, VIDEO_PID};
 
 /// Push channel capacity: ~1 s of 1080p30 video at 5 Mbps is a few
 /// hundred packets. 1024 keeps the decoder on real hardware from
@@ -92,7 +92,7 @@ impl ReceiverProtocol for MiracastReceiver {
     }
 
     fn create_puller(&self) -> Result<Self::Puller> {
-        Ok(MiracastPuller::default())
+        Ok(MiracastPuller)
     }
 
     fn advertise_info(&self) -> AdvertiseInfo {
@@ -221,9 +221,9 @@ impl MiracastReceiverControl {
             return Ok(());
         }
         let bind = format!("0.0.0.0:{}", self.bind_port);
-        let listener = TcpListener::bind(&bind).await.map_err(|e| {
-            FerricastError::Receiver(format!("bind {bind}: {e}"))
-        })?;
+        let listener = TcpListener::bind(&bind)
+            .await
+            .map_err(|e| FerricastError::Receiver(format!("bind {bind}: {e}")))?;
         tracing::info!(addr = %listener.local_addr().ok()
             .map(|a| a.to_string()).unwrap_or_default(),
             "miracast sink listening");
@@ -248,8 +248,7 @@ impl ControlSession for MiracastReceiverControl {
 
         *self.pending_stream.lock().await = Some(stream);
         *self.pump.lock().await = Some(pump);
-        self.alive
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.alive.store(true, std::sync::atomic::Ordering::Release);
         // The RTP → push bridge is now live; drop the producer handle
         // here so the Eos propagates once the pump task closes it.
         drop(tx);
@@ -316,12 +315,8 @@ async fn drive_sink_m1_m7(
     let cseq = m1.headers.cseq().unwrap_or(1);
     framed
         .send_response(
-            options_response(&[
-                "org.wfa.wfd1.0",
-                "GET_PARAMETER",
-                "SET_PARAMETER",
-            ])
-            .with_header("cseq", cseq.to_string()),
+            options_response(&["org.wfa.wfd1.0", "GET_PARAMETER", "SET_PARAMETER"])
+                .with_header("cseq", cseq.to_string()),
         )
         .await
         .map_err(rtsp_err)?;
@@ -369,8 +364,8 @@ async fn drive_sink_m1_m7(
     // --- M4: Source → Sink SET_PARAMETER with negotiated subset.
     let m4 = read_request(&mut framed).await?;
     expect_method(&m4, Method::SetParameter)?;
-    let m4_body =
-        std::str::from_utf8(&m4.body).map_err(|_| FerricastError::Rtsp("non-UTF8 M4 body".into()))?;
+    let m4_body = std::str::from_utf8(&m4.body)
+        .map_err(|_| FerricastError::Rtsp("non-UTF8 M4 body".into()))?;
     let m4_params = crate::parameters::decode_body(m4_body);
     let presentation_url: PresentationUrl = m4_params
         .iter()
@@ -394,8 +389,8 @@ async fn drive_sink_m1_m7(
     // --- M5: Source → Sink SET_PARAMETER wfd_trigger_method:SETUP.
     let m5 = read_request(&mut framed).await?;
     expect_method(&m5, Method::SetParameter)?;
-    let m5_body =
-        std::str::from_utf8(&m5.body).map_err(|_| FerricastError::Rtsp("non-UTF8 M5 body".into()))?;
+    let m5_body = std::str::from_utf8(&m5.body)
+        .map_err(|_| FerricastError::Rtsp("non-UTF8 M5 body".into()))?;
     let trigger: TriggerMethod = crate::parameters::decode_body(m5_body)
         .into_iter()
         .find(|p| p.name.eq_ignore_ascii_case("wfd_trigger_method"))
@@ -428,11 +423,10 @@ async fn drive_sink_m1_m7(
     // --- M6: Sink → Source SETUP. We expect 200 with server_port + session token.
     let cseq6 = framed
         .send_request(
-            Request::new(Method::Setup, presentation_url.url0.clone())
-                .with_header(
-                    "transport",
-                    format!("RTP/AVP/UDP;unicast;client_port={}", rtp_local.port()),
-                ),
+            Request::new(Method::Setup, presentation_url.url0.clone()).with_header(
+                "transport",
+                format!("RTP/AVP/UDP;unicast;client_port={}", rtp_local.port()),
+            ),
         )
         .await
         .map_err(rtsp_err)?;

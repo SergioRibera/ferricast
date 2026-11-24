@@ -9,12 +9,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 use ferricast_core::{
-    Codec, Device, DeviceAddresses, DeviceCapabilities, Discovery, DiscoveryEvent,
-    FerricastError, MdnsDiscovery, Result,
+    Codec, Device, DeviceAddresses, DeviceCapabilities, Discovery, DiscoveryEvent, FerricastError,
+    MdnsDiscovery, Result,
 };
 
 use crate::transport::mice::MICE_SERVICE_TYPE;
@@ -77,9 +77,8 @@ impl Discovery for MiracastDiscovery {
                             .trim_end_matches('.')
                             .to_string();
                         let mut metadata = std::collections::HashMap::new();
-                        if let Some(port) = service
-                            .get_properties()
-                            .get_property_val_str("rtsp_port")
+                        if let Some(port) =
+                            service.get_properties().get_property_val_str("rtsp_port")
                         {
                             metadata.insert("rtsp_port".to_string(), port.to_string());
                         }
@@ -99,11 +98,7 @@ impl Discovery for MiracastDiscovery {
                             },
                             metadata,
                         };
-                        if tx
-                            .send(DiscoveryEvent::DeviceFound(device))
-                            .await
-                            .is_err()
-                        {
+                        if tx.send(DiscoveryEvent::DeviceFound(device)).await.is_err() {
                             break;
                         }
                     }
@@ -182,10 +177,13 @@ impl MiracastDiscovery {
                 if !peer.is_sink() {
                     continue;
                 }
-                if let Some(device) = p2p_peer_to_device(&peer) {
-                    if tx_out.send(DiscoveryEvent::DeviceFound(device)).await.is_err() {
-                        break;
-                    }
+                if let Some(device) = p2p_peer_to_device(&peer)
+                    && tx_out
+                        .send(DiscoveryEvent::DeviceFound(device))
+                        .await
+                        .is_err()
+                {
+                    break;
                 }
             }
         });

@@ -22,7 +22,7 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, Proxy};
 
 use super::TransportError;
-use crate::ie::{DeviceRole, SubelementId, WfdIe, WIFI_ALLIANCE_OUI, WFD_OUI_TYPE};
+use crate::ie::{DeviceRole, SubelementId, WFD_OUI_TYPE, WIFI_ALLIANCE_OUI, WfdIe};
 
 const SUPPLICANT_BUS: &str = "fi.w1.wpa_supplicant1";
 const SUPPLICANT_ROOT_PATH: &str = "/fi/w1/wpa_supplicant1";
@@ -49,7 +49,9 @@ impl DiscoveredPeer {
     /// or dual-role device.
     #[must_use]
     pub fn is_miracast(&self) -> bool {
-        self.wfd.as_ref().is_some_and(|w| w.device_information.is_some())
+        self.wfd
+            .as_ref()
+            .is_some_and(|w| w.device_information.is_some())
     }
 
     /// Whether we (a source) should offer to cast to it.
@@ -125,20 +127,14 @@ impl LinuxP2pClient {
         let conn = self.conn.clone();
         let interface_path = self.interface_path.clone();
         tokio::spawn(async move {
-            let p2p_owned = match Proxy::new(
-                &conn,
-                SUPPLICANT_BUS,
-                interface_path.clone(),
-                P2P_IFACE,
-            )
-            .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(error = %e, "linux p2p: proxy for signal stream");
-                    return;
-                }
-            };
+            let p2p_owned =
+                match Proxy::new(&conn, SUPPLICANT_BUS, interface_path.clone(), P2P_IFACE).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "linux p2p: proxy for signal stream");
+                        return;
+                    }
+                };
             let mut stream = match p2p_owned.receive_signal("DeviceFound").await {
                 Ok(s) => s,
                 Err(e) => {
@@ -195,29 +191,26 @@ impl LinuxP2pClient {
         // 30 s is the Wi-Fi Alliance recommended GO negotiation ceiling.
         let fut = async {
             while let Some(sig) = stream.next().await {
-                if let Ok(dict) = sig.body().deserialize::<HashMap<String, OwnedValue>>() {
-                    if let Some(iface_val) = dict.get("interface_object") {
-                        if let Ok(path) = iface_val.try_clone().and_then(ObjectPath::try_from) {
-                            let role = dict
-                                .get("role")
-                                .and_then(|v| v.downcast_ref::<&str>().ok())
-                                .unwrap_or("client")
-                                .to_string();
-                            return Ok(GroupStarted {
-                                interface_path: path.to_string(),
-                                role: if role == "GO" {
-                                    GroupRole::Owner
-                                } else {
-                                    GroupRole::Client
-                                },
-                            });
-                        }
-                    }
+                if let Ok(dict) = sig.body().deserialize::<HashMap<String, OwnedValue>>()
+                    && let Some(iface_val) = dict.get("interface_object")
+                    && let Ok(path) = iface_val.try_clone().and_then(ObjectPath::try_from)
+                {
+                    let role = dict
+                        .get("role")
+                        .and_then(|v| v.downcast_ref::<&str>().ok())
+                        .unwrap_or("client")
+                        .to_string();
+                    return Ok(GroupStarted {
+                        interface_path: path.to_string(),
+                        role: if role == "GO" {
+                            GroupRole::Owner
+                        } else {
+                            GroupRole::Client
+                        },
+                    });
                 }
             }
-            Err(TransportError::LinuxP2p(
-                "GroupStarted stream ended".into(),
-            ))
+            Err(TransportError::LinuxP2p("GroupStarted stream ended".into()))
         };
         tokio::time::timeout(Duration::from_secs(30), fut)
             .await
@@ -260,10 +253,12 @@ async fn resolve_or_create_interface(conn: &Connection) -> Result<OwnedObjectPat
 
     // Prefer an already-existing interface so we coexist with
     // NetworkManager (which keeps the sole wpa_supplicant around).
-    if let Ok(existing) = root.get_property::<Vec<OwnedObjectPath>>("Interfaces").await {
-        if let Some(path) = existing.into_iter().next() {
-            return Ok(path);
-        }
+    if let Ok(existing) = root
+        .get_property::<Vec<OwnedObjectPath>>("Interfaces")
+        .await
+        && let Some(path) = existing.into_iter().next()
+    {
+        return Ok(path);
     }
 
     // Fallback: try wlan0. Users with a different radio can override via
@@ -281,7 +276,10 @@ async fn resolve_or_create_interface(conn: &Connection) -> Result<OwnedObjectPat
     Ok(path)
 }
 
-async fn read_peer(conn: &Connection, path: &ObjectPath<'_>) -> Result<DiscoveredPeer, TransportError> {
+async fn read_peer(
+    conn: &Connection,
+    path: &ObjectPath<'_>,
+) -> Result<DiscoveredPeer, TransportError> {
     let proxy = Proxy::new(conn, SUPPLICANT_BUS, path.to_owned(), PEER_IFACE)
         .await
         .map_err(|e| TransportError::LinuxP2p(format!("peer proxy: {e}")))?;
@@ -366,10 +364,8 @@ fn extract_wfd(bytes: &[u8]) -> Option<WfdIe> {
 /// GUI calls this to tell users "install wpa_supplicant" or "your
 /// adapter does not expose P2P" without blowing up on D-Bus errors.
 pub async fn probe_supplicant() -> Result<(), TransportError> {
-    let _ = LinuxP2pClient::connect(&WfdIe::new(
-        crate::ie::DeviceInformation::linux_dual_role(),
-    ))
-    .await?;
+    let _ = LinuxP2pClient::connect(&WfdIe::new(crate::ie::DeviceInformation::linux_dual_role()))
+        .await?;
     Ok(())
 }
 
