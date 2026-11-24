@@ -20,8 +20,12 @@
 mod eld;
 #[cfg(feature = "fdk-aac")]
 mod fdk_impl;
-#[cfg(feature = "fdk-aac")]
-mod resample;
+// Shared by the encoders that resample to AAC-ELD's 44.1 kHz themselves.
+#[cfg(any(
+    feature = "fdk-aac",
+    all(any(target_os = "macos", target_os = "ios"), feature = "audiotoolbox")
+))]
+pub(crate) mod resample;
 
 use ferricast_codec::AudioEncoderRegistry;
 #[cfg(feature = "fdk-aac")]

@@ -74,7 +74,7 @@ istmo = ["ferricast-codec/istmo"]
 # - `media-foundation`: Windows Media Foundation transforms (hardware
 #   MFTs first, then Microsoft's software ones).
 # - `videotoolbox`: Apple VideoToolbox (macOS, iOS) H.264 / H.265.
-# - `audiotoolbox`: Apple AudioToolbox `AudioConverter`, AAC.
+# - `audiotoolbox`: Apple AudioToolbox `AudioConverter`, AAC-LC and AAC-ELD.
 # - `mediacodec`: Android NDK `AMediaCodec` (API 28+), hardware and
 #   software codecs.
 media-foundation = ["dep:windows", "ferricast-codec/media-foundation"]

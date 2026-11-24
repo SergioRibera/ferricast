@@ -1,16 +1,22 @@
-//! AAC-LC encode through AudioToolbox's `AudioConverter`.
+//! AAC-LC and AAC-ELD encode through AudioToolbox's `AudioConverter`.
 //!
 //! The converter pulls PCM through an input callback; each call feeds it
-//! exactly one AAC frame (1024 samples per channel) and asks for one
-//! packet. The encoder's priming delay means the first calls yield
-//! nothing. Packets come out raw and are framed as ADTS, the shape the
-//! MPEG-TS / HLS pipeline carries.
+//! exactly one frame (1024 samples per channel for AAC-LC, 480 for
+//! AAC-ELD) and asks for one packet. The encoder's priming delay means
+//! the first calls yield nothing.
+//!
+//! - AAC-LC packets are framed as ADTS, the shape the MPEG-TS / HLS
+//!   pipeline carries.
+//! - AAC-ELD is AirPlay mirroring audio: raw access units at 44.1 kHz,
+//!   480-sample frames, no SBR (`AudioSpecificConfig` `f8 e8 50 00` for
+//!   stereo). Input at other rates is resampled to 44.1 kHz first, as the
+//!   fdk-aac ELD encoder does.
 
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
 
 use bytes::Bytes;
-use ferricast_codec::aac::AacLc;
+use ferricast_codec::aac::{AacLc, AudioSpecificConfig};
 use ferricast_codec::{AudioEncoderRegistry, Candidate};
 use ferricast_core::{
     Acceleration, AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame, BackendId, CodecError,
@@ -24,23 +30,27 @@ use objc2_audio_toolbox::{
 use objc2_core_audio_types::{
     AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioStreamPacketDescription,
     kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
-    kAudioFormatMPEG4AAC,
+    kAudioFormatMPEG4AAC, kAudioFormatMPEG4AAC_ELD,
 };
 use tracing::{debug, info};
 
 use super::os_status;
+use crate::aac::resample::Resampler;
 use crate::audio_clock::{AudioClock, ClockEvent};
 
 const BACKEND: BackendId = BackendId::AudioToolbox;
-/// Samples per channel in one AAC-LC frame.
-const FRAME_SAMPLES: usize = 1024;
 /// What the input callback returns once its frame is consumed, so the
 /// converter stops pulling; not an error.
 const NO_MORE_INPUT: i32 = i32::from_be_bytes(*b"!dat");
+/// Sample rate of AirPlay's AAC-ELD.
+const ELD_SAMPLE_RATE: u32 = 44_100;
 
-/// Adds the AudioToolbox AAC-LC encoder.
+/// Adds the AudioToolbox AAC-LC and AAC-ELD encoders.
 pub(crate) fn audio(registry: AudioEncoderRegistry) -> AudioEncoderRegistry {
-    if registry.target().codec != CodecKind::Audio(AudioCodec::Aac) {
+    if !matches!(
+        registry.target().codec,
+        CodecKind::Audio(AudioCodec::Aac | AudioCodec::AacEld)
+    ) {
         return registry;
     }
     registry.candidate(Candidate::new(
@@ -54,6 +64,32 @@ pub(crate) fn audio(registry: AudioEncoderRegistry) -> AudioEncoderRegistry {
 
 fn fail(operation: Operation, what: impl std::fmt::Display) -> CodecError {
     CodecError::backend(BACKEND, operation, what)
+}
+
+/// The AAC flavour an encoder produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Profile {
+    /// AAC-LC, ADTS-framed.
+    Lc(AacLc),
+    /// AAC-ELD, raw access units.
+    Eld,
+}
+
+impl Profile {
+    fn codec(self) -> AudioCodec {
+        match self {
+            Self::Lc(_) => AudioCodec::Aac,
+            Self::Eld => AudioCodec::AacEld,
+        }
+    }
+
+    /// Samples per channel in one frame.
+    fn frame_samples(self) -> usize {
+        match self {
+            Self::Lc(_) => 1024,
+            Self::Eld => 480,
+        }
+    }
 }
 
 /// An owned `AudioConverterRef`.
@@ -73,7 +109,7 @@ impl Drop for Converter {
     }
 }
 
-/// The PCM one fill call may pull: one AAC frame.
+/// The PCM one fill call may pull: one frame.
 struct Feed {
     data: *const i16,
     frames: u32,
@@ -109,12 +145,20 @@ unsafe extern "C-unwind" fn feed(
     0
 }
 
-/// AAC-LC encoder over AudioToolbox.
+/// AAC-LC / AAC-ELD encoder over AudioToolbox.
 pub(crate) struct AtAacEncoder {
     converter: Converter,
-    shape: AacLc,
+    profile: Profile,
+    /// The stream's `AudioSpecificConfig`.
+    audio_specific_config: Vec<u8>,
+    /// The rate PCM arrives at.
+    input_rate: u32,
+    /// The rate the encoder codes (the input rate for AAC-LC, 44.1 kHz
+    /// for AAC-ELD).
     sample_rate: u32,
     channels: u16,
+    resampler: Option<Resampler>,
+    resampled: Vec<i16>,
     pcm: Vec<i16>,
     clock: AudioClock,
     packet: Vec<u8>,
@@ -123,24 +167,40 @@ pub(crate) struct AtAacEncoder {
 
 impl AtAacEncoder {
     fn open(config: &AudioEncoderConfig) -> CodecResult<Self> {
-        if config.codec != AudioCodec::Aac {
-            return Err(CodecError::UnsupportedConfig {
-                backend: BACKEND,
-                what: format!("{} in the AAC-LC encoder", config.codec),
-            });
-        }
-        let shape = AacLc::new(config.sample_rate, config.channels).ok_or_else(|| {
-            CodecError::UnsupportedConfig {
-                backend: BACKEND,
-                what: format!(
-                    "AAC-LC at {} Hz with {} channels",
-                    config.sample_rate, config.channels
-                ),
+        let unsupported = |what: String| CodecError::UnsupportedConfig {
+            backend: BACKEND,
+            what,
+        };
+        let (profile, sample_rate, audio_specific_config) = match config.codec {
+            AudioCodec::Aac => {
+                let lc = AacLc::new(config.sample_rate, config.channels).ok_or_else(|| {
+                    unsupported(format!(
+                        "AAC-LC at {} Hz with {} channels",
+                        config.sample_rate, config.channels
+                    ))
+                })?;
+                (
+                    Profile::Lc(lc),
+                    config.sample_rate,
+                    lc.audio_specific_config().to_vec(),
+                )
             }
-        })?;
+            AudioCodec::AacEld => {
+                let asc = AudioSpecificConfig::eld(ELD_SAMPLE_RATE, config.channels, true)
+                    .and_then(AudioSpecificConfig::to_bytes)
+                    .ok_or_else(|| {
+                        unsupported(format!("AAC-ELD with {} channels", config.channels))
+                    })?;
+                (Profile::Eld, ELD_SAMPLE_RATE, asc)
+            }
+            other => return Err(unsupported(format!("{other} in the AAC encoder"))),
+        };
+        if config.sample_rate == 0 {
+            return Err(unsupported("PCM input at 0 Hz".to_owned()));
+        }
         let channels = u32::from(config.channels);
         let pcm = AudioStreamBasicDescription {
-            mSampleRate: f64::from(config.sample_rate),
+            mSampleRate: f64::from(sample_rate),
             mFormatID: kAudioFormatLinearPCM,
             mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
             mBytesPerPacket: 2 * channels,
@@ -150,12 +210,16 @@ impl AtAacEncoder {
             mBitsPerChannel: 16,
             mReserved: 0,
         };
+        let frame_samples = u32::try_from(profile.frame_samples()).unwrap_or(u32::MAX);
         let aac = AudioStreamBasicDescription {
-            mSampleRate: f64::from(config.sample_rate),
-            mFormatID: kAudioFormatMPEG4AAC,
+            mSampleRate: f64::from(sample_rate),
+            mFormatID: match profile {
+                Profile::Lc(_) => kAudioFormatMPEG4AAC,
+                Profile::Eld => kAudioFormatMPEG4AAC_ELD,
+            },
             mFormatFlags: 0,
             mBytesPerPacket: 0,
-            mFramesPerPacket: FRAME_SAMPLES as u32,
+            mFramesPerPacket: frame_samples,
             mBytesPerFrame: 0,
             mChannelsPerFrame: channels,
             mBitsPerChannel: 0,
@@ -173,7 +237,12 @@ impl AtAacEncoder {
         if status != 0 || raw.is_null() {
             return Err(CodecError::BackendUnavailable {
                 backend: BACKEND,
-                reason: format!("no AAC encoder for this input: {}", os_status(status)),
+                reason: format!(
+                    "no {} encoder for {sample_rate} Hz / {} channels: {}",
+                    profile.codec(),
+                    config.channels,
+                    os_status(status)
+                ),
             });
         }
         let converter = Converter(raw);
@@ -188,16 +257,13 @@ impl AtAacEncoder {
             )
         };
         if status != 0 {
-            return Err(CodecError::UnsupportedConfig {
-                backend: BACKEND,
-                what: format!(
-                    "{} kbps at {} Hz with {} channels ({})",
-                    config.bitrate_kbps,
-                    config.sample_rate,
-                    config.channels,
-                    os_status(status)
-                ),
-            });
+            return Err(unsupported(format!(
+                "{} at {} kbps, {sample_rate} Hz, {} channels ({})",
+                profile.codec(),
+                config.bitrate_kbps,
+                config.channels,
+                os_status(status)
+            )));
         }
         let mut max_packet = 0u32;
         let mut size = 4u32;
@@ -217,31 +283,43 @@ impl AtAacEncoder {
             ));
         }
         info!(
-            sample_rate = config.sample_rate,
+            codec = %profile.codec(),
+            input_rate = config.sample_rate,
+            sample_rate,
             channels = config.channels,
             bitrate_kbps = config.bitrate_kbps,
             "AAC encoder backend: AudioToolbox"
         );
         Ok(Self {
             converter,
-            shape,
-            sample_rate: config.sample_rate,
+            profile,
+            audio_specific_config,
+            input_rate: config.sample_rate,
+            sample_rate,
             channels: config.channels,
-            pcm: Vec::with_capacity(FRAME_SAMPLES * usize::from(config.channels) * 4),
-            clock: AudioClock::new(config.sample_rate),
+            resampler: (config.sample_rate != sample_rate)
+                .then(|| Resampler::new(config.sample_rate, sample_rate, config.channels)),
+            resampled: Vec::new(),
+            pcm: Vec::with_capacity(profile.frame_samples() * usize::from(config.channels) * 4),
+            clock: AudioClock::new(sample_rate),
             packet: vec![0; max_packet as usize],
             pending: Vec::new(),
         })
     }
 
-    /// Feeds one AAC frame of PCM from the front of `pcm` (or, with
-    /// `drain`, none, to pull out what the encoder still holds) and
-    /// queues the packet it yields; returns whether one came out.
+    /// Feeds one frame of PCM from the front of `pcm` (or, with `drain`,
+    /// none, to pull out what the encoder still holds) and queues the
+    /// packet it yields; returns whether one came out.
     fn encode_frame(&mut self, drain: bool) -> CodecResult<bool> {
         let channels = u32::from(self.channels);
+        let frame_samples = self.profile.frame_samples();
         let mut feed = Feed {
             data: self.pcm.as_ptr(),
-            frames: if drain { 0 } else { FRAME_SAMPLES as u32 },
+            frames: if drain {
+                0
+            } else {
+                u32::try_from(frame_samples).unwrap_or(u32::MAX)
+            },
             channels,
         };
         let mut output = AudioBufferList {
@@ -272,7 +350,7 @@ impl AtAacEncoder {
             )
         };
         if !drain {
-            self.pcm.drain(..FRAME_SAMPLES * usize::from(self.channels));
+            self.pcm.drain(..frame_samples * usize::from(self.channels));
         }
         if status != 0 && status != NO_MORE_INPUT {
             return Err(fail(
@@ -285,18 +363,20 @@ impl AtAacEncoder {
             return Ok(false);
         }
         let len = (output.mBuffers[0].mDataByteSize as usize).min(self.packet.len());
-        let adts = self
-            .shape
-            .adts_frame(&self.packet[..len])
-            .ok_or_else(|| fail(Operation::Encode, "the AAC packet is too long for ADTS"))?;
+        let data = match self.profile {
+            Profile::Lc(lc) => lc
+                .adts_frame(&self.packet[..len])
+                .ok_or_else(|| fail(Operation::Encode, "the AAC packet is too long for ADTS"))?,
+            Profile::Eld => self.packet[..len].to_vec(),
+        };
         self.pending.push(AudioFrame {
-            codec: AudioCodec::Aac,
-            data: Bytes::from(adts),
+            codec: self.profile.codec(),
+            data: Bytes::from(data),
             timestamp_us: self.clock.next_timestamp_us(),
             sample_rate: self.sample_rate,
             channels: self.channels,
         });
-        self.clock.advance(FRAME_SAMPLES as u64);
+        self.clock.advance(frame_samples as u64);
         Ok(true)
     }
 }
@@ -325,21 +405,36 @@ impl AudioEncoder for AtAacEncoder {
                 format!("expected PCM input, got {}", frame.codec),
             ));
         }
-        if frame.sample_rate != self.sample_rate || frame.channels != self.channels {
+        if frame.sample_rate != self.input_rate || frame.channels != self.channels {
             return Err(fail(
                 Operation::Encode,
                 format!(
                     "input shape changed mid-stream: configured {} Hz / {} ch, got {} Hz / {} ch",
-                    self.sample_rate, self.channels, frame.sample_rate, frame.channels
+                    self.input_rate, self.channels, frame.sample_rate, frame.channels
                 ),
             ));
         }
         let channels = usize::from(self.channels.max(1));
-        let bytes = frame.data.as_ref();
-        let usable = bytes.len() & !1;
+        let samples: Vec<i16> = frame
+            .data
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let samples = &samples[..samples.len() / channels * channels];
+        let chunk: &[i16] = match self.resampler.as_mut() {
+            Some(resampler) => {
+                self.resampled.clear();
+                resampler.process(samples, &mut self.resampled);
+                &self.resampled
+            }
+            None => samples,
+        };
         let buffered = (self.pcm.len() / channels) as u64;
-        let chunk = (usable / 2 / channels) as u64;
-        let event = self.clock.observe(frame.timestamp_us, buffered, chunk);
+        let event = self.clock.observe(
+            frame.timestamp_us,
+            buffered,
+            (chunk.len() / channels) as u64,
+        );
         match event {
             ClockEvent::Resynced { gap_us } => {
                 debug!(
@@ -357,14 +452,11 @@ impl AudioEncoder for AtAacEncoder {
             ),
             ClockEvent::Anchored | ClockEvent::Continuous | ClockEvent::Trimmed { .. } => {}
         }
-        let skipped = usize::try_from(event.skip())
-            .map_or(usable, |skip| skip.saturating_mul(channels * 2).min(usable));
-        self.pcm.extend(
-            bytes[skipped..usable]
-                .chunks_exact(2)
-                .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
-        );
-        while self.pcm.len() >= FRAME_SAMPLES * channels {
+        let skipped = usize::try_from(event.skip()).map_or(chunk.len(), |skip| {
+            skip.saturating_mul(channels).min(chunk.len())
+        });
+        self.pcm.extend_from_slice(&chunk[skipped..]);
+        while self.pcm.len() >= self.profile.frame_samples() * channels {
             self.encode_frame(false)?;
         }
         Ok(())
@@ -375,7 +467,7 @@ impl AudioEncoder for AtAacEncoder {
     }
 
     fn codec_config(&self) -> Vec<u8> {
-        self.shape.audio_specific_config().to_vec()
+        self.audio_specific_config.clone()
     }
 
     fn flush(mut self) -> CodecResult<Vec<AudioFrame>> {
@@ -387,5 +479,20 @@ impl AudioEncoder for AtAacEncoder {
             }
         }
         Ok(std::mem::take(&mut self.pending))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profiles_frame_their_codec() {
+        let lc = Profile::Lc(AacLc::new(48_000, 2).unwrap());
+        assert_eq!((lc.codec(), lc.frame_samples()), (AudioCodec::Aac, 1024));
+        assert_eq!(
+            (Profile::Eld.codec(), Profile::Eld.frame_samples()),
+            (AudioCodec::AacEld, 480)
+        );
     }
 }
