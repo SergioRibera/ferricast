@@ -25,6 +25,20 @@ pub mod video_encoder;
 #[cfg(feature = "istmo")]
 pub mod plugin;
 
+// Planes / HDR descriptors of the Android surfaces, also tested on the host.
+#[cfg(any(test, all(target_os = "android", feature = "mediacodec")))]
+pub mod cta861;
+#[cfg(any(test, all(target_os = "android", feature = "mediacodec")))]
+pub mod yuv420;
+
+// Android NDK media surfaces (`AHardwareBuffer`, `AImageReader`).
+#[cfg(all(target_os = "android", feature = "mediacodec"))]
+#[allow(
+    unsafe_code,
+    reason = "the NDK is a C API; every block carries a SAFETY comment"
+)]
+pub mod android;
+
 // Windows FFI: the one module of this crate that needs `unsafe`.
 #[cfg(all(target_os = "windows", feature = "media-foundation"))]
 #[allow(
