@@ -10,6 +10,7 @@ use ndk::media::media_codec::{
     MediaFormat,
 };
 use ndk::media_error::MediaError;
+use ndk::native_window::NativeWindow;
 
 /// `AMediaFormat` keys (`NdkMediaFormat.h`). Spelled out rather than read
 /// from the NDK's exported `AMEDIAFORMAT_KEY_*` symbols: several of them
@@ -38,6 +39,8 @@ pub(crate) mod key {
     pub(crate) const IS_ADTS: &str = "is-adts";
     pub(crate) const PCM_ENCODING: &str = "pcm-encoding";
     pub(crate) const MAX_INPUT_SIZE: &str = "max-input-size";
+    /// CTA-861.3 static HDR metadata (`MediaFormat.KEY_HDR_STATIC_INFO`).
+    pub(crate) const HDR_STATIC_INFO: &str = "hdr-static-info";
 }
 
 /// `AMediaCodec` buffer flags.
@@ -50,6 +53,8 @@ pub(crate) mod color_format {
     pub(crate) const I420: i32 = 19;
     /// `COLOR_FormatYUV420SemiPlanar`: NV12.
     pub(crate) const NV12: i32 = 21;
+    /// `COLOR_FormatYUVP010`: P010 (API 29 name; codecs report it earlier).
+    pub(crate) const P010: i32 = 54;
     /// `COLOR_FormatYUV420Flexible`: the codec picks; Codec2 software
     /// decoders lay byte buffers out as I420.
     pub(crate) const FLEXIBLE: i32 = 0x7F42_0888;
@@ -142,9 +147,14 @@ impl Codec {
         self.name().unwrap_or_else(|_| "unnamed codec".to_owned())
     }
 
-    /// Configures the codec as a decoder for `format` and starts it.
-    pub(crate) fn start_decoder(&self, format: &MediaFormat) -> Result<(), CodecError> {
-        self.configure(format, None, MediaCodecDirection::Decoder)
+    /// Configures the codec as a decoder for `format` and starts it,
+    /// rendering into `surface` when one is given.
+    pub(crate) fn start_decoder(
+        &self,
+        format: &MediaFormat,
+        surface: Option<&NativeWindow>,
+    ) -> Result<(), CodecError> {
+        self.configure(format, surface, MediaCodecDirection::Decoder)
             .map_err(media(Operation::Open, "AMediaCodec_configure"))?;
         self.start()
             .map_err(media(Operation::Open, "AMediaCodec_start"))
@@ -185,7 +195,9 @@ impl Codec {
     }
 
     /// Takes the next output buffer within `timeout`: `Some` with its
-    /// bytes, flags and presentation time, `None` when nothing came.
+    /// bytes (or, when `render`, nothing: a picture is rendered to the
+    /// output surface instead), flags and presentation time, `None` when
+    /// nothing came.
     /// An output format change calls `format_changed` (the next
     /// buffers have a new layout); buffer-set changes are consumed.
     pub(crate) fn next_output(
@@ -193,6 +205,7 @@ impl Codec {
         operation: Operation,
         timeout: Duration,
         mut format_changed: impl FnMut(),
+        render: bool,
     ) -> Result<Option<Output>, CodecError> {
         loop {
             match self
@@ -203,15 +216,22 @@ impl Codec {
                     let info = *buffer.info();
                     let start = usize::try_from(info.offset()).unwrap_or(0);
                     let len = usize::try_from(info.size()).unwrap_or(0);
-                    let data = buffer
-                        .buffer()
-                        .get(start..start.saturating_add(len))
-                        .map(<[u8]>::to_vec)
-                        .ok_or_else(|| fail(operation, "output buffer range out of bounds"));
-                    self.release_output_buffer(buffer, false)
+                    // An empty buffer (the end-of-stream marker) has no picture.
+                    let rendered = render && len > 0;
+                    let data = if render {
+                        Ok(Vec::new())
+                    } else {
+                        buffer
+                            .buffer()
+                            .get(start..start.saturating_add(len))
+                            .map(<[u8]>::to_vec)
+                            .ok_or_else(|| fail(operation, "output buffer range out of bounds"))
+                    };
+                    self.release_output_buffer(buffer, rendered)
                         .map_err(media(operation, "AMediaCodec_releaseOutputBuffer"))?;
                     return Ok(Some(Output {
                         data: data?,
+                        rendered,
                         flags: info.flags(),
                         pts_us: u64::try_from(info.presentation_time_us()).unwrap_or(0),
                     }));
@@ -224,9 +244,11 @@ impl Codec {
     }
 }
 
-/// One output buffer, copied out of the codec.
+/// One output buffer, copied out of the codec or rendered to its surface.
 pub(crate) struct Output {
     pub(crate) data: Vec<u8>,
+    /// The picture went to the output surface (`data` is empty).
+    pub(crate) rendered: bool,
     pub(crate) flags: u32,
     pub(crate) pts_us: u64,
 }
