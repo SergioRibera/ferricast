@@ -439,3 +439,102 @@ libgbm 26 with the NVIDIA GBM backend, `/dev/dri/renderD128`.
 - Tests: `tests/decode.rs` on clips from `scripts/decode_fixtures.sh`, each
   picture compared by FNV-1a 64 with FFmpeg's `rawvideo` decode
   (`-flags unaligned` so FFmpeg honours left crops).
+## NVENC decisions
+
+### Per-version structure (`encode/raw.rs`)
+
+- `EncodeApi` (crate-private, on top of `NvencApi`) holds every call whose
+  argument structs differ between API versions: caps / GUID / input-format
+  queries, initialize, reconfigure, sequence params, bitstream buffers,
+  `nvEncSetIOCudaStreams`, register / unregister, map / unmap, encode, EOS,
+  lock. One macro body (`encode_api!`) implements it for every marker
+  `V11_1 … V13_1`, so each instantiation is compiled against that
+  version's bindings. Differences are `yes` / `no` tokens per version,
+  expanded by `pick!`:
+  - `av1` (12.0): AV1 GUIDs, `av1Config`, `av1PicParams`.
+  - `typed_vui` (12.0): VUI colour fields are enums; 11.1 has `u32`.
+  - `bit_depth_enum` (12.2): `inputBitDepth` / `outputBitDepth` replace
+    HEVC `pixelBitDepthMinus8` and AV1 `(input)PixelBitDepthMinus8`.
+  - `native_hdr` (13.0): HEVC / AV1 `outputMasteringDisplay` /
+    `outputMaxCll` and `pMasteringDisplay` / `pMaxCll`.
+  - `chroma_offset_in` (13.0): `NV_ENC_REGISTER_RESOURCE::chromaOffsetIn`.
+  - `uhq` (13.0): `NV_ENC_TUNING_INFO_ULTRA_HIGH_QUALITY`.
+  Other layout changes (`NV_ENC_RC_PARAMS`, `NV_ENC_INITIALIZE_PARAMS`,
+  `NV_ENC_PIC_PARAMS`, `NV_ENC_LOCK_BITSTREAM`, ...) need no code: the
+  fields used exist in every version, the per-module types and `*_VER`
+  constants carry the layout.
+- `ApiFeature` (public) names those features with `added_in()`;
+  `Capabilities::features` lists what the negotiated version has, and a
+  test checks the macro tokens agree with `added_in()`. Use on an older
+  version is `Error::Unsupported` naming the version and driver.
+- `Encoder` is an enum over `Engine<A>` per version (no `dyn`);
+  `Engine<A>` (`encode/engine.rs`) is version-independent.
+- 11.1's generated `GUID` derives no `PartialEq`: GUIDs compare by field.
+
+### HDR10
+
+- 13.0+: HEVC (and AV1) metadata written by NVENC (config bits plus
+  pointers on every picture). H.264 on every version and HEVC before 13.0:
+  this crate builds SEI 137 / 144 payloads (`encode/sei.rs`) and passes them
+  through `seiPayloadArray` on pictures it expects to be IDRs. AV1 HDR10
+  before 13.0 is refused (no tested OBU path).
+- IDR prediction: first picture, forced IDR, and every `idr_period` since
+  the last IDR. Verified on driver 595: a forced IDR restarts NVENC's IDR
+  period (period 10, forced 4, requested 13 → IDRs 0, 4, 13, 23).
+
+### Inputs and pipeline
+
+- Pipeline depth = 1 + `frames_in_flight` + B frames + lookahead: one
+  bitstream buffer and one (lazily created, registered once) host slot per
+  position. Inputs are mapped per picture and unmapped after the lock.
+- Host input: `cuMemcpy2DAsync` on the encoder stream, then an event wait
+  before the call returns (the caller's slice is free afterwards, even if
+  pinned by someone).
+- Device input: cached by `Arc<DeviceBuffer>` address with a `Weak`; the
+  `Weak` keeps the `Arc` allocation, so the address cannot be reused while
+  the entry exists, and `strong_count() == 0` retires it (swept on each
+  device encode). A pending picture holds a strong `Arc`, so a buffer is
+  never freed while NVENC reads it. Deviation from NVIDIA's "unregister
+  before free": a dropped buffer's registration is unregistered at the next
+  sweep, after `cuMemFree`; it is never mapped in between. A buffer still
+  pending is refused rather than mapped twice. The decode module should
+  hand out frames as `Arc<DeviceBuffer>` (or something lending one).
+- A chroma plane not right after the luma rows (`DeviceFrame::chroma_row`)
+  uses `chromaOffsetIn` (13.0); verified bit-identical to a contiguous
+  frame on 13.0, refused on 11.1–12.2.
+- CUDA arrays (packed RGB only): cached by a caller key, compared with the
+  array handle and size; `encode_array` is `unsafe` because a destroyed
+  array whose handle is reused under the same key without
+  `invalidate_array` would hit a stale registration.
+- Evicted registrations are retired and unregistered only once every
+  picture submitted before the eviction has been locked.
+- Readiness: `NV_ENC_ERR_NEED_MORE_INPUT` holds pictures (B frames). With
+  lookahead NVENC answers success while the last `depth` pictures are not
+  lockable yet (locking them fails with `INVALID_PARAM`), so after a
+  success all but `lookahead` pending pictures are ready; EOS releases all.
+
+### Errors
+
+- Session limit: driver 595 on an RTX 3060 answers
+  `NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY` from `nvEncOpenEncodeSessionEx` after
+  12 sessions; older drivers `NV_ENC_ERR_OUT_OF_MEMORY`. Both map to
+  `Error::NvencSessionLimit`.
+- Every NVENC failure carries `nvEncGetLastErrorString` (often empty).
+
+### Verified (RTX 3060, driver 595.71.05, API 11.1–13.0 forced)
+
+- H.264 / HEVC from NV12, ARGB, ABGR and HEVC Main10 from P010 with
+  HDR10: identical bitstreams across versions, ffprobe codec / profile /
+  pix_fmt / colour / keyframes / HDR side data as configured, PSNR 58.7
+  (NV12), 43.5 (RGB, BT.709 conversion), 61.9 dB (P010).
+- Host, device and CUDA-array input give identical bitstreams.
+- Ultra-high-quality tuning on 13.0 is refused by this GPU
+  (`nvEncInitializeEncoder` `INVALID_PARAM`); AV1 is `MissingFromGpu`.
+- 1080p NV12 H.264 P1 ultra-low-latency (debug build): 426 fps host, 473
+  device; with 3 frames in flight 477 / 484 fps.
+- Open: with many NVENC sessions opening and closing at once on the GPU
+  (the parallel test run, one test holding the 12-session limit), an
+  `nvEncOpenEncodeSessionEx` once failed with `NV_ENC_ERR_INVALID_VERSION`
+  instead of the limit status; not reproduced with two processes looping
+  over different API versions. The encode tests are serialised and the
+  limit test runs in its own process.
