@@ -233,8 +233,68 @@ impl LinuxP2pClient {
                     return;
                 }
             };
+            // supplicant fires ProvisionDiscoveryRequestDisplayPin with
+            // a PIN *it* generated as soon as the phone picks us from
+            // its list and asks "show me a PIN I can type". That PIN
+            // is what the phone screen's keypad expects — if we don't
+            // display it the user sees the entry field but has nothing
+            // to type.
+            let mut prov_pin =
+                match p2p_owned.receive_signal("ProvisionDiscoveryRequestDisplayPin").await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sink: subscribe ProvDisc display-pin");
+                        return;
+                    }
+                };
+            let mut prov_pbc = match p2p_owned.receive_signal("ProvisionDiscoveryPBCRequest").await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sink: subscribe ProvDisc PBC");
+                    return;
+                }
+            };
+            let mut prov_fail = match p2p_owned.receive_signal("ProvisionDiscoveryFailure").await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sink: subscribe ProvDisc failure");
+                    return;
+                }
+            };
+            // Last PIN supplicant handed us for the pending peer — used
+            // if the subsequent GONegotiationRequest asks for the same
+            // method so we feed back the PIN the phone is typing.
+            let mut last_prov_pin: Option<(OwnedObjectPath, String)> = None;
             loop {
                 tokio::select! {
+                    msg = prov_pin.next() => {
+                        let Some(sig) = msg else { break };
+                        // `ProvisionDiscoveryRequestDisplayPin(peer: o, pin: s)`.
+                        let Ok((peer, pin)): Result<(OwnedObjectPath, String), _>
+                            = sig.body().deserialize() else { continue };
+                        // Show the PIN prominently so the user can type it
+                        // on the phone.
+                        tracing::warn!(
+                            peer = %peer.as_str(),
+                            pin = %pin,
+                            "miracast sink: PIN to type on phone → **{}** ←",
+                            pin,
+                        );
+                        last_prov_pin = Some((peer, pin));
+                    }
+                    msg = prov_pbc.next() => {
+                        let Some(sig) = msg else { break };
+                        if let Ok(peer) = sig.body().deserialize::<OwnedObjectPath>() {
+                            tracing::info!(peer = %peer.as_str(), "sink: ProvDisc PBC request");
+                        }
+                    }
+                    msg = prov_fail.next() => {
+                        let Some(sig) = msg else { break };
+                        if let Ok((peer, status)) = sig.body().deserialize::<(OwnedObjectPath, i32)>() {
+                            tracing::warn!(peer = %peer.as_str(), status, "sink: ProvDisc failed");
+                        }
+                    }
                     msg = gon.next() => {
                         let Some(sig) = msg else { break };
                         // supplicant's signal body is
@@ -248,28 +308,28 @@ impl LinuxP2pClient {
                         //   0x0004 Push-Button
                         //   0x0005 Registrar-specified
                         //   0x0007 NFC
+                        // Prefer the PIN supplicant generated at
+                        // ProvDisc time for this very peer — that's the
+                        // PIN the phone is prompting for.
+                        let prov_pin_for_peer = last_prov_pin
+                            .as_ref()
+                            .filter(|(p, _)| p == &peer)
+                            .map(|(_, pin)| pin.clone());
                         let (wps_method, maybe_pin): (&str, Option<String>) = match pwd_id {
                             0x0004 => ("pbc", None),
-                            _ => match &pairing {
-                                PairingMode::PushButton => {
-                                    // Peer wants a PIN but caller asked
-                                    // for PBC. Auto-generate a Miracast
-                                    // 8-digit WPS PIN and shout it in the
-                                    // logs so the user can read it off
-                                    // the terminal and type it on the
-                                    // phone. GUI can intercept this log
-                                    // or read the PIN from the pairing
-                                    // mode after the fact.
+                            _ => match (&pairing, prov_pin_for_peer) {
+                                (_, Some(pin)) => ("display", Some(pin)),
+                                (PairingMode::PushButton, None) => {
                                     let pin = generate_wps_pin();
                                     tracing::warn!(
                                         pin = %pin,
-                                        "miracast sink: peer asked for PIN pairing but PairingMode::PushButton — displaying generated PIN **{}**",
+                                        "miracast sink: GON asked PIN w/o ProvDisc hint — displaying **{}**",
                                         pin,
                                     );
                                     ("display", Some(pin))
                                 }
-                                PairingMode::DisplayPin(p) => ("display", Some(p.clone())),
-                                PairingMode::EnterPin(p) => ("keypad", Some(p.clone())),
+                                (PairingMode::DisplayPin(p), None) => ("display", Some(p.clone())),
+                                (PairingMode::EnterPin(p), None) => ("keypad", Some(p.clone())),
                             },
                         };
                         tracing::info!(
