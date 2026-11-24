@@ -12,6 +12,8 @@
 //! - [`version`]: NVENC API version negotiation against the installed driver
 //!   and the per-version plumbing ([`version::NvencApi`]).
 //! - [`encode`]: NVENC sessions.
+//! - `interop` (Linux): zero-copy import of DMA-BUFs (screen capture) into
+//!   CUDA through EGL, lending CUDA arrays NVENC encodes from.
 //! - [`sys`]: the raw generated bindings.
 //!
 //! The bindings come from FFmpeg's nv-codec-headers (one NVENC module per API
@@ -38,6 +40,8 @@
 pub mod cuda;
 pub mod encode;
 pub mod error;
+#[cfg(target_os = "linux")]
+pub mod interop;
 pub mod loader;
 pub mod sys;
 pub mod version;

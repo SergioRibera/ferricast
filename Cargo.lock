@@ -2358,6 +2358,7 @@ dependencies = [
 name = "ferricast-nvcodec"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libloading 0.9.1",
  "thiserror 2.0.18",
  "tracing",
