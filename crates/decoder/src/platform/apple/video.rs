@@ -635,12 +635,16 @@ impl VideoDecoder for VtDecoder {
 
     fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()> {
         codec_type(config.codec)?;
-        if config.codec != self.codec {
+        // The same codec keeps its parameter sets and session: a
+        // reconfigure mid-stream must not drop slices until the next
+        // in-band SPS / PPS.
+        let slots = if config.codec == Codec::H265 { 3 } else { 2 };
+        if config.codec != self.codec || self.sets.len() != slots {
             self.session = None;
             self.session_sets.clear();
             self.codec = config.codec;
+            self.sets = vec![None; slots];
         }
-        self.sets = vec![None; if self.codec == Codec::H265 { 3 } else { 2 }];
         self.format = OutputFormat(config.pixel_format);
         self.low_latency = config.low_latency;
         self.container_colour = config.colour;

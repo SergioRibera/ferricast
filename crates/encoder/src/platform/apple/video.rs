@@ -10,6 +10,7 @@
 //! keeps the parameter sets in the sample's format description; they are
 //! copied in front of every keyframe, as x264 repeats them in-band.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -655,6 +656,8 @@ pub(crate) struct VtEncoder {
     frame_count: u64,
     /// The parameter sets of the latest keyframe (Annex B).
     headers: Vec<u8>,
+    /// Outputs delivered beyond the one each `encode` returns, oldest first.
+    queued: VecDeque<Output>,
 }
 
 impl VtEncoder {
@@ -666,6 +669,7 @@ impl VtEncoder {
             pending_keyframe: false,
             frame_count: 0,
             headers: Vec::new(),
+            queued: VecDeque::new(),
         };
         encoder.configure(config)?;
         Ok(encoder)
@@ -678,8 +682,14 @@ impl VtEncoder {
         })
     }
 
-    /// Submits one picture and waits for its output.
-    fn submit(&mut self, view: &FrameView<'_>, pts_us: i64, keyframe: bool) -> CodecResult<Output> {
+    /// Submits one picture and waits for its output; returns everything
+    /// the callback delivered meanwhile (normally that one output).
+    fn submit(
+        &mut self,
+        view: &FrameView<'_>,
+        pts_us: i64,
+        keyframe: bool,
+    ) -> CodecResult<Vec<Output>> {
         let session = self.session(Operation::Encode)?;
         let codec = session.config.codec;
         let fps = i64::from(session.config.fps.max(1));
@@ -716,21 +726,33 @@ impl VtEncoder {
             Operation::Encode,
             "VTCompressionSessionCompleteFrames",
         )?;
-        let mut outputs = std::mem::take(&mut *lock(&session.outbox));
-        match outputs.len() {
-            1 => Ok(outputs.remove(0)),
-            0 => Err(fail(
-                Operation::Encode,
-                "the encoder returned no output for the frame",
-            )),
-            more => {
-                warn!(
-                    outputs = more,
-                    "VideoToolbox returned several outputs for one frame"
-                );
-                Ok(outputs.remove(0))
+        let outputs = std::mem::take(&mut *lock(&session.outbox));
+        if outputs.len() > 1 {
+            debug!(
+                outputs = outputs.len(),
+                "VideoToolbox returned several outputs for one frame; queueing the extras"
+            );
+        }
+        Ok(outputs)
+    }
+
+    /// The oldest queued picture, skipping (and logging) dropped ones.
+    fn next_frame(
+        &mut self,
+        codec: Codec,
+        fps: u32,
+        timestamp_us: u64,
+    ) -> CodecResult<EncodedFrame> {
+        while let Some(output) = self.queued.pop_front() {
+            match output {
+                Output::Dropped => warn!("VideoToolbox dropped a frame"),
+                other => return self.finish(other, codec, fps, timestamp_us),
             }
         }
+        Err(fail(
+            Operation::Encode,
+            "the encoder returned no output for the frame (it was dropped)",
+        ))
     }
 
     fn try_encode(&mut self, frame: CapturedFrame) -> CodecResult<EncodedFrame> {
@@ -752,9 +774,10 @@ impl VtEncoder {
             .map_err(CodecError::from_backend(BACKEND, Operation::Encode))?;
         let pts_us = i64::try_from(raw.timestamp_us)
             .map_err(|_| fail(Operation::Encode, "timestamp exceeds i64"))?;
-        let output = self.submit(&view, pts_us, self.pending_keyframe)?;
+        let outputs = self.submit(&view, pts_us, self.pending_keyframe)?;
         self.pending_keyframe = false;
-        self.finish(output, codec, fps, raw.timestamp_us)
+        self.queued.extend(outputs);
+        self.next_frame(codec, fps, raw.timestamp_us)
     }
 
     fn finish(
@@ -816,12 +839,26 @@ impl VtEncoder {
         };
         let view = FrameView::new(&raw, width, height)
             .map_err(CodecError::from_backend(BACKEND, Operation::Headers))?;
-        match self.submit(&view, 0, true)? {
-            Output::Frame { parameter_sets, .. } => self.headers = parameter_sets,
-            Output::Dropped => {
-                return Err(fail(Operation::Headers, "the priming frame was dropped"));
+        // Everything the priming submission yields is discarded; only the
+        // parameter sets are kept.
+        let mut failure = None;
+        for output in self.submit(&view, 0, true)? {
+            match output {
+                Output::Frame { parameter_sets, .. } if !parameter_sets.is_empty() => {
+                    self.headers = parameter_sets;
+                }
+                Output::Frame { .. } => {}
+                Output::Dropped => {
+                    failure = failure.or(Some("the priming frame was dropped".to_owned()))
+                }
+                Output::Failed(reason) => failure = Some(reason),
             }
-            Output::Failed(reason) => return Err(fail(Operation::Headers, reason)),
+        }
+        if self.headers.is_empty() {
+            return Err(fail(
+                Operation::Headers,
+                failure.unwrap_or_else(|| "the priming frame carried no parameter sets".to_owned()),
+            ));
         }
         self.pending_keyframe = true;
         Ok(())
@@ -876,11 +913,32 @@ impl VideoEncoder for VtEncoder {
             Operation::Flush,
             "VTCompressionSessionCompleteFrames",
         )?;
-        let outputs = std::mem::take(&mut *lock(&session.outbox));
-        outputs
-            .into_iter()
-            .map(|output| self.finish(output, codec, fps, 0))
-            .collect()
+        let delivered = std::mem::take(&mut *lock(&session.outbox));
+        self.queued.extend(delivered);
+        // A dropped or failed picture loses only itself: the rest of the
+        // tail is still handed out.
+        let mut frames = Vec::new();
+        let mut lost = Vec::new();
+        while let Some(output) = self.queued.pop_front() {
+            match output {
+                Output::Dropped => {
+                    warn!("VideoToolbox dropped a frame while flushing");
+                    lost.push("dropped".to_owned());
+                }
+                Output::Failed(reason) => {
+                    warn!(%reason, "VideoToolbox failed a frame while flushing");
+                    lost.push(reason);
+                }
+                frame @ Output::Frame { .. } => frames.push(self.finish(frame, codec, fps, 0)?),
+            }
+        }
+        if frames.is_empty() && !lost.is_empty() {
+            return Err(fail(
+                Operation::Flush,
+                format!("no flushed frame survived: {}", lost.join("; ")),
+            ));
+        }
+        Ok(frames)
     }
 
     fn get_headers(&mut self) -> CodecResult<Vec<u8>> {
