@@ -34,8 +34,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ferricast_core::{
-    BackendId, ChromaLocation, CodecError, CodecResult, ColourDescription, ColourPrimaries,
-    ColourRange, MatrixCoefficients, Operation, TransferCharacteristics,
+    BackendId, ChromaLocation, Chromaticity, CodecError, CodecResult, ColourDescription,
+    ColourPrimaries, ColourRange, ContentLightLevel, HdrMetadata, MasteringDisplay,
+    MatrixCoefficients, Operation, TransferCharacteristics,
 };
 use windows::Win32::Foundation::RPC_E_TIMEOUT;
 use windows::Win32::Media::MediaFoundation::{
@@ -43,13 +44,15 @@ use windows::Win32::Media::MediaFoundation::{
     IMFTransform, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
     MF_E_NO_EVENTS_AVAILABLE, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
     MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_EVENT_TYPE, MF_LOW_LATENCY,
-    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_CHROMA_SITING,
-    MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_TRANSFORM_ASYNC,
-    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateAlignedMemoryBuffer, MFCreateMediaType,
-    MFCreateSample, MFSTARTUP_NOSOCKET, MFStartup, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute,
-    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    MF_MT_CUSTOM_VIDEO_PRIMARIES, MF_MT_MAJOR_TYPE, MF_MT_MAX_FRAME_AVERAGE_LUMINANCE_LEVEL,
+    MF_MT_MAX_LUMINANCE_LEVEL, MF_MT_MAX_MASTERING_LUMINANCE, MF_MT_MIN_MASTERING_LUMINANCE,
+    MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_CHROMA_SITING, MF_MT_VIDEO_NOMINAL_RANGE,
+    MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
+    MF_VERSION, MFCreateAlignedMemoryBuffer, MFCreateMediaType, MFCreateSample, MFSTARTUP_NOSOCKET,
+    MFStartup, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MFT_REGISTER_TYPE_INFO, MFTEnumEx,
 };
@@ -58,6 +61,10 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4};
 use windows::core::{GUID, Interface, PWSTR};
+
+mod d3d11;
+
+pub use d3d11::{D3d11Texture, Device, Rect};
 
 /// How long an asynchronous MFT may go without sending an event the
 /// session waits for before the call fails.
@@ -1154,4 +1161,128 @@ pub fn colour_of(media: &IMFMediaType) -> Option<ColourDescription> {
         _ => None,
     };
     Some(siting.map_or(colour, |location| colour.with_chroma_location(location)))
+}
+
+/// Bytes of an `MT_CUSTOM_VIDEO_PRIMARIES` blob: eight `f32`s, red,
+/// green, blue and white point, `x` then `y`.
+const PRIMARIES_BLOB_LEN: usize = 32;
+
+/// Writes `hdr` as Media Foundation's static HDR attributes: the
+/// mastering luminances (`MF_MT_MAX_MASTERING_LUMINANCE` in cd/m²,
+/// `MF_MT_MIN_MASTERING_LUMINANCE` in 0.0001 cd/m²), the mastering
+/// primaries as `MF_MT_CUSTOM_VIDEO_PRIMARIES` (the colour primaries
+/// themselves stay in `MF_MT_VIDEO_PRIMARIES`), and `MaxCLL` / `MaxFALL`.
+///
+/// # Errors
+/// The attribute write failure.
+pub fn set_hdr(media: &IMFMediaType, hdr: HdrMetadata, operation: Operation) -> CodecResult<()> {
+    // SAFETY: plain attribute writes on a live media type.
+    unsafe {
+        if let Some(display) = hdr.mastering_display {
+            media
+                .SetUINT32(
+                    &MF_MT_MAX_MASTERING_LUMINANCE,
+                    display.max_luminance / 10_000,
+                )
+                .mf(operation, "setting MF_MT_MAX_MASTERING_LUMINANCE")?;
+            media
+                .SetUINT32(&MF_MT_MIN_MASTERING_LUMINANCE, display.min_luminance)
+                .mf(operation, "setting MF_MT_MIN_MASTERING_LUMINANCE")?;
+            let mut blob = [0u8; PRIMARIES_BLOB_LEN];
+            let points = [
+                display.red,
+                display.green,
+                display.blue,
+                display.white_point,
+            ];
+            for (chunk, point) in blob.chunks_exact_mut(8).zip(points) {
+                let (x, y) = point.xy();
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "chromaticities are in 0..=1.31, far inside f32"
+                )]
+                let (x, y) = (x as f32, y as f32);
+                chunk[..4].copy_from_slice(&x.to_le_bytes());
+                chunk[4..].copy_from_slice(&y.to_le_bytes());
+            }
+            media
+                .SetBlob(&MF_MT_CUSTOM_VIDEO_PRIMARIES, &blob)
+                .mf(operation, "setting MF_MT_CUSTOM_VIDEO_PRIMARIES")?;
+        }
+        if let Some(light) = hdr.content_light {
+            media
+                .SetUINT32(&MF_MT_MAX_LUMINANCE_LEVEL, u32::from(light.max_cll))
+                .mf(operation, "setting MF_MT_MAX_LUMINANCE_LEVEL")?;
+            media
+                .SetUINT32(
+                    &MF_MT_MAX_FRAME_AVERAGE_LUMINANCE_LEVEL,
+                    u32::from(light.max_fall),
+                )
+                .mf(operation, "setting MF_MT_MAX_FRAME_AVERAGE_LUMINANCE_LEVEL")?;
+        }
+    }
+    Ok(())
+}
+
+/// The static HDR metadata a media type carries (see [`set_hdr`]). The
+/// mastering display needs both luminances and the primaries blob;
+/// Media Foundation has no other place for its primaries.
+#[must_use]
+pub fn hdr_of(media: &IMFMediaType) -> Option<HdrMetadata> {
+    // SAFETY: plain attribute reads on a live media type.
+    let read = |key: &GUID| unsafe { media.GetUINT32(key) }.ok();
+    let mut blob = [0u8; PRIMARIES_BLOB_LEN];
+    // SAFETY: the blob is read into a buffer of its declared size.
+    let primaries = unsafe { media.GetBlob(&MF_MT_CUSTOM_VIDEO_PRIMARIES, &mut blob, None) }
+        .is_ok()
+        .then_some(blob);
+    let mastering_display = match (
+        read(&MF_MT_MAX_MASTERING_LUMINANCE),
+        read(&MF_MT_MIN_MASTERING_LUMINANCE),
+        primaries,
+    ) {
+        (Some(max), Some(min), Some(blob)) => {
+            let coordinate = |at: usize| {
+                let value =
+                    f32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "clamped to the u16 range first"
+                )]
+                let units = (f64::from(value) * Chromaticity::SCALE)
+                    .round()
+                    .clamp(0.0, f64::from(u16::MAX)) as u16;
+                units
+            };
+            let point = |at: usize| Chromaticity {
+                x: coordinate(at),
+                y: coordinate(at + 4),
+            };
+            Some(MasteringDisplay {
+                red: point(0),
+                green: point(8),
+                blue: point(16),
+                white_point: point(24),
+                max_luminance: max.saturating_mul(10_000),
+                min_luminance: min,
+            })
+        }
+        _ => None,
+    };
+    let content_light = match (
+        read(&MF_MT_MAX_LUMINANCE_LEVEL),
+        read(&MF_MT_MAX_FRAME_AVERAGE_LUMINANCE_LEVEL),
+    ) {
+        (None, None) => None,
+        (cll, fall) => Some(ContentLightLevel {
+            max_cll: cll.map_or(0, |v| u16::try_from(v).unwrap_or(u16::MAX)),
+            max_fall: fall.map_or(0, |v| u16::try_from(v).unwrap_or(u16::MAX)),
+        }),
+    };
+    let hdr = HdrMetadata {
+        mastering_display,
+        content_light,
+    };
+    (!hdr.is_empty()).then_some(hdr)
 }
