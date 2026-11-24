@@ -191,9 +191,9 @@ async fn video_frames_survive_the_wire_and_are_paced() {
     let h = harness().await;
     let capture = unix_now_us();
     let key_frame: Vec<u8> = (0..MAX_PAYLOAD_SIZE * 100 + 123)
-        .map(|i| (i * 13) as u8)
+        .map(|i| (i * 13).to_le_bytes()[0])
         .collect();
-    let delta: Vec<u8> = (0..2_000).map(|i| (i * 3) as u8).collect();
+    let delta: Vec<u8> = (0..2_000_u16).map(|i| (i * 3).to_le_bytes()[0]).collect();
 
     // A delta frame before any key frame is useless to the receiver.
     send(&h, StreamKind::Video, &delta, false, capture - 10_000).await;
@@ -270,8 +270,16 @@ async fn video_frames_survive_the_wire_and_are_paced() {
     assert_eq!(u32::from_be_bytes(sr[4..8].try_into().unwrap()), TX_SSRC);
     let ntp = u64::from_be_bytes(sr[8..16].try_into().unwrap());
     let sr_rtp = u32::from_be_bytes(sr[16..20].try_into().unwrap());
-    let since_capture_s = (ntp - unix_us_to_ntp(capture)) as f64 / 4_294_967_296.0;
-    let expected = ts0.wrapping_add((since_capture_s * 90_000.0).round() as u32);
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a few seconds of NTP time: exact in f64, positive and small in u32"
+    )]
+    let expected = {
+        let since_capture_s = (ntp - unix_us_to_ntp(capture)) as f64 / 4_294_967_296.0;
+        ts0.wrapping_add((since_capture_s * 90_000.0).round() as u32)
+    };
     let diff = sr_rtp
         .wrapping_sub(expected)
         .min(expected.wrapping_sub(sr_rtp));

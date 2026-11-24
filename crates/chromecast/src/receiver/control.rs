@@ -239,6 +239,10 @@ impl MediaState {
     /// position replaces the locally extrapolated one (re-basing the
     /// clock when playing), and what the media really is overrides the
     /// sender's LOAD `streamType`.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "media positions in microseconds stay far below 2^52"
+    )]
     fn apply(&mut self, status: &PlaybackStatus) {
         if let Some(position_us) = status.position_us {
             self.position = position_us as f64 / 1_000_000.0;
@@ -672,7 +676,7 @@ async fn dispatch_receiver(
                 if let Some(level) = vol.get("level").and_then(Value::as_f64) {
                     let level = level.clamp(0.0, 1.0);
                     ctx.shared.set_volume_level(level);
-                    ctx.forward(MediaCommand::SetSystemVolume(level as f32))
+                    ctx.forward(MediaCommand::SetSystemVolume(narrow(level)))
                         .await;
                 }
                 if let Some(muted) = vol.get("muted").and_then(Value::as_bool) {
@@ -694,6 +698,10 @@ async fn dispatch_receiver(
     ctx.send(&reply).await
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match over the media namespace's message types"
+)]
 async fn dispatch_media(
     msg: &CastMessage,
     value: &Value,
@@ -769,7 +777,7 @@ async fn dispatch_media(
                 if let Some(level) = vol.get("level").and_then(Value::as_f64) {
                     let level = level.clamp(0.0, 1.0);
                     ctx.shared.set_volume_level(level);
-                    ctx.forward(MediaCommand::SetVolume(level as f32)).await;
+                    ctx.forward(MediaCommand::SetVolume(narrow(level))).await;
                 }
                 if let Some(muted) = vol.get("muted").and_then(Value::as_bool) {
                     ctx.shared.set_muted(muted);
@@ -780,7 +788,7 @@ async fn dispatch_media(
         "GET_STATUS" => {}
         "SET_PLAYBACK_RATE" => {
             if let Some(rate) = value.get("playbackRate").and_then(Value::as_f64) {
-                ctx.forward(MediaCommand::SetPlaybackRate(rate as f32))
+                ctx.forward(MediaCommand::SetPlaybackRate(narrow(rate)))
                     .await;
             }
         }
@@ -915,6 +923,21 @@ async fn send_media_status(ctx: &Ctx, request_id: Option<i64>, destination: &str
     ctx.send(&reply).await
 }
 
+/// A sender's volume level or playback rate as the `f32` the media
+/// commands carry.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "volume levels (0..=1) and playback rates fit f32"
+)]
+fn narrow(value: f64) -> f32 {
+    value as f32
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped non-negative, and far below u64::MAX µs for any real position"
+)]
 fn secs_to_us(secs: f64) -> u64 {
     // Non-negative and far below u64::MAX µs for any real position.
     (secs.max(0.0) * 1_000_000.0) as u64

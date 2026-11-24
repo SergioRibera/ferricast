@@ -386,9 +386,9 @@ mod tests {
     async fn recv_handles_split_and_coalesced_frames() {
         let (mut tx, mut rx) = tokio::io::duplex(64);
         let ping = ping_message().unwrap();
-        let pong = pong_message().unwrap();
+        let heartbeat_reply = pong_message().unwrap();
         let mut bytes = frame(&ping);
-        bytes.extend(frame(&pong));
+        bytes.extend(frame(&heartbeat_reply));
         let writer = tokio::spawn(async move {
             // Dribble 3 bytes at a time across both frames.
             for chunk in bytes.chunks(3) {
@@ -398,7 +398,10 @@ mod tests {
         });
         let mut buf = BytesMut::new();
         assert_eq!(recv(&mut rx, &mut buf).await.unwrap(), Some(ping));
-        assert_eq!(recv(&mut rx, &mut buf).await.unwrap(), Some(pong));
+        assert_eq!(
+            recv(&mut rx, &mut buf).await.unwrap(),
+            Some(heartbeat_reply)
+        );
         writer.await.unwrap();
         assert_eq!(recv(&mut rx, &mut buf).await.unwrap(), None);
     }

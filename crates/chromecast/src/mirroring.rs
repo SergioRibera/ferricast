@@ -53,7 +53,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const CONTROL_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(15);
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
-/// Minimum spacing of GET_STATUS requests while waiting for the app.
+/// Minimum spacing of `GET_STATUS` requests while waiting for the app.
 const STATUS_NUDGE_INTERVAL: Duration = Duration::from_millis(500);
 /// After the first frame is sent, the receiver must acknowledge a frame
 /// within this time or mirroring is considered not to work.
@@ -309,6 +309,10 @@ impl CastSession for ChromecastMirrorSession {
         Ok(ConnectOutcome::Ready)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the Cast Streaming OFFER / ANSWER negotiation, one step after the other"
+    )]
     async fn setup_stream(&mut self, config: &StreamConfig) -> Result<()> {
         if config.codec != Codec::H264 {
             return Err(FerricastError::UnsupportedCodec {
@@ -704,7 +708,7 @@ impl ControlReader {
     }
 }
 
-/// What a RECEIVER_STATUS application list means for our mirroring app.
+/// What a `RECEIVER_STATUS` application list means for our mirroring app.
 #[derive(Debug, PartialEq, Eq)]
 enum StatusVerdict {
     Running,

@@ -138,12 +138,12 @@ impl Transport {
         loop {
             let wake = self.next_burst_at(Instant::now());
             let sleep_target = wake.map_or_else(
-                || tokio::time::Instant::now() + Duration::from_secs(3600),
+                || tokio::time::Instant::now() + Duration::from_hours(1),
                 tokio::time::Instant::from_std,
             );
             tokio::select! {
                 frame = frames.recv() => match frame {
-                    Some(frame) => self.enqueue(frame, Instant::now()),
+                    Some(frame) => self.enqueue(&frame, Instant::now()),
                     None => break,
                 },
                 received = self.socket.recv(&mut recv_buf) => match received {
@@ -171,7 +171,7 @@ impl Transport {
         }
     }
 
-    fn enqueue(&mut self, frame: MediaFrame, now: Instant) {
+    fn enqueue(&mut self, frame: &MediaFrame, now: Instant) {
         if frame.kind == StreamKind::Video {
             if self.shared.upstream_drop.swap(false, Ordering::Relaxed) {
                 self.awaiting_video_key_frame = true;

@@ -48,7 +48,7 @@ const MAX_PENDING_PER_PEER: usize = 8;
 /// Senders ready for the pipeline, queued at most.
 const READY_QUEUE: usize = 8;
 /// How often the connections that ended before casting are summarised.
-const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+const SUMMARY_INTERVAL: Duration = Duration::from_mins(1);
 const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(50);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
