@@ -291,6 +291,19 @@ impl LinuxP2pClient {
             // once. If supplicant regenerates a different PIN for the
             // same peer we announce it as "UPDATED".
             let mut last_prov_at: Option<std::time::Instant> = None;
+            // De-dup Connect calls: supplicant sometimes emits GON
+            // signal twice (once per ProvDisc completion, once per
+            // peer re-request). Calling Connect twice on the same peer
+            // aborts the first attempt. Track peers we've already
+            // responded to within a short window.
+            let mut last_connect_at: Option<(OwnedObjectPath, std::time::Instant)> = None;
+            let mut gon_ok = match p2p_owned.receive_signal("GONegotiationSuccess").await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sink: subscribe GONegotiationSuccess");
+                    return;
+                }
+            };
             loop {
                 tokio::select! {
                     msg = prov_pin.next() => {
@@ -365,12 +378,26 @@ impl LinuxP2pClient {
                             tracing::error!(?dict, "miracast sink: GONegotiationFailure");
                         }
                     }
+                    msg = gon_ok.next() => {
+                        let Some(sig) = msg else { break };
+                        tracing::info!(?sig, "sink: GONegotiationSuccess");
+                    }
                     msg = gon.next() => {
                         let Some(sig) = msg else { break };
                         // supplicant's signal body is
                         // `(peer: o, password_id: q, go_intent: y)`.
                         let Ok((peer, pwd_id, go_intent)): Result<(OwnedObjectPath, u16, u8), _>
                             = sig.body().deserialize() else { continue };
+                        // Skip if we Connect-ed to this peer recently;
+                        // doubling up aborts the first attempt.
+                        let now = std::time::Instant::now();
+                        if let Some((p, t)) = &last_connect_at
+                            && p == &peer
+                            && now.duration_since(*t) < std::time::Duration::from_secs(5)
+                        {
+                            tracing::debug!(peer = %peer.as_str(), "sink: GON duplicate, skipping second Connect");
+                            continue;
+                        }
 
                         // WSC Device Password ID (spec §12):
                         //   0x0000 Default / label PIN
@@ -418,10 +445,17 @@ impl LinuxP2pClient {
                         }
                         // Bias ourselves toward being the Group Owner —
                         // the sink needs to run a DHCP server for the
-                        // phone and supplicant's GO mode handles that.
-                        args.insert("go_intent", Value::from(15i32));
-                        if let Err(e) = p2p_owned.call_method("Connect", &(args,)).await {
-                            tracing::warn!(error = %e, "sink: Connect");
+                        // phone. supplicant's property is u32; sending
+                        // i32 silently dropped the key, so both ends
+                        // ran with default intent 7 → tie-breaker bug.
+                        args.insert("go_intent", Value::from(14u32));
+                        match p2p_owned.call_method("Connect", &(args,)).await {
+                            Ok(_) => {
+                                last_connect_at = Some((peer.clone(), now));
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "sink: Connect");
+                            }
                         }
                     }
                     msg = started.next() => {
