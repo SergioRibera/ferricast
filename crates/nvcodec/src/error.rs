@@ -159,6 +159,35 @@ pub enum Error {
         /// Why (which version, GPU or driver lacks it).
         reason: String,
     },
+    /// The driver refused another NVENC session, most likely because the
+    /// GPU's limit on concurrent sessions (consumer GPUs have one) is reached.
+    /// Fall back to another encoder or retry once a session closes.
+    #[error(
+        "{call} failed: {status}{}: NVENC session limit reached?",
+        detail.as_deref().map(|d| format!(" ({d})")).unwrap_or_default()
+    )]
+    NvencSessionLimit {
+        /// The NVENC entry point.
+        call: &'static str,
+        /// What it returned.
+        status: NvencStatus,
+        /// `nvEncGetLastErrorString`, when there is one.
+        detail: Option<String>,
+    },
+    /// An encoder configuration that cannot work on any GPU.
+    #[error("invalid encoder configuration ({field}): {reason}")]
+    InvalidEncodeConfig {
+        /// The offending field.
+        field: &'static str,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// A picture that does not match the encoder it is given to.
+    #[error("invalid encoder input: {reason}")]
+    InvalidEncodeInput {
+        /// What does not match.
+        reason: String,
+    },
 }
 
 /// The list of NVENC API versions this build carries, for messages.
