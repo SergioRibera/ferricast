@@ -35,7 +35,7 @@ use shiguredo_nvcodec::{
 use tracing::{debug, info};
 
 use self::sealed::Headers as _;
-use ferricast_codec::bitstream::{NalSyntax, hevc};
+use ferricast_codec::bitstream::{NalSyntax, split_annex_b};
 
 use crate::nv12::{self, OutputFormat};
 use crate::signalling::NalSignalling;
@@ -153,14 +153,20 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
             .next_frame()
             .map_err(|e| FerricastError::Decode(format!("NVDEC ({}) next_frame: {e}", C::NAME)))?
         {
-            // NV12: Y plane (full res) + interleaved UV (half height),
-            // both at the CUDA pitch, forwarded as one contiguous buffer.
+            // NV12 (P016 above 8 bits): Y plane (full res) + interleaved UV
+            // (half height), both at the CUDA pitch, forwarded as one
+            // contiguous buffer.
             let y_stride = nv_frame.y_stride();
             let (width, height) = (nv_frame.width(), nv_frame.height());
             let mut data = Vec::with_capacity(y_stride * height * 3 / 2);
             data.extend_from_slice(nv_frame.y_plane());
             data.extend_from_slice(nv_frame.uv_plane());
-            let mut frame = nv12::deliver(
+            let deliver = if nv_frame.bit_depth() > 8 {
+                nv12::deliver_p010
+            } else {
+                nv12::deliver
+            };
+            let mut frame = deliver(
                 Bytes::from(data),
                 y_stride,
                 (width, height),
@@ -299,18 +305,18 @@ impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
     }
 
     fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
-        // The binding only has 8-bit NV12 surfaces: a 10-bit stream goes
-        // to a backend that keeps its samples (the selection hands over).
-        if C::FERRICAST_CODEC == Codec::H265
-            && let Some((luma, chroma)) = hevc::annex_b_bit_depth(&frame.data)
-            && luma.max(chroma) > 8
+        // NVDEC decodes H.264 at 8 bits only (HEVC to 16-bit P016): a
+        // High 10 stream goes to a backend that keeps its samples.
+        if C::FERRICAST_CODEC == Codec::H264
+            && let Some(depth) = split_annex_b(&frame.data)
+                .into_iter()
+                .filter(|nal| nal.first().is_some_and(|header| header & 0x1f == 7))
+                .find_map(ferricast_codec::bitstream::h264::sps_bit_depth)
+            && depth > 8
         {
             return Err(CodecError::UnsupportedStream {
                 backend: BackendId::Nvdec,
-                reason: format!(
-                    "{}-bit HEVC: the NVDEC binding only produces 8-bit NV12",
-                    luma.max(chroma)
-                ),
+                reason: format!("{depth}-bit H.264: NVDEC decodes 8-bit H.264 only"),
             });
         }
         self.try_decode(&frame).map_err(CodecError::from_backend(

@@ -156,6 +156,45 @@ pub(crate) fn downshift_p010(
     (out, row)
 }
 
+/// Hands out a P010 picture (luma rows, then interleaved chroma rows,
+/// `stride` bytes apart) in the caller's requested format: P010 as is,
+/// anything else from its top eight bits through [`deliver`].
+#[cfg(feature = "nvdec-decode")]
+pub(crate) fn deliver_p010(
+    data: Bytes,
+    stride: usize,
+    (width, height): (usize, usize),
+    timestamp_us: u64,
+    format: PixelFormat,
+    colour: ColourDescription,
+) -> Option<RawFrame> {
+    if format != PixelFormat::P010 {
+        let (narrow, stride) = downshift_p010(&data, stride, width, height);
+        return deliver(
+            Bytes::from(narrow),
+            stride,
+            (width, height),
+            timestamp_us,
+            format,
+            colour,
+        );
+    }
+    let rows = height + height.div_ceil(2);
+    if data.len() < stride.checked_mul(rows)? || stride < width.div_ceil(2) * 4 {
+        return None;
+    }
+    Some(RawFrame {
+        width: u32::try_from(width).ok()?,
+        height: u32::try_from(height).ok()?,
+        stride: u32::try_from(stride).ok()?,
+        format: PixelFormat::P010,
+        data,
+        timestamp_us,
+        colour: Some(colour),
+        hdr: None,
+    })
+}
+
 /// Hands out an NV12 picture in the caller's requested format; planar
 /// requests get NV12, the only planar layout the decoders produce, with
 /// its colour description so the consumer can convert it.

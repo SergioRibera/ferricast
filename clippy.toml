@@ -27,6 +27,7 @@ doc-valid-idents = [
     "ScreenCast",
     "UxPlay",
     "VideoToolbox",
+    "WebM",
     "WinRT",
     "XORed",
     "XRandR",

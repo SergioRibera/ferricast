@@ -42,8 +42,9 @@ pub enum DecoderCodec {
 
 /// デコーダー出力サーフェスフォーマット (NVDEC: cudaVideoSurfaceFormat)
 ///
-/// 現在はフレームコピー処理が NV12 前提のため、NV12 のみサポートしている。
-/// 他フォーマットが必要になった場合は、コピー処理の分岐と DecodedFrame の拡張を同時に行うこと。
+/// [ferricast] High-bit-depth streams always decode to P016 (16-bit
+/// little-endian samples, value in the high bits); see
+/// [`DecodedFrame::bit_depth`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurfaceFormat {
     /// Semi-Planar YUV 4:2:0 8bit [Y plane + interleaved UV plane]
@@ -195,6 +196,7 @@ impl Decoder {
                 surface_width: 0,
                 surface_height: 0,
                 surface_format: config.surface_format.to_sys(),
+                bit_depth: 8,
                 frame_tx,
                 ctx,
                 ctx_lock,
@@ -342,6 +344,8 @@ struct DecoderState {
     surface_width: u32,
     surface_height: u32,
     surface_format: u32,
+    /// 現在のシーケンスの輝度ビット深度
+    bit_depth: u8,
     frame_tx: Sender<Result<DecodedFrame, Error>>,
     ctx: sys::CUcontext,
     ctx_lock: sys::CUvideoctxlock,
@@ -407,7 +411,14 @@ fn handle_video_sequence_inner(
     let mut create_info: sys::CUVIDDECODECREATEINFO = unsafe { std::mem::zeroed() };
     create_info.CodecType = format.codec;
     create_info.ChromaFormat = format.chroma_format;
-    create_info.OutputFormat = state.surface_format;
+    // [ferricast] NV12 cannot hold more than 8 bits: deeper streams
+    // decode to P016, which has the same plane layout with 16-bit samples.
+    create_info.OutputFormat = if format.bit_depth_luma_minus8 > 0 {
+        sys::cudaVideoSurfaceFormat_enum_cudaVideoSurfaceFormat_P016
+    } else {
+        state.surface_format
+    };
+    state.bit_depth = 8 + format.bit_depth_luma_minus8;
     create_info.bitDepthMinus8 = format.bit_depth_luma_minus8 as u64;
     create_info.DeinterlaceMode = if format.progressive_sequence != 0 {
         sys::cudaVideoDeinterlaceMode_enum_cudaVideoDeinterlaceMode_Weave
@@ -624,6 +635,7 @@ fn handle_picture_display_inner(
             width: state.width,
             height: state.height,
             pitch: pitch as usize,
+            bit_depth: state.bit_depth,
             data: host_data,
         })
     })?;
@@ -634,16 +646,24 @@ fn handle_picture_display_inner(
     Ok(())
 }
 
-/// デコードされた映像フレーム (NV12 形式)
+/// デコードされた映像フレーム (NV12 形式、8 bit を超える場合は P016 形式)
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
     width: u32,
     height: u32,
     pitch: usize,
+    bit_depth: u8,
     data: Vec<u8>,
 }
 
 impl DecodedFrame {
+    /// [ferricast] The luma bit depth of the stream. Above 8 the planes
+    /// are P016: 16-bit little-endian samples with the value in the high
+    /// bits, and the strides are in bytes.
+    pub fn bit_depth(&self) -> u8 {
+        self.bit_depth
+    }
+
     /// フレームの Y 成分のデータを返す
     pub fn y_plane(&self) -> &[u8] {
         let y_size = self.pitch * self.height as usize;

@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# Vendored crates patched below are not members: they keep their
+# upstream lints and build setup.
+exclude = ["vendor"]
 members = [
     ".",
     "crates/core",
@@ -243,3 +246,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.ferricast-airplay]
 opt-level = 3
+
+# `shiguredo_nvcodec` 2026.1.0 with the changes ferricast needs, each
+# marked `[ferricast]` in the source: NVDEC decodes streams deeper than
+# 8 bits to P016 instead of failing on an NV12 surface. Drop the patch
+# once upstream covers it.
+[patch.crates-io]
+shiguredo_nvcodec = { path = "vendor/shiguredo_nvcodec" }
