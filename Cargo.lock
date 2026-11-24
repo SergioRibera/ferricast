@@ -2026,6 +2026,8 @@ dependencies = [
  "ferricast-core",
  "istmo-core",
  "istmo-macros",
+ "objc2-core-foundation",
+ "objc2-core-video",
  "pollster",
  "tracing",
  "windows 0.62.2",

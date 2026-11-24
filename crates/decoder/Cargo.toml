@@ -68,6 +68,7 @@ istmo = ["ferricast-codec/istmo"]
 #   software codecs.
 media-foundation = ["dep:windows", "ferricast-codec/media-foundation"]
 videotoolbox = [
+    "ferricast-codec/videotoolbox",
     "dep:objc2",
     "dep:block2",
     "dep:objc2-core-foundation",

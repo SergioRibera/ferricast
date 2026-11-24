@@ -14,6 +14,7 @@
 //! the istmo plugin `ferricast.codec`.
 
 pub mod aac;
+pub mod alac;
 pub mod audio;
 pub mod bitstream;
 pub mod facade;
@@ -25,13 +26,21 @@ pub mod video_encoder;
 #[cfg(feature = "istmo")]
 pub mod plugin;
 
-// Windows FFI: the one module of this crate that needs `unsafe`.
+// Windows FFI: Media Foundation plumbing.
 #[cfg(all(target_os = "windows", feature = "media-foundation"))]
 #[allow(
     unsafe_code,
     reason = "Media Foundation is a COM API; every block carries a SAFETY comment"
 )]
 pub mod mf;
+
+// Apple FFI: Core Video pixel buffers shared as native frames.
+#[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox"))]
+#[allow(
+    unsafe_code,
+    reason = "Core Video is a C API; every block carries a SAFETY comment"
+)]
+pub mod apple;
 
 pub use audio::{
     AudioDecoderRegistry, AudioEncoderRegistry, SelectingAudioDecoder, SelectingAudioEncoder,
