@@ -38,6 +38,8 @@ pub struct MiracastReceiver {
     pub friendly_name: String,
     pub device_id: String,
     pub bind_port: u16,
+    #[cfg(target_os = "linux")]
+    pub pairing: crate::transport::linux_p2p::PairingMode,
 }
 
 impl MiracastReceiver {
@@ -47,6 +49,8 @@ impl MiracastReceiver {
             friendly_name: friendly_name.into(),
             device_id: device_id.into(),
             bind_port: WFD_RTSP_PORT,
+            #[cfg(target_os = "linux")]
+            pairing: crate::transport::linux_p2p::PairingMode::PushButton,
         }
     }
 
@@ -57,6 +61,17 @@ impl MiracastReceiver {
         self.bind_port = port;
         self
     }
+
+    /// Override the Wi-Fi Direct WPS pairing mode (Linux only).
+    /// Default is Push-Button (no PIN). Set to
+    /// [`PairingMode::DisplayPin`] when you want the GUI to display a
+    /// fixed PIN the sender types.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn with_pairing(mut self, mode: crate::transport::linux_p2p::PairingMode) -> Self {
+        self.pairing = mode;
+        self
+    }
 }
 
 impl Clone for MiracastReceiver {
@@ -65,6 +80,8 @@ impl Clone for MiracastReceiver {
             friendly_name: self.friendly_name.clone(),
             device_id: self.device_id.clone(),
             bind_port: self.bind_port,
+            #[cfg(target_os = "linux")]
+            pairing: self.pairing.clone(),
         }
     }
 }
@@ -84,7 +101,20 @@ impl ReceiverProtocol for MiracastReceiver {
     type Puller = MiracastPuller;
 
     fn create_advertiser(&self) -> Self::Advertiser {
-        MiracastReceiverAdvertiser::default()
+        #[cfg(target_os = "linux")]
+        {
+            MiracastReceiverAdvertiser {
+                daemon: None,
+                fullname: None,
+                device_id: None,
+                p2p_task: None,
+                pairing: self.pairing.clone(),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            MiracastReceiverAdvertiser::default()
+        }
     }
 
     fn create_control(&self) -> Result<Self::Control> {
@@ -124,8 +154,11 @@ impl ReceiverProtocol for MiracastReceiver {
 pub struct MiracastReceiverAdvertiser {
     daemon: Option<mdns_sd::ServiceDaemon>,
     fullname: Option<String>,
+    device_id: Option<String>,
     #[cfg(target_os = "linux")]
     p2p_task: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(target_os = "linux")]
+    pairing: crate::transport::linux_p2p::PairingMode,
 }
 
 impl Advertiser for MiracastReceiverAdvertiser {
@@ -135,13 +168,17 @@ impl Advertiser for MiracastReceiverAdvertiser {
         let daemon = mdns_sd::ServiceDaemon::new()
             .map_err(|e| FerricastError::Receiver(format!("mdns-sd: {e}")))?;
         let host = local_hostname();
+        // Carry the stable per-device id in the TXT so the discovery
+        // loop can short-circuit when it encounters our own record.
+        let mut txt = info.txt.clone();
+        txt.insert("id".to_string(), info.device_id.clone());
         let service = mdns_sd::ServiceInfo::new(
             MICE_SERVICE_TYPE,
             &info.friendly_name,
             &format!("{host}.local."),
             "",
             info.port,
-            info.txt.clone(),
+            txt,
         )
         .map_err(|e| FerricastError::Receiver(format!("mdns service: {e}")))?
         .enable_addr_auto();
@@ -149,12 +186,14 @@ impl Advertiser for MiracastReceiverAdvertiser {
         daemon
             .register(service)
             .map_err(|e| FerricastError::Receiver(format!("mdns register: {e}")))?;
+        crate::self_filter::register(&info.device_id);
         self.daemon = Some(daemon);
         self.fullname = Some(fullname);
+        self.device_id = Some(info.device_id.clone());
 
         #[cfg(target_os = "linux")]
         {
-            match start_linux_p2p_sink(info.friendly_name.clone()).await {
+            match start_linux_p2p_sink(info.friendly_name.clone(), self.pairing.clone()).await {
                 Ok(handle) => self.p2p_task = Some(handle),
                 Err(e) => tracing::warn!(
                     error = %e,
@@ -168,6 +207,9 @@ impl Advertiser for MiracastReceiverAdvertiser {
     async fn stop(&mut self) -> Result<()> {
         if let (Some(daemon), Some(fullname)) = (self.daemon.take(), self.fullname.take()) {
             let _ = daemon.unregister(&fullname);
+        }
+        if let Some(id) = self.device_id.take() {
+            crate::self_filter::unregister(&id);
         }
         #[cfg(target_os = "linux")]
         if let Some(task) = self.p2p_task.take() {
@@ -184,6 +226,7 @@ impl Advertiser for MiracastReceiverAdvertiser {
 #[cfg(target_os = "linux")]
 async fn start_linux_p2p_sink(
     device_name: String,
+    pairing: crate::transport::linux_p2p::PairingMode,
 ) -> Result<tokio::task::JoinHandle<()>> {
     use crate::ie::{DeviceInformation, WfdIe};
     use crate::transport::linux_p2p::LinuxP2pClient;
@@ -193,7 +236,7 @@ async fn start_linux_p2p_sink(
         .await
         .map_err(|e| FerricastError::Receiver(format!("wpa_supplicant: {e}")))?;
     let mut groups = client
-        .listen_as_sink(&device_name)
+        .listen_as_sink(&device_name, &pairing)
         .await
         .map_err(|e| FerricastError::Receiver(format!("Listen: {e}")))?;
 

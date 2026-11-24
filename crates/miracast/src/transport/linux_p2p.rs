@@ -166,12 +166,14 @@ impl LinuxP2pClient {
     /// set the P2P device name + Primary Device Type to Display/TV so
     /// phones' Smart View / Cast UIs classify us correctly, enter
     /// continuous `Listen` mode, and auto-accept inbound
-    /// `GONegotiationRequest`s via WPS PBC. Every successful
-    /// `GroupStarted` is pushed on the returned channel so the caller
-    /// can bind RTSP on the new virtual interface.
+    /// `GONegotiationRequest`s via the configured [`PairingMode`].
+    /// Every successful `GroupStarted` is pushed on the returned
+    /// channel so the caller can bind RTSP on the new virtual
+    /// interface.
     pub async fn listen_as_sink(
         &self,
         device_name: &str,
+        pairing: &PairingMode,
     ) -> Result<mpsc::Receiver<GroupStarted>, TransportError> {
         // Primary Device Type: Category 0x0005 Display, OUI 50:6F:9A
         // (Wi-Fi Alliance), Subcategory 0x0001 Television.
@@ -179,16 +181,24 @@ impl LinuxP2pClient {
             [0x00, 0x05, 0x50, 0x6F, 0x9A, 0x02, 0x00, 0x01];
 
         let p2p = self.p2p_proxy().await?;
-        // Push P2PDeviceConfig (DeviceName + PrimaryDeviceType). supplicant
-        // merges with the existing config so this is non-destructive for
-        // other keys (`GOIntent`, `SsidPostfix`, …).
+        // Push P2PDeviceConfig (DeviceName + PrimaryDeviceType).
+        // supplicant merges with the existing config so this is
+        // non-destructive for other keys (`GOIntent`, `SsidPostfix`,
+        // …). `ConfigMethod` is NOT a valid P2PDeviceConfig key —
+        // its old presence silently rejected the whole dict and left
+        // the device unnamed in Android's picker. Advertised WPS
+        // methods come from the global `config_methods` supplicant
+        // option (default = all); we honour the caller's choice at
+        // GON-accept time instead.
         let name_val = Value::from(device_name.to_string());
         let pdt_val = Value::from(PRIMARY_DEVICE_TYPE_DISPLAY_TV.to_vec());
         let mut cfg: HashMap<&str, Value> = HashMap::new();
         cfg.insert("DeviceName", name_val);
         cfg.insert("PrimaryDeviceType", pdt_val);
         if let Err(e) = p2p.set_property("P2PDeviceConfig", Value::from(cfg)).await {
-            tracing::warn!(error = %e, "miracast sink: P2PDeviceConfig set failed");
+            tracing::error!(error = %e, "miracast sink: P2PDeviceConfig set FAILED — peers will see us as unnamed");
+        } else {
+            tracing::info!(name = %device_name, "miracast sink: P2PDeviceConfig set");
         }
 
         // `Listen(timeout)` with 0 = until explicitly stopped.
@@ -199,6 +209,7 @@ impl LinuxP2pClient {
         let (tx, rx) = mpsc::channel(4);
         let conn = self.conn.clone();
         let interface_path = self.interface_path.clone();
+        let pairing = pairing.clone();
         tokio::spawn(async move {
             let p2p_owned =
                 match Proxy::new(&conn, SUPPLICANT_BUS, interface_path.clone(), P2P_IFACE).await {
@@ -226,12 +237,35 @@ impl LinuxP2pClient {
                 tokio::select! {
                     msg = gon.next() => {
                         let Some(sig) = msg else { break };
-                        let Ok((peer, _pwd_id, _dev_passwd)): Result<(OwnedObjectPath, u16, u8), _>
+                        let Ok((peer, pwd_id, dev_passwd)): Result<(OwnedObjectPath, u16, u8), _>
                             = sig.body().deserialize() else { continue };
-                        tracing::info!(peer = %peer.as_str(), "sink: auto-accepting GON request");
+                        // Map WSC password_id (RFC-stable) to supplicant's
+                        // `wps_method` string. Spec §12:
+                        //   0x0004 = Push-Button
+                        //   0x0007 = Registrar-specified
+                        //   0x0000 = Default (from label)
+                        //   Keypad / Display are driven by the DEV PasswordID.
+                        let (wps_method, maybe_pin): (&str, Option<String>) = match pwd_id {
+                            0x0004 => ("pbc", None),
+                            _ => match &pairing {
+                                PairingMode::PushButton => ("pbc", None),
+                                PairingMode::DisplayPin(p) => ("display", Some(p.clone())),
+                                PairingMode::EnterPin(p) => ("keypad", Some(p.clone())),
+                            },
+                        };
+                        tracing::info!(
+                            peer = %peer.as_str(),
+                            pwd_id = format_args!("0x{:04x}", pwd_id),
+                            dev_passwd,
+                            wps_method,
+                            "sink: auto-accepting GON request"
+                        );
                         let mut args: HashMap<&str, Value> = HashMap::new();
                         args.insert("peer", Value::from(peer.as_ref().to_owned()));
-                        args.insert("wps_method", Value::from("pbc"));
+                        args.insert("wps_method", Value::from(wps_method));
+                        if let Some(pin) = maybe_pin {
+                            args.insert("pin", Value::from(pin));
+                        }
                         if let Err(e) = p2p_owned.call_method("Connect", &(args,)).await {
                             tracing::warn!(error = %e, "sink: Connect");
                         }
@@ -357,6 +391,64 @@ pub struct GroupStarted {
 pub enum GroupRole {
     Owner,
     Client,
+}
+
+/// How the peer authenticates with the sink during WPS provisioning.
+///
+/// WPS config method bits (Wi-Fi Simple Config §12):
+/// - `0x0080` Push-Button
+/// - `0x0008` Display
+/// - `0x0100` Keypad
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairingMode {
+    /// Push-Button Config. Peer sees the sink in its picker and
+    /// taps "Connect"; sink auto-accepts, no PIN. Default — matches
+    /// how most phones/TVs ship out of the box.
+    PushButton,
+    /// Sink *displays* a fixed 4- or 8-digit PIN; the peer types it.
+    /// Classic "TV Miracast" flow.
+    DisplayPin(String),
+    /// Sink *prompts the user* for a PIN the peer displays. Rare in
+    /// consumer flows; useful when the sink is a device without a
+    /// screen but has a keypad.
+    EnterPin(String),
+}
+
+impl PairingMode {
+    /// WPS ConfigMethod bitmap we advertise in P2PDeviceConfig.
+    #[must_use]
+    pub const fn config_methods_bitmap(&self) -> u32 {
+        match self {
+            Self::PushButton => 0x0080,
+            Self::DisplayPin(_) => 0x0008,
+            Self::EnterPin(_) => 0x0100,
+        }
+    }
+
+    /// `wps_method` string supplicant's `Connect` expects.
+    #[must_use]
+    pub const fn wps_method(&self) -> &'static str {
+        match self {
+            Self::PushButton => "pbc",
+            Self::DisplayPin(_) => "display",
+            Self::EnterPin(_) => "keypad",
+        }
+    }
+
+    /// PIN to pass in the `Connect` dict, when any.
+    #[must_use]
+    pub fn pin(&self) -> Option<&str> {
+        match self {
+            Self::PushButton => None,
+            Self::DisplayPin(p) | Self::EnterPin(p) => Some(p.as_str()),
+        }
+    }
+}
+
+impl Default for PairingMode {
+    fn default() -> Self {
+        Self::PushButton
+    }
 }
 
 async fn resolve_or_create_interface(conn: &Connection) -> Result<OwnedObjectPath, TransportError> {

@@ -62,6 +62,18 @@ impl Discovery for MiracastDiscovery {
                         if !is_mice(&service) {
                             continue;
                         }
+                        // Self-filter: a receiver advertiser in this
+                        // same process registers its `id` here; skip
+                        // records that match so the GUI picker doesn't
+                        // list ourselves.
+                        if let Some(id) = service
+                            .get_properties()
+                            .get_property_val_str("id")
+                            && crate::self_filter::contains(id)
+                        {
+                            tracing::debug!(id = %id, "miracast: skipping self-advertised sink");
+                            continue;
+                        }
                         let fullname = service.get_fullname().to_string();
                         if !seen.insert(fullname.clone()) {
                             continue;

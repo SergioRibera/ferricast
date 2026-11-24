@@ -26,6 +26,7 @@ pub mod parameters;
 pub mod receiver;
 pub mod rtp;
 pub mod rtsp;
+pub(crate) mod self_filter;
 pub mod session;
 pub mod transport;
 pub mod ts;
@@ -34,3 +35,6 @@ pub use discovery::MiracastDiscovery;
 pub use handler::MiracastHandler;
 pub use receiver::{MiracastReceiver, MiracastReceiverAdvertiser, MiracastReceiverControl};
 pub use session::MiracastSession;
+
+#[cfg(target_os = "linux")]
+pub use transport::linux_p2p::PairingMode;

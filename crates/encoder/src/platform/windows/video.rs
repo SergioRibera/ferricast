@@ -59,8 +59,7 @@ use super::mf::{
     colour_attributes, hns, media_type, micros, pack, set_codec_u32, set_hdr,
 };
 use crate::frame_view::FrameView;
-use crate::nv12::{self, Nv12Layout};
-use crate::p010::{fill_u16, write_p010};
+use crate::nv12::{self, Nv12Layout, fill_u16};
 use crate::scale::{FrameScaler, FrameSize};
 
 /// How long `encode` lets a hardware MFT finish the frame it was given.
@@ -651,7 +650,7 @@ impl Session {
         let (colour, layout, input) = (self.colour, self.layout, self.input);
         mf::sample_with(layout.len(), self.alignment, op, |dst| {
             if input == PixelFormat::P010 {
-                write_p010(&view, layout, dst, BACKEND)
+                nv12::write_p010(&view, colour, layout, dst, BACKEND)
             } else {
                 nv12::write(&view, colour, layout, dst, BACKEND)
             }

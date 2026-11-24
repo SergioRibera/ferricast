@@ -337,6 +337,20 @@ pub(crate) fn write_p010(
     Ok(())
 }
 
+/// Fills `dst` with the little-endian 16-bit `value` (a P010 sample).
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "conditional: only the Media Foundation encoder primes P010 black"
+    )
+)]
+pub(crate) fn fill_u16(dst: &mut [u8], value: u16) {
+    for pair in dst.chunks_exact_mut(2) {
+        pair.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
 /// Copies `rows` rows of `row_bytes` bytes between two strides.
 fn copy_plane(
     dst: &mut [u8],
@@ -541,6 +555,13 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn fill_writes_little_endian() {
+        let mut out = [0; 4];
+        fill_u16(&mut out, 512 << 6);
+        assert_eq!(out, [0x00, 0x80, 0x00, 0x80]);
     }
 
     #[test]

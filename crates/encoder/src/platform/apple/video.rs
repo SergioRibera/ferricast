@@ -656,8 +656,8 @@ impl Session {
     }
 
     /// Writes `view` into the planes of a locked NV12 / P010 (`format`)
-    /// buffer: P010 into P010 row by row; anything else through 8-bit
-    /// NV12 in the configured colour, widened for a P010 buffer.
+    /// buffer: P010 into P010 row by row; anything else through the shared
+    /// NV12 / P010 writers in the configured colour.
     fn fill_planar(
         &mut self,
         buffer: &CVPixelBuffer,
@@ -677,61 +677,25 @@ impl Session {
                 dst.copy_from_slice(&chroma[row * view.chroma_stride()..][..dst.len()]);
             });
         }
-        let layout = Nv12Layout::packed(view.width(), view.height());
-        self.nv12.resize(layout.len(), 0);
-        if view.format() == PixelFormat::P010 {
-            narrow_p010(view, layout, &mut self.nv12);
+        let colour = self.config.colour;
+        let layout = if format == PixelFormat::P010 {
+            let layout = Nv12Layout::packed_p010(view.width(), view.height());
+            self.nv12.resize(layout.len(), 0);
+            nv12::write_p010(view, colour, layout, &mut self.nv12, BACKEND)?;
+            layout
         } else {
-            nv12::write(view, self.config.colour, layout, &mut self.nv12, BACKEND)?;
-        }
-        let (luma, chroma) = self.nv12.split_at(layout.chroma_offset);
-        let wide = format == PixelFormat::P010;
-        let row_bytes = if wide {
-            layout.stride * 2
-        } else {
-            layout.stride
+            let layout = Nv12Layout::packed(view.width(), view.height());
+            self.nv12.resize(layout.len(), 0);
+            nv12::write(view, colour, layout, &mut self.nv12, BACKEND)?;
+            layout
         };
+        let (luma, chroma) = self.nv12.split_at(layout.chroma_offset);
         for (plane, source, plane_rows) in [(0, luma, rows), (1, chroma, chroma_rows)] {
-            write_plane(buffer, plane, plane_rows, row_bytes, |row, dst| {
-                let line = &source[row * layout.stride..][..layout.stride];
-                if wide {
-                    // 8-bit samples in the high bits of 16-bit ones.
-                    for (pair, &sample) in dst.chunks_exact_mut(2).zip(line) {
-                        pair.copy_from_slice(&(u16::from(sample) << 8).to_le_bytes());
-                    }
-                } else {
-                    dst.copy_from_slice(line);
-                }
+            write_plane(buffer, plane, plane_rows, layout.stride, |row, dst| {
+                dst.copy_from_slice(&source[row * layout.stride..][..layout.stride]);
             })?;
         }
         Ok(())
-    }
-}
-
-/// P010 `view` as packed NV12 (`layout`) in `out`: the high byte of each
-/// sample.
-fn narrow_p010(view: &FrameView<'_>, layout: Nv12Layout, out: &mut [u8]) {
-    let data = view.data();
-    let width = view.width() as usize;
-    let chroma_samples = view.width().div_ceil(2) as usize * 2;
-    let (luma, chroma) = out.split_at_mut(layout.chroma_offset);
-    let planes = [
-        (luma, 0, view.stride(), width, view.height() as usize),
-        (
-            chroma,
-            view.chroma_offset(),
-            view.chroma_stride(),
-            chroma_samples,
-            view.chroma_rows(),
-        ),
-    ];
-    for (dst, offset, stride, samples, rows) in planes {
-        for (row, line) in dst.chunks_exact_mut(layout.stride).take(rows).enumerate() {
-            let source = &data[offset + row * stride..][..samples * 2];
-            for (sample, pair) in line[..samples].iter_mut().zip(source.chunks_exact(2)) {
-                *sample = pair[1];
-            }
-        }
     }
 }
 
