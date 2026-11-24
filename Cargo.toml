@@ -20,6 +20,14 @@ members = [
     "crates/gui",
 ]
 
+# Shared by every member through `[lints] workspace = true`;
+# `ferricast-codec` keeps its own, stricter table.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "warn"
+allow_attributes_without_reason = "deny"
+
 [workspace.dependencies]
 ferricast = { path = ".", default-features = false }
 ferricast-core = { path = "crates/core" }
