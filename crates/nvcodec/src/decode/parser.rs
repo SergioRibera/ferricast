@@ -22,7 +22,7 @@ use super::format::{DecodeStatus, Fields, FrameInfo, Layout, PixelFormat, Rect, 
 use super::frame::{DeviceFrame, DeviceSlot, HostFrame, HostSlot};
 use super::pool::Pool;
 use super::sei::SeiStore;
-use super::{Codec, CuvidCheck as _, DecoderConfig};
+use super::{Codec, CuvidCheck as _, DecoderConfig, ulong};
 use crate::cuda::{Context, DeviceBuffer, Event, Stream};
 use crate::error::{CheckStatus as _, Error, Result};
 use crate::loader::{CudaLibrary, CuvidLibrary};
@@ -500,22 +500,20 @@ impl HwDecoder {
         let max_width = wanted_width.clamp(width, caps.max_width.max(width));
         let max_height = wanted_height.clamp(height, caps.max_height.max(height));
         let mut info = sys::CUVIDDECODECREATEINFO {
-            ulWidth: width.into(),
-            ulHeight: height.into(),
-            ulNumDecodeSurfaces: surfaces.into(),
+            ulWidth: ulong(width),
+            ulHeight: ulong(height),
+            ulNumDecodeSurfaces: ulong(surfaces),
             CodecType: sequence.codec.raw(),
             ChromaFormat: sequence.chroma.raw(),
-            ulCreationFlags: sys::cudaVideoCreateFlags::cudaVideoCreate_PreferCUVID
-                .0
-                .into(),
-            bitDepthMinus8: u32::from(sequence.bit_depth - 8).into(),
-            ulMaxWidth: max_width.into(),
-            ulMaxHeight: max_height.into(),
+            ulCreationFlags: ulong(sys::cudaVideoCreateFlags::cudaVideoCreate_PreferCUVID.0),
+            bitDepthMinus8: ulong(u32::from(sequence.bit_depth - 8)),
+            ulMaxWidth: ulong(max_width),
+            ulMaxHeight: ulong(max_height),
             OutputFormat: sequence.format.surface_format(),
             DeinterlaceMode: sys::cudaVideoDeinterlaceMode::cudaVideoDeinterlaceMode_Weave,
-            ulTargetWidth: width.into(),
-            ulTargetHeight: height.into(),
-            ulNumOutputSurfaces: config.output_surfaces.into(),
+            ulTargetWidth: ulong(width),
+            ulTargetHeight: ulong(height),
+            ulNumOutputSurfaces: ulong(config.output_surfaces),
             vidLock: lock,
             ..Default::default()
         };

@@ -40,7 +40,7 @@
 //! their buffer to the decoder's pool when dropped, so steady-state decoding
 //! allocates nothing. At most [`DecoderConfig::max_frames`] can be held at
 //! once; past that, decoding fails with
-//! [`Error::FramesInFlight`](crate::Error::FramesInFlight) until some are
+//! [`Error::FramesInFlight`] until some are
 //! dropped.
 //!
 //! Every frame describes itself in a [`FrameInfo`]: the display size (the
@@ -106,6 +106,15 @@ use crate::sys::cuvid as sys;
 fn cuvid_library() -> Result<&'static CuvidLibrary> {
     CudaLibrary::get()?;
     CuvidLibrary::get()
+}
+
+/// A `u32` as the header's `unsigned long` (64 bits on Linux, 32 on Windows).
+#[allow(
+    clippy::useless_conversion,
+    reason = "the identity conversion on Windows, where `unsigned long` is 32 bits"
+)]
+fn ulong(value: u32) -> sys::tcu_ulong {
+    value.into()
 }
 
 /// Turns a cuvid status into a `Result` naming the call.
@@ -387,7 +396,7 @@ impl<M: OutputMode> Decoder<M> {
     fn parse(&mut self, flags: u32, data: &[u8], timestamp: i64) -> Result<()> {
         let cuvid = cuvid_library()?;
         let mut packet = sys::CUVIDSOURCEDATAPACKET {
-            flags: flags.into(),
+            flags: ulong(flags),
             payload_size: sys::tcu_ulong::try_from(data.len())
                 .map_err(|_| Error::SizeOverflow { what: "a packet" })?,
             payload: if data.is_empty() {
