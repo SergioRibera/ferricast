@@ -15,6 +15,7 @@
 //! front of it.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use ferricast_core::{
@@ -24,6 +25,8 @@ use ferricast_core::{
 use tracing::warn;
 
 use crate::bitstream::{NalSyntax, ParameterSets};
+use crate::cache::SelectionCache;
+use crate::events::{EventReceiver, SessionEvent, SessionEvents};
 use crate::registry::{Plan, Registry};
 use crate::session::VideoDecoderSession;
 
@@ -107,6 +110,7 @@ pub struct SelectingVideoDecoder {
     /// Pictures a backend finished before the stream moved to the next
     /// one; served ahead of anything the next backend produces.
     handed_over: VecDeque<CapturedFrame>,
+    events: SessionEvents,
 }
 
 impl std::fmt::Debug for SelectingVideoDecoder {
@@ -130,13 +134,36 @@ impl SelectingVideoDecoder {
             parameter_sets: syntax.map(ParameterSets::new),
             active: None,
             handed_over: VecDeque::new(),
+            events: SessionEvents::default(),
         }
+    }
+
+    /// Remembers automatic selection's winner in `cache` instead of the
+    /// process-wide one (see [`crate::cache`]).
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<dyn SelectionCache>) -> Self {
+        self.registry.set_cache(cache);
+        self
     }
 
     /// The job this decoder does.
     #[must_use]
     pub fn target(&self) -> CodecTarget {
         self.registry.target()
+    }
+
+    /// The session's event hub.
+    #[must_use]
+    pub fn events(&self) -> &SessionEvents {
+        &self.events
+    }
+
+    /// Subscribes to the session's events, with a queue of `capacity`;
+    /// the first event is [`SessionEvent::Opened`] for the backend open
+    /// now, if one is.
+    #[must_use]
+    pub fn subscribe(&self, capacity: usize) -> EventReceiver {
+        self.events.subscribe_at(capacity, self.backend())
     }
 
     /// The registry, for capability reports.
@@ -159,6 +186,11 @@ impl SelectingVideoDecoder {
     /// The selection's errors (see [`Registry::plan`] and
     /// [`Registry::open`]) or the open backend's `configure` error.
     pub fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()> {
+        let result = self.select(config);
+        self.events.report(result)
+    }
+
+    fn select(&mut self, config: &DecoderConfig) -> CodecResult<()> {
         if let Some(active) = &mut self.active
             && active.config.backend == config.backend
         {
@@ -168,6 +200,10 @@ impl SelectingVideoDecoder {
         }
         let plan = self.registry.plan(&config.backend)?;
         let opened = self.registry.open(&plan, 0, config)?;
+        self.events.emit(&SessionEvent::Opened {
+            backend: opened.backend,
+            acceleration: opened.acceleration,
+        });
         self.active = Some(Active {
             probation: Probation::new(plan.runtime_fallback()),
             session: opened.session,
@@ -186,6 +222,11 @@ impl SelectingVideoDecoder {
     /// [`CodecError::NotConfigured`] before `configure`; otherwise the
     /// backend's error once no fallback applies.
     pub fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+        let result = self.decode_packet(frame);
+        self.events.report(result)
+    }
+
+    fn decode_packet(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
         let target = self.target();
         let active = self.active.as_mut().ok_or(CodecError::NotConfigured {
             target,
@@ -215,6 +256,11 @@ impl SelectingVideoDecoder {
     /// # Errors
     /// The backend's error once no fallback applies.
     pub fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
+        let result = self.drain();
+        self.events.report(result)
+    }
+
+    fn drain(&mut self) -> CodecResult<Vec<CapturedFrame>> {
         let Some(active) = &mut self.active else {
             return Ok(self.handed_over.drain(..).collect());
         };
@@ -288,10 +334,18 @@ impl SelectingVideoDecoder {
             %error,
             "codec backend failed on the stream; moving to the next backend"
         );
+        self.registry
+            .demote(&active.plan, &active.config, active.backend);
         let opened = self
             .registry
             .open(&active.plan, active.position + 1, &active.config)
-            .map_err(|_| error)?;
+            .map_err(|_| error.clone())?;
+        self.events.emit(&SessionEvent::Switched {
+            from: active.backend,
+            to: opened.backend,
+            acceleration: opened.acceleration,
+            reason: error,
+        });
         active.session = opened.session;
         active.backend = opened.backend;
         active.acceleration = opened.acceleration;
@@ -324,6 +378,12 @@ impl SelectingVideoDecoder {
         self.parameter_sets
             .as_ref()
             .map(|sets| Bytes::from(sets.annex_b()))
+    }
+}
+
+impl Drop for SelectingVideoDecoder {
+    fn drop(&mut self) {
+        self.events.emit(&SessionEvent::Closed);
     }
 }
 
@@ -456,6 +516,7 @@ mod tests {
         first: crate::registry::OpenFn<DecoderConfig, dyn VideoDecoderSession>,
     ) -> SelectingVideoDecoder {
         let registry = VideoDecoderRegistry::new(CodecTarget::decode(Codec::H264))
+            .with_cache(Arc::new(crate::cache::NoCache))
             .candidate(Candidate::new(
                 BackendId::Nvdec,
                 Acceleration::Hardware,
@@ -541,5 +602,45 @@ mod tests {
             .with_acceleration(ferricast_core::AccelerationPolicy::SoftwareOnly);
         decoder.configure(&config(software_only.into())).unwrap();
         assert_eq!(decoder.backend().map(|b| b.0), Some(BackendId::OpenH264));
+    }
+
+    #[test]
+    fn subscribers_see_the_open_the_switch_and_the_end() {
+        let mut decoder = decoder(rejecting);
+        decoder
+            .configure(&config(BackendSelection::default()))
+            .unwrap();
+        let events = decoder.subscribe(8);
+        decoder.decode(packet(1)).unwrap();
+        drop(decoder);
+        let seen: Vec<_> = events.drain().collect();
+        assert_eq!(
+            seen,
+            [
+                SessionEvent::Opened {
+                    backend: BackendId::Nvdec,
+                    acceleration: Acceleration::Hardware,
+                },
+                SessionEvent::Switched {
+                    from: BackendId::Nvdec,
+                    to: BackendId::OpenH264,
+                    acceleration: Acceleration::Software,
+                    reason: CodecError::backend(BackendId::Nvdec, Operation::Decode, "CUVID_ERROR"),
+                },
+                SessionEvent::Closed,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failure_with_no_fallback_is_reported() {
+        let mut decoder = decoder(rejecting);
+        decoder.configure(&config(BackendId::Nvdec.into())).unwrap();
+        let events = decoder.subscribe(8);
+        decoder.decode(packet(1)).unwrap_err();
+        assert!(matches!(
+            events.drain().last(),
+            Some(SessionEvent::Failed { error }) if error.to_string().contains("CUVID_ERROR")
+        ));
     }
 }

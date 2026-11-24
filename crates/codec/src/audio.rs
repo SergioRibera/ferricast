@@ -9,8 +9,12 @@ use ferricast_core::{
     Acceleration, AudioDecoderConfig, AudioEncoderConfig, AudioFrame, BackendId, BackendSelection,
     CodecError, CodecResult, CodecTarget, DecodedAudio, Operation, RuntimeFallback,
 };
+use std::sync::Arc;
+
 use tracing::warn;
 
+use crate::cache::{SelectionCache, SelectionInput};
+use crate::events::{EventReceiver, SessionEvent, SessionEvents};
 use crate::registry::{Plan, Registry};
 use crate::session::{AudioDecoderSession, AudioEncoderSession};
 
@@ -32,9 +36,10 @@ struct Active<S: ?Sized> {
 
 /// Opens or re-opens `active` for `config`: a new selection re-plans,
 /// a refused reconfiguration moves on to the next candidate.
-fn configure<C, S: ?Sized>(
+fn configure<C: SelectionInput, S: ?Sized>(
     registry: &Registry<C, S>,
     active: &mut Option<Active<S>>,
+    events: &SessionEvents,
     config: &C,
     selection: &BackendSelection,
     reconfigure: impl FnOnce(&mut S, &C) -> CodecResult<()>,
@@ -53,7 +58,13 @@ fn configure<C, S: ?Sized>(
         warn!(target_job = %registry.target(), backend = %open.backend, %error, "audio backend refused the new configuration; moving to the next backend");
         let opened = registry
             .open(&open.plan, open.position + 1, config)
-            .map_err(|_| error)?;
+            .map_err(|_| error.clone())?;
+        events.emit(&SessionEvent::Switched {
+            from: open.backend,
+            to: opened.backend,
+            acceleration: opened.acceleration,
+            reason: error,
+        });
         open.session = opened.session;
         open.backend = opened.backend;
         open.acceleration = opened.acceleration;
@@ -62,6 +73,10 @@ fn configure<C, S: ?Sized>(
     }
     let plan = registry.plan(selection)?;
     let opened = registry.open(&plan, 0, config)?;
+    events.emit(&SessionEvent::Opened {
+        backend: opened.backend,
+        acceleration: opened.acceleration,
+    });
     *active = Some(Active {
         session: opened.session,
         backend: opened.backend,
@@ -78,6 +93,7 @@ fn configure<C, S: ?Sized>(
 pub struct SelectingAudioEncoder {
     registry: AudioEncoderRegistry,
     active: Option<Active<dyn AudioEncoderSession>>,
+    events: SessionEvents,
 }
 
 impl std::fmt::Debug for SelectingAudioEncoder {
@@ -96,6 +112,7 @@ impl SelectingAudioEncoder {
         Self {
             registry,
             active: None,
+            events: SessionEvents::default(),
         }
     }
 
@@ -117,30 +134,54 @@ impl SelectingAudioEncoder {
         self.active.as_ref().map(|a| (a.backend, a.acceleration))
     }
 
+    /// Remembers automatic selection's winner in `cache` instead of the
+    /// process-wide one (see [`crate::cache`]).
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<dyn SelectionCache>) -> Self {
+        self.registry.set_cache(cache);
+        self
+    }
+
+    /// The session's event hub.
+    #[must_use]
+    pub fn events(&self) -> &SessionEvents {
+        &self.events
+    }
+
+    /// Subscribes to the session's events; see
+    /// [`SessionEvents::subscribe_at`].
+    #[must_use]
+    pub fn subscribe(&self, capacity: usize) -> EventReceiver {
+        self.events.subscribe_at(capacity, self.backend())
+    }
+
     /// # Errors
     /// The selection's errors or the backend's `configure` error.
     pub fn configure(&mut self, config: &AudioEncoderConfig) -> CodecResult<()> {
-        configure(
+        let result = configure(
             &self.registry,
             &mut self.active,
+            &self.events,
             config,
             &config.backend,
             AudioEncoderSession::configure,
-        )
+        );
+        self.events.report(result)
     }
 
     /// # Errors
     /// [`CodecError::NotConfigured`] before `configure`, or the backend's.
     pub fn encode(&mut self, frame: &AudioFrame) -> CodecResult<()> {
         let target = self.registry.target();
-        self.active
+        let result = self
+            .active
             .as_mut()
             .ok_or(CodecError::NotConfigured {
                 target,
                 operation: Operation::Encode,
-            })?
-            .session
-            .encode(frame)
+            })
+            .and_then(|active| active.session.encode(frame));
+        self.events.report(result)
     }
 
     /// Output produced so far; empty before `configure`.
@@ -162,9 +203,18 @@ impl SelectingAudioEncoder {
 
     /// # Errors
     /// The backend's; an encoder never configured flushes nothing.
-    pub fn flush(self) -> CodecResult<Vec<AudioFrame>> {
-        self.active
-            .map_or_else(|| Ok(Vec::new()), |active| active.session.flush())
+    pub fn flush(mut self) -> CodecResult<Vec<AudioFrame>> {
+        let result = self
+            .active
+            .take()
+            .map_or_else(|| Ok(Vec::new()), |active| active.session.flush());
+        self.events.report(result)
+    }
+}
+
+impl Drop for SelectingAudioEncoder {
+    fn drop(&mut self) {
+        self.events.emit(&SessionEvent::Closed);
     }
 }
 
@@ -173,6 +223,7 @@ impl SelectingAudioEncoder {
 pub struct SelectingAudioDecoder {
     registry: AudioDecoderRegistry,
     active: Option<Active<dyn AudioDecoderSession>>,
+    events: SessionEvents,
 }
 
 impl std::fmt::Debug for SelectingAudioDecoder {
@@ -191,6 +242,7 @@ impl SelectingAudioDecoder {
         Self {
             registry,
             active: None,
+            events: SessionEvents::default(),
         }
     }
 
@@ -212,37 +264,69 @@ impl SelectingAudioDecoder {
         self.active.as_ref().map(|a| (a.backend, a.acceleration))
     }
 
+    /// Remembers automatic selection's winner in `cache` instead of the
+    /// process-wide one (see [`crate::cache`]).
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<dyn SelectionCache>) -> Self {
+        self.registry.set_cache(cache);
+        self
+    }
+
+    /// The session's event hub.
+    #[must_use]
+    pub fn events(&self) -> &SessionEvents {
+        &self.events
+    }
+
+    /// Subscribes to the session's events; see
+    /// [`SessionEvents::subscribe_at`].
+    #[must_use]
+    pub fn subscribe(&self, capacity: usize) -> EventReceiver {
+        self.events.subscribe_at(capacity, self.backend())
+    }
+
     /// # Errors
     /// The selection's errors or the backend's `configure` error.
     pub fn configure(&mut self, config: &AudioDecoderConfig) -> CodecResult<()> {
-        configure(
+        let result = configure(
             &self.registry,
             &mut self.active,
+            &self.events,
             config,
             &config.backend,
             AudioDecoderSession::configure,
-        )
+        );
+        self.events.report(result)
     }
 
     /// # Errors
     /// [`CodecError::NotConfigured`] before `configure`, or the backend's.
     pub fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>> {
         let target = self.registry.target();
-        self.active
+        let result = self
+            .active
             .as_mut()
             .ok_or(CodecError::NotConfigured {
                 target,
                 operation: Operation::Decode,
-            })?
-            .session
-            .decode(frame)
+            })
+            .and_then(|active| active.session.decode(frame));
+        self.events.report(result)
     }
 
     /// # Errors
     /// The backend's; a decoder never configured flushes nothing.
     pub fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>> {
-        self.active
+        let result = self
+            .active
             .as_mut()
-            .map_or_else(|| Ok(Vec::new()), |active| active.session.flush())
+            .map_or_else(|| Ok(Vec::new()), |active| active.session.flush());
+        self.events.report(result)
+    }
+}
+
+impl Drop for SelectingAudioDecoder {
+    fn drop(&mut self) {
+        self.events.emit(&SessionEvent::Closed);
     }
 }

@@ -2,12 +2,16 @@
 //! turns them into the ordered list a codec tries.
 
 use std::fmt;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ferricast_core::{
     Acceleration, AccelerationPolicy, BackendAttempt, BackendId, BackendSelection, CodecError,
     CodecResult, CodecTarget, RuntimeFallback,
 };
 use tracing::{debug, info};
+
+use crate::cache::{self, SelectionCache, SelectionInput, SelectionKey};
 
 /// Opens a backend session for a configuration.
 pub type OpenFn<C, S> = fn(&C) -> CodecResult<Box<S>>;
@@ -107,6 +111,8 @@ pub struct Registry<C, S: ?Sized> {
     target: CodecTarget,
     candidates: Vec<Candidate<C, S>>,
     missing: Vec<Missing>,
+    /// `None`: the process-wide cache ([`cache::global`]).
+    cache: Option<Arc<dyn SelectionCache>>,
 }
 
 impl<C, S: ?Sized> fmt::Debug for Registry<C, S> {
@@ -115,6 +121,7 @@ impl<C, S: ?Sized> fmt::Debug for Registry<C, S> {
             .field("target", &self.target)
             .field("candidates", &self.candidates)
             .field("missing", &self.missing)
+            .field("cache", &self.cache)
             .finish()
     }
 }
@@ -127,7 +134,27 @@ impl<C, S: ?Sized> Registry<C, S> {
             target,
             candidates: Vec::new(),
             missing: Vec::new(),
+            cache: None,
         }
+    }
+
+    /// Remembers automatic selection's winners in `cache` instead of the
+    /// process-wide one (see [`crate::cache`]).
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<dyn SelectionCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Uses `cache` from now on, as [`Self::with_cache`] does.
+    pub fn set_cache(&mut self, cache: Arc<dyn SelectionCache>) {
+        self.cache = Some(cache);
+    }
+
+    /// The cache automatic selection remembers its winners in.
+    #[must_use]
+    pub fn cache(&self) -> Arc<dyn SelectionCache> {
+        self.cache.clone().unwrap_or_else(cache::global)
     }
 
     /// Appends a compiled backend (lower preference than the ones before).
@@ -254,48 +281,90 @@ impl<C, S: ?Sized> Registry<C, S> {
             order,
             runtime_fallback: selection.runtime_fallback(),
             fixed: matches!(selection, BackendSelection::Fixed(_)),
+            auto: match &selection {
+                BackendSelection::Auto(auto) => Some(auto.acceleration),
+                BackendSelection::Fixed(_) | BackendSelection::Ordered { .. } => None,
+            },
         })
     }
 
     /// Opens the first candidate of `plan`, starting at `from`, that
     /// accepts `config`.
     ///
+    /// An automatic plan opened from its start tries the backend its
+    /// cache remembers for this job and configuration first (see
+    /// [`crate::cache`]), then the rest in order; whichever opens is
+    /// remembered. A candidate with a probe is only opened when its
+    /// (once per process) probe passes.
+    ///
     /// # Errors
     /// A [`Plan`] for a single named backend returns that backend's own
     /// error; otherwise [`CodecError::NoBackendOpened`] lists why each
-    /// candidate was rejected.
-    pub fn open(&self, plan: &Plan, from: usize, config: &C) -> CodecResult<Opened<S>> {
+    /// candidate was rejected and how long it took.
+    pub fn open(&self, plan: &Plan, from: usize, config: &C) -> CodecResult<Opened<S>>
+    where
+        C: SelectionInput,
+    {
+        let memory = self.memory(plan, config);
+        let remembered = memory
+            .as_ref()
+            .filter(|_| from == 0)
+            .and_then(|(cache, key)| cache.winner(key))
+            .and_then(|winner| {
+                plan.order
+                    .iter()
+                    .position(|&index| self.candidates[index].backend == winner)
+            });
+        let order = remembered
+            .into_iter()
+            .chain((from..plan.order.len()).filter(|&position| Some(position) != remembered));
         let mut attempts = Vec::new();
-        for (position, &index) in plan.order.iter().enumerate().skip(from) {
-            let candidate = &self.candidates[index];
-            match candidate.open(config) {
+        for position in order {
+            let candidate = &self.candidates[plan.order[position]];
+            let started = Instant::now();
+            let result = self.try_open(candidate, config);
+            let elapsed = started.elapsed();
+            match result {
                 Ok(session) => {
                     info!(
                         target_job = %self.target,
                         backend = %candidate.backend,
                         acceleration = %candidate.acceleration,
+                        elapsed_ms = elapsed.as_secs_f64() * 1e3,
+                        remembered = remembered == Some(position),
+                        rejected = attempts.len(),
                         "codec backend opened"
                     );
+                    if let Some((cache, key)) = &memory {
+                        cache.record(key, candidate.backend);
+                    }
                     return Ok(Opened {
                         session,
                         position,
                         backend: candidate.backend,
                         acceleration: candidate.acceleration,
+                        elapsed,
+                        attempts,
                     });
                 }
                 Err(error) => {
                     debug!(
                         target_job = %self.target,
                         backend = %candidate.backend,
+                        elapsed_ms = elapsed.as_secs_f64() * 1e3,
                         %error,
                         "codec backend rejected the configuration"
                     );
+                    if let Some((cache, key)) = &memory {
+                        cache.evict(key, candidate.backend);
+                    }
                     if plan.fixed && plan.order.len() == 1 {
                         return Err(error);
                     }
                     attempts.push(BackendAttempt {
                         backend: candidate.backend,
                         reason: error.to_string(),
+                        elapsed_us: micros(elapsed),
                     });
                 }
             }
@@ -306,8 +375,45 @@ impl<C, S: ?Sized> Registry<C, S> {
         })
     }
 
+    /// `backend`, which `plan` opened for `config`, failed on the
+    /// stream: automatic selection stops trying it first.
+    pub fn demote(&self, plan: &Plan, config: &C, backend: BackendId)
+    where
+        C: SelectionInput,
+    {
+        if let Some((cache, key)) = self.memory(plan, config) {
+            cache.evict(&key, backend);
+        }
+    }
+
+    /// The cache and key an automatic plan remembers its winner under.
+    fn memory(&self, plan: &Plan, config: &C) -> Option<(Arc<dyn SelectionCache>, SelectionKey)>
+    where
+        C: SelectionInput,
+    {
+        let policy = plan.auto?;
+        let key = SelectionKey {
+            target: self.target,
+            policy,
+            traits: config.selection_traits(),
+        };
+        Some((self.cache(), key))
+    }
+
+    /// Probes (once per process) then opens `candidate`. A failed open
+    /// forgets the probe verdict, so the next selection probes again.
+    fn try_open(&self, candidate: &Candidate<C, S>, config: &C) -> CodecResult<Box<S>> {
+        if let Some(probe) = candidate.probe {
+            cache::probe_once(candidate.backend, self.target, probe)?;
+        }
+        candidate
+            .open(config)
+            .inspect_err(|_| cache::forget_probe(candidate.backend, self.target))
+    }
+
     /// Every compiled backend with whether it can run here (probing the
-    /// ones that have a probe), plus the ones this build leaves out.
+    /// ones that have a probe, once per process), plus the ones this
+    /// build leaves out.
     #[must_use]
     pub fn report(&self) -> Vec<BackendReport> {
         let compiled = self.candidates.iter().map(|candidate| BackendReport {
@@ -316,7 +422,7 @@ impl<C, S: ?Sized> Registry<C, S> {
             acceleration: Some(candidate.acceleration),
             automatic: candidate.automatic,
             availability: match candidate.probe {
-                Some(probe) => match probe() {
+                Some(probe) => match cache::probe_once(candidate.backend, self.target, probe) {
                     Ok(()) => Availability::Available,
                     Err(error) => Availability::Unavailable {
                         reason: error.to_string(),
@@ -395,6 +501,9 @@ pub struct Plan {
     order: Vec<usize>,
     runtime_fallback: RuntimeFallback,
     fixed: bool,
+    /// The acceleration policy of an automatic selection, the one kind
+    /// of plan that remembers its winner.
+    auto: Option<AccelerationPolicy>,
 }
 
 impl Plan {
@@ -421,6 +530,10 @@ pub struct Opened<S: ?Sized> {
     pub backend: BackendId,
     /// Whether it runs on media hardware.
     pub acceleration: Acceleration,
+    /// How long opening it took.
+    pub elapsed: Duration,
+    /// The candidates rejected before it, with why and how long each took.
+    pub attempts: Vec<BackendAttempt>,
 }
 
 impl<S: ?Sized> fmt::Debug for Opened<S> {
@@ -429,8 +542,15 @@ impl<S: ?Sized> fmt::Debug for Opened<S> {
             .field("position", &self.position)
             .field("backend", &self.backend)
             .field("acceleration", &self.acceleration)
+            .field("elapsed", &self.elapsed)
+            .field("attempts", &self.attempts)
             .finish_non_exhaustive()
     }
+}
+
+/// `elapsed` in whole microseconds, saturating.
+fn micros(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Whether a backend can run here.
@@ -480,6 +600,16 @@ mod tests {
 
     type TestRegistry = Registry<u32, str>;
 
+    /// A test configuration is a picture height.
+    impl SelectionInput for u32 {
+        fn selection_traits(&self) -> cache::ConfigTraits {
+            cache::ConfigTraits {
+                size: cache::SizeClass::of(*self, *self),
+                ..cache::ConfigTraits::AUDIO
+            }
+        }
+    }
+
     #[expect(
         clippy::unnecessary_wraps,
         clippy::trivially_copy_pass_by_ref,
@@ -498,8 +628,10 @@ mod tests {
         ))
     }
 
+    /// Remembers nothing, so tests do not see each other's winners.
     fn registry() -> TestRegistry {
         Registry::new(CodecTarget::decode(Codec::H264))
+            .with_cache(Arc::new(cache::NoCache))
             .candidate(Candidate::new(
                 BackendId::Nvdec,
                 Acceleration::Hardware,
@@ -623,5 +755,87 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    static COUNTED_REFUSALS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[expect(clippy::trivially_copy_pass_by_ref, reason = "an `OpenFn`")]
+    fn counted_refusal(config: &u32) -> CodecResult<Box<str>> {
+        COUNTED_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        refuses(config)
+    }
+
+    #[test]
+    fn a_warm_cache_opens_the_remembered_winner_first() {
+        let memory: Arc<dyn SelectionCache> = Arc::new(cache::MemoryCache::default());
+        let registry = TestRegistry::new(CodecTarget::encode(Codec::H264))
+            .with_cache(Arc::clone(&memory))
+            .candidate(Candidate::new(
+                BackendId::Nvenc,
+                Acceleration::Hardware,
+                counted_refusal,
+            ))
+            .candidate(Candidate::new(
+                BackendId::X264,
+                Acceleration::Software,
+                opens,
+            ));
+        let plan = registry.plan(&BackendSelection::default()).unwrap();
+        let cold = registry.open(&plan, 0, &1080).unwrap();
+        assert_eq!(cold.backend, BackendId::X264);
+        assert_eq!(cold.attempts.len(), 1, "the cold open tried nvenc first");
+        let refusals = COUNTED_REFUSALS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let warm = registry.open(&plan, 0, &1080).unwrap();
+        assert_eq!((warm.backend, warm.position), (BackendId::X264, 1));
+        assert!(warm.attempts.is_empty(), "the warm open skipped nvenc");
+        assert_eq!(
+            COUNTED_REFUSALS.load(std::sync::atomic::Ordering::SeqCst),
+            refusals
+        );
+
+        // Another size class is another key: the full order again.
+        let other = registry.open(&plan, 0, &4000).unwrap();
+        assert_eq!(other.attempts.len(), 1);
+
+        // A pinned selection never consults the cache.
+        let fixed = registry.plan(&BackendId::Nvenc.into()).unwrap();
+        assert!(registry.open(&fixed, 0, &1080).is_err());
+
+        // A runtime failure of the winner makes it lose its place.
+        registry.demote(&plan, &1080, BackendId::X264);
+        assert_eq!(registry.open(&plan, 0, &1080).unwrap().attempts.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_probe_skips_the_open_and_is_remembered() {
+        static PROBED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        // A job no other test uses: probe verdicts are process-wide.
+        let registry = TestRegistry::new(CodecTarget::encode(Codec::Vp8))
+            .with_cache(Arc::new(cache::NoCache))
+            .candidate(
+                Candidate::new(BackendId::Nvenc, Acceleration::Hardware, counted_refusal)
+                    .with_probe(|| {
+                        PROBED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err(CodecError::BackendUnavailable {
+                            backend: BackendId::Nvenc,
+                            reason: "no NVIDIA driver".into(),
+                        })
+                    }),
+            )
+            .candidate(Candidate::new(
+                BackendId::X264,
+                Acceleration::Software,
+                opens,
+            ));
+        let plan = registry.plan(&BackendSelection::default()).unwrap();
+        for _ in 0..3 {
+            let opened = registry.open(&plan, 0, &720).unwrap();
+            assert!(opened.attempts[0].reason.contains("no NVIDIA driver"));
+        }
+        assert_eq!(registry.report().len(), 2);
+        assert_eq!(PROBED.load(std::sync::atomic::Ordering::SeqCst), 1);
+        cache::forget_probe(BackendId::Nvenc, CodecTarget::encode(Codec::Vp8));
     }
 }
