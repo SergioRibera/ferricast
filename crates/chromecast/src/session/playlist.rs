@@ -184,6 +184,7 @@ impl LoadGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::net::Ipv6Addr;
 
     #[test]
@@ -236,7 +237,7 @@ mod tests {
                 let _ = s.read(&mut req).await.unwrap();
                 let mut body = String::from("#EXTM3U\n");
                 for i in 0..n {
-                    body.push_str(&format!("#EXTINF:2.0,\nseg{i}.ts\n"));
+                    write!(body, "#EXTINF:2.0,\nseg{i}.ts\n").unwrap();
                 }
                 let resp = format!(
                     "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}",

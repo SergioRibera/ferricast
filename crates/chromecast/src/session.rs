@@ -92,8 +92,10 @@ struct SessionHealth {
 
 impl SessionHealth {
     fn end(&self, reason: SessionEnd) {
-        if self.end.set(reason.clone()).is_ok() {
-            match &reason {
+        if self.end.set(reason).is_ok()
+            && let Some(reason) = self.end.get()
+        {
+            match reason {
                 SessionEnd::Remote(why) => info!(%why, "chromecast session ended by the receiver"),
                 SessionEnd::Failure(why) => warn!(%why, "chromecast session failed"),
             }
@@ -294,6 +296,10 @@ impl ChromecastSession {
 }
 
 impl CastSession for ChromecastSession {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the CASTv2 connect handshake, one step after the other"
+    )]
     async fn connect(&mut self, device: &Device) -> Result<ConnectOutcome> {
         if device.protocol != "chromecast" {
             return Err(FerricastError::Protocol(format!(

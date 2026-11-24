@@ -19,12 +19,12 @@ const CHROMECAST_SERVICE_TYPE: &str = "_googlecast._tcp.local.";
 const CHROMECAST_ICON: Bytes = Bytes::from_static(include_bytes!("../../../assets/chromecast.svg"));
 
 const CA_VIDEO_OUT: u32 = 1;
-#[allow(dead_code)]
+#[expect(dead_code, reason = "documents the Cast device-capability bitfield")]
 const CA_VIDEO_IN: u32 = 2;
 const CA_AUDIO_OUT: u32 = 4;
-#[allow(dead_code)]
+#[expect(dead_code, reason = "documents the Cast device-capability bitfield")]
 const CA_AUDIO_IN: u32 = 8;
-#[allow(dead_code)]
+#[expect(dead_code, reason = "documents the Cast device-capability bitfield")]
 const CA_MULTIZONE_GROUP: u32 = 32;
 
 pub struct ChromecastDiscovery {
@@ -50,6 +50,10 @@ impl MdnsDiscovery for ChromecastDiscovery {
 impl Discovery for ChromecastDiscovery {
     const PROTOCOL: &'static str = "chromecast";
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the mDNS browse loop and its event mapping read best in one place"
+    )]
     async fn start(&mut self, tx: mpsc::Sender<DiscoveryEvent>) -> Result<()> {
         if self.running.load(Ordering::SeqCst) {
             debug!("chromecast discovery already running");

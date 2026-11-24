@@ -101,11 +101,13 @@ impl FrameId {
     }
 
     #[must_use]
+    #[expect(clippy::cast_sign_loss, reason = "masked to the low bits first")]
     pub(crate) const fn lower_8_bits(self) -> u8 {
         (self.0 & 0xFF) as u8
     }
 
     #[must_use]
+    #[expect(clippy::cast_sign_loss, reason = "masked to the low bits first")]
     pub(crate) const fn lower_32_bits(self) -> u32 {
         (self.0 & 0xFFFF_FFFF) as u32
     }
@@ -352,7 +354,11 @@ pub(crate) mod tests {
             rtp_timestamp: 0x1122_3344,
             reference_time_us: 0,
             new_playout_delay_ms: delay,
-            data: Bytes::from((0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>()),
+            data: Bytes::from(
+                (0..len)
+                    .map(|i| u8::try_from(i % 251).unwrap())
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -364,7 +370,7 @@ pub(crate) mod tests {
         assert!(p.generate_packet(&f, 0, &mut out));
         let expected = [
             0x80,
-            0x80 | 101,
+            0x80 | 0x65, // marker + payload type 101
             0xFF,
             0xFF,
             0x11,
@@ -402,13 +408,13 @@ pub(crate) mod tests {
             assert!(p.generate_packet(&f, pid, &mut out));
             let last = pid == 2;
             assert_eq!(out[0], 0x80);
-            assert_eq!(out[1], if last { 0x80 | 96 } else { 96 });
+            assert_eq!(out[1], if last { 0x80 | 0x60 } else { 0x60 }); // payload type 96
             assert_eq!(u16::from_be_bytes([out[2], out[3]]), 100 + pid);
             assert_eq!(out[12], 0x40, "delta frame: only the reference bit");
-            assert_eq!(out[13], (300 & 0xFF) as u8);
+            assert_eq!(out[13], 300_u16.to_le_bytes()[0]);
             assert_eq!(u16::from_be_bytes([out[14], out[15]]), pid);
             assert_eq!(u16::from_be_bytes([out[16], out[17]]), 2);
-            assert_eq!(out[18], (299 & 0xFF) as u8);
+            assert_eq!(out[18], 299_u16.to_le_bytes()[0]);
             let start = MAX_PAYLOAD_SIZE * usize::from(pid);
             let end = if last { len } else { start + MAX_PAYLOAD_SIZE };
             assert_eq!(&out[19..], &f.data[start..end]);
@@ -439,7 +445,7 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         assert!(p.generate_packet(&f, 0, &mut out));
         assert_eq!(out.len(), BASE_RTP_HEADER_SIZE);
-        assert_eq!(out[1], 0x80 | 96);
+        assert_eq!(out[1], 0x80 | 0x60);
     }
 
     #[test]
@@ -467,8 +473,8 @@ pub(crate) mod tests {
         // FIPS-197 C.1: AES-128(000102..0f, 00112233..ff) = 69c4e0d86a7b0430d8cdb78070b4c55a.
         // With an all-zero frame id and an IV mask equal to that plaintext,
         // the first keystream block is exactly that ciphertext.
-        let key: [u8; 16] = core::array::from_fn(|i| i as u8);
-        let mask: [u8; 16] = core::array::from_fn(|i| (i as u8) * 0x11);
+        let key: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).unwrap());
+        let mask: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).unwrap() * 0x11);
         let c = FrameCrypto::new(key, mask);
         let ks = c.crypt(FrameId::new(0), &[0u8; 16]);
         assert_eq!(
@@ -483,10 +489,10 @@ pub(crate) mod tests {
     #[test]
     fn packet_chunks_decrypt_with_continuous_keystream() {
         let key = [0x3C; 16];
-        let mask: [u8; 16] = core::array::from_fn(|i| (i as u8).wrapping_mul(37));
+        let mask: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).unwrap().wrapping_mul(37));
         let crypto = FrameCrypto::new(key, mask);
         let plain: Vec<u8> = (0..MAX_PAYLOAD_SIZE * 3 + 77)
-            .map(|i| (i * 7) as u8)
+            .map(|i| (i * 7).to_le_bytes()[0])
             .collect();
         let id = FrameId::new(0x0012_3456_789A);
         let cipher = crypto.crypt(id, &plain);

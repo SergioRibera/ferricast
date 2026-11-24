@@ -223,10 +223,7 @@ impl Server {
         };
         let listener =
             bind().map_err(|e| FerricastError::Receiver(format!("bind tcp {addr}: {e}")))?;
-        let port = listener
-            .local_addr()
-            .map(|a| a.port())
-            .unwrap_or(addr.port());
+        let port = listener.local_addr().map_or(addr.port(), |a| a.port());
         info!(port, "AirPlay receiver listening");
         let shared = Arc::new(Shared {
             settings,
@@ -296,14 +293,13 @@ impl ControlSession for AirPlayReceiverControl {
                 "no AirPlay sender accepted".into(),
             ));
         };
-        match conn.commands.recv().await {
-            Some(cmd) => Ok(cmd),
-            None => {
-                self.alive = false;
-                Err(FerricastError::RemoteStopped(
-                    "AirPlay sender disconnected".into(),
-                ))
-            }
+        if let Some(cmd) = conn.commands.recv().await {
+            Ok(cmd)
+        } else {
+            self.alive = false;
+            Err(FerricastError::RemoteStopped(
+                "AirPlay sender disconnected".into(),
+            ))
         }
     }
 

@@ -43,6 +43,7 @@ pub struct ChromecastReceiverAdvertiser {
 }
 
 impl ChromecastReceiverAdvertiser {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -119,7 +120,7 @@ impl Advertiser for ChromecastReceiverAdvertiser {
                 "bs".into(),
                 info.device_id
                     .chars()
-                    .filter(|c| c.is_ascii_hexdigit())
+                    .filter(char::is_ascii_hexdigit)
                     .take(12)
                     .collect::<String>()
                     .to_uppercase(),
@@ -131,7 +132,7 @@ impl Advertiser for ChromecastReceiverAdvertiser {
                 // Caller-supplied overrides: replace existing entry
                 // with the same key, else append.
                 if let Some(pos) = props.iter().position(|(pk, _)| pk == k) {
-                    props[pos].1 = v.clone();
+                    props[pos].1.clone_from(v);
                 } else {
                     props.push((k.clone(), v.clone()));
                 }

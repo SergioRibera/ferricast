@@ -10,3 +10,6 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 thiserror.workspace = true
+
+[lints]
+workspace = true

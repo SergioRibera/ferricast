@@ -83,7 +83,7 @@ enum Anchor {
 
 /// `a - b` in RTP sequence space.
 fn seq_diff(a: u16, b: u16) -> i32 {
-    i32::from(a.wrapping_sub(b) as i16)
+    i32::from(a.wrapping_sub(b).cast_signed())
 }
 
 /// The audio receiver of one stream.
@@ -259,7 +259,7 @@ impl AudioReceiver {
     fn timestamp_us(&self, anchor: Anchor, rtp: u32) -> u64 {
         let rate = i128::from(self.format.sample_rate.max(1));
         let offset_ns =
-            |base: u32| i128::from(rtp.wrapping_sub(base) as i32) * 1_000_000_000 / rate;
+            |base: u32| i128::from(rtp.wrapping_sub(base).cast_signed()) * 1_000_000_000 / rate;
         match anchor {
             Anchor::Remote {
                 rtp: base,

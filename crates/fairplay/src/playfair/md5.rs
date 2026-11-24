@@ -80,6 +80,10 @@ const SINE: [u32; 64] = [
 /// Runs the 64 MD5 steps over `block`, starting from `key` instead of the
 /// MD5 initial state, and returns `key` plus the final state. After step
 /// 31 some input words are swapped, picked by the state at that point.
+#[expect(
+    clippy::many_single_char_names,
+    reason = "MD5's `a`, `b`, `c`, `d` state words (RFC 1321)"
+)]
 pub(super) fn modified_md5(block: &[u8; 64], key: &[u8; 16]) -> [u8; 16] {
     // Input words are read big-endian; the key and output little-endian.
     let (words, _) = block.as_chunks::<4>();

@@ -5,6 +5,11 @@
 //! were printed by a small C program that includes those files, so every
 //! size and value is the C compiler's.
 
+#![expect(
+    clippy::unreadable_literal,
+    reason = "the tables are copied verbatim from the C source"
+)]
+
 pub(crate) static MESSAGE_KEY: [[u8; 144]; 4] = [
     [
         0x1d, 0x24, 0x03, 0x40, 0xdc, 0xae, 0xc7, 0xa8, 0x26, 0x7c, 0x20, 0x99, 0x5d, 0x7e, 0x89,

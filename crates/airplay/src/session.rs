@@ -70,7 +70,7 @@ struct Stream {
     /// Connection to the receiver's `eventPort`, held open like iOS does;
     /// `None` when the receiver announces none (UxPlay) or refuses it.
     _event: Option<TcpStream>,
-    _feedback: TaskGuard,
+    feedback: TaskGuard,
 }
 
 /// Connection to the receiver that survives from `connect` to `stop`.
@@ -481,7 +481,7 @@ impl AirPlaySession {
             audio,
             _timing: timing,
             _event: event,
-            _feedback: TaskGuard(feedback),
+            feedback: TaskGuard(feedback),
         })
     }
 }
@@ -909,7 +909,7 @@ impl CastSession for AirPlaySession {
             if stream.audio.is_some() {
                 stream_types.push(STREAM_TYPE_AUDIO);
             }
-            drop(stream._feedback);
+            drop(stream.feedback);
             stream.mirror.shutdown().await;
         }
         if let Some(link) = self.link.take() {

@@ -2,11 +2,32 @@
 # enable `clippy::unwrap_used` (ferricast-codec) are affected.
 allow-unwrap-in-tests = true
 
-# Product and protocol names that `clippy::doc_markdown` would otherwise
-# want in backticks; `..` keeps clippy's defaults.
+# Product and protocol names written as prose in docs, which
+# `clippy::doc_markdown` would otherwise want in backticks; `..` keeps
+# clippy's defaults (`GitHub`, `macOS`, ...).
 doc-valid-idents = [
     "..",
-    "AirPlay", "AirScreen", "FairPlay", "HomeKit", "CoreUtils", "UxPlay", "RPiPlay",
-    "PipeWire", "PulseAudio", "ScreenCast", "XRandR", "WinRT", "YouTube",
-    "VideoToolbox", "AudioToolbox", "MediaCodec", "ICtCp",
+    "AirPlay",
+    "AirScreen",
+    "AudioToolbox",
+    "BubbleUPnP",
+    "CASTv2",
+    "CoreUtils",
+    "FairPlay",
+    "GnuTLS",
+    "HomeKit",
+    "HomePods",
+    "ICtCp",
+    "MediaCodec",
+    "NACKed",
+    "PipeWire",
+    "PulseAudio",
+    "RPiPlay",
+    "ScreenCast",
+    "UxPlay",
+    "VideoToolbox",
+    "WinRT",
+    "XORed",
+    "XRandR",
+    "YouTube",
 ]

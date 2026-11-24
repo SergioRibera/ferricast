@@ -529,9 +529,8 @@ impl StreamSender {
             for pid in range {
                 let eligible = match (pending.sent_at.get(pid).copied().flatten(), too_recent) {
                     (Some(sent), Some(limit)) => sent <= limit,
-                    (Some(_), None) => false,
                     // Never sent: it's already flagged.
-                    (None, _) => false,
+                    (Some(_), None) | (None, _) => false,
                 };
                 if eligible && let Some(flag) = pending.send_flags.get_mut(pid) {
                     *flag = true;
@@ -701,7 +700,7 @@ mod tests {
     fn span_limit_rejects_and_ack_reopens() {
         let t0 = Instant::now();
         let mut p = params(StreamKind::Video);
-        p.target_playout_delay = Duration::from_secs(60);
+        p.target_playout_delay = Duration::from_mins(1);
         let mut s = StreamSender::new(p);
         for i in 0..MAX_UNACKED_FRAMES {
             let id = s
@@ -775,8 +774,8 @@ mod tests {
         assert_eq!(&out[4..8], &60_000u32.to_be_bytes());
         let ntp = u64::from_be_bytes(out[8..16].try_into().unwrap());
         assert_eq!(ntp, unix_us_to_ntp(send_us));
-        let rtp = u32::from_be_bytes(out[16..20].try_into().unwrap());
-        assert_eq!(rtp, rtp0.wrapping_add(9_000));
+        let rtp_ts = u32::from_be_bytes(out[16..20].try_into().unwrap());
+        assert_eq!(rtp_ts, rtp0.wrapping_add(9_000));
 
         // Not due again until RTT is known (every frame) or interval elapses.
         out.clear();

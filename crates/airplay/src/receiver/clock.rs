@@ -116,13 +116,12 @@ impl RemoteClock {
     /// from now.
     pub fn to_local_us(&self, remote_ns: u64) -> u64 {
         let mut state = self.lock();
-        let offset = match state.offset_ns() {
-            Some(offset) => offset,
-            None => {
-                let offset = signed_diff(remote_ns, local_now_ns());
-                state.arrival_offset_ns = Some(offset);
-                offset
-            }
+        let offset = if let Some(offset) = state.offset_ns() {
+            offset
+        } else {
+            let offset = signed_diff(remote_ns, local_now_ns());
+            state.arrival_offset_ns = Some(offset);
+            offset
         };
         let local_ns = i128::from(remote_ns) - i128::from(offset);
         u64::try_from(local_ns.max(0) / 1_000).unwrap_or(u64::MAX)
@@ -161,7 +160,7 @@ fn sample(reply: &[u8], received_ns: u64) -> Option<Sample> {
     let t2 = i128::from(remote_sent);
     let t3 = i128::from(received_ns);
     Some(Sample {
-        offset_ns: i64::try_from(((t1 - t0) + (t2 - t3)) / 2).ok()?,
+        offset_ns: i64::try_from(i128::midpoint(t1 - t0, t2 - t3)).ok()?,
         round_trip_ns: i64::try_from((t3 - t0) - (t2 - t1)).ok()?,
     })
 }

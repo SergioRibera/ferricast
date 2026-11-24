@@ -47,11 +47,17 @@ impl Connection {
             route,
             (
                 "POST",
-                "/reverse" | "/play" | "/scrub" | "/rate" | "/stop" | "/action" | "/volume"
+                "/reverse"
+                    | "/play"
+                    | "/scrub"
+                    | "/rate"
+                    | "/stop"
+                    | "/action"
+                    | "/volume"
+                    | "/fp-setup2"
             ) | ("GET", "/playback-info" | "/scrub" | "/server-info")
                 | ("PUT", "/setProperty")
                 | ("POST" | "GET", "/getProperty")
-                | ("POST", "/fp-setup2")
         );
         if !is_video {
             return None;

@@ -110,7 +110,7 @@ pub(crate) async fn pair_setup(
         (TAG_SIGNATURE, &signature),
     ]);
     let sealed = aead(&encrypt_key)
-        .encrypt(&hap_nonce(b"PS-Msg05"), inner.as_slice())
+        .encrypt(&hap_nonce(*b"PS-Msg05"), inner.as_slice())
         .map_err(|_| FerricastError::Protocol("pair-setup M5: encryption failed".into()))?;
     let m5 = tlv::encode(&[(TAG_STATE, &[5]), (TAG_ENCRYPTED_DATA, &sealed)]);
     let m6 = post(rtsp, "/pair-setup", &m5, "pair-setup M6").await?;
@@ -119,7 +119,7 @@ pub(crate) async fn pair_setup(
     // M6: the receiver's long-term key, signed the same way.
     let plain = aead(&encrypt_key)
         .decrypt(
-            &hap_nonce(b"PS-Msg06"),
+            &hap_nonce(*b"PS-Msg06"),
             m6.require(TAG_ENCRYPTED_DATA, "pair-setup M6")?,
         )
         .map_err(|_| FerricastError::Protocol("pair-setup M6: authentication failed".into()))?;
@@ -184,7 +184,7 @@ pub(crate) async fn pair_verify(
     )?;
     let plain = aead(&session_key)
         .decrypt(
-            &hap_nonce(b"PV-Msg02"),
+            &hap_nonce(*b"PV-Msg02"),
             m2.require(TAG_ENCRYPTED_DATA, "pair-verify M2")?,
         )
         .map_err(|_| FerricastError::Protocol("pair-verify M2: authentication failed".into()))?;
@@ -216,7 +216,7 @@ pub(crate) async fn pair_verify(
         (TAG_SIGNATURE, &signature),
     ]);
     let sealed = aead(&session_key)
-        .encrypt(&hap_nonce(b"PV-Msg03"), inner.as_slice())
+        .encrypt(&hap_nonce(*b"PV-Msg03"), inner.as_slice())
         .map_err(|_| FerricastError::Protocol("pair-verify M3: encryption failed".into()))?;
     let m3 = tlv::encode(&[(TAG_STATE, &[3]), (TAG_ENCRYPTED_DATA, &sealed)]);
     let m4 = post(rtsp, "/pair-verify", &m3, "pair-verify M4").await?;

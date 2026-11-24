@@ -65,19 +65,19 @@ pub enum PayloadType {
 /// The outer envelope for every CASTv2 message on the wire.
 ///
 /// Field numbers match the official `cast_channel.proto`:
-///   1 = protocol_version
-///   2 = source_id
-///   3 = destination_id
+///   1 = `protocol_version`
+///   2 = `source_id`
+///   3 = `destination_id`
 ///   4 = namespace
-///   5 = payload_type
-///   6 = payload_utf8
-///   7 = payload_binary
+///   5 = `payload_type`
+///   6 = `payload_utf8`
+///   7 = `payload_binary`
 ///
 /// `protocol_version` and `payload_type` are wrapped in `Option`
 /// even though they're conceptually required — that forces prost to
 /// emit the tag on the wire even when the value is the proto3
 /// default (0). The official schema is proto2 with `required`
-/// semantics; some chromecast firmwares reject CastMessages that
+/// semantics; some chromecast firmwares reject `CastMessages` that
 /// lack tag=1 / tag=5 entirely (which is what plain `i32` fields do
 /// when they happen to be zero — `CASTV2_1_0 = 0` and `STRING = 0`
 /// are the only values we ever send for these). Without this, the
@@ -107,7 +107,7 @@ pub struct CastMessage {
     pub payload_binary: Option<Vec<u8>>,
 }
 
-/// Protocol version enum (only CASTV2_1_0 is used in practice).
+/// Protocol version enum (only `CASTV2_1_0` is used in practice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
 #[repr(i32)]
 pub enum ProtocolVersion {
@@ -175,8 +175,9 @@ impl ConnectPayload {
     /// (notably 1st-gen audio devices and certain Google TV
     /// versions) silently close the TLS channel when those fields
     /// are present from a sender they don't recognise. Both
-    /// pychromecast and rust_cast send plain `{type:CONNECT}` and
+    /// pychromecast and `rust_cast` send plain `{type:CONNECT}` and
     /// it's the lowest-common-denominator form.
+    #[must_use]
     pub fn connect() -> Self {
         Self {
             msg_type: "CONNECT".into(),
@@ -186,6 +187,7 @@ impl ConnectPayload {
         }
     }
 
+    #[must_use]
     pub fn close() -> Self {
         Self {
             msg_type: "CLOSE".into(),
@@ -205,12 +207,14 @@ pub struct HeartbeatPayload {
 }
 
 impl HeartbeatPayload {
+    #[must_use]
     pub fn ping() -> Self {
         Self {
             msg_type: "PING".into(),
         }
     }
 
+    #[must_use]
     pub fn pong() -> Self {
         Self {
             msg_type: "PONG".into(),
@@ -299,6 +303,7 @@ pub struct LaunchPayload {
 }
 
 impl LaunchPayload {
+    #[must_use]
     pub fn new(request_id: i64, app_id: &str) -> Self {
         Self {
             msg_type: "LAUNCH".into(),
@@ -318,6 +323,7 @@ pub struct GetStatusPayload {
 }
 
 impl GetStatusPayload {
+    #[must_use]
     pub fn new(request_id: i64) -> Self {
         Self {
             msg_type: "GET_STATUS".into(),
@@ -339,6 +345,7 @@ pub struct StopPayload {
 }
 
 impl StopPayload {
+    #[must_use]
     pub fn new(request_id: i64, session_id: &str) -> Self {
         Self {
             msg_type: "STOP".into(),
@@ -479,6 +486,7 @@ pub struct LoadPayload {
 }
 
 impl LoadPayload {
+    #[must_use]
     pub fn new(request_id: i64, media: MediaInfo) -> Self {
         Self {
             msg_type: "LOAD".into(),
@@ -495,6 +503,9 @@ pub const MIRRORING_APP_ID: &str = "0F5096E8";
 
 impl CastMessage {
     /// Create a new string-payload message.
+    ///
+    /// # Errors
+    /// [`CastV2Error::Json`] when the payload does not serialize.
     pub fn new_json(
         source_id: &str,
         destination_id: &str,
@@ -521,6 +532,7 @@ impl CastMessage {
     }
 
     /// Create a binary-payload message.
+    #[must_use]
     pub fn new_binary(
         source_id: &str,
         destination_id: &str,
@@ -539,6 +551,9 @@ impl CastMessage {
     }
 
     /// Encode this message into a length-prefixed byte buffer ready for the wire.
+    ///
+    /// # Errors
+    /// [`CastV2Error::FrameTooLarge`] above [`MAX_BODY_SIZE`], [`CastV2Error::Encode`] when protobuf encoding fails.
     pub fn encode_length_prefixed(&self) -> Result<Vec<u8>> {
         let proto_len = self.encoded_len();
         if proto_len > MAX_BODY_SIZE {
@@ -569,6 +584,9 @@ impl CastMessage {
     ///
     /// Returns `Ok(None)` if there are not enough bytes yet (the caller should
     /// read more data and retry).
+    ///
+    /// # Errors
+    /// [`CastV2Error::FrameTooLarge`] for a prefix above [`MAX_MESSAGE_SIZE`], [`CastV2Error::Decode`] for a malformed message.
     pub fn decode_length_prefixed(buf: &mut BytesMut) -> Result<Option<Self>> {
         if buf.len() < LENGTH_PREFIX_SIZE {
             return Ok(None);
@@ -628,11 +646,16 @@ impl CastMessage {
         }
     }
 
+    /// Parses the JSON string payload (an absent one reads as `{}`) as `T`.
+    ///
+    /// # Errors
+    /// [`CastV2Error::Json`] when it is not a `T`.
     pub fn parse_payload<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
         let payload = self.payload_utf8.as_deref().unwrap_or("{}");
         Ok(serde_json::from_str(payload)?)
     }
 
+    #[must_use]
     pub fn message_type(&self) -> Option<String> {
         let payload = self.payload_utf8.as_deref()?;
         let parsed: GenericPayload = serde_json::from_str(payload).ok()?;
@@ -641,6 +664,9 @@ impl CastMessage {
 }
 
 /// Build a CONNECT message for the connection namespace.
+///
+/// # Errors
+/// [`CastV2Error::Json`] when the payload does not serialize.
 pub fn connect_message(source_id: &str, destination_id: &str) -> Result<CastMessage> {
     CastMessage::new_json(
         source_id,
@@ -651,6 +677,9 @@ pub fn connect_message(source_id: &str, destination_id: &str) -> Result<CastMess
 }
 
 /// Build a CLOSE message for the connection namespace.
+///
+/// # Errors
+/// [`CastV2Error::Json`] when the payload does not serialize.
 pub fn close_message(source_id: &str, destination_id: &str) -> Result<CastMessage> {
     CastMessage::new_json(
         source_id,
@@ -661,6 +690,9 @@ pub fn close_message(source_id: &str, destination_id: &str) -> Result<CastMessag
 }
 
 /// Build a PING message.
+///
+/// # Errors
+/// [`CastV2Error::Json`] when the payload does not serialize.
 pub fn ping_message() -> Result<CastMessage> {
     CastMessage::new_json(
         DEFAULT_SENDER_ID,
@@ -671,6 +703,9 @@ pub fn ping_message() -> Result<CastMessage> {
 }
 
 /// Build a PONG message.
+///
+/// # Errors
+/// [`CastV2Error::Json`] when the payload does not serialize.
 pub fn pong_message() -> Result<CastMessage> {
     CastMessage::new_json(
         DEFAULT_SENDER_ID,
@@ -683,6 +718,9 @@ pub fn pong_message() -> Result<CastMessage> {
 /// Build the PONG answering `ping`, addressed back to whoever sent it.
 /// A broadcast destination (`*`) cannot be a reply source, so we fall
 /// back to our own sender id.
+///
+/// # Errors
+/// [`CastV2Error::Json`] when the payload does not serialize.
 pub fn pong_reply(ping: &CastMessage) -> Result<CastMessage> {
     let source = match ping.destination_id.as_str() {
         "" | "*" => DEFAULT_SENDER_ID,
@@ -701,7 +739,10 @@ pub fn pong_reply(ping: &CastMessage) -> Result<CastMessage> {
     )
 }
 
-/// Build a GET_STATUS message for the receiver namespace.
+/// Build a `GET_STATUS` message for the receiver namespace.
+///
+/// # Errors
+/// [`CastV2Error::Json`] when the payload does not serialize.
 pub fn get_status_message(request_id: i64) -> Result<CastMessage> {
     CastMessage::new_json(
         DEFAULT_SENDER_ID,
@@ -712,6 +753,9 @@ pub fn get_status_message(request_id: i64) -> Result<CastMessage> {
 }
 
 /// Build a LAUNCH message for the receiver namespace.
+///
+/// # Errors
+/// [`CastV2Error::Json`] when the payload does not serialize.
 pub fn launch_message(request_id: i64, app_id: &str) -> Result<CastMessage> {
     CastMessage::new_json(
         DEFAULT_SENDER_ID,
@@ -722,6 +766,9 @@ pub fn launch_message(request_id: i64, app_id: &str) -> Result<CastMessage> {
 }
 
 /// Build a STOP message for the receiver namespace.
+///
+/// # Errors
+/// [`CastV2Error::Json`] when the payload does not serialize.
 pub fn stop_app_message(request_id: i64, session_id: &str) -> Result<CastMessage> {
     CastMessage::new_json(
         DEFAULT_SENDER_ID,
@@ -732,6 +779,9 @@ pub fn stop_app_message(request_id: i64, session_id: &str) -> Result<CastMessage
 }
 
 /// Build a LOAD message for the media namespace.
+///
+/// # Errors
+/// [`CastV2Error::Json`] when the payload does not serialize.
 pub fn load_media_message(
     request_id: i64,
     transport_id: &str,
@@ -759,7 +809,7 @@ pub fn load_media_message(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i64)]
 pub enum MediaDetailedErrorCode {
-    /// 100 — `MEDIA_UNKNOWN`. The HTMLMediaElement threw an error,
+    /// 100 — `MEDIA_UNKNOWN`. The `HTMLMediaElement` threw an error,
     /// but CAF doesn't recognise the specific cause.
     MediaUnknown = 100,
     /// 101 — `MEDIA_ABORTED`. User agent aborted fetching the
@@ -842,6 +892,7 @@ pub enum MediaDetailedErrorCode {
 }
 
 impl MediaDetailedErrorCode {
+    #[must_use]
     pub fn from_code(code: i64) -> Self {
         match code {
             100 => Self::MediaUnknown,
@@ -893,6 +944,7 @@ impl MediaDetailedErrorCode {
     /// up on a fresh LAUNCH; decoder / unsupported-format errors
     /// won't because nothing about the stream we send is going to
     /// change between attempts.
+    #[must_use]
     pub fn is_retryable(self) -> bool {
         matches!(
             self,
@@ -998,9 +1050,9 @@ mod tests {
     #[test]
     fn decodes_multiple_frames_from_one_buffer() {
         let ping = ping_message().unwrap();
-        let pong = pong_message().unwrap();
+        let heartbeat_reply = pong_message().unwrap();
         let mut bytes = frame(&ping);
-        bytes.extend(frame(&pong));
+        bytes.extend(frame(&heartbeat_reply));
         let mut buf = BytesMut::from(&bytes[..]);
         let first = CastMessage::decode_length_prefixed(&mut buf)
             .unwrap()
@@ -1009,7 +1061,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first, ping);
-        assert_eq!(second, pong);
+        assert_eq!(second, heartbeat_reply);
         assert!(
             CastMessage::decode_length_prefixed(&mut buf)
                 .unwrap()
@@ -1079,10 +1131,10 @@ mod tests {
         let mut ping = ping_message().unwrap();
         ping.source_id = "receiver-0".into();
         ping.destination_id = "*".into();
-        let pong = pong_reply(&ping).unwrap();
-        assert_eq!(pong.source_id, DEFAULT_SENDER_ID);
-        assert_eq!(pong.destination_id, "receiver-0");
-        assert_eq!(pong.message_type().as_deref(), Some("PONG"));
+        let reply = pong_reply(&ping).unwrap();
+        assert_eq!(reply.source_id, DEFAULT_SENDER_ID);
+        assert_eq!(reply.destination_id, "receiver-0");
+        assert_eq!(reply.message_type().as_deref(), Some("PONG"));
     }
 
     #[test]

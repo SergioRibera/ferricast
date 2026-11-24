@@ -188,7 +188,7 @@ impl ReceiverIdentity {
 
     /// `AABBCCDDEEFF`, the `_raop._tcp` instance-name prefix.
     fn device_id_hex(&self) -> String {
-        self.device_id.iter().map(|b| format!("{b:02X}")).collect()
+        hex::encode_upper(self.device_id)
     }
 
     fn public_key_hex(&self) -> String {

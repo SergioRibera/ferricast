@@ -6,7 +6,7 @@
 //! that daemon over D-Bus. This example bypasses that entirely.
 //!
 //! Run:
-//!     cargo run --example probe_mdns -p ferricast-chromecast
+//!     cargo run --example `probe_mdns` -p ferricast-chromecast
 //!
 //! It browses `_googlecast._tcp` for ~10 s, prints every resolved
 //! service plus its TXT records, then exits. Use it after starting
@@ -49,17 +49,17 @@ fn main() {
                 println!("  port:     {}", info.get_port());
                 println!("  txt ({} keys):", txt.len());
                 for t in txt {
-                    println!("    {}", t);
+                    println!("    {t}");
                 }
             }
             Ok(ServiceEvent::ServiceFound(_ty, name)) => {
-                println!("  found: {} (resolving …)", name);
+                println!("  found: {name} (resolving …)");
             }
             Ok(ServiceEvent::ServiceRemoved(_, name)) => {
-                println!("  removed: {}", name);
+                println!("  removed: {name}");
             }
             Ok(ServiceEvent::SearchStarted(ty)) => {
-                println!("  search started for {}", ty);
+                println!("  search started for {ty}");
             }
             Ok(ServiceEvent::SearchStopped(_)) => {}
             Ok(other) => println!("  other event: {other:?}"),

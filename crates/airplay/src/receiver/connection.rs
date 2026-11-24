@@ -38,7 +38,7 @@ const BIND_RETRY_STEP: Duration = Duration::from_millis(50);
 /// How long the sender has to open the mirroring connection.
 const MIRROR_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a connection without a session may go without a request.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 /// Media events queued from the stream receivers.
 const MEDIA_QUEUE: usize = 256;
 /// UUID UxPlay reports for its one display.
@@ -261,11 +261,11 @@ impl Connection {
                         self.announce(stream).await;
                     }
                 }
-                _ = closed(&mut self.promoted) => {
+                () = closed(&mut self.promoted) => {
                     debug!(peer = %self.peer, "pipeline closed the AirPlay session");
                     break;
                 }
-                _ = preempted(&mut self.media) => {
+                () = preempted(&mut self.media) => {
                     info!(peer = %self.peer, "AirPlay session replaced by another sender");
                     break;
                 }
@@ -276,16 +276,13 @@ impl Connection {
         if self.pin_shown {
             self.command(MediaCommand::PairingPin(None)).await;
         }
-        match reversed {
-            Some(key) => {
-                let shared = self.shared.clone();
-                drop(self);
-                shared.reverse.serve(&key, rtsp.into_inner()).await;
-            }
-            None => {
-                rtsp.shutdown().await;
-                debug!(peer = %self.peer, "AirPlay control connection closed");
-            }
+        if let Some(key) = reversed {
+            let shared = self.shared.clone();
+            drop(self);
+            shared.reverse.serve(&key, rtsp.into_inner()).await;
+        } else {
+            rtsp.shutdown().await;
+            debug!(peer = %self.peer, "AirPlay control connection closed");
         }
     }
 
@@ -319,11 +316,11 @@ impl Connection {
         }
         let result = match (request.method.as_str(), request.path()) {
             ("GET", "/info") => Ok(self.info(request)),
-            ("POST", "/pair-setup") => self.pair_setup(request).await,
-            ("POST", "/pair-verify") => self.pair_verify(request).await,
+            ("POST", "/pair-setup") => self.pair_setup(request),
+            ("POST", "/pair-verify") => self.pair_verify(request),
             ("POST", "/pair-pin-start") => self.pair_pin_start().await,
             ("POST", "/pair-setup-pin") => self.pair_setup_pin(request).await,
-            ("POST", "/fp-setup") => self.fp_setup(request).await,
+            ("POST", "/fp-setup") => self.fp_setup(request),
             ("POST", "/feedback" | "/audioMode") => Ok(Response::ok()),
             ("OPTIONS", _) => Ok(Response::ok().header(
                 "Public",
@@ -354,6 +351,10 @@ impl Connection {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one flat list of the /info keys AirPlay senders read"
+    )]
     fn info(&self, request: &Request) -> Response {
         let settings = &self.shared.settings;
         let mut qualifiers = Vec::new();
@@ -467,7 +468,7 @@ impl Connection {
         bplist_response(dict)
     }
 
-    async fn pair_setup(&mut self, request: &Request) -> Result<Response> {
+    fn pair_setup(&mut self, request: &Request) -> Result<Response> {
         if request.body.len() != 32 {
             return Err(FerricastError::Protocol(
                 "pair-setup: expected 32 bytes".into(),
@@ -482,7 +483,7 @@ impl Connection {
         self.shared.is_paired(&hex::encode(key))
     }
 
-    async fn pair_verify(&mut self, request: &Request) -> Result<Response> {
+    fn pair_verify(&mut self, request: &Request) -> Result<Response> {
         let identity = &self.shared.settings.identity.key;
         match request.body.first() {
             Some(1) => {
@@ -553,7 +554,7 @@ impl Connection {
     }
 
     #[cfg(feature = "fairplay")]
-    async fn fp_setup(&mut self, request: &Request) -> Result<Response> {
+    fn fp_setup(&mut self, request: &Request) -> Result<Response> {
         use ferricast_fairplay as fp;
         let fp_error = |e: fp::FairPlayError| FerricastError::Protocol(format!("fp-setup: {e}"));
         match request.body.len() {
@@ -573,14 +574,25 @@ impl Connection {
     }
 
     #[cfg(not(feature = "fairplay"))]
-    #[expect(clippy::unused_async, reason = "same signature as the FairPlay build")]
-    async fn fp_setup(&mut self, _request: &Request) -> Result<Response> {
+    #[expect(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "same signature as the FairPlay build"
+    )]
+    fn fp_setup(&mut self, _request: &Request) -> Result<Response> {
         warn!("fp-setup refused: built without FairPlay support (the `fairplay` feature)");
         Ok(Response::status(501, "Not Implemented"))
     }
 
     /// The AES key of `ekey`: FairPlay-decrypted with the stored key
     /// message, then hashed with the pairing secret when pairing ran.
+    #[cfg_attr(
+        not(feature = "fairplay"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "only the FairPlay build can fail to decrypt `ekey`"
+        )
+    )]
     fn session_key(&self, ekey: &[u8]) -> Result<[u8; 16]> {
         let base = match self.keymsg {
             #[cfg(feature = "fairplay")]
@@ -910,6 +922,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(clippy::float_cmp, reason = "the silent floor is exactly 0.0")]
     fn volume_maps_to_gain() {
         assert_eq!(gain_from_db(-144.0), 0.0);
         assert_eq!(gain_from_db(-30.0), 0.0);

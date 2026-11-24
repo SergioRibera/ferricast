@@ -7,7 +7,7 @@
 //! We can't replicate that chain (Google doesn't issue these for
 //! third-party software), so the self-signed approach is the
 //! lowest-common-denominator that interoperates with senders that
-//! don't enforce CA validation — VLC, Stream2Chromecast,
+//! don't enforce CA validation — VLC, `Stream2Chromecast`,
 //! BubbleUPnP, the Cast SDK in dev mode, etc.
 
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use ferricast_core::{FerricastError, Result};
 pub fn build_server_config(advertised_ips: &[std::net::IpAddr]) -> Result<Arc<ServerConfig>> {
     let mut params = CertificateParams::new(
         std::iter::once("localhost".to_string())
-            .chain(advertised_ips.iter().map(|ip| ip.to_string()))
+            .chain(advertised_ips.iter().map(std::string::ToString::to_string))
             .collect::<Vec<_>>(),
     )
     .map_err(|e| FerricastError::Receiver(format!("rcgen params: {e}")))?;

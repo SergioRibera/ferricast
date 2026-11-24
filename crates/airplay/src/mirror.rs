@@ -267,6 +267,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the header stores the exact integer sizes"
+    )]
     fn header_layout() {
         let h = codec_header(20, 0x0102_0304_0506_0708, 1280, 720).unwrap();
         assert_eq!(&h[..4], &20_u32.to_le_bytes());

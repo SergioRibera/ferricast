@@ -25,7 +25,7 @@ pub(crate) struct Timing {
     /// Silence after which the receiver counts as gone. Three missed
     /// heartbeat round-trips.
     pub inactivity: Duration,
-    /// Minimum gap between two GET_STATUS nudges while waiting for
+    /// Minimum gap between two `GET_STATUS` nudges while waiting for
     /// the launched app to show up.
     pub nudge_interval: Duration,
 }
@@ -67,7 +67,7 @@ pub(crate) enum Action {
     Nothing,
     /// Send this message (a PONG answering the receiver's PING).
     Reply(CastMessage),
-    /// Send a receiver GET_STATUS.
+    /// Send a receiver `GET_STATUS`.
     Nudge,
     /// The app we launched is up; the monitor already switched to the
     /// running phase.
@@ -104,7 +104,7 @@ pub(crate) struct ReceiverMonitor {
 impl ReceiverMonitor {
     /// Start in the launch phase, waiting for `app_id` (asked for with
     /// LAUNCH `launch_request_id`). `now` counts as the moment of the
-    /// last nudge because the caller sends GET_STATUS right after
+    /// last nudge because the caller sends `GET_STATUS` right after
     /// LAUNCH.
     pub(crate) fn launching(
         app_id: &str,
@@ -257,9 +257,9 @@ impl ReceiverMonitor {
         }
     }
 
-    /// Send GET_STATUS now, or schedule it if the last one went out
+    /// Send `GET_STATUS` now, or schedule it if the last one went out
     /// less than [`Timing::nudge_interval`] ago. Some firmwares emit a
-    /// single half-populated RECEIVER_STATUS and go quiet, so the nudge
+    /// single half-populated `RECEIVER_STATUS` and go quiet, so the nudge
     /// is needed; answering every status immediately would ping-pong at
     /// round-trip speed for the whole launch.
     fn request_nudge(&mut self, reason: &str, now: Instant) -> Action {
@@ -426,7 +426,7 @@ fn log_media_error(msg: &CastMessage, ty: &str) {
     }
 }
 
-/// MEDIA_STATUS bookkeeping: decides when playback ended for good and
+/// `MEDIA_STATUS` bookkeeping: decides when playback ended for good and
 /// keeps the diagnostics that make the log a readable timeline.
 #[derive(Debug)]
 struct MediaTracker {
@@ -687,9 +687,9 @@ mod tests {
         ping.source_id = DEFAULT_RECEIVER_ID.into();
         ping.destination_id = DEFAULT_SENDER_ID.into();
         match m.on_message(&ping, now) {
-            Action::Reply(pong) => {
-                assert_eq!(pong.message_type().as_deref(), Some("PONG"));
-                assert_eq!(pong.destination_id, DEFAULT_RECEIVER_ID);
+            Action::Reply(reply) => {
+                assert_eq!(reply.message_type().as_deref(), Some("PONG"));
+                assert_eq!(reply.destination_id, DEFAULT_RECEIVER_ID);
             }
             other => panic!("unexpected {other:?}"),
         }

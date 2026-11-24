@@ -23,9 +23,9 @@ pub(crate) struct PairedSession {
 }
 
 /// `[0; 4] ‖ label` nonce used by HomeKit ChaCha20-Poly1305 messages.
-pub(crate) fn hap_nonce(label: &[u8; 8]) -> chacha20poly1305::Nonce {
+pub(crate) fn hap_nonce(label: [u8; 8]) -> chacha20poly1305::Nonce {
     let mut nonce = [0_u8; 12];
-    nonce[4..].copy_from_slice(label);
+    nonce[4..].copy_from_slice(&label);
     nonce.into()
 }
 
@@ -33,7 +33,7 @@ pub(crate) fn hap_nonce(label: &[u8; 8]) -> chacha20poly1305::Nonce {
 mod tests {
     #[test]
     fn nonce_is_twelve_bytes_with_zero_prefix() {
-        let n = super::hap_nonce(b"PV-Msg03");
+        let n = super::hap_nonce(*b"PV-Msg03");
         assert_eq!(&n[..4], &[0, 0, 0, 0]);
         assert_eq!(&n[4..], b"PV-Msg03");
     }
