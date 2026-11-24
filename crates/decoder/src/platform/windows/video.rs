@@ -241,6 +241,17 @@ fn select_output(mft: &IMFTransform, preferred: [GUID; 2]) -> windows::core::Res
     Err(MF_E_INVALIDMEDIATYPE.into())
 }
 
+/// What the transform reports, each half completed from the container's
+/// `fallback`.
+fn merge_hdr(reported: Option<HdrMetadata>, fallback: Option<HdrMetadata>) -> Option<HdrMetadata> {
+    let (reported, fallback) = (reported.unwrap_or_default(), fallback.unwrap_or_default());
+    let merged = HdrMetadata {
+        mastering_display: reported.mastering_display.or(fallback.mastering_display),
+        content_light: reported.content_light.or(fallback.content_light),
+    };
+    (!merged.is_empty()).then_some(merged)
+}
+
 /// NV12, else P010 (downshifted to 8 bits on the CPU path).
 fn select_nv12(mft: &IMFTransform) -> windows::core::Result<()> {
     select_output(mft, [MFVideoFormat_NV12, MFVideoFormat_P010])
@@ -413,7 +424,7 @@ impl Session {
                 .take(unsafe { sample.GetSampleTime() }.ok().map(micros));
             let picture = self.picture;
             let colour = picture.colour.unwrap_or(self.fallback_colour);
-            let hdr = self.fallback_hdr.or(picture.hdr);
+            let hdr = merge_hdr(picture.hdr, self.fallback_hdr);
             let texture = match (&self.device, picture.visible()) {
                 (Some(_), Some(visible)) => D3d11Texture::from_sample(&sample, visible)?,
                 _ => None,
