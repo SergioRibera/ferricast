@@ -31,7 +31,7 @@ pub struct GpuFrame {
     pub plane: DmaBufPlane,
     /// `None` means readback isn't possible (this frame came from a
     /// path that didn't have a GPU importer attached). In practice
-    /// always populated when the PipeWire DmaBuf path produces a
+    /// always populated when the PipeWire `DmaBuf` path produces a
     /// `GpuFrame`.
     pub importer: Option<Arc<dyn DmaBufImporter>>,
     /// Keeps the producer from rendering into this DMA-BUF while any
@@ -87,8 +87,8 @@ impl GpuFrame {
     }
 }
 
-/// One DMA-BUF plane. Single-plane formats (BGRA / BGRx / RGBA /
-/// RGBx) are the common case; multi-plane (NV12, I420) would carry
+/// One DMA-BUF plane. Single-plane formats (BGRA / `BGRx` / RGBA /
+/// `RGBx`) are the common case; multi-plane (NV12, I420) would carry
 /// a `Vec<DmaBufPlane>` once those formats are wired through.
 #[derive(Debug, Clone)]
 pub struct DmaBufPlane {

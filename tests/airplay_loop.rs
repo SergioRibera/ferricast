@@ -108,6 +108,10 @@ impl FrameSink for HeadlessSink {
 
 // ── Sender media ────────────────────────────────────────────────
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the pattern wraps every channel mod 256 on purpose"
+)]
 fn pattern(frame: u32) -> Bytes {
     let mut data = vec![0_u8; (WIDTH * HEIGHT * 4) as usize];
     for (i, px) in data.chunks_exact_mut(4).enumerate() {
@@ -125,6 +129,11 @@ fn pattern(frame: u32) -> Bytes {
     Bytes::from(data)
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "a short test tone: sample indices and an 8000-peak sine fit exactly"
+)]
 fn tone(start: u64, count: u64) -> Bytes {
     let mut out = Vec::with_capacity(count as usize * 4);
     for n in start..start + count {
@@ -137,10 +146,13 @@ fn tone(start: u64, count: u64) -> Bytes {
 }
 
 fn now_us() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as u64
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros(),
+    )
+    .unwrap()
 }
 
 /// Strongest frequency (10 Hz steps, 100 Hz to 2 kHz) of a mono signal.
@@ -346,8 +358,8 @@ impl Loop {
                 data: pattern(n),
                 timestamp_us: now,
             });
-            let encoded = encoder.encode(frame).unwrap();
-            self.session.send_frame(&encoded).await.unwrap();
+            let packet = encoder.encode(frame).unwrap();
+            self.session.send_frame(&packet).await.unwrap();
             let due = (now - start_us) * u64::from(ELD_SAMPLE_RATE) / 1_000_000;
             audio_encoder
                 .encode(&AudioFrame {
@@ -432,7 +444,9 @@ async fn mirror_loop(pin: bool) {
     // One second from the middle, past the lead-in silence.
     let mid = mono.len() / 2;
     let window = &mono[mid - 22_050..mid + 22_050];
-    let rms = (window.iter().map(|x| x * x).sum::<f64>() / window.len() as f64).sqrt();
+    let rms = (window.iter().map(|x| x * x).sum::<f64>()
+        / f64::from(u32::try_from(window.len()).unwrap()))
+    .sqrt();
     assert!(rms > 1000.0, "audio is (nearly) silent: rms {rms}");
     let peak = peak_frequency(window, 44_100.0);
     println!("pin={pin}: audio peak at {peak} Hz, rms {rms:.0}");
@@ -516,7 +530,9 @@ impl FrameSink for WindowLikeSink {
 
     async fn push_audio(&mut self, audio: DecodedAudio) -> Result<()> {
         let frames = audio.pcm.len() / usize::from(audio.channels.max(1));
-        let length = Duration::from_secs_f64(frames as f64 / f64::from(audio.sample_rate));
+        let length = Duration::from_secs_f64(
+            f64::from(u32::try_from(frames).unwrap()) / f64::from(audio.sample_rate),
+        );
         let start = self.play_head.max(Instant::now());
         self.play_head = start + length;
         let latency = latency_of(start, audio.timestamp_us);
@@ -569,7 +585,7 @@ async fn mirroring_stays_at_the_live_edge() {
     mirror.stop().await;
 
     let log = log.lock().unwrap();
-    let steady_from = end - Duration::from_secs(3);
+    let steady_from = end.checked_sub(Duration::from_secs(3)).unwrap();
     let steady = |items: &[(Instant, Duration)]| {
         median(
             items

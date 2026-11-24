@@ -66,6 +66,9 @@ version = "0.1.0"
 edition = "2024"
 description = "Unified screen and video streaming library for Linux"
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/lib.rs"
 

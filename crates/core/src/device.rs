@@ -62,6 +62,9 @@ impl DeviceAddresses {
     }
 
     /// The address to try first.
+    ///
+    /// # Panics
+    /// Never: every constructor refuses an empty address list.
     #[must_use]
     pub fn primary(&self) -> SocketAddr {
         *self
@@ -71,6 +74,7 @@ impl DeviceAddresses {
     }
 
     /// Every address, most preferred first.
+    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = SocketAddr> + '_ {
         self.0.iter().copied()
     }
@@ -182,6 +186,10 @@ impl Ipv4Subnet {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent capability flags, each read from a receiver's advertisement"
+)]
 pub struct DeviceCapabilities {
     pub supports_audio: bool,
     pub supports_video: bool,
@@ -457,7 +465,10 @@ pub enum H265Profile {
 }
 
 #[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "found devices dominate the stream; boxing them buys nothing"
+)]
 pub enum DiscoveryEvent {
     DeviceFound(Device),
     DeviceLost(Uuid),

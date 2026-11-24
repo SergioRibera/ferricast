@@ -673,7 +673,7 @@ async fn external_process() {
     churn(target, 2000, 6, Duration::ZERO).await;
     tokio::time::sleep(Duration::from_secs(5)).await;
     report("burst");
-    let steady = tokio::spawn(churn(target, u64::MAX, 2, Duration::from_millis(1000)));
+    let steady = tokio::spawn(churn(target, u64::MAX, 2, Duration::from_secs(1)));
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(secs) {
         tokio::time::sleep(Duration::from_secs(10)).await;

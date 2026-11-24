@@ -132,12 +132,14 @@ pub struct AudioMuteHandle {
 }
 
 impl AudioMuteHandle {
+    #[must_use]
     pub fn new(initial: bool) -> Self {
         Self {
             inner: Arc::new(AtomicBool::new(initial)),
         }
     }
 
+    #[must_use]
     pub fn is_muted(&self) -> bool {
         self.inner.load(Ordering::Relaxed)
     }

@@ -114,9 +114,9 @@ pub mod protocols {
 
 /// Miracast (Wi-Fi Display) receiver building blocks.
 pub mod miracast {
-    pub use ferricast_miracast::{MiracastReceiver, MiracastReceiverAdvertiser};
     #[cfg(target_os = "linux")]
     pub use ferricast_miracast::PairingMode;
+    pub use ferricast_miracast::{MiracastReceiver, MiracastReceiverAdvertiser};
 }
 
 /// The AirPlay receiver (screen mirroring and audio from Apple devices).

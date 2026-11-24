@@ -68,6 +68,10 @@ impl fmt::Display for Lags {
         if self.count == 0 {
             return f.write_str("-");
         }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "lags are display-only and far inside f64's exact range"
+        )]
         let ms = |us: i64| us as f64 / 1000.0;
         let count = i64::try_from(self.count).unwrap_or(i64::MAX);
         write!(

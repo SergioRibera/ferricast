@@ -101,6 +101,10 @@ impl FrameSink for RecordingSink {
         Ok(())
     }
 
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a chunk holds a few thousand frames"
+    )]
     async fn push_audio(&mut self, audio: DecodedAudio) -> ferricast_core::Result<()> {
         let now = Instant::now();
         let start = self.play_head.max(now);
@@ -293,7 +297,7 @@ async fn a_slower_network_moves_the_timeline_later() {
     // From now on every packet arrives 400 ms after capture: within two
     // transit windows the timeline follows, and frames are shown again.
     sender
-        .stream(Duration::from_millis(3_000), Duration::from_millis(400))
+        .stream(Duration::from_secs(3), Duration::from_millis(400))
         .await;
     let _ = cmd.send(PumpCmd::Stop).await;
     let seen = seen.lock().unwrap();

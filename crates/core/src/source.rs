@@ -45,7 +45,7 @@ pub struct Geometry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MonitorInfo {
     /// Stable identifier. On X11 this is the XRandR output name
-    /// (`HDMI-1`, `DP-2`…). On wlroots it's the wl_output `name`
+    /// (`HDMI-1`, `DP-2`…). On wlroots it's the `wl_output` `name`
     /// event payload, which compositors guarantee is stable across
     /// reconnects for the same physical output.
     pub id: String,
@@ -61,7 +61,7 @@ pub struct MonitorInfo {
     /// Scale factor (1.0, 1.25, 1.5, 2.0…). Logical pixels =
     /// physical / `scale`.
     pub scale: f32,
-    /// Refresh rate in millihertz (60_000 = 60 Hz). `None` when
+    /// Refresh rate in millihertz (`60_000` = 60 Hz). `None` when
     /// the backend can't report it.
     pub refresh_mhz: Option<u32>,
     /// Whether this monitor is the user's primary. On wlroots
@@ -117,6 +117,7 @@ pub enum EnumerationCapability {
 }
 
 impl EnumerationCapability {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Monitors => "monitors",
@@ -209,6 +210,7 @@ pub struct StubEnumerator {
 }
 
 impl StubEnumerator {
+    #[must_use]
     pub fn new() -> Self {
         // Capacity 1 is plenty — stub never emits — but
         // `broadcast::channel` requires > 0.

@@ -71,6 +71,11 @@ pub trait ProtocolHandler: Send + Sync {
     type Session: CastSession;
 
     fn create_discovery(&self) -> Self::Discovery;
+
+    /// A new session for this protocol.
+    ///
+    /// # Errors
+    /// The protocol's failure to set one up.
     fn create_session(&self) -> Result<Self::Session>;
 
     /// Create a session tailored to a specific device. Default ignores
@@ -78,6 +83,9 @@ pub trait ProtocolHandler: Send + Sync {
     /// that support multiple session types (e.g. HLS vs. Cast Streaming
     /// on Chromecast) override this to pick based on
     /// `device.capabilities`.
+    ///
+    /// # Errors
+    /// As [`Self::create_session`].
     fn create_session_for_device(&self, _device: &Device) -> Result<Self::Session> {
         self.create_session()
     }
@@ -89,7 +97,7 @@ pub trait ProtocolHandler: Send + Sync {
     /// (Chromecast, AirPlay, DIAL, Miracast-over-LAN).
     ///
     /// Protocols that depend on platform-specific infrastructure
-    /// (Wi-Fi Direct hardware + wpa_supplicant on Linux, Miracast WDI
+    /// (Wi-Fi Direct hardware + `wpa_supplicant` on Linux, Miracast WDI
     /// driver on Windows) override this to surface a concrete reason
     /// when the local host can't reach the fast path.
     fn availability(&self) -> ProtocolAvailability {
@@ -130,7 +138,16 @@ pub trait ReceiverProtocol: Send + Sync {
     type Puller: MediaPuller;
 
     fn create_advertiser(&self) -> Self::Advertiser;
+    /// The control channel senders drive this receiver through.
+    ///
+    /// # Errors
+    /// The protocol's failure to set it up.
     fn create_control(&self) -> Result<Self::Control>;
+
+    /// The puller that fetches media senders point this receiver at.
+    ///
+    /// # Errors
+    /// The protocol's failure to set it up.
     fn create_puller(&self) -> Result<Self::Puller>;
 
     /// What to publish about this receiver. Called once at

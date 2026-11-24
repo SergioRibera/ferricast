@@ -1,3 +1,12 @@
 # Tests may unwrap: a panic is the right failure there. Only crates that
 # enable `clippy::unwrap_used` (ferricast-codec) are affected.
 allow-unwrap-in-tests = true
+
+# Product and protocol names that `clippy::doc_markdown` would otherwise
+# want in backticks; `..` keeps clippy's defaults.
+doc-valid-idents = [
+    "..",
+    "AirPlay", "AirScreen", "FairPlay", "HomeKit", "CoreUtils", "UxPlay", "RPiPlay",
+    "PipeWire", "PulseAudio", "ScreenCast", "XRandR", "WinRT", "YouTube",
+    "VideoToolbox", "AudioToolbox", "MediaCodec", "ICtCp",
+]

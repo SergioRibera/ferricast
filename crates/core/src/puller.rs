@@ -2,7 +2,7 @@
 //! [`EncodedFrame`] / [`AudioFrame`] packets the decoder can consume.
 //!
 //! Sender of this data is whoever owns the URL: an HLS origin server,
-//! a Chromecast sender app that just LOADed an `.m3u8`, an HTTP MP4
+//! a Chromecast sender app that just `LOADed` an `.m3u8`, an HTTP MP4
 //! progressive download, etc. Concrete impls live in the protocol
 //! crates (`ferricast-hls` for HLS, future `ferricast-dash` for DASH).
 //!
@@ -29,7 +29,7 @@ pub struct PullSpec {
 }
 
 /// What the puller learned about the stream after opening it.
-/// Receiver pipeline uses this to configure decoders, the FrameSink,
+/// Receiver pipeline uses this to configure decoders, the `FrameSink`,
 /// and any UI ("Playing: 1920x1080 H.264, 5.1 AAC").
 #[derive(Debug, Clone)]
 pub struct MediaInfo {

@@ -115,12 +115,11 @@ impl MasteringDisplay {
         max: u32,
         min: u32,
     ) -> Self {
-        // 0.16 fixed point → 0.00002 units: v / 65536 * 50000.
+        // 0.16 fixed point → 0.00002 units: v / 65536 * 50000, at most
+        // 50_000, so the conversion back to u16 never saturates.
         let chroma = |(x, y): (u16, u16)| {
-            let scale = |v: u16| {
-                u16::try_from((u32::from(v) * 50_000 + 32_768) >> 16)
-                    .expect("invariant: 65535 * 50000 / 65536 < 50000 fits u16")
-            };
+            let scale =
+                |v: u16| u16::try_from((u32::from(v) * 50_000 + 32_768) >> 16).unwrap_or(u16::MAX);
             Chromaticity {
                 x: scale(x),
                 y: scale(y),
