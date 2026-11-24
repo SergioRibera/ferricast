@@ -177,6 +177,15 @@ impl LinuxP2pClient {
         device_name: &str,
         pairing: &PairingMode,
     ) -> Result<mpsc::Receiver<GroupStarted>, TransportError> {
+        // Detect STA's current frequency early so we can pass it to
+        // `Connect` later. mt7925e-class single-radio drivers can only
+        // host the P2P group on the same freq the STA is already
+        // tuned to; without passing `frequency` to Connect, supplicant
+        // lets the peer-GO pick whatever it wants and the driver then
+        // silently refuses to tune two channels at once, leaving the
+        // group formation to time out.
+        let iface_ref_for_freq = self.interface_path.as_ref();
+        let sta_freq = detect_sta_frequency(&self.conn, &iface_ref_for_freq).await;
         // Primary Device Type (WPS 2.0 Appendix B):
         //   category(u16 BE) = 0x0005  (Display)
         //   OUI(u8[3])       = 50:6F:9A (Wi-Fi Alliance)
@@ -247,6 +256,7 @@ impl LinuxP2pClient {
         let conn = self.conn.clone();
         let interface_path = self.interface_path.clone();
         let pairing = pairing.clone();
+        let sta_freq_for_task = sta_freq;
         tokio::spawn(async move {
             let p2p_owned =
                 match Proxy::new(&conn, SUPPLICANT_BUS, interface_path.clone(), P2P_IFACE).await {
@@ -555,6 +565,16 @@ impl LinuxP2pClient {
                         // because RTSP listens on 0.0.0.0:7236 and the
                         // P2P client iface still hosts that port.
                         args.insert("go_intent", Value::from(14i32));
+                        // If the local STA is associated, force GON to
+                        // settle on that exact freq. Single-radio
+                        // drivers can't retune, so if the peer GO
+                        // picks a different channel the group never
+                        // forms. supplicant's Connect() handler takes
+                        // `frequency` as DBUS_TYPE_INT32 (MHz).
+                        if let Some(freq) = sta_freq_for_task {
+                            args.insert("frequency", Value::from(i32::from(freq)));
+                            tracing::info!(freq_mhz = freq, "sink: pinning Connect frequency to STA band");
+                        }
                         // Record BEFORE Connect so dedupe fires even
                         // when Connect itself errored out.
                         last_connect_at = Some((peer.clone(), now));
@@ -730,6 +750,21 @@ async fn detect_sta_channel(
     conn: &Connection,
     interface_path: &ObjectPath<'_>,
 ) -> Option<(u32, u32)> {
+    let freq = detect_sta_frequency(conn, interface_path).await?;
+    let (ch, reg) = freq_to_channel_class(freq);
+    tracing::info!(
+        freq_mhz = freq,
+        channel = ch,
+        reg_class = reg,
+        "sink: STA current channel detected — pinning P2P to match band"
+    );
+    Some((ch, reg))
+}
+
+/// Raw STA centre frequency (MHz) via D-Bus, used both for channel
+/// mapping and for `Connect(frequency=...)` so GON settles on the
+/// freq the radio is already tuned to.
+async fn detect_sta_frequency(conn: &Connection, interface_path: &ObjectPath<'_>) -> Option<u16> {
     let iface = Proxy::new(
         conn,
         SUPPLICANT_BUS,
@@ -740,22 +775,10 @@ async fn detect_sta_channel(
     .ok()?;
     let bss_path: OwnedObjectPath = iface.get_property("CurrentBSS").await.ok()?;
     if bss_path.as_str() == "/" {
-        tracing::info!("sink: STA not associated — defaulting P2P to 2.4 GHz social ch 1");
         return None;
     }
-    let bss = Proxy::new(conn, SUPPLICANT_BUS, bss_path.clone(), BSS_IFACE)
-        .await
-        .ok()?;
-    let freq: u16 = bss.get_property("Frequency").await.ok()?;
-    let (ch, reg) = freq_to_channel_class(freq);
-    tracing::info!(
-        bss = %bss_path.as_str(),
-        freq_mhz = freq,
-        channel = ch,
-        reg_class = reg,
-        "sink: STA current channel detected — pinning P2P to match band"
-    );
-    Some((ch, reg))
+    let bss = Proxy::new(conn, SUPPLICANT_BUS, bss_path, BSS_IFACE).await.ok()?;
+    bss.get_property::<u16>("Frequency").await.ok()
 }
 
 /// Map centre frequency in MHz to (channel, Wi-Fi Alliance regulatory
