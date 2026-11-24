@@ -1,7 +1,10 @@
 //! Annex B byte-stream helpers shared by the H.264 / H.265 encoders,
-//! decoders and the backend hand-over.
+//! decoders and the backend hand-over, and the HDR metadata they carry
+//! ([`hdr`]).
 
 use bytes::Bytes;
+
+pub mod hdr;
 
 /// The 4-byte Annex B start code.
 pub const START_CODE: [u8; 4] = [0, 0, 0, 1];
