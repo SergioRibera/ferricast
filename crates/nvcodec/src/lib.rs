@@ -11,6 +11,8 @@
 //!   pitched device buffers with 2D copies.
 //! - [`version`]: NVENC API version negotiation against the installed driver
 //!   and the per-version plumbing ([`version::NvencApi`]).
+//! - [`decode`]: NVDEC decoding (H.264, HEVC, VP8, VP9, AV1) to host or
+//!   pooled device frames, with timestamps, colour and HDR SEI.
 //! - [`encode`]: NVENC sessions.
 //! - [`sys`]: the raw generated bindings.
 //!
@@ -36,6 +38,7 @@
 #![warn(missing_docs, unreachable_pub)]
 
 pub mod cuda;
+pub mod decode;
 pub mod encode;
 pub mod error;
 pub mod loader;

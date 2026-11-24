@@ -159,6 +159,29 @@ pub enum Error {
         /// Why (which version, GPU or driver lacks it).
         reason: String,
     },
+    /// Every pooled output frame of a decoder is still held by the caller, so
+    /// the next picture has nowhere to go.
+    #[error(
+        "all {capacity} decoded frames are still held: drop or drain some before decoding more"
+    )]
+    FramesInFlight {
+        /// The decoder's limit on frames handed out and not yet dropped.
+        capacity: usize,
+    },
+    /// A packet is malformed in a way the driver would not survive, so it was
+    /// not passed on.
+    #[error("invalid packet: {reason}")]
+    InvalidPacket {
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// Code this crate runs inside a driver callback panicked. A bug in this
+    /// crate; the panic was caught before it could unwind into the driver.
+    #[error("the NVDEC {callback} callback panicked")]
+    CallbackPanicked {
+        /// Which parser callback.
+        callback: &'static str,
+    },
 }
 
 /// The list of NVENC API versions this build carries, for messages.
