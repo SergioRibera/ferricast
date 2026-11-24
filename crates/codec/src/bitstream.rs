@@ -5,6 +5,7 @@
 use bytes::Bytes;
 
 pub mod hdr;
+pub mod hevc;
 
 /// The 4-byte Annex B start code.
 pub const START_CODE: [u8; 4] = [0, 0, 0, 1];
