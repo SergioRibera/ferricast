@@ -12,6 +12,7 @@ pub mod h264;
 pub mod hdr;
 pub mod hevc;
 pub mod vp9;
+pub mod vui;
 
 /// The 4-byte Annex B start code.
 pub const START_CODE: [u8; 4] = [0, 0, 0, 1];

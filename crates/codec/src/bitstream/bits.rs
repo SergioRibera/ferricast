@@ -54,6 +54,13 @@ impl<'a> Bits<'a> {
         (1_u32 << zeros).checked_sub(1)?.checked_add(rest)
     }
 
+    /// A signed Exp-Golomb code (H.264 / H.265 `se(v)`).
+    pub fn se(&mut self) -> Option<i32> {
+        let code = i64::from(self.ue()?);
+        let magnitude = (code + 1) / 2;
+        i32::try_from(if code % 2 == 1 { magnitude } else { -magnitude }).ok()
+    }
+
     /// An AV1 `uvlc()`.
     pub fn uvlc(&mut self) -> Option<u32> {
         let mut zeros = 0;
@@ -152,6 +159,19 @@ impl Writer {
         self.put(0, len - 1).put(coded, len)
     }
 
+    pub(crate) fn se(&mut self, value: i32) -> &mut Self {
+        let magnitude = value.unsigned_abs();
+        self.ue(if value > 0 {
+            2 * magnitude - 1
+        } else {
+            2 * magnitude
+        })
+    }
+
+    pub(crate) fn flag(&mut self, value: bool) -> &mut Self {
+        self.put(u32::from(value), 1)
+    }
+
     /// The bits, zero-padded to whole bytes.
     pub(crate) fn bytes(&self) -> Vec<u8> {
         self.bits
@@ -189,6 +209,18 @@ mod tests {
         assert_eq!(bits.read(3), Some(0b101));
         assert_eq!(bits.read(1), Some(0));
         assert_eq!(bits.read(1), None);
+    }
+
+    #[test]
+    fn signed_exp_golomb_codes_alternate_around_zero() {
+        let mut writer = Writer::default();
+        for code in 0..5 {
+            writer.ue(code);
+        }
+        let bytes = writer.bytes();
+        let mut bits = Bits::new(&bytes);
+        let read: Vec<_> = std::iter::from_fn(|| bits.se()).take(5).collect();
+        assert_eq!(read, [0, 1, -1, 2, -2]);
     }
 
     #[test]
