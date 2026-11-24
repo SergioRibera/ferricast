@@ -1,11 +1,13 @@
 use std::io::BufReader;
 
 use ferricast_core::{
-    AudioCodec, AudioFrame, Codec, ColourDescription, EncodedFrame, FerricastError, Result,
+    AudioCodec, AudioFrame, Chromaticity, Codec, ColourDescription, ContentLightLevel,
+    EncodedFrame, FerricastError, HdrMetadata, MasteringDisplay, Result,
 };
 use matroska_demuxer::{
-    ContentCompAlgo, ContentEncAlgo, ContentEncodingValue, Frame, MatrixCoefficients, MatroskaFile,
-    Primaries, Range, TrackEntry, TrackType, TransferCharacteristics,
+    ContentCompAlgo, ContentEncAlgo, ContentEncodingValue, Frame, MasteringMetadata,
+    MatrixCoefficients, MatroskaFile, Primaries, Range, TrackEntry, TrackType,
+    TransferCharacteristics,
 };
 
 mod cues;
@@ -141,6 +143,7 @@ impl VideoTrack {
                     colour.range() == Some(Range::Full),
                 )
             }),
+            hdr: video.colour().and_then(hdr_metadata),
             duration_us: None,
             presentation_start_us: 0,
         };
@@ -610,6 +613,97 @@ fn framing(entry: &TrackEntry, codec: Codec) -> Option<Framing> {
     .map(Framing::LengthPrefixed)
 }
 
+/// The static HDR metadata of a Matroska `Colour` element. Matroska
+/// stores chromaticities as fractions and luminances in cd/m² (floats);
+/// they are rounded to the nearest SEI unit (0.00002, 0.0001 cd/m²).
+/// A mastering display missing any field is dropped.
+fn hdr_metadata(colour: &matroska_demuxer::Colour) -> Option<HdrMetadata> {
+    let hdr = HdrMetadata {
+        mastering_display: colour.mastering_metadata().and_then(mastering_display),
+        content_light: match (colour.max_cll(), colour.max_fall()) {
+            (None, None) => None,
+            (max_cll, max_fall) => Some(ContentLightLevel {
+                max_cll: saturate_u16(max_cll.unwrap_or(0)),
+                max_fall: saturate_u16(max_fall.unwrap_or(0)),
+            }),
+        },
+    };
+    (!hdr.is_empty()).then_some(hdr)
+}
+
+fn saturate_u16(value: u64) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+fn mastering_display(meta: &MasteringMetadata) -> Option<MasteringDisplay> {
+    FloatMastering {
+        points: [
+            (
+                meta.primary_r_chromaticity_x(),
+                meta.primary_r_chromaticity_y(),
+            ),
+            (
+                meta.primary_g_chromaticity_x(),
+                meta.primary_g_chromaticity_y(),
+            ),
+            (
+                meta.primary_b_chromaticity_x(),
+                meta.primary_b_chromaticity_y(),
+            ),
+            (
+                meta.white_point_chromaticity_x(),
+                meta.white_point_chromaticity_y(),
+            ),
+        ],
+        max_nits: meta.luminance_max(),
+        min_nits: meta.luminance_min(),
+    }
+    .to_units()
+}
+
+/// A Matroska `MasteringMetadata` as stored: R, G, B, white point xy
+/// fractions and luminances in cd/m².
+struct FloatMastering {
+    points: [(Option<f64>, Option<f64>); 4],
+    max_nits: Option<f64>,
+    min_nits: Option<f64>,
+}
+
+impl FloatMastering {
+    /// Rounded to SEI units; `None` when a field is missing, negative,
+    /// not finite or out of the unit's range.
+    fn to_units(&self) -> Option<MasteringDisplay> {
+        fn scaled<T: TryFrom<u64>>(value: Option<f64>, scale: f64) -> Option<T> {
+            let scaled = (value? * scale).round();
+            if !(0.0..=1e15).contains(&scaled) {
+                return None;
+            }
+            // Non-negative and below 2^53 (NaN fails the range): exact as u64.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "range checked above"
+            )]
+            T::try_from(scaled as u64).ok()
+        }
+        let xy = |(x, y): (Option<f64>, Option<f64>)| {
+            Some(Chromaticity {
+                x: scaled(x, Chromaticity::SCALE)?,
+                y: scaled(y, Chromaticity::SCALE)?,
+            })
+        };
+        let [red, green, blue, white_point] = self.points;
+        Some(MasteringDisplay {
+            red: xy(red)?,
+            green: xy(green)?,
+            blue: xy(blue)?,
+            white_point: xy(white_point)?,
+            max_luminance: scaled(self.max_nits, MasteringDisplay::LUMINANCE_SCALE)?,
+            min_luminance: scaled(self.min_nits, MasteringDisplay::LUMINANCE_SCALE)?,
+        })
+    }
+}
+
 /// The H.273 `colour_primaries` code of a Matroska `Primaries` value
 /// (Matroska adopts the H.273 table; `2` is "unspecified").
 fn primaries_code(primaries: Primaries) -> u8 {
@@ -674,6 +768,54 @@ fn matrix_code(matrix: MatrixCoefficients) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_mastering_metadata_rounds_to_sei_units() {
+        let hdr10 = FloatMastering {
+            points: [
+                (Some(0.708), Some(0.292)),
+                (Some(0.170), Some(0.797)),
+                (Some(0.131), Some(0.046)),
+                (Some(0.3127), Some(0.329)),
+            ],
+            max_nits: Some(1000.0),
+            min_nits: Some(0.005),
+        };
+        let display = hdr10.to_units().unwrap();
+        assert_eq!(
+            display.red,
+            Chromaticity {
+                x: 35_400,
+                y: 14_600
+            }
+        );
+        assert_eq!(
+            display.white_point,
+            Chromaticity {
+                x: 15_635,
+                y: 16_450
+            }
+        );
+        assert_eq!(
+            (display.max_luminance, display.min_luminance),
+            (10_000_000, 50)
+        );
+        let missing = FloatMastering {
+            max_nits: None,
+            ..hdr10
+        };
+        assert!(missing.to_units().is_none());
+        let negative = FloatMastering {
+            min_nits: Some(-1.0),
+            ..hdr10
+        };
+        assert!(negative.to_units().is_none());
+        let too_wide = FloatMastering {
+            points: [(Some(2.0), Some(0.3)); 4],
+            ..hdr10
+        };
+        assert!(too_wide.to_units().is_none(), "x 100000 does not fit u16");
+    }
 
     #[test]
     fn container_sniffing_accepts_ebml_and_rejects_mp4() {
