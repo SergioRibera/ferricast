@@ -36,7 +36,7 @@ use super::mf::{
     colour_of, hdr_of, hns, media_type, micros, pack, unpack,
 };
 use crate::nv12;
-use crate::p010::downshift_p010;
+use crate::nv12::downshift_p010;
 
 /// The open and probe functions of one (codec, kind) candidate.
 #[derive(Clone, Copy)]

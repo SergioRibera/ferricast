@@ -30,7 +30,6 @@ mod nv12;
 #[cfg(feature = "nvenc")]
 pub mod nvenc;
 pub mod opus;
-#[cfg(any(test, all(target_os = "windows", feature = "media-foundation")))]
 mod platform;
 // The scaler is crate-private: an audio-only build leaves it unused.
 #[allow(dead_code, reason = "conditional: used by the video encoders only")]
