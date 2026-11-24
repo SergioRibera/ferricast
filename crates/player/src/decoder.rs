@@ -1,112 +1,109 @@
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, PixelFormat, Result, VideoDecoder,
+    Acceleration, AccelerationPolicy, AutoSelect, BackendId, BackendSelection, CapturedFrame,
+    Codec, CodecResult, DecoderConfig, EncodedFrame, PixelFormat, RuntimeFallback, VideoDecoder,
 };
-use ferricast_decoder::h264::OpenH264Decoder;
-#[cfg(feature = "vaapi")]
-use ferricast_decoder::h264::VaapiH264Decoder;
-use ferricast_decoder::{Av1Decoder, H265Decoder, Vp8Decoder, Vp9Decoder};
-
-/// Same switch the decoder crate's H.264 facade reads; VA-API decode is
-/// not yet verified across drivers, so it only runs when asked for.
-#[cfg(feature = "vaapi")]
-const H264_BACKEND_VAR: &str = "FERRICAST_H264_DECODE_BACKEND";
+use ferricast_decoder::{Av1Decoder, H264Decoder, H265Decoder, Vp8Decoder, Vp9Decoder};
 
 pub(crate) enum Decoder {
-    /// openh264 directly rather than the H.264 facade: the facade would
-    /// pick VA-API again when the environment asks for it, and this is
-    /// the variant the player falls back to after VA-API failed.
-    H264(OpenH264Decoder),
+    H264(H264Decoder),
     H265(H265Decoder),
     Vp8(Box<Vp8Decoder>),
     Vp9(Box<Vp9Decoder>),
     Av1(Av1Decoder),
-    #[cfg(feature = "vaapi")]
-    VaapiH264(Box<VaapiH264Decoder>),
 }
 
 impl Decoder {
-    pub(crate) fn open(codec: Codec, width: u32, height: u32, software_only: bool) -> Result<Self> {
+    /// Opens a decoder for `codec`. Hardware decode is not yet verified
+    /// across drivers for local playback, so it runs only when the
+    /// codec's `FERRICAST_<CODEC>_DECODE_BACKEND` asks for it; with
+    /// `software_only` (the player's fallback after a hardware decoder
+    /// failed) the environment is ignored too.
+    pub(crate) fn open(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        software_only: bool,
+    ) -> CodecResult<Self> {
+        let backend = if software_only {
+            BackendSelection::Ordered {
+                backends: vec![software_backend(codec)],
+                runtime_fallback: RuntimeFallback::Disabled,
+            }
+        } else {
+            AutoSelect::default()
+                .with_acceleration(AccelerationPolicy::SoftwareOnly)
+                .into()
+        };
         let config = DecoderConfig {
             codec,
             width,
             height,
             pixel_format: PixelFormat::Nv12,
             low_latency: false,
+            colour: None,
+            backend,
         };
-        if !software_only {
-            match hardware(codec, &config) {
-                Some(Ok(decoder)) => {
-                    tracing::info!(%codec, width, height, "decoding on the GPU through VA-API");
-                    return Ok(decoder);
-                }
-                Some(Err(error)) => {
-                    tracing::info!(%error, %codec, "no hardware decoder; using software");
-                }
-                None => {}
-            }
-        }
-        tracing::info!(%codec, width, height, "decoding in software");
-        match codec {
+        let decoder = match codec {
             Codec::H264 => configured(&config).map(Self::H264),
             Codec::H265 => configured(&config).map(Self::H265),
             Codec::Vp8 => configured(&config).map(|d| Self::Vp8(Box::new(d))),
             Codec::Vp9 => configured(&config).map(|d| Self::Vp9(Box::new(d))),
             Codec::Av1 => configured(&config).map(Self::Av1),
+        }?;
+        if let Some((backend, acceleration)) = decoder.backend() {
+            tracing::info!(%codec, width, height, %backend, %acceleration, "decoder opened");
+        }
+        Ok(decoder)
+    }
+
+    fn backend(&self) -> Option<(BackendId, Acceleration)> {
+        match self {
+            Decoder::H264(d) => d.backend(),
+            Decoder::H265(d) => d.backend(),
+            Decoder::Vp8(d) => d.backend(),
+            Decoder::Vp9(d) => d.backend(),
+            Decoder::Av1(d) => d.backend(),
         }
     }
 
     pub(crate) fn is_hardware(&self) -> bool {
-        match self {
-            #[cfg(feature = "vaapi")]
-            Decoder::VaapiH264(_) => true,
-            _ => false,
-        }
+        self.backend()
+            .is_some_and(|(_, acceleration)| acceleration == Acceleration::Hardware)
     }
 
-    pub(crate) fn decode(&mut self, packet: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    pub(crate) fn decode(&mut self, packet: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
         match self {
             Decoder::H264(d) => d.decode(packet),
             Decoder::H265(d) => d.decode(packet),
             Decoder::Vp8(d) => d.decode(packet),
             Decoder::Vp9(d) => d.decode(packet),
             Decoder::Av1(d) => d.decode(packet),
-            #[cfg(feature = "vaapi")]
-            Decoder::VaapiH264(d) => d.decode(packet),
         }
     }
 
-    pub(crate) fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
+    pub(crate) fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
         match self {
             Decoder::H264(d) => d.flush(),
             Decoder::H265(d) => d.flush(),
             Decoder::Vp8(d) => d.flush(),
             Decoder::Vp9(d) => d.flush(),
             Decoder::Av1(d) => d.flush(),
-            #[cfg(feature = "vaapi")]
-            Decoder::VaapiH264(d) => d.flush(),
         }
     }
 }
 
-#[cfg(feature = "vaapi")]
-fn hardware(codec: Codec, config: &DecoderConfig) -> Option<Result<Decoder>> {
-    if codec != Codec::H264 || std::env::var(H264_BACKEND_VAR).as_deref() != Ok("vaapi") {
-        return None;
+/// The software decoder the player falls back to for `codec`.
+fn software_backend(codec: Codec) -> BackendId {
+    match codec {
+        Codec::H264 => BackendId::OpenH264,
+        Codec::H265 => BackendId::RustHevc,
+        Codec::Vp8 => BackendId::RustVp8,
+        Codec::Vp9 => BackendId::RustVp9,
+        Codec::Av1 => BackendId::Rav1d,
     }
-    Some(
-        VaapiH264Decoder::probe_with(config).and_then(|mut decoder| {
-            decoder.configure(config)?;
-            Ok(Decoder::VaapiH264(Box::new(decoder)))
-        }),
-    )
 }
 
-#[cfg(not(feature = "vaapi"))]
-fn hardware(_codec: Codec, _config: &DecoderConfig) -> Option<Result<Decoder>> {
-    None
-}
-
-fn configured<D: VideoDecoder + Default>(config: &DecoderConfig) -> Result<D> {
+fn configured<D: VideoDecoder + Default>(config: &DecoderConfig) -> CodecResult<D> {
     let mut decoder = D::default();
     decoder.configure(config)?;
     Ok(decoder)

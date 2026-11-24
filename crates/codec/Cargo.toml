@@ -1,0 +1,25 @@
+[package]
+name = "ferricast-codec"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Backend selection, runtime fallback and the istmo plugin surface shared by the ferricast encoders and decoders"
+
+[dependencies]
+ferricast-core = { path = "../core", default-features = false }
+bytes.workspace = true
+tracing.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+dbg_macro = "deny"
+todo = "warn"
+allow_attributes_without_reason = "deny"

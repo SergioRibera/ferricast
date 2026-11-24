@@ -1,15 +1,13 @@
 //! Receiver-side decoders.
 //!
-//! Two unrelated trees:
-//! * [`h264`] — backend-agnostic H.264 facade. Auto-selects NVDEC →
-//!   VA-API → openh264 at first `configure()`. Mirror of the
-//!   encoder's `H264Encoder` facade.
-//! * [`aac`] — AAC decoder: libfdk-aac (HE-AAC v1/v2 too) when built in,
-//!   else pure-Rust AAC-LC over symphonia.
-//! * [`PcmDecoder`] — pass-through for 16-bit PCM packets.
+//! One facade per codec ([`H264Decoder`], [`H265Decoder`], [`Vp8Decoder`],
+//! [`Vp9Decoder`], [`Av1Decoder`], [`AacDecoder`], [`AacEldDecoder`],
+//! [`AlacDecoder`], [`OpusDecoder`], [`PcmDecoder`]), each selecting its
+//! backend from its configuration's [`ferricast_core::BackendSelection`]
+//! (see [`ferricast_codec`]). `Foo::backends()` reports which backends
+//! this build has and whether each can run here.
 //!
-//! Each module re-exports its facade type; the typical receiver
-//! pipeline registers both with the manager:
+//! The typical receiver pipeline registers them with the manager:
 //!
 //! ```ignore
 //! use ferricast::prelude::*;
@@ -21,61 +19,31 @@
 //!     ...;
 //! ```
 
-pub mod h264;
-
-mod nv12;
-mod pcm;
-
-#[cfg(any(
-    feature = "nvdec-hevc-decode",
-    feature = "vaapi-hevc-decode",
-    feature = "hevc-decode"
-))]
-pub mod h265;
-
-#[cfg(feature = "nvdec-decode")]
-pub mod nvdec;
-
-#[cfg(any(feature = "nvdec-decode", feature = "vaapi-decode"))]
-mod probation;
-
 #[cfg(feature = "aac")]
 pub mod aac;
-
 #[cfg(feature = "alac-decode")]
 mod alac;
-
 #[cfg(feature = "av1-decode")]
 mod av1;
-
+mod facades;
+pub mod h264;
+pub mod h265;
+mod nv12;
+#[cfg(feature = "nvdec-decode")]
+pub mod nvdec;
 #[cfg(feature = "opus-decode")]
 mod opus;
-
+mod pcm;
+mod platform;
 #[cfg(feature = "vp8-decode")]
 mod vp8;
-
 #[cfg(feature = "vp9-decode")]
 mod vp9;
 
-#[cfg(feature = "aac")]
-pub use aac::AacDecoder;
-#[cfg(feature = "fdk-aac-decode")]
-pub use aac::AacEldDecoder;
-#[cfg(feature = "alac-decode")]
-pub use alac::AlacDecoder;
-#[cfg(feature = "av1-decode")]
-pub use av1::Av1Decoder;
+pub use facades::{
+    AacDecoder, AacEldDecoder, AlacDecoder, Av1Decoder, OpusDecoder, PcmDecoder, Vp8Decoder,
+    Vp9Decoder,
+};
+pub use ferricast_codec::{Availability, BackendReport};
 pub use h264::H264Decoder;
-#[cfg(any(
-    feature = "nvdec-hevc-decode",
-    feature = "vaapi-hevc-decode",
-    feature = "hevc-decode"
-))]
 pub use h265::H265Decoder;
-#[cfg(feature = "opus-decode")]
-pub use opus::OpusDecoder;
-pub use pcm::PcmDecoder;
-#[cfg(feature = "vp8-decode")]
-pub use vp8::Vp8Decoder;
-#[cfg(feature = "vp9-decode")]
-pub use vp9::Vp9Decoder;

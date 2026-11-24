@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
     CapturedFrame, Codec, ColourDescription, ColourRange, DecoderConfig, EncodedFrame,
     FerricastError, Result, VideoDecoder,
@@ -12,19 +13,17 @@ use crate::nv12::{self, OutputFormat, Planar};
 const SUPERFRAME_MAX_FRAMES: usize = 8;
 
 #[derive(Default)]
-pub struct Vp9Decoder {
+pub struct RustVp9Decoder {
     decoder: Option<rusty_vp9::Vp9Decoder>,
     ready: VecDeque<CapturedFrame>,
     format: OutputFormat,
 }
 
-impl VideoDecoder for Vp9Decoder {
-    const CODEC: Codec = Codec::Vp9;
-
-    fn configure(&mut self, config: &DecoderConfig) -> Result<()> {
+impl RustVp9Decoder {
+    fn try_configure(&mut self, config: &DecoderConfig) -> Result<()> {
         if config.codec != Codec::Vp9 {
             return Err(FerricastError::Decode(format!(
-                "Vp9Decoder asked to decode {:?}; only VP9 supported",
+                "RustVp9Decoder asked to decode {:?}; only VP9 supported",
                 config.codec
             )));
         }
@@ -34,9 +33,9 @@ impl VideoDecoder for Vp9Decoder {
         Ok(())
     }
 
-    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
         let decoder = self.decoder.as_mut().ok_or_else(|| {
-            FerricastError::Decode("Vp9Decoder::decode before configure()".into())
+            FerricastError::Decode("RustVp9Decoder::decode before configure()".into())
         })?;
         decoder
             .push(&frame.data, Some(frame.timestamp_us as i64))
@@ -55,7 +54,7 @@ impl VideoDecoder for Vp9Decoder {
         Ok(self.ready.pop_front())
     }
 
-    fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
+    fn try_flush(&mut self) -> Result<Vec<CapturedFrame>> {
         if let Some(decoder) = self.decoder.as_mut() {
             decoder.flush();
             // Every call consumes one queued frame, so this ends at `Eof`
@@ -70,6 +69,31 @@ impl VideoDecoder for Vp9Decoder {
             }
         }
         Ok(self.ready.drain(..).collect())
+    }
+}
+
+impl VideoDecoder for RustVp9Decoder {
+    const CODEC: Codec = Codec::Vp9;
+
+    fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::RustVp9,
+            Operation::Configure,
+        ))
+    }
+
+    fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+        self.try_decode(frame).map_err(CodecError::from_backend(
+            BackendId::RustVp9,
+            Operation::Decode,
+        ))
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
+        self.try_flush().map_err(CodecError::from_backend(
+            BackendId::RustVp9,
+            Operation::Flush,
+        ))
     }
 }
 

@@ -32,10 +32,13 @@ struct PassVideo;
 
 impl VideoDecoder for PassVideo {
     const CODEC: Codec = Codec::H264;
-    fn configure(&mut self, _config: &DecoderConfig) -> ferricast_core::Result<()> {
+    fn configure(&mut self, _config: &DecoderConfig) -> ferricast_core::CodecResult<()> {
         Ok(())
     }
-    fn decode(&mut self, frame: EncodedFrame) -> ferricast_core::Result<Option<CapturedFrame>> {
+    fn decode(
+        &mut self,
+        frame: EncodedFrame,
+    ) -> ferricast_core::CodecResult<Option<CapturedFrame>> {
         Ok(Some(CapturedFrame::Cpu(RawFrame {
             width: 2,
             height: 2,
@@ -46,7 +49,7 @@ impl VideoDecoder for PassVideo {
             colour: None,
         })))
     }
-    fn flush(&mut self) -> ferricast_core::Result<Vec<CapturedFrame>> {
+    fn flush(&mut self) -> ferricast_core::CodecResult<Vec<CapturedFrame>> {
         Ok(Vec::new())
     }
 }
@@ -55,10 +58,10 @@ struct PassAudio;
 
 impl AudioDecoder for PassAudio {
     const CODEC: AudioCodec = AudioCodec::Pcm;
-    fn configure(&mut self, _config: &AudioDecoderConfig) -> ferricast_core::Result<()> {
+    fn configure(&mut self, _config: &AudioDecoderConfig) -> ferricast_core::CodecResult<()> {
         Ok(())
     }
-    fn decode(&mut self, frame: AudioFrame) -> ferricast_core::Result<Option<DecodedAudio>> {
+    fn decode(&mut self, frame: AudioFrame) -> ferricast_core::CodecResult<Option<DecodedAudio>> {
         Ok(Some(DecodedAudio {
             pcm: vec![1; AUDIO_FRAMES * 2],
             sample_rate: 48_000,
@@ -66,7 +69,7 @@ impl AudioDecoder for PassAudio {
             timestamp_us: frame.timestamp_us,
         }))
     }
-    fn flush(&mut self) -> ferricast_core::Result<Vec<DecodedAudio>> {
+    fn flush(&mut self) -> ferricast_core::CodecResult<Vec<DecodedAudio>> {
         Ok(Vec::new())
     }
 }
@@ -126,6 +129,7 @@ fn info(audio: bool) -> MediaInfo {
             width: 2,
             height: 2,
             fps: 30,
+            colour: None,
         }),
         audio: audio.then_some(AudioStreamInfo {
             codec: AudioCodec::Pcm,

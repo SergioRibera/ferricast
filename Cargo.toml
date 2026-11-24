@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     ".",
     "crates/core",
+    "crates/codec",
     "crates/capture",
     "crates/chromecast",
     "crates/airplay",
@@ -22,6 +23,7 @@ members = [
 [workspace.dependencies]
 ferricast = { path = ".", default-features = false }
 ferricast-core = { path = "crates/core" }
+ferricast-codec = { path = "crates/codec" }
 ferricast-capture = { path = "crates/capture", default-features = false }
 ferricast-chromecast = { path = "crates/chromecast", default-features = false }
 ferricast-encoder = { path = "crates/encoder", default-features = false }

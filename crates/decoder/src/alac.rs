@@ -10,6 +10,7 @@
 use ferricast_core::{
     AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame, DecodedAudio, FerricastError, Result,
 };
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use symphonia::core::codecs::{CODEC_TYPE_ALAC, CodecParameters, Decoder as _, DecoderOptions};
 use symphonia::core::formats::Packet;
 use symphonia::default::codecs::AlacDecoder as SymphoniaAlac;
@@ -33,17 +34,15 @@ fn magic_cookie(sample_rate: u32, channels: u8) -> [u8; 24] {
 
 /// Decodes AirPlay ALAC frames into interleaved 16-bit PCM.
 #[derive(Default)]
-pub struct AlacDecoder {
+pub struct SymphoniaAlacDecoder {
     decoder: Option<SymphoniaAlac>,
 }
 
-impl AudioDecoder for AlacDecoder {
-    const CODEC: AudioCodec = AudioCodec::Alac;
-
-    fn configure(&mut self, config: &AudioDecoderConfig) -> Result<()> {
+impl SymphoniaAlacDecoder {
+    fn try_configure(&mut self, config: &AudioDecoderConfig) -> Result<()> {
         if config.codec != AudioCodec::Alac {
             return Err(FerricastError::Decode(format!(
-                "AlacDecoder asked to decode {:?}",
+                "SymphoniaAlacDecoder asked to decode {:?}",
                 config.codec
             )));
         }
@@ -65,9 +64,9 @@ impl AudioDecoder for AlacDecoder {
         Ok(())
     }
 
-    fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
+    fn try_decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
         let decoder = self.decoder.as_mut().ok_or_else(|| {
-            FerricastError::Decode("AlacDecoder::decode before configure()".into())
+            FerricastError::Decode("SymphoniaAlacDecoder::decode before configure()".into())
         })?;
         let packet = Packet::new_from_slice(0, 0, 0, &frame.data);
         let buf = decoder
@@ -88,8 +87,33 @@ impl AudioDecoder for AlacDecoder {
         }))
     }
 
-    fn flush(&mut self) -> Result<Vec<DecodedAudio>> {
+    fn try_flush(&mut self) -> Result<Vec<DecodedAudio>> {
         Ok(Vec::new())
+    }
+}
+
+impl AudioDecoder for SymphoniaAlacDecoder {
+    const CODEC: AudioCodec = AudioCodec::Alac;
+
+    fn configure(&mut self, config: &AudioDecoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::Symphonia,
+            Operation::Configure,
+        ))
+    }
+
+    fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>> {
+        self.try_decode(frame).map_err(CodecError::from_backend(
+            BackendId::Symphonia,
+            Operation::Decode,
+        ))
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>> {
+        self.try_flush().map_err(CodecError::from_backend(
+            BackendId::Symphonia,
+            Operation::Flush,
+        ))
     }
 }
 
@@ -139,11 +163,12 @@ mod tests {
 
     #[test]
     fn decodes_an_uncompressed_stereo_frame() {
-        let mut d = AlacDecoder::default();
+        let mut d = SymphoniaAlacDecoder::default();
         d.configure(&AudioDecoderConfig {
             codec: AudioCodec::Alac,
             sample_rate: 44_100,
             channels: 2,
+            backend: ferricast_core::BackendSelection::default(),
         })
         .unwrap();
         let samples: Vec<(i16, i16)> = (0..100).map(|i| (i * 100, -i * 50)).collect();

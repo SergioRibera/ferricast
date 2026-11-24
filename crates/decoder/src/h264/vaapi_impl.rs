@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
     CapturedFrame, ChromaLocation, Codec, ColourDescription, ColourRange, DecoderConfig,
     EncodedFrame, FerricastError, MatrixCoefficients, PixelFormat, Result, VideoDecoder,
@@ -33,8 +34,8 @@ use libva::{
 
 use super::dpb::{Dpb, Frame as DpbFrame, Released};
 use super::slice::{self, PocKind, Pps, SliceHeader, SliceType, Sps, Unsupported};
-use super::split_annex_b;
 use crate::nv12::{self, Nv12Planes};
+use ferricast_codec::bitstream::split_annex_b;
 
 /// Why a VA-API decode call failed, split so the facade can tell a
 /// stream it should hand to another backend from a real failure.
@@ -70,7 +71,15 @@ impl From<Unsupported> for VaapiH264Error {
 
 impl From<VaapiH264Error> for FerricastError {
     fn from(error: VaapiH264Error) -> Self {
-        FerricastError::Decode(error.to_string())
+        FerricastError::Codec(match error {
+            VaapiH264Error::Unsupported(reason) => CodecError::UnsupportedStream {
+                backend: BackendId::Vaapi,
+                reason,
+            },
+            VaapiH264Error::Failed(reason) => {
+                CodecError::backend(BackendId::Vaapi, Operation::Decode, reason)
+            }
+        })
     }
 }
 
@@ -168,10 +177,8 @@ impl Drop for VaapiH264Decoder {
     }
 }
 
-impl VideoDecoder for VaapiH264Decoder {
-    const CODEC: Codec = Codec::H264;
-
-    fn configure(&mut self, config: &DecoderConfig) -> Result<()> {
+impl VaapiH264Decoder {
+    fn try_configure(&mut self, config: &DecoderConfig) -> Result<()> {
         match self.send(Cmd::Configure(config.clone()))? {
             Reply::Configured => Ok(()),
             Reply::Frames { .. } => Err(FerricastError::Decode(
@@ -180,11 +187,11 @@ impl VideoDecoder for VaapiH264Decoder {
         }
     }
 
-    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
         Ok(self.decode_packet(frame)?)
     }
 
-    fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
+    fn try_flush(&mut self) -> Result<Vec<CapturedFrame>> {
         let flushed = self.frames(Cmd::Flush);
         let frames: Vec<CapturedFrame> = self.ready.drain(..).collect();
         match flushed {
@@ -195,6 +202,29 @@ impl VideoDecoder for VaapiH264Decoder {
             }
             Ok(()) => Ok(frames),
         }
+    }
+}
+
+impl VideoDecoder for VaapiH264Decoder {
+    const CODEC: Codec = Codec::H264;
+
+    fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::Vaapi,
+            Operation::Configure,
+        ))
+    }
+
+    fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+        self.try_decode(frame).map_err(CodecError::from_backend(
+            BackendId::Vaapi,
+            Operation::Decode,
+        ))
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
+        self.try_flush()
+            .map_err(CodecError::from_backend(BackendId::Vaapi, Operation::Flush))
     }
 }
 

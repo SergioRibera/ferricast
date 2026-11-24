@@ -10,7 +10,8 @@ mod dmabuf;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use dmabuf::{DmaBufFd, DmaBufId, DmaBufImporter, DmaBufPlane, GpuFrame};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
 pub enum PixelFormat {
     Bgra,
     Rgba,
@@ -184,6 +185,7 @@ pub struct AudioFrame {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
 pub enum AudioCodec {
     /// AAC-LC, ADTS-framed.
     Aac,

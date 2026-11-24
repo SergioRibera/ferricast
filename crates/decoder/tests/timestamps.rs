@@ -27,6 +27,8 @@ fn configured<D: VideoDecoder + Default>(low_latency: bool) -> D {
             height: HEIGHT,
             pixel_format: PixelFormat::Nv12,
             low_latency,
+            colour: None,
+            backend: ferricast_core::BackendSelection::default(),
         })
         .unwrap();
     decoder

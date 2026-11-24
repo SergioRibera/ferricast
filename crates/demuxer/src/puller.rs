@@ -159,6 +159,7 @@ fn media_info(demuxer: &Demuxer) -> MediaInfo {
             width: v.width,
             height: v.height,
             fps: 0,
+            colour: v.colour,
         }),
         audio: demuxer.audio().map(|a| AudioStreamInfo {
             codec: a.codec,

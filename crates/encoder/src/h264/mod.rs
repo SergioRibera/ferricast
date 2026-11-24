@@ -1,44 +1,19 @@
 //! H.264 encoder facade.
 //!
-//! Picks a backend at runtime, in order of preference:
-//! 1. **VA-API** via `cros-libva` — Intel iGPU + AMD Mesa. Encode
-//!    on the GPU, no CPU readback needed once the dmabuf import
-//!    path is wired.
-//! 2. **NVENC** via `shiguredo_nvcodec` — NVIDIA proprietary
-//!    driver. NVIDIA's VA-API implementation is decode-only, so
-//!    this is the path that actually engages the GPU on NVIDIA
-//!    hardware.
-//! 3. **openh264** — software fallback. Always available because
-//!    `openh264` is a build-time dep *when its feature is on*.
+//! [`H264Encoder`] picks its backend from [`EncoderConfig::backend`]
+//! (see [`ferricast_core::BackendSelection`]). Automatic selection
+//! tries, in order:
 //!
-//! Each backend is gated behind its own Cargo feature (`openh264`,
-//! `vaapi`, `nvenc`). At least one must be enabled — see the
-//! `compile_error!` below. Backends not in the feature set are
-//! removed at compile time from the enum, the dispatcher, and the
-//! preference list; their files don't even get `mod`-included.
+//! 1. **NVENC** — NVIDIA. First because on the common laptop combo of
+//!    an NVIDIA dGPU and an AMD / Intel iGPU, VA-API would pick the
+//!    iGPU and move every captured frame across PCIe twice.
+//! 2. **VA-API** — Intel / AMD on Linux.
+//! 3. **x264** — software; works everywhere it is compiled in.
 //!
-//! All compiled-in backends implement the same [`VideoEncoder`]
-//! trait so consumers don't need to care which one is active.
-//! Output is plain H.264 — every receiver protocol we ship
-//! (Chromecast / Miracast / AirPlay) decodes any of the three
-//! backends' bitstreams identically.
-//!
-//! Construction has two phases:
-//! * `H264Encoder::new()` returns an enum stuck in `Pending` —
-//!   detection is deferred so we can size surfaces / SPS / NVENC
-//!   session correctly from the user's actual resolution.
-//! * `configure(&EncoderConfig)` walks the preference list with
-//!   that config; on any failure at any backend (no driver, profile
-//!   not supported, session creation refused, ...) it transparently
-//!   tries the next one.
-
-#[cfg(not(any(feature = "x264", feature = "vaapi", feature = "nvenc")))]
-compile_error!(
-    "ferricast-encoder requires at least one of the `openh264` / `vaapi` / `nvenc` \
-     features to be enabled — the H.264 facade has nothing to dispatch to otherwise. \
-     Re-enable defaults or pick one explicitly, e.g. \
-     `ferricast-encoder = { default-features = false, features = [\"openh264\"] }`."
-);
+//! `FERRICAST_H264_ENCODE_BACKEND` (or the older
+//! `FERRICAST_H264_BACKEND`) overrides automatic selection without a
+//! rebuild: a backend name, a comma-separated list, `hardware` or
+//! `software`.
 
 // Helper modules used only by the VA-API backend today. Gated so a
 // no-vaapi build doesn't compile them just to drop dead code.
@@ -54,11 +29,14 @@ mod vaapi_impl;
 #[cfg(feature = "x264")]
 mod x264_impl;
 
-use ferricast_core::{
-    CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, Result, VideoEncoder,
-};
-#[allow(unused_imports)]
-use tracing::{info, warn};
+#[cfg(any(feature = "nvenc", feature = "vaapi", feature = "x264"))]
+use ferricast_codec::Candidate;
+use ferricast_codec::VideoEncoderRegistry;
+#[cfg(any(feature = "nvenc", feature = "vaapi"))]
+use ferricast_core::CodecError;
+#[cfg(any(feature = "nvenc", feature = "vaapi"))]
+use ferricast_core::EncoderConfig;
+use ferricast_core::{Acceleration, BackendId, Codec, CodecTarget};
 
 #[cfg(feature = "nvenc")]
 pub use crate::nvenc::NvencH264Encoder;
@@ -67,302 +45,85 @@ pub use vaapi_impl::VaapiH264Encoder;
 #[cfg(feature = "x264")]
 pub use x264_impl::X264Encoder;
 
-const H264_BACKEND_VAR: &str = "FERRICAST_H264_BACKEND";
+ferricast_codec::video_encoder_facade! {
+    /// H.264 encoder over whichever backend its configuration selects.
+    pub struct H264Encoder: Codec::H264, registry = registry;
+}
 
-/// Backend-agnostic H.264 encoder. Variants are conditional on
-/// their feature flag — disabled backends are removed from the enum
-/// at compile time so disabling one doesn't leave dead `match`
-/// arms.
-#[derive(Default)]
-#[allow(
-    clippy::large_enum_variant,
-    reason = "one long-lived instance per stream; boxing only adds a per-frame indirection \
-              (conditional: the size gap depends on which backends are compiled in)"
-)]
-pub enum H264Encoder {
-    /// Pre-configure placeholder. Replaced with one of the concrete
-    /// variants on first `configure()` call.
-    #[default]
-    Pending,
-    /// Hardware VA-API path — Intel / AMD.
-    #[cfg(feature = "vaapi")]
-    Vaapi(VaapiH264Encoder),
-    /// Hardware NVENC path — NVIDIA.
+/// The H.264 encode backends of this build, in automatic order.
+fn registry() -> VideoEncoderRegistry {
+    let registry = VideoEncoderRegistry::new(CodecTarget::encode(Codec::H264));
     #[cfg(feature = "nvenc")]
-    Nvenc(NvencH264Encoder),
-    /// Software x264 path — always works when compiled in.
-    #[cfg(feature = "x264")]
-    X264(X264Encoder),
-}
-
-impl H264Encoder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl VideoEncoder for H264Encoder {
-    const CODEC: Codec = Codec::H264;
-
-    fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
-        match self {
-            H264Encoder::Pending => {
-                let var = std::env::var(H264_BACKEND_VAR).unwrap_or_default();
-
-                // Try NVENC first; if that fails (no NVIDIA, libs
-                // missing) try VA-API; if that fails fall back to
-                // openh264. NVENC takes priority over VA-API because
-                // multi-GPU systems (NVIDIA dGPU + AMD iGPU is a
-                // very common laptop / Ryzen-with-graphics combo)
-                // would otherwise pick the iGPU's VA-API and force
-                // every frame across PCIe twice — capture on NVIDIA
-                // → readback to CPU → upload to AMD VA-API. NVENC
-                // keeps the entire pipeline on the discrete GPU.
-                //
-                // Each branch is feature-gated. When a backend isn't
-                // compiled in, the chain skips its probe and moves
-                // to the next candidate. If all hardware backends
-                // are disabled AND openh264 is off too, the
-                // `compile_error!` at the top of the module would
-                // already have triggered — so by the time we reach
-                // the final fallback we're guaranteed *some* backend
-                // exists.
-                #[cfg(feature = "nvenc")]
-                {
-                    if var.is_empty() || var == "nvenc" {
-                        match NvencH264Encoder::probe_with(config.clone()) {
-                            Ok(enc) => {
-                                info!(
-                                    width = config.width,
-                                    height = config.height,
-                                    fps = config.fps,
-                                    "H.264 encoder backend: NVENC"
-                                );
-                                *self = H264Encoder::Nvenc(enc);
-                                return Ok(());
-                            }
-                            Err(e) => info!(
-                                error = %e,
-                                "NVENC unavailable, trying VA-API. \
-                                 If you expected NVENC, ensure libcuda.so.1 + \
-                                 libnvidia-encode.so.1 are on LD_LIBRARY_PATH \
-                                 (NixOS: /run/opengl-driver/lib)."
-                            ),
-                        }
-                    }
-                }
-
-                #[cfg(feature = "vaapi")]
-                {
-                    if var.is_empty() || var == "vaapi" {
-                        match VaapiH264Encoder::probe_with(config.clone()) {
-                            Ok(enc) => {
-                                info!(
-                                    width = config.width,
-                                    height = config.height,
-                                    fps = config.fps,
-                                    "H.264 encoder backend: VA-API"
-                                );
-                                *self = H264Encoder::Vaapi(enc);
-                                return Ok(());
-                            }
-                            Err(e) => info!(error = %e, "VA-API unavailable, falling back to x264"),
-                        }
-                    }
-                }
-
-                #[cfg(feature = "x264")]
-                {
-                    if var.is_empty() || var == "x264" {
-                        info!("H.264 encoder backend: x264 (software)");
-                        let mut x = X264Encoder::default();
-                        x.configure(config)?;
-                        *self = H264Encoder::X264(x);
-                        return Ok(());
-                    }
-                }
-
-                Err(FerricastError::Encoder(format!(
-                    "no H.264 encoder backend available for FERRICAST_H264_BACKEND={var:?}"
-                )))
-            }
-            #[cfg(feature = "vaapi")]
-            H264Encoder::Vaapi(e) => match e.configure(config) {
-                Ok(()) => Ok(()),
-                Err(err) => fall_back_to_x264_or_pending(self, config, err, "VA-API"),
+    let registry = registry.candidate(
+        Candidate::new(
+            BackendId::Nvenc,
+            Acceleration::Hardware,
+            |config: &EncoderConfig| {
+                NvencH264Encoder::probe_with(config.clone())
+                    .map(|encoder| Box::new(encoder) as _)
+                    .map_err(CodecError::from_backend(
+                        BackendId::Nvenc,
+                        ferricast_core::Operation::Open,
+                    ))
             },
-            #[cfg(feature = "nvenc")]
-            H264Encoder::Nvenc(e) => match e.configure(config) {
-                Ok(()) => Ok(()),
-                Err(err) => fall_back_to_x264_or_pending(self, config, err, "NVENC"),
-            },
-            #[cfg(feature = "x264")]
-            H264Encoder::X264(e) => e.configure(config),
-        }
-    }
-
-    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
-        match self {
-            H264Encoder::Pending => Err(FerricastError::Encoder(
-                "H264Encoder::encode called before configure()".into(),
-            )),
-            #[cfg(feature = "vaapi")]
-            H264Encoder::Vaapi(e) => e.encode(frame),
-            #[cfg(feature = "nvenc")]
-            H264Encoder::Nvenc(e) => e.encode(frame),
-            #[cfg(feature = "x264")]
-            H264Encoder::X264(e) => e.encode(frame),
-        }
-    }
-
-    fn flush(self) -> Result<Vec<EncodedFrame>> {
-        match self {
-            H264Encoder::Pending => Ok(Vec::new()),
-            #[cfg(feature = "vaapi")]
-            H264Encoder::Vaapi(e) => e.flush(),
-            #[cfg(feature = "nvenc")]
-            H264Encoder::Nvenc(e) => e.flush(),
-            #[cfg(feature = "x264")]
-            H264Encoder::X264(e) => e.flush(),
-        }
-    }
-
-    fn get_headers(&mut self) -> Result<Vec<u8>> {
-        match self {
-            H264Encoder::Pending => Err(FerricastError::Encoder(
-                "H264Encoder::get_headers called before configure()".into(),
-            )),
-            #[cfg(feature = "vaapi")]
-            H264Encoder::Vaapi(e) => e.get_headers(),
-            #[cfg(feature = "nvenc")]
-            H264Encoder::Nvenc(e) => e.get_headers(),
-            #[cfg(feature = "x264")]
-            H264Encoder::X264(e) => e.get_headers(),
-        }
-    }
-
-    fn request_keyframe(&mut self) {
-        match self {
-            // No backend wired up yet; the request is dropped.
-            // Once `configure()` runs the next call lands on a
-            // real backend.
-            H264Encoder::Pending => {}
-            #[cfg(feature = "vaapi")]
-            H264Encoder::Vaapi(e) => e.request_keyframe(),
-            #[cfg(feature = "nvenc")]
-            H264Encoder::Nvenc(e) => e.request_keyframe(),
-            #[cfg(feature = "x264")]
-            H264Encoder::X264(e) => e.request_keyframe(),
-        }
-    }
-
-    fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
-        match self {
-            // Nothing to retarget yet; `configure()` takes the bitrate.
-            H264Encoder::Pending => Ok(()),
-            #[cfg(feature = "vaapi")]
-            H264Encoder::Vaapi(e) => e.set_bitrate_kbps(kbps),
-            #[cfg(feature = "nvenc")]
-            H264Encoder::Nvenc(e) => e.set_bitrate_kbps(kbps),
-            #[cfg(feature = "x264")]
-            H264Encoder::X264(e) => e.set_bitrate_kbps(kbps),
-        }
-    }
-}
-
-/// Reconfiguration-failure helper: switch the encoder to openh264 when
-/// it's compiled in, otherwise reset to `Pending` so the caller's
-/// next `configure()` runs the discovery chain from scratch. Keeps
-/// the per-backend match arms short and the policy in one place.
-#[cfg(any(feature = "vaapi", feature = "nvenc"))]
-fn fall_back_to_x264_or_pending(
-    slot: &mut H264Encoder,
-    config: &EncoderConfig,
-    err: FerricastError,
-    backend_name: &'static str,
-) -> Result<()> {
-    #[cfg(feature = "x264")]
-    {
-        warn!(error = %err, backend = backend_name, "reconfigure failed, switching to openh264");
-        let mut x = X264Encoder::default();
-        x.configure(config)?;
-        *slot = H264Encoder::X264(x);
-        Ok(())
-    }
-    #[cfg(not(feature = "x264"))]
-    {
-        let _ = (slot, config);
-        warn!(
-            error = %err,
-            backend = backend_name,
-            "reconfigure failed and `openh264` feature is off — no software fallback"
-        );
-        Err(err)
-    }
-}
-
-/// Returns true when a VA-API H.264 encoder can be brought up on
-/// this system at the given resolution / fps. Useful for telemetry
-/// and config UIs. Always `false` when the `vaapi` feature is off.
-#[allow(dead_code)]
-pub fn vaapi_available(config: &EncoderConfig) -> bool {
+        )
+        .with_probe(|| {
+            NvencH264Encoder::probe()
+                .map(drop)
+                .map_err(CodecError::from_backend(
+                    BackendId::Nvenc,
+                    ferricast_core::Operation::Probe,
+                ))
+        }),
+    );
+    #[cfg(not(feature = "nvenc"))]
+    let registry = registry.missing(BackendId::Nvenc, "ferricast-encoder/nvenc");
     #[cfg(feature = "vaapi")]
-    {
-        VaapiH264Encoder::probe_with(config.clone()).is_ok()
-    }
+    let registry = registry.candidate(
+        Candidate::new(
+            BackendId::Vaapi,
+            Acceleration::Hardware,
+            |config: &EncoderConfig| {
+                VaapiH264Encoder::probe_with(config.clone())
+                    .map(|encoder| Box::new(encoder) as _)
+                    .map_err(CodecError::from_backend(
+                        BackendId::Vaapi,
+                        ferricast_core::Operation::Open,
+                    ))
+            },
+        )
+        .with_probe(|| {
+            VaapiH264Encoder::probe()
+                .map(drop)
+                .map_err(CodecError::from_backend(
+                    BackendId::Vaapi,
+                    ferricast_core::Operation::Probe,
+                ))
+        }),
+    );
     #[cfg(not(feature = "vaapi"))]
-    {
-        let _ = config;
-        false
-    }
+    let registry = registry.missing(BackendId::Vaapi, "ferricast-encoder/vaapi");
+    let registry = crate::platform::h264(registry);
+    #[cfg(feature = "x264")]
+    let registry = registry.candidate(Candidate::new(
+        BackendId::X264,
+        Acceleration::Software,
+        ferricast_codec::open_video_encoder::<X264Encoder>,
+    ));
+    #[cfg(not(feature = "x264"))]
+    let registry = registry.missing(BackendId::X264, "ferricast-encoder/x264");
+    registry
 }
-
 pub mod utils {
+    use ferricast_codec::bitstream::{NalSyntax, ParameterSets};
+
+    /// The SPS and PPS of an Annex B access unit, each behind a 4-byte
+    /// start code; empty when it carries none.
+    #[must_use]
     pub fn extract_sps_pps(annex_b: &[u8]) -> Vec<u8> {
-        let positions = find_start_codes(annex_b);
-        if positions.is_empty() {
-            return Vec::new();
-        }
-
-        let mut out = Vec::new();
-        for (i, &(start, sc_len)) in positions.iter().enumerate() {
-            let nal_start = start + sc_len;
-            if nal_start >= annex_b.len() {
-                continue;
-            }
-            let nal_type = annex_b[nal_start] & 0x1f;
-            if nal_type != 7 && nal_type != 8 {
-                continue;
-            }
-            let nal_end = positions
-                .get(i + 1)
-                .map(|(s, _)| *s)
-                .unwrap_or(annex_b.len());
-            out.extend_from_slice(&[0, 0, 0, 1]);
-            out.extend_from_slice(&annex_b[nal_start..nal_end]);
-        }
-        out
-    }
-
-    fn find_start_codes(buf: &[u8]) -> Vec<(usize, usize)> {
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i + 3 <= buf.len() {
-            if buf[i] == 0 && buf[i + 1] == 0 {
-                if buf[i + 2] == 1 {
-                    out.push((i, 3));
-                    i += 3;
-                    continue;
-                }
-                if i + 4 <= buf.len() && buf[i + 2] == 0 && buf[i + 3] == 1 {
-                    out.push((i, 4));
-                    i += 4;
-                    continue;
-                }
-            }
-            i += 1;
-        }
-        out
+        let mut sets = ParameterSets::new(NalSyntax::H264);
+        sets.remember(annex_b);
+        sets.annex_b()
     }
 }
 

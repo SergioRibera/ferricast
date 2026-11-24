@@ -20,7 +20,7 @@ aac = ["dep:symphonia"]
 # AAC decode through libfdk-aac (bundled C++ source, built by
 # fdk-aac-sys): adds HE-AAC (SBR) and HE-AAC v2 (PS) at full rate and
 # channel count. Preferred over symphonia when on; symphonia stays the
-# fallback (`FERRICAST_AAC_DECODER=symphonia`).
+# fallback (`FERRICAST_AAC_DECODE_BACKEND=symphonia` picks it).
 fdk-aac-decode = ["aac", "dep:fdk-aac-sys"]
 # Apple Lossless decode for AirPlay audio streams (`ct = 2`).
 alac-decode = ["aac", "symphonia/alac"]
@@ -30,12 +30,10 @@ hevc-decode = ["dep:rust_h265", "dep:h264-reader"]
 av1-decode = ["dep:rav1d", "dep:libc"]
 # Pure-Rust Opus decode (WebM / Matroska / MP4 Opus audio in the receiver).
 opus-decode = ["dep:opus-rs"]
-# Hardware H.264 decode via VA-API. Opt-in (not in defaults) until
-# the slice-submission path is fully verified against a real
-# bitstream test rig — until then `FERRICAST_H264_DECODE_BACKEND=vaapi`
-# is the runtime escape hatch to engage it. Default-off keeps every
-# build that turns this feature on at compile time from accidentally
-# using a half-validated decode path.
+# Hardware H.264 decode via VA-API (Intel / AMD). Off in this crate's
+# defaults; the root `vaapi` feature turns it on, and automatic
+# selection then tries it after NVDEC. A stream it cannot handle moves
+# to the next backend (see `ferricast_codec::SelectingVideoDecoder`).
 vaapi-decode = ["dep:cros-libva", "dep:h264-reader"]
 # VA-API HEVC decode. Sits next to `vaapi-decode` so the two share
 # the cros-libva dependency. Opt-in: HEVC decode is part of the
@@ -53,6 +51,7 @@ nvdec-hevc-decode = ["nvdec-decode", "dep:rust_h265"]
 
 [dependencies]
 ferricast-core = { path = "../core", default-features = false }
+ferricast-codec.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 

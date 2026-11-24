@@ -310,6 +310,8 @@ fn receiver_video_cost(format: PixelFormat) {
             height: 1080,
             pixel_format: format,
             low_latency: true,
+            colour: None,
+            backend: ferricast::BackendSelection::default(),
         })
         .unwrap();
     let mut surface = gpu.surface(1280, 720);

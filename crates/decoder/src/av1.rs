@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
     CapturedFrame, ChromaLocation, Codec, ColourDescription, ColourRange, DecoderConfig,
     EncodedFrame, FerricastError, Result, VideoDecoder,
@@ -20,7 +21,7 @@ const I420: u32 = 1;
 const MAX_FRAME_PIXELS: u32 = 8192 * 8192;
 
 #[derive(Default)]
-pub struct Av1Decoder {
+pub struct Rav1dDecoder {
     context: Option<Dav1dContext>,
     ready: VecDeque<CapturedFrame>,
     format: OutputFormat,
@@ -28,15 +29,13 @@ pub struct Av1Decoder {
 
 // SAFETY: the context is an Arc-backed rav1d decoder that is only ever used through
 // `&mut self`, and rav1d synchronises its own worker threads internally.
-unsafe impl Send for Av1Decoder {}
+unsafe impl Send for Rav1dDecoder {}
 
-impl VideoDecoder for Av1Decoder {
-    const CODEC: Codec = Codec::Av1;
-
-    fn configure(&mut self, config: &DecoderConfig) -> Result<()> {
+impl Rav1dDecoder {
+    fn try_configure(&mut self, config: &DecoderConfig) -> Result<()> {
         if config.codec != Codec::Av1 {
             return Err(FerricastError::Decode(format!(
-                "Av1Decoder asked to decode {:?}; only AV1 supported",
+                "Rav1dDecoder asked to decode {:?}; only AV1 supported",
                 config.codec
             )));
         }
@@ -74,9 +73,9 @@ impl VideoDecoder for Av1Decoder {
         }
     }
 
-    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
         let context = self.context.ok_or_else(|| {
-            FerricastError::Decode("Av1Decoder::decode before configure()".into())
+            FerricastError::Decode("Rav1dDecoder::decode before configure()".into())
         })?;
         let mut data = Dav1dData::default();
         // SAFETY: `data` is valid for writes; on success dav1d owns a buffer of the requested size.
@@ -96,12 +95,35 @@ impl VideoDecoder for Av1Decoder {
         Ok(self.ready.pop_front())
     }
 
-    fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
+    fn try_flush(&mut self) -> Result<Vec<CapturedFrame>> {
         Ok(self.ready.drain(..).collect())
     }
 }
 
-impl Av1Decoder {
+impl VideoDecoder for Rav1dDecoder {
+    const CODEC: Codec = Codec::Av1;
+
+    fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::Rav1d,
+            Operation::Configure,
+        ))
+    }
+
+    fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+        self.try_decode(frame).map_err(CodecError::from_backend(
+            BackendId::Rav1d,
+            Operation::Decode,
+        ))
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
+        self.try_flush()
+            .map_err(CodecError::from_backend(BackendId::Rav1d, Operation::Flush))
+    }
+}
+
+impl Rav1dDecoder {
     fn feed(&mut self, context: Dav1dContext, data: &mut Dav1dData) -> Result<()> {
         while data.sz > 0 {
             // SAFETY: `context` comes from dav1d_open and has not been closed; `data` is valid.
@@ -155,7 +177,7 @@ impl Av1Decoder {
     }
 }
 
-impl Drop for Av1Decoder {
+impl Drop for Rav1dDecoder {
     fn drop(&mut self) {
         self.close();
     }

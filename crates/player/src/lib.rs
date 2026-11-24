@@ -77,7 +77,7 @@ impl Player {
                             self.deliver(frame);
                         }
                     }
-                    Err(error) => self.recover(error)?,
+                    Err(error) => self.recover(error.into())?,
                 }
                 continue;
             };
@@ -92,7 +92,7 @@ impl Player {
             match self.decoder.decode(packet) {
                 Ok(Some(frame)) => self.deliver(frame),
                 Ok(None) => {}
-                Err(error) => self.recover(error)?,
+                Err(error) => self.recover(error.into())?,
             }
         }
     }
@@ -148,5 +148,10 @@ impl Player {
 }
 
 fn open_decoder(stream: &VideoStream, software_only: bool) -> Result<Decoder> {
-    Decoder::open(stream.codec, stream.width, stream.height, software_only)
+    Ok(Decoder::open(
+        stream.codec,
+        stream.width,
+        stream.height,
+        software_only,
+    )?)
 }

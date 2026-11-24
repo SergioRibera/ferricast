@@ -221,7 +221,7 @@ impl Decode for Box<dyn ErasedVideoDecoder> {
     type Packet = EncodedFrame;
     type Output = CapturedFrame;
     fn decode(&mut self, packet: EncodedFrame) -> ferricast_core::Result<Option<CapturedFrame>> {
-        ErasedVideoDecoder::decode(self.as_mut(), packet)
+        Ok(ErasedVideoDecoder::decode(self.as_mut(), packet)?)
     }
     fn flush(&mut self) -> Vec<CapturedFrame> {
         ErasedVideoDecoder::flush(self.as_mut()).unwrap_or_default()
@@ -238,7 +238,7 @@ impl Decode for Box<dyn ErasedAudioDecoder> {
     type Packet = AudioFrame;
     type Output = DecodedAudio;
     fn decode(&mut self, packet: AudioFrame) -> ferricast_core::Result<Option<DecodedAudio>> {
-        ErasedAudioDecoder::decode(self.as_mut(), packet)
+        Ok(ErasedAudioDecoder::decode(self.as_mut(), packet)?)
     }
     fn flush(&mut self) -> Vec<DecodedAudio> {
         ErasedAudioDecoder::flush(self.as_mut()).unwrap_or_default()

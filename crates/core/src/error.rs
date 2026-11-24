@@ -82,6 +82,9 @@ pub enum FerricastError {
     #[error(transparent)]
     Frame(#[from] crate::frame::FrameError),
 
+    #[error(transparent)]
+    Codec(#[from] crate::codec::CodecError),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

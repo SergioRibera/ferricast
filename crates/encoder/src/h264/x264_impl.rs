@@ -22,6 +22,7 @@ use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
 
 use bytes::Bytes;
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
     CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, H264Profile, PixelFormat,
     Result, VideoEncoder,
@@ -62,10 +63,8 @@ pub struct X264Encoder {
     scaler: FrameScaler,
 }
 
-impl VideoEncoder for X264Encoder {
-    const CODEC: Codec = Codec::H264;
-
-    fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
+impl X264Encoder {
+    fn try_configure(&mut self, config: &EncoderConfig) -> Result<()> {
         let preset = env_choice(X264_PRESET_VAR, "veryfast", preset_name)?;
         if preset == c"placebo" {
             warn!(
@@ -94,7 +93,7 @@ impl VideoEncoder for X264Encoder {
         Ok(())
     }
 
-    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
+    fn try_encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
         let timestamp_us = frame.timestamp_us();
         let raw = frame.into_cpu()?;
         let session = self.session.as_mut().ok_or_else(|| {
@@ -128,7 +127,7 @@ impl VideoEncoder for X264Encoder {
         }
     }
 
-    fn flush(mut self) -> Result<Vec<EncodedFrame>> {
+    fn try_flush(mut self) -> Result<Vec<EncodedFrame>> {
         let Some(session) = self.session.as_mut() else {
             return Ok(Vec::new());
         };
@@ -144,7 +143,7 @@ impl VideoEncoder for X264Encoder {
         Ok(drained.into_iter().map(|out| self.finish(out, 0)).collect())
     }
 
-    fn get_headers(&mut self) -> Result<Vec<u8>> {
+    fn try_get_headers(&mut self) -> Result<Vec<u8>> {
         // Re-pull from the live encoder so any internal SPS/PPS
         // regeneration is reflected. Falls back to the cached copy when
         // the encoder isn't built yet or the call fails, so callers that
@@ -160,16 +159,52 @@ impl VideoEncoder for X264Encoder {
         Ok(self.sps_pps.clone())
     }
 
-    fn request_keyframe(&mut self) {
-        self.pending_keyframe = true;
-    }
-
-    fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
+    fn try_set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
         match self.session.as_mut() {
             Some(session) => session.set_bitrate(kbps),
             // Not configured yet: `configure()` takes the bitrate.
             None => Ok(()),
         }
+    }
+}
+
+impl VideoEncoder for X264Encoder {
+    const CODEC: Codec = Codec::H264;
+
+    fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::X264,
+            Operation::Configure,
+        ))
+    }
+
+    fn encode(&mut self, frame: CapturedFrame) -> CodecResult<EncodedFrame> {
+        self.try_encode(frame)
+            .map_err(CodecError::from_backend(BackendId::X264, Operation::Encode))
+    }
+
+    fn flush(self) -> CodecResult<Vec<EncodedFrame>> {
+        self.try_flush()
+            .map_err(CodecError::from_backend(BackendId::X264, Operation::Flush))
+    }
+
+    fn get_headers(&mut self) -> CodecResult<Vec<u8>> {
+        self.try_get_headers().map_err(CodecError::from_backend(
+            BackendId::X264,
+            Operation::Headers,
+        ))
+    }
+
+    fn set_bitrate_kbps(&mut self, kbps: u32) -> CodecResult<()> {
+        self.try_set_bitrate_kbps(kbps)
+            .map_err(CodecError::from_backend(
+                BackendId::X264,
+                Operation::SetBitrate,
+            ))
+    }
+
+    fn request_keyframe(&mut self) {
+        self.pending_keyframe = true;
     }
 }
 
@@ -673,6 +708,7 @@ mod tests {
             pixel_format: PixelFormat::Bgra,
             max_h264_profile: Some(H264Profile::High),
             max_h265_profile: None,
+            ..EncoderConfig::default()
         }
     }
 

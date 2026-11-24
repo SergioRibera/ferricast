@@ -18,6 +18,7 @@ use fdk_aac_sys as sys;
 use ferricast_core::{
     AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame, FerricastError, Result,
 };
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use tracing::{debug, info};
 
 use super::resample::Resampler;
@@ -384,8 +385,8 @@ impl Configured {
     }
 }
 
-impl AudioEncoder for FdkEldEncoder {
-    fn configure(&mut self, config: &AudioEncoderConfig) -> Result<()> {
+impl FdkEldEncoder {
+    fn try_configure(&mut self, config: &AudioEncoderConfig) -> Result<()> {
         if config.codec != AudioCodec::AacEld {
             return Err(FerricastError::Encoder(format!(
                 "FdkEldEncoder: only AAC-ELD is supported, got {:?}",
@@ -397,7 +398,7 @@ impl AudioEncoder for FdkEldEncoder {
         Ok(())
     }
 
-    fn encode(&mut self, frame: &AudioFrame) -> Result<()> {
+    fn try_encode(&mut self, frame: &AudioFrame) -> Result<()> {
         let Some(state) = self.state.as_mut() else {
             return Err(FerricastError::Encoder(
                 "FdkEldEncoder::encode called before configure()".into(),
@@ -418,16 +419,38 @@ impl AudioEncoder for FdkEldEncoder {
         state.push(frame, &mut self.pending)
     }
 
+    fn try_flush(self) -> Result<Vec<AudioFrame>> {
+        Ok(self.pending)
+    }
+}
+
+impl AudioEncoder for FdkEldEncoder {
+    fn configure(&mut self, config: &AudioEncoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::FdkAac,
+            Operation::Configure,
+        ))
+    }
+
+    fn encode(&mut self, frame: &AudioFrame) -> CodecResult<()> {
+        self.try_encode(frame).map_err(CodecError::from_backend(
+            BackendId::FdkAac,
+            Operation::Encode,
+        ))
+    }
+
+    fn flush(self) -> CodecResult<Vec<AudioFrame>> {
+        self.try_flush().map_err(CodecError::from_backend(
+            BackendId::FdkAac,
+            Operation::Flush,
+        ))
+    }
+
     fn take_output(&mut self) -> Vec<AudioFrame> {
         mem::take(&mut self.pending)
     }
-
     fn codec_config(&self) -> Vec<u8> {
         ELD_AUDIO_SPECIFIC_CONFIG.to_vec()
-    }
-
-    fn flush(self) -> Result<Vec<AudioFrame>> {
-        Ok(self.pending)
     }
 }
 
@@ -441,6 +464,7 @@ mod tests {
             sample_rate,
             channels: 2,
             bitrate_kbps: 128,
+            backend: ferricast_core::BackendSelection::default(),
         }
     }
 

@@ -34,6 +34,7 @@ use std::rc::Rc;
 
 use bytes::Bytes;
 use cros_libva::*;
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
     CapturedFrame, Codec, ColourDescription, EncodedFrame, EncoderConfig, FerricastError, GpuFrame,
     H264Profile, PixelFormat, Result, VideoEncoder,
@@ -571,10 +572,8 @@ fn pick_level(width_mbs: u32, height_mbs: u32, fps: u32, bitrate_bps: u32) -> u8
         .map_or(62, |&(level, ..)| level)
 }
 
-impl VideoEncoder for VaapiH264Encoder {
-    const CODEC: Codec = Codec::H264;
-
-    fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
+impl VaapiH264Encoder {
+    fn try_configure(&mut self, config: &EncoderConfig) -> Result<()> {
         if self.requested.same_session_shape(config)
             && self.requested.bitrate_kbps == config.bitrate_kbps
         {
@@ -586,7 +585,7 @@ impl VideoEncoder for VaapiH264Encoder {
         Ok(())
     }
 
-    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
+    fn try_encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
         let result = self.encode_frame(frame);
         if result.is_err() {
             // The driver may have half-written the target surface or
@@ -597,17 +596,13 @@ impl VideoEncoder for VaapiH264Encoder {
         result
     }
 
-    fn flush(self) -> Result<Vec<EncodedFrame>> {
+    fn try_flush(self) -> Result<Vec<EncodedFrame>> {
         // No B-frame queue, no buffered frames — every `encode()`
         // already produced its output.
         Ok(Vec::new())
     }
 
-    fn request_keyframe(&mut self) {
-        self.state.borrow_mut().gop.request_idr();
-    }
-
-    fn get_headers(&mut self) -> Result<Vec<u8>> {
+    fn try_get_headers(&mut self) -> Result<Vec<u8>> {
         // SPS + PPS, AnnexB-prefixed, ready to live at the start of
         // every HLS segment. The bitstream we hand out from
         // `encode()` does NOT include these (we emit them via
@@ -617,6 +612,40 @@ impl VideoEncoder for VaapiH264Encoder {
         out.extend_from_slice(&self.sps_nal);
         out.extend_from_slice(&self.pps_nal);
         Ok(out)
+    }
+}
+
+impl VideoEncoder for VaapiH264Encoder {
+    const CODEC: Codec = Codec::H264;
+
+    fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::Vaapi,
+            Operation::Configure,
+        ))
+    }
+
+    fn encode(&mut self, frame: CapturedFrame) -> CodecResult<EncodedFrame> {
+        self.try_encode(frame).map_err(CodecError::from_backend(
+            BackendId::Vaapi,
+            Operation::Encode,
+        ))
+    }
+
+    fn flush(self) -> CodecResult<Vec<EncodedFrame>> {
+        self.try_flush()
+            .map_err(CodecError::from_backend(BackendId::Vaapi, Operation::Flush))
+    }
+
+    fn get_headers(&mut self) -> CodecResult<Vec<u8>> {
+        self.try_get_headers().map_err(CodecError::from_backend(
+            BackendId::Vaapi,
+            Operation::Headers,
+        ))
+    }
+
+    fn request_keyframe(&mut self) {
+        self.state.borrow_mut().gop.request_idr();
     }
 }
 

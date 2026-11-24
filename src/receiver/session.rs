@@ -702,6 +702,7 @@ async fn prepare(
                     codec: a.codec,
                     sample_rate: a.sample_rate,
                     channels: a.channels,
+                    backend: ferricast_core::BackendSelection::default(),
                 })?;
                 Some(d)
             }
@@ -733,6 +734,8 @@ async fn prepare(
                 height: v.height,
                 pixel_format: sink.video_format(),
                 low_latency: true,
+                colour: v.colour,
+                backend: ferricast_core::BackendSelection::default(),
             };
             // Starting a hardware decoder blocks for hundreds of
             // milliseconds; on a runtime worker that would hold up

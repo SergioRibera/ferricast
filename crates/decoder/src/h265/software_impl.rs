@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
     CapturedFrame, Codec, ColourDescription, ColourRange, DecoderConfig, EncodedFrame,
     FerricastError, Result, VideoDecoder,
@@ -19,10 +20,8 @@ pub struct SoftwareH265Decoder {
     timestamps: Timestamps,
 }
 
-impl VideoDecoder for SoftwareH265Decoder {
-    const CODEC: Codec = Codec::H265;
-
-    fn configure(&mut self, config: &DecoderConfig) -> Result<()> {
+impl SoftwareH265Decoder {
+    fn try_configure(&mut self, config: &DecoderConfig) -> Result<()> {
         if config.codec != Codec::H265 {
             return Err(FerricastError::Decode(format!(
                 "SoftwareH265Decoder asked to decode {:?}; only H.265 supported",
@@ -37,7 +36,7 @@ impl VideoDecoder for SoftwareH265Decoder {
         Ok(())
     }
 
-    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
         let decoder = self.decoder.as_mut().ok_or_else(|| {
             FerricastError::Decode("SoftwareH265Decoder::decode before configure()".into())
         })?;
@@ -61,7 +60,7 @@ impl VideoDecoder for SoftwareH265Decoder {
         Ok(self.ready.pop_front())
     }
 
-    fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
+    fn try_flush(&mut self) -> Result<Vec<CapturedFrame>> {
         if let Some(decoder) = self.decoder.as_mut() {
             let mut last = 0;
             while let Some(decoded) = decoder.flush() {
@@ -71,6 +70,31 @@ impl VideoDecoder for SoftwareH265Decoder {
             self.timestamps = Timestamps::default();
         }
         Ok(self.ready.drain(..).collect())
+    }
+}
+
+impl VideoDecoder for SoftwareH265Decoder {
+    const CODEC: Codec = Codec::H265;
+
+    fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::RustHevc,
+            Operation::Configure,
+        ))
+    }
+
+    fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+        self.try_decode(frame).map_err(CodecError::from_backend(
+            BackendId::RustHevc,
+            Operation::Decode,
+        ))
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
+        self.try_flush().map_err(CodecError::from_backend(
+            BackendId::RustHevc,
+            Operation::Flush,
+        ))
     }
 }
 

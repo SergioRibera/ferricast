@@ -30,7 +30,11 @@ pub use capture::{
     AudioCapture, AudioCaptureConfig, AudioMuteHandle, AudioSource, CaptureConfig, CaptureSource,
     ScreenCapture, WindowIdentifier,
 };
-pub use codec::Codec;
+pub use codec::{
+    Acceleration, AccelerationPolicy, AutoSelect, BackendAttempt, BackendId, BackendSelection,
+    Codec, CodecError, CodecKind, CodecResult, CodecTarget, Direction, Operation, RuntimeFallback,
+    UnknownBackend,
+};
 pub use colour::{
     ChromaLocation, ColourDescription, ColourPrimaries, ColourRange, MatrixCoefficients,
     ReservedColourCode, TransferCharacteristics, YuvColour, YuvMatrix,

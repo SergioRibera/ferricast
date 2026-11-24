@@ -1,0 +1,3 @@
+# Tests may unwrap: a panic is the right failure there. Only crates that
+# enable `clippy::unwrap_used` (ferricast-codec) are affected.
+allow-unwrap-in-tests = true

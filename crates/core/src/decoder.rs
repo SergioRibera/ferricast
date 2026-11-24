@@ -9,7 +9,8 @@
 //! `CapturedFrame::Gpu` on the sender side.
 
 use crate::codec::Codec;
-use crate::error::Result;
+use crate::codec::{BackendSelection, CodecResult};
+use crate::colour::ColourDescription;
 use crate::frame::{AudioCodec, AudioFrame, CapturedFrame, EncodedFrame, PixelFormat};
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,11 @@ pub struct DecoderConfig {
     /// software decoders typically force NV12 / I420 regardless.
     pub pixel_format: PixelFormat,
     pub low_latency: bool,
+    /// The colour signalling of the container, used for pictures whose
+    /// bitstream carries none (or whose backend cannot read it).
+    pub colour: Option<ColourDescription>,
+    /// Which backend decodes; see [`BackendSelection`].
+    pub backend: BackendSelection,
 }
 
 /// Decode an [`EncodedFrame`] stream to [`CapturedFrame`].
@@ -38,9 +44,9 @@ pub struct DecoderConfig {
 pub trait VideoDecoder: Send {
     const CODEC: Codec;
 
-    fn configure(&mut self, config: &DecoderConfig) -> Result<()>;
-    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>>;
-    fn flush(&mut self) -> Result<Vec<CapturedFrame>>;
+    fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()>;
+    fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>>;
+    fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>>;
 }
 
 /// Audio decoder config. Sample rate / channels come from the
@@ -51,6 +57,8 @@ pub struct AudioDecoderConfig {
     pub codec: AudioCodec,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Which backend decodes; see [`BackendSelection`].
+    pub backend: BackendSelection,
 }
 
 /// PCM output from an audio decoder. Always interleaved, 16-bit
@@ -74,7 +82,7 @@ pub struct DecodedAudio {
 pub trait AudioDecoder: Send {
     const CODEC: AudioCodec;
 
-    fn configure(&mut self, config: &AudioDecoderConfig) -> Result<()>;
-    fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>>;
-    fn flush(&mut self) -> Result<Vec<DecodedAudio>>;
+    fn configure(&mut self, config: &AudioDecoderConfig) -> CodecResult<()>;
+    fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>>;
+    fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>>;
 }

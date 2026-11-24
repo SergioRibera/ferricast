@@ -208,6 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sample_rate: ELD_SAMPLE_RATE,
         channels: 2,
         bitrate_kbps: 128,
+        backend: ferricast_core::BackendSelection::default(),
     })?;
 
     let start_us = now_us();

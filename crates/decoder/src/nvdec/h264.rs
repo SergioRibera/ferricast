@@ -6,7 +6,7 @@ use h264_reader::nal::sps::SeqParameterSet;
 use h264_reader::rbsp::{BitReader, decode_nal};
 
 use super::timestamps::Picture;
-use crate::h264::split_annex_b;
+use ferricast_codec::bitstream::split_annex_b;
 
 const NAL_SLICE: u8 = 1;
 const NAL_SLICE_DATA_PARTITION_A: u8 = 2;

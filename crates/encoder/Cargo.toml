@@ -59,6 +59,7 @@ opus-rs = ["dep:opus-rs"]
 
 [dependencies]
 ferricast-core.workspace = true
+ferricast-codec.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 
