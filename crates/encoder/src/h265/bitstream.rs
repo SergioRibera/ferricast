@@ -4,9 +4,10 @@
 //! `nuh_layer_id[6]` + `nuh_temporal_id_plus1[3]`).
 //!
 //! Largely shaped like the H.264 variant in [`crate::h264::bitstream`]
-//! — the only differences are the NAL header width and the prevention
-//! byte boundary check that operates on the post-header payload, not
-//! the whole NAL.
+//! — the only difference is the NAL header width; emulation prevention
+//! runs on the payload only (the header cannot form a start code).
+
+use ferricast_codec::bitstream::bits::escape;
 
 /// Big-endian bit packer.
 pub(super) struct BitWriter {
@@ -102,27 +103,6 @@ pub(super) fn finalize_nal(nal_unit_type: u8, rbsp: Vec<u8>) -> Vec<u8> {
     out.extend_from_slice(&[0, 0, 0, 1]);
     let hdr = nal_header(nal_unit_type);
     out.extend_from_slice(&hdr);
-    write_with_emulation_prevention(&mut out, &rbsp);
+    out.extend(escape(&rbsp));
     out
-}
-
-/// Insert `0x03` between any byte pair that would otherwise form a
-/// start-code prefix (`0x00 0x00 0x00` / `0x01` / `0x02` / `0x03`).
-/// The check operates on the *payload bytes only* — the NAL header
-/// is already written and can't itself form a prefix (top bit
-/// guaranteed zero, so its first byte is never 0).
-fn write_with_emulation_prevention(out: &mut Vec<u8>, payload: &[u8]) {
-    let mut zero_run = 0u8;
-    for &b in payload {
-        if zero_run >= 2 && b <= 0x03 {
-            out.push(0x03);
-            zero_run = 0;
-        }
-        out.push(b);
-        if b == 0 {
-            zero_run += 1;
-        } else {
-            zero_run = 0;
-        }
-    }
 }

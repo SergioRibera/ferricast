@@ -18,11 +18,13 @@
 
 #![allow(dead_code)] // referenced from the SPS/PPS builders
 
+use ferricast_codec::bitstream::bits::escape;
+
 /// Writes bits into a backing `Vec<u8>`. Produces an RBSP (Raw Byte
 /// Sequence Payload) suitable for wrapping into a NAL unit; call
 /// [`Self::finish_rbsp`] to add the trailing `1` bit + zero-pad to
 /// the next byte boundary, then run the result through
-/// [`emulation_prevent`] before emitting an Annex B NAL.
+/// [`escape`] before emitting an Annex B NAL.
 pub(super) struct BitWriter {
     buf: Vec<u8>,
     /// Bit offset within the current byte, 0..=7 (0 = MSB).
@@ -109,28 +111,6 @@ impl BitWriter {
     }
 }
 
-/// Insert emulation-prevention bytes (`0x03`) into an RBSP per
-/// §7.4.1.1, producing the EBSP that's actually transmitted in a
-/// NAL unit. Any sequence of `0x000000`, `0x000001`, `0x000002`,
-/// `0x000003` becomes `0x0000XX` → `0x0000 03 XX`.
-pub(super) fn emulation_prevent(rbsp: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rbsp.len() + rbsp.len() / 64);
-    let mut zeros = 0;
-    for &b in rbsp {
-        if zeros >= 2 && b <= 0x03 {
-            out.push(0x03);
-            zeros = 0;
-        }
-        out.push(b);
-        if b == 0 {
-            zeros += 1;
-        } else {
-            zeros = 0;
-        }
-    }
-    out
-}
-
 /// Wrap an EBSP into an Annex B (§B.1.1) byte stream NAL unit:
 /// `00 00 00 01` start code prefix + `nal_unit_type / nal_ref_idc`
 /// header byte + EBSP.
@@ -149,7 +129,7 @@ pub(super) fn nal_annexb(nal_ref_idc: u8, nal_unit_type: u8, ebsp: &[u8]) -> Vec
 /// `finish_rbsp` + `emulation_prevent` + `nal_annexb` in sequence.
 pub(super) fn finalize_nal(writer: BitWriter, nal_ref_idc: u8, nal_unit_type: u8) -> Vec<u8> {
     let rbsp = writer.finish_rbsp();
-    let ebsp = emulation_prevent(&rbsp);
+    let ebsp = escape(&rbsp);
     nal_annexb(nal_ref_idc, nal_unit_type, &ebsp)
 }
 
@@ -226,19 +206,13 @@ mod tests {
     #[test]
     fn emulation_prevention() {
         // Plain pass-through.
-        assert_eq!(emulation_prevent(&[0xAA, 0xBB]), &[0xAA, 0xBB]);
+        assert_eq!(escape(&[0xAA, 0xBB]), &[0xAA, 0xBB]);
         // 00 00 00 → 00 00 03 00
-        assert_eq!(
-            emulation_prevent(&[0x00, 0x00, 0x00]),
-            &[0x00, 0x00, 0x03, 0x00]
-        );
+        assert_eq!(escape(&[0x00, 0x00, 0x00]), &[0x00, 0x00, 0x03, 0x00]);
         // 00 00 01 → 00 00 03 01
-        assert_eq!(
-            emulation_prevent(&[0x00, 0x00, 0x01]),
-            &[0x00, 0x00, 0x03, 0x01]
-        );
+        assert_eq!(escape(&[0x00, 0x00, 0x01]), &[0x00, 0x00, 0x03, 0x01]);
         // 00 00 04 → 00 00 04 (above the 0x03 threshold)
-        assert_eq!(emulation_prevent(&[0x00, 0x00, 0x04]), &[0x00, 0x00, 0x04]);
+        assert_eq!(escape(&[0x00, 0x00, 0x04]), &[0x00, 0x00, 0x04]);
     }
 
     #[test]
