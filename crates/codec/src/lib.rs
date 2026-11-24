@@ -25,6 +25,14 @@ pub mod video_encoder;
 #[cfg(feature = "istmo")]
 pub mod plugin;
 
+// Windows FFI: the one module of this crate that needs `unsafe`.
+#[cfg(all(target_os = "windows", feature = "media-foundation"))]
+#[allow(
+    unsafe_code,
+    reason = "Media Foundation is a COM API; every block carries a SAFETY comment"
+)]
+pub mod mf;
+
 pub use audio::{
     AudioDecoderRegistry, AudioEncoderRegistry, SelectingAudioDecoder, SelectingAudioEncoder,
 };

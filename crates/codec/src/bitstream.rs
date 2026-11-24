@@ -36,7 +36,7 @@ pub fn split_annex_b(buf: &[u8]) -> Vec<&[u8]> {
 }
 
 /// The NAL units of an Annex B buffer rewritten with a 4-byte big-endian
-/// length in front of each (AVCC / HVCC framing, what VideoToolbox and
+/// length in front of each (AVCC / HVCC framing, what `VideoToolbox` and
 /// MP4 carry).
 #[must_use]
 pub fn annex_b_to_length_prefixed(buf: &[u8]) -> Vec<u8> {
