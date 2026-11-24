@@ -1,5 +1,9 @@
 /// Decides which decoded frames are shown and rebases their timestamps so
 /// the first displayed frame of the stream sits at 0.
+#[expect(
+    clippy::struct_field_names,
+    reason = "the `_us` suffix names the unit of every timestamp"
+)]
 pub(crate) struct Presentation {
     /// Timestamp (demuxer timeline) of the first frame meant to be shown;
     /// anything earlier is pre-roll.

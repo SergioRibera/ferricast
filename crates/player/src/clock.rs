@@ -50,6 +50,7 @@ pub struct Clock {
 impl Clock {
     /// Creates a clock that still shows frames up to `max_lateness` behind
     /// their due time and reports later ones as [`Due::Late`].
+    #[must_use]
     pub fn new(max_lateness: Duration) -> Self {
         Self {
             state: Mutex::new(State::default()),
@@ -92,7 +93,10 @@ impl Clock {
                 return Due::Stopped;
             }
             if state.paused {
-                state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 continue;
             }
             let now = Instant::now();
@@ -112,7 +116,7 @@ impl Clock {
                     state = self
                         .changed
                         .wait_timeout(state, wait)
-                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .0;
                 }
                 Plan::Show => {
@@ -125,7 +129,9 @@ impl Clock {
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -171,6 +177,10 @@ mod tests {
 
     const LATENESS: Duration = Duration::from_millis(50);
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "shaped like the anchor `plan` takes"
+    )]
     fn anchored(now: Instant) -> Option<(Instant, u64)> {
         Some((now, 1_000_000))
     }
@@ -239,7 +249,7 @@ mod tests {
     fn a_frame_too_far_behind_is_late_when_another_was_just_shown() {
         let start = Instant::now();
         let now = start + Duration::from_millis(200);
-        let shown = now - Duration::from_millis(10);
+        let shown = now.checked_sub(Duration::from_millis(10)).unwrap();
         assert_eq!(
             plan(anchored(start), Some(shown), now, 1_020_000, LATENESS),
             Plan::Late
@@ -272,7 +282,7 @@ mod tests {
         let mut shown = Vec::new();
         for index in 0..count {
             now = now.max(start + arrival * index);
-            let pts = frame.as_micros() as u64 * u64::from(index);
+            let pts = u64::try_from(frame.as_micros()).unwrap() * u64::from(index);
             loop {
                 match plan(anchor, last_shown, now, pts, LATENESS) {
                     Plan::Anchor => {
@@ -301,7 +311,11 @@ mod tests {
             Duration::from_micros(33_333),
             120,
         );
-        let longest_gap = shown.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        let longest_gap = shown
+            .windows(2)
+            .map(|w| w[1].checked_sub(w[0]).unwrap())
+            .max()
+            .unwrap();
         assert!(
             shown.len() >= 90,
             "only {} of 120 frames shown",

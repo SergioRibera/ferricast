@@ -26,7 +26,7 @@ fn cell_means(plane: &[u8], width: usize, height: usize, cell: (usize, usize)) -
                 sum += line.iter().map(|&p| usize::from(p)).sum::<usize>();
                 count += line.len();
             }
-            means.push(((sum + count / 2) / count) as u8);
+            means.push(u8::try_from((sum + count / 2) / count).unwrap());
         }
     }
     means
@@ -66,7 +66,7 @@ fn assert_matches_reference(name: &str, tolerance: u8) {
     let frames = play(&mut Player::open(&fixture(name)).unwrap());
     let reference = std::fs::read(fixture(&format!("{name}.sig"))).unwrap();
     let (chunks, _) = reference.as_chunks::<SIGNATURE_LEN>();
-    let references: Vec<&[u8]> = chunks.iter().map(|chunk| chunk.as_slice()).collect();
+    let references: Vec<&[u8]> = chunks.iter().map(<[u8; 216]>::as_slice).collect();
     assert_eq!(frames.len(), references.len(), "{name}");
     for (i, frame) in frames.iter().enumerate() {
         let decoded = signature(frame);
@@ -145,5 +145,11 @@ fn rewinding_midway_restarts_from_the_first_frame() {
 fn the_stream_description_matches_the_clip() {
     let player = Player::open(&fixture("h264.mkv")).unwrap();
     let video = player.video();
-    assert_eq!((video.width, video.height), (WIDTH as u32, HEIGHT as u32));
+    assert_eq!(
+        (video.width, video.height),
+        (
+            u32::try_from(WIDTH).unwrap(),
+            u32::try_from(HEIGHT).unwrap()
+        )
+    );
 }

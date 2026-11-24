@@ -35,6 +35,11 @@ pub struct Player {
 }
 
 impl Player {
+    /// Opens `path` and a decoder for its video track.
+    ///
+    /// # Errors
+    /// The demuxer's error, [`FerricastError::Demux`] when the file has no
+    /// supported video track, or the decoder's when none opens.
     pub fn open(path: &Path) -> Result<Self> {
         let demuxer = Demuxer::open(path)?;
         let video = demuxer
@@ -61,6 +66,11 @@ impl Player {
         &self.video
     }
 
+    /// The next decoded frame in presentation order; `None` at the end.
+    ///
+    /// # Errors
+    /// Demuxing errors, and decoding errors the software fallback cannot
+    /// recover from.
     pub fn next_frame(&mut self) -> Result<Option<CapturedFrame>> {
         loop {
             if let Some(frame) = self.ready.pop_front() {
@@ -97,6 +107,10 @@ impl Player {
         }
     }
 
+    /// Restarts playback from the beginning.
+    ///
+    /// # Errors
+    /// The demuxer's or the decoder's error when either cannot reopen.
     pub fn rewind(&mut self) -> Result<()> {
         self.restart()?;
         self.presentation.restart();
