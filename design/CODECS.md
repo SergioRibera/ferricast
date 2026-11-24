@@ -82,8 +82,13 @@ ferricast           umbrella: re-exports, `codec_service()` (feature `istmo`)
   produce it fails `configure` with `UnsupportedConfig`.
 - `DecoderConfig::colour` / `VideoStreamInfo::colour` carry the
   container's signalling (MP4 `colr` / `vpcC`, Matroska `Colour`) for
-  bitstreams or backends that give none (openh264, NVDEC binding,
-  rust_h265).
+  bitstreams or backends that give none.
+- Backends that report no colour (openh264, NVDEC binding, rust_h265) get
+  it from the SPS VUI (`bitstream::vui::ColourTracker`, H.264 and H.265
+  SPS walked to the VUI), which wins over the container per field group
+  (signal type, chroma location), like HDR metadata. Before this an HDR10
+  stream over MPEG-TS / RTP (no container colour) came out with an
+  unspecified transfer and was shown as SDR.
 
 ## istmo plugin `ferricast.codec`
 
@@ -208,9 +213,17 @@ ferricast           umbrella: re-exports, `codec_service()` (feature `istmo`)
   `MF_MT_VIDEO_PRIMARIES`).
 - The GUI renders P010 through Skia YUVA with 16-bit planes and converts
   BT.2020 / PQ / HLG to sRGB on the GPU (tone-mapped SDR, not HDR output).
-- Linux hardware decoders (NVDEC binding, VA-API pool) are NV12-only:
-  10-bit streams hand over with `UnsupportedStream`, so `Auto` falls back
-  to rav1d / rust_h265.
+- NVDEC decodes HEVC Main10 to P016 (= P010 for 10-bit) through the
+  patched `shiguredo_nvcodec` in `vendor/` (`[patch.crates-io]`; changes
+  marked `[ferricast]`). H.264 High 10 hands over: NVDEC has no 10-bit
+  H.264, and neither has openh264, so Linux has no High 10 decoder. VA-API
+  HEVC decode is a stub (no slice submission) and stays opt-in.
+- `crates/decoder/tests/ten_bit.rs` checks real streams (x265 Main10 with
+  B-frames and HDR10 SEI, SVT-AV1 10-bit with metadata OBUs, libvpx VP9
+  profile 2) bit-exact against FFmpeg's P010 output, with the container's
+  colour and HDR dropped where the bitstream carries them. Also checked
+  once at 1080p (coded 1088): rust_h265 and NVDEC bit-exact, NVDEC about
+  490 fps against 263.
 
 ## Selection cost
 
@@ -270,8 +283,9 @@ ferricast           umbrella: re-exports, `codec_service()` (feature `istmo`)
   `ferricast-miracast`, which was being written in parallel; it still has
   to opt in. `ferricast-codec` keeps its own, stricter table. Product names
   allowed in docs live in `clippy.toml` (`doc-valid-idents`).
-- `nvenc-zero-copy` does not build against the `shiguredo_nvcodec` in the
-  lock (no `register_external_dmabuf` / `encode_external`); it is left out
-  of every feature set that is checked.
+- `nvenc-zero-copy` does not build: it calls `register_external_dmabuf` /
+  `encode_external`, which no `shiguredo_nvcodec` has (the fork its comment
+  names never existed). It is left out of every feature set that is
+  checked.
 - `tests/airplay_loop.rs` ("only N of M frames shown") is timing-bound and
   fails under heavy machine load; it passes run alone.
