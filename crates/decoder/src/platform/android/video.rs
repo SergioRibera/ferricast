@@ -560,7 +560,7 @@ impl Session {
         Ok(output)
     }
 
-    fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+    fn decode(&mut self, frame: &EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
         // Output drained while waiting for an input buffer is filed after
         // the queue; each buffer keeps the layout current when it was
         // dequeued, so a format change part-way through the batch only
@@ -694,7 +694,7 @@ impl VideoDecoder for MediaCodecVideoDecoder {
         self.session
             .as_mut()
             .ok_or_else(|| fail(Operation::Decode, "the decoder is not configured"))?
-            .decode(frame)
+            .decode(&frame)
     }
 
     fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {

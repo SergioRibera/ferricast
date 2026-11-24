@@ -31,9 +31,7 @@ pub(crate) fn video(registry: VideoDecoderRegistry) -> VideoDecoderRegistry {
     let CodecKind::Video(codec) = registry.target().codec else {
         return registry;
     };
-    let Some((hardware, software)) = video::openers(codec) else {
-        return registry;
-    };
+    let (hardware, software) = video::openers(codec);
     registry
         .candidate(
             Candidate::new(

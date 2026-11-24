@@ -1,4 +1,4 @@
-//! AAC-LC and AAC-ELD encode through AudioToolbox's `AudioConverter`.
+//! AAC-LC and AAC-ELD encode through `AudioToolbox`'s `AudioConverter`.
 //!
 //! The converter pulls PCM through an input callback; each call feeds it
 //! exactly one frame (1024 samples per channel for AAC-LC, 480 for
@@ -7,7 +7,7 @@
 //!
 //! - AAC-LC packets are framed as ADTS, the shape the MPEG-TS / HLS
 //!   pipeline carries.
-//! - AAC-ELD is AirPlay mirroring audio: raw access units at 44.1 kHz,
+//! - AAC-ELD is `AirPlay` mirroring audio: raw access units at 44.1 kHz,
 //!   480-sample frames, no SBR (`AudioSpecificConfig` `f8 e8 50 00` for
 //!   stereo). Input at other rates is resampled to 44.1 kHz first, as the
 //!   fdk-aac ELD encoder does.
@@ -42,10 +42,10 @@ const BACKEND: BackendId = BackendId::AudioToolbox;
 /// What the input callback returns once its frame is consumed, so the
 /// converter stops pulling; not an error.
 const NO_MORE_INPUT: i32 = i32::from_be_bytes(*b"!dat");
-/// Sample rate of AirPlay's AAC-ELD.
+/// Sample rate of `AirPlay`'s AAC-ELD.
 const ELD_SAMPLE_RATE: u32 = 44_100;
 
-/// Adds the AudioToolbox AAC-LC and AAC-ELD encoders.
+/// Adds the `AudioToolbox` AAC-LC and AAC-ELD encoders.
 pub(crate) fn audio(registry: AudioEncoderRegistry) -> AudioEncoderRegistry {
     if !matches!(
         registry.target().codec,
@@ -145,7 +145,7 @@ unsafe extern "C-unwind" fn feed(
     0
 }
 
-/// AAC-LC / AAC-ELD encoder over AudioToolbox.
+/// AAC-LC / AAC-ELD encoder over `AudioToolbox`.
 pub(crate) struct AtAacEncoder {
     converter: Converter,
     profile: Profile,
@@ -166,6 +166,10 @@ pub(crate) struct AtAacEncoder {
 }
 
 impl AtAacEncoder {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear AudioToolbox converter bring-up"
+    )]
     fn open(config: &AudioEncoderConfig) -> CodecResult<Self> {
         let unsupported = |what: String| CodecError::UnsupportedConfig {
             backend: BACKEND,

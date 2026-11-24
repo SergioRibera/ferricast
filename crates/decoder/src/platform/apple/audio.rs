@@ -1,5 +1,5 @@
 //! AAC (LC, HE-AAC v1 / v2), AAC-ELD and ALAC decode through
-//! AudioToolbox's `AudioConverter`.
+//! `AudioToolbox`'s `AudioConverter`.
 //!
 //! Each access unit is fed to a converter built for its [`Format`]: the
 //! compressed format, its magic cookie (the `AudioSpecificConfig` for the
@@ -15,9 +15,9 @@
 //!   signalling) is what such rates carry in practice. A plain LC stream
 //!   at those rates then comes out upsampled 2x, which is still correct
 //!   audio.
-//! - AAC-ELD: raw access units; `extra_data` or the AirPlay mirroring
+//! - AAC-ELD: raw access units; `extra_data` or the `AirPlay` mirroring
 //!   default (480-sample frames at the configured rate and channels).
-//! - ALAC: raw frames; `extra_data` or the AirPlay default cookie.
+//! - ALAC: raw frames; `extra_data` or the `AirPlay` default cookie.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -55,7 +55,7 @@ const MICROS_PER_SECOND: u64 = 1_000_000;
 /// The highest AAC core rate treated as carrying implicit SBR.
 const IMPLICIT_SBR_MAX_RATE: u32 = 24_000;
 
-/// Adds the AudioToolbox AAC, AAC-ELD and ALAC decoders.
+/// Adds the `AudioToolbox` AAC, AAC-ELD and ALAC decoders.
 pub(crate) fn audio(registry: AudioDecoderRegistry) -> AudioDecoderRegistry {
     match registry.target().codec {
         CodecKind::Audio(AudioCodec::Aac | AudioCodec::AacEld | AudioCodec::Alac) => registry
@@ -87,13 +87,17 @@ fn channels_of(code: u8) -> Option<u16> {
 }
 
 /// What one converter decodes: the compressed side, its cookie, and the
+#[expect(
+    clippy::struct_field_names,
+    reason = "`format_id` / `format_flags` keep the AudioStreamBasicDescription names"
+)]
 /// PCM it produces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Format {
     format_id: AudioFormatID,
     format_flags: u32,
     /// The rate the compressed description declares (for HE-AAC, the SBR
-    /// output rate, as AudioToolbox describes it).
+    /// output rate, as `AudioToolbox` describes it).
     sample_rate: u32,
     channels: u16,
     frames_per_packet: u32,
@@ -377,19 +381,17 @@ impl Source {
                 Ok(Self::Fixed(Format::aac(asc)?))
             }
             AudioCodec::Alac => {
-                let cookie = match extra {
-                    Some(bytes) => AlacConfig::parse(bytes)
-                        .ok_or_else(|| bad_extra("an ALACSpecificConfig"))?,
-                    None => {
-                        let channels = u8::try_from(config.channels)
-                            .ok()
-                            .filter(|channels| (1..=8).contains(channels))
-                            .ok_or_else(|| CodecError::UnsupportedConfig {
-                                backend: BACKEND,
-                                what: format!("ALAC with {} channels", config.channels),
-                            })?;
-                        AlacConfig::airplay(config.sample_rate, channels)
-                    }
+                let cookie = if let Some(bytes) = extra {
+                    AlacConfig::parse(bytes).ok_or_else(|| bad_extra("an ALACSpecificConfig"))?
+                } else {
+                    let channels = u8::try_from(config.channels)
+                        .ok()
+                        .filter(|channels| (1..=8).contains(channels))
+                        .ok_or_else(|| CodecError::UnsupportedConfig {
+                            backend: BACKEND,
+                            what: format!("ALAC with {} channels", config.channels),
+                        })?;
+                    AlacConfig::airplay(config.sample_rate, channels)
                 };
                 Ok(Self::Fixed(Format::alac(cookie)?))
             }
@@ -401,7 +403,7 @@ impl Source {
     }
 }
 
-/// AAC / AAC-ELD / ALAC decoder over AudioToolbox.
+/// AAC / AAC-ELD / ALAC decoder over `AudioToolbox`.
 pub(crate) struct AtDecoder {
     source: Source,
     active: Option<(Format, Converter)>,

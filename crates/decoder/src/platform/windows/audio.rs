@@ -209,25 +209,22 @@ impl Session {
             };
             // SAFETY: plain attribute read on the output sample.
             let reported = unsafe { sample.GetSampleTime() }.ok().map(micros);
-            let timestamp_us = match reported {
-                Some(time) => {
-                    // Units up to this one are decoded.
-                    while self.in_flight.front().is_some_and(|&fed| fed <= time) {
-                        self.in_flight.pop_front();
-                    }
-                    time
+            let timestamp_us = if let Some(time) = reported {
+                // Units up to this one are decoded.
+                while self.in_flight.front().is_some_and(|&fed| fed <= time) {
+                    self.in_flight.pop_front();
                 }
-                None => {
-                    let fallback = self.in_flight.pop_front();
-                    tracing::warn!(
-                        ?fallback,
-                        "Media Foundation AAC output carries no sample time; using the oldest \
-                         pending access unit timestamp"
-                    );
-                    fallback
-                        .or(self.ready.back().map(|last| last.timestamp_us))
-                        .unwrap_or(0)
-                }
+                time
+            } else {
+                let fallback = self.in_flight.pop_front();
+                tracing::warn!(
+                    ?fallback,
+                    "Media Foundation AAC output carries no sample time; using the oldest \
+                     pending access unit timestamp"
+                );
+                fallback
+                    .or(self.ready.back().map(|last| last.timestamp_us))
+                    .unwrap_or(0)
             };
             let bytes = mf::sample_bytes(&sample, op)?;
             let pcm: Vec<i16> = bytes

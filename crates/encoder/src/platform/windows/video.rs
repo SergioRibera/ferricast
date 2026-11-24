@@ -280,6 +280,10 @@ impl Session {
     }
 
     /// Sets `transform` up; a `device` it takes moves into the session.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear Media Foundation media-type negotiation"
+    )]
     fn setup(
         search: Search,
         mut transform: Transform,
@@ -670,16 +674,15 @@ impl Session {
         };
         if self.keyframe_requested {
             self.keyframe_requested = false;
-            match &self.codec_api {
-                Some(api) => {
-                    if let Err(error) = set_codec_u32(api, &CODECAPI_AVEncVideoForceKeyFrame, 1) {
-                        tracing::warn!(transform = self.transform.name(), %error, "keyframe request refused");
-                    }
+            if let Some(api) = &self.codec_api {
+                if let Err(error) = set_codec_u32(api, &CODECAPI_AVEncVideoForceKeyFrame, 1) {
+                    tracing::warn!(transform = self.transform.name(), %error, "keyframe request refused");
                 }
-                None => tracing::warn!(
+            } else {
+                tracing::warn!(
                     transform = self.transform.name(),
                     "no ICodecAPI: keyframe request dropped"
-                ),
+                );
             }
         }
         let duration_us = 1_000_000 / u64::from(self.fps);
@@ -734,20 +737,17 @@ impl Session {
             self.in_flight.drain(..=at);
             return capture;
         }
-        match self.in_flight.pop_front() {
-            Some((_, capture)) => {
-                tracing::debug!(
-                    ?time,
-                    capture,
-                    "packet sample time matches no frame; using the oldest in flight"
-                );
-                capture
-            }
-            None => {
-                let fallback = time.map_or(0, micros);
-                tracing::warn!(?time, fallback, "packet with no frame in flight");
-                fallback
-            }
+        if let Some((_, capture)) = self.in_flight.pop_front() {
+            tracing::debug!(
+                ?time,
+                capture,
+                "packet sample time matches no frame; using the oldest in flight"
+            );
+            capture
+        } else {
+            let fallback = time.map_or(0, micros);
+            tracing::warn!(?time, fallback, "packet with no frame in flight");
+            fallback
         }
     }
 

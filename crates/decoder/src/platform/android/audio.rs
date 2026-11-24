@@ -155,7 +155,7 @@ impl MediaCodecAudioDecoder {
     }
 
     /// Files one output buffer as PCM.
-    fn accept(&mut self, output: Output) -> CodecResult<()> {
+    fn accept(&mut self, output: &Output) -> CodecResult<()> {
         if output.is(FLAG_CODEC_CONFIG) || output.data.is_empty() {
             return Ok(());
         }
@@ -163,13 +163,12 @@ impl MediaCodecAudioDecoder {
             .open
             .as_mut()
             .ok_or_else(|| fail(Operation::Decode, "output from a closed codec"))?;
-        let (sample_rate, channels) = match open.output {
-            Some(shape) => shape,
-            None => {
-                let shape = output_shape(&open.codec)?;
-                open.output = Some(shape);
-                shape
-            }
+        let (sample_rate, channels) = if let Some(shape) = open.output {
+            shape
+        } else {
+            let shape = output_shape(&open.codec)?;
+            open.output = Some(shape);
+            shape
         };
         let pcm = output
             .data
@@ -201,7 +200,7 @@ impl MediaCodecAudioDecoder {
                 return Ok(false);
             };
             let ended = output.is(FLAG_END_OF_STREAM);
-            self.accept(output)?;
+            self.accept(&output)?;
             if ended {
                 return Ok(true);
             }
@@ -244,7 +243,7 @@ impl MediaCodecAudioDecoder {
             if let Some(open) = self.open.as_mut() {
                 open.output = snapshot;
             }
-            self.accept(output)?;
+            self.accept(&output)?;
         }
         if let Some(open) = self.open.as_mut() {
             open.output = shape;

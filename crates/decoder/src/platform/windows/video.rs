@@ -63,7 +63,7 @@ fn codec_of(index: u8) -> Codec {
 }
 
 /// The hardware and software openers of `codec`.
-pub(super) fn openers(codec: Codec) -> Option<(Opener, Opener)> {
+pub(super) fn openers(codec: Codec) -> (Opener, Opener) {
     fn pair<const CODEC: u8>() -> (Opener, Opener) {
         (
             Opener {
@@ -76,13 +76,13 @@ pub(super) fn openers(codec: Codec) -> Option<(Opener, Opener)> {
             },
         )
     }
-    Some(match codec {
+    match codec {
         Codec::H264 => pair::<H264>(),
         Codec::H265 => pair::<H265>(),
         Codec::Vp8 => pair::<VP8>(),
         Codec::Vp9 => pair::<VP9>(),
         Codec::Av1 => pair::<AV1>(),
-    })
+    }
 }
 
 fn search(codec: Codec, hardware: bool) -> Search {
@@ -429,29 +429,26 @@ impl Session {
                 (Some(_), Some(visible)) => D3d11Texture::from_sample(&sample, visible)?,
                 _ => None,
             };
-            let (data, stride, format) = match texture {
-                Some(texture) => {
-                    let frame = NativeFrame {
-                        width: u32::try_from(picture.width).unwrap_or(u32::MAX),
-                        height: u32::try_from(picture.height).unwrap_or(u32::MAX),
-                        timestamp_us,
-                        colour: Some(colour),
-                        hdr,
-                        surface: Arc::new(texture),
-                    };
-                    if self.memory == FrameMemory::Native {
-                        self.ready.push_back(CapturedFrame::Native(frame));
-                        continue;
-                    }
-                    let raw = frame
-                        .into_cpu()
-                        .map_err(|error| CodecError::backend(BACKEND, op, error))?;
-                    (raw.data.to_vec(), raw.stride as usize, raw.format)
+            let (data, stride, format) = if let Some(texture) = texture {
+                let frame = NativeFrame {
+                    width: u32::try_from(picture.width).unwrap_or(u32::MAX),
+                    height: u32::try_from(picture.height).unwrap_or(u32::MAX),
+                    timestamp_us,
+                    colour: Some(colour),
+                    hdr,
+                    surface: Arc::new(texture),
+                };
+                if self.memory == FrameMemory::Native {
+                    self.ready.push_back(CapturedFrame::Native(frame));
+                    continue;
                 }
-                None => {
-                    let (packed, stride) = self.pack(&mf::sample_bytes(&sample, op)?)?;
-                    (packed, stride, picture.format)
-                }
+                let raw = frame
+                    .into_cpu()
+                    .map_err(|error| CodecError::backend(BACKEND, op, error))?;
+                (raw.data.to_vec(), raw.stride as usize, raw.format)
+            } else {
+                let (packed, stride) = self.pack(&mf::sample_bytes(&sample, op)?)?;
+                (packed, stride, picture.format)
             };
             let raw = self.deliver(data, stride, format, timestamp_us, colour, hdr)?;
             self.ready.push_back(CapturedFrame::Cpu(raw));
