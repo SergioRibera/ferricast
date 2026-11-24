@@ -2,6 +2,7 @@
 //! buffer to the decoder's pool on drop.
 
 use std::fmt;
+use std::sync::Arc;
 
 use super::format::{FrameInfo, Layout};
 use super::pool::Pooled;
@@ -20,7 +21,7 @@ pub(super) struct HostSlot {
 /// picture in it.
 #[derive(Debug)]
 pub(super) struct DeviceSlot {
-    pub(super) buffer: DeviceBuffer,
+    pub(super) buffer: Arc<DeviceBuffer>,
     /// Recorded on the decoder's stream after the copy into `buffer`.
     pub(super) ready: Event,
     /// Recorded on the consumer's stream by [`DeviceFrame::release_after`];
@@ -145,6 +146,18 @@ impl DeviceFrame {
     /// plane is.
     #[must_use]
     pub fn buffer(&self) -> &DeviceBuffer {
+        &self.slot.buffer
+    }
+
+    /// The buffer as an `Arc`, for consumers that cache it by identity, such
+    /// as [`encode::DeviceFrame`](crate::encode::DeviceFrame): the pool lends
+    /// the same buffer to later pictures, so NVENC registers it once.
+    ///
+    /// Holding a clone past dropping the frame is safe but costs an
+    /// allocation: the decoder will not write a buffer someone else still
+    /// holds and gives the slot a new one instead.
+    #[must_use]
+    pub fn shared_buffer(&self) -> &Arc<DeviceBuffer> {
         &self.slot.buffer
     }
 

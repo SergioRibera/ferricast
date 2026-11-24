@@ -271,6 +271,7 @@ impl State {
             Output::Device { pool, queue } => {
                 let mut slot = pool
                     .take(|| DeviceSlot::new(context, frame.format, frame.width, frame.height))?;
+                slot.make_exclusive(context, frame.format, frame.width, frame.height)?;
                 let layout =
                     Layout::pitched(frame.format, frame.width, frame.height, slot.buffer.pitch());
                 if slot.release_pending {
@@ -375,14 +376,41 @@ impl fmt::Debug for State {
 
 impl DeviceSlot {
     fn new(context: &Arc<Context>, format: PixelFormat, width: u32, height: u32) -> Result<Self> {
-        let layout = Layout::pitched(format, width, height, 0);
         Ok(Self {
-            buffer: DeviceBuffer::pitched(context, layout.max_width_bytes(), layout.total_rows())?,
+            buffer: Self::buffer(context, format, width, height)?,
             ready: Event::new(context)?,
             released: Event::new(context)?,
             release_pending: false,
             sei: SeiStore::default(),
         })
+    }
+
+    fn buffer(
+        context: &Arc<Context>,
+        format: PixelFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<Arc<DeviceBuffer>> {
+        let layout = Layout::pitched(format, width, height, 0);
+        DeviceBuffer::pitched(context, layout.max_width_bytes(), layout.total_rows()).map(Arc::new)
+    }
+
+    /// Gives the slot a buffer nobody else holds. A consumer that kept the
+    /// buffer's `Arc` past dropping the frame (an encoder with the picture
+    /// still pending) may still be reading it, so the slot moves on to a new
+    /// buffer instead of overwriting that one.
+    fn make_exclusive(
+        &mut self,
+        context: &Arc<Context>,
+        format: PixelFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        if Arc::strong_count(&self.buffer) > 1 {
+            tracing::debug!("a decoded frame's buffer is still held: decoding into a new one");
+            self.buffer = Self::buffer(context, format, width, height)?;
+        }
+        Ok(())
     }
 }
 
