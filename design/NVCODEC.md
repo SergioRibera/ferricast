@@ -389,3 +389,9 @@ header sits at a different offset in the newest one. Findings for
   (`nvEncInitializeEncoder` `INVALID_PARAM`); AV1 is `MissingFromGpu`.
 - 1080p NV12 H.264 P1 ultra-low-latency (debug build): 426 fps host, 473
   device; with 3 frames in flight 477 / 484 fps.
+- Open: with many NVENC sessions opening and closing at once on the GPU
+  (the parallel test run, one test holding the 12-session limit), an
+  `nvEncOpenEncodeSessionEx` once failed with `NV_ENC_ERR_INVALID_VERSION`
+  instead of the limit status; not reproduced with two processes looping
+  over different API versions. The encode tests are serialised and the
+  limit test runs in its own process.

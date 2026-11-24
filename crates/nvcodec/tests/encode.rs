@@ -52,6 +52,16 @@ fn context() -> Option<Arc<Context>> {
     }
 }
 
+/// Serialises the tests of this binary: several at once on one GPU (one of
+/// them filling the session limit) make the driver refuse sessions with
+/// errors that are not the test's subject. Children run while their parent
+/// holds it.
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn driver_max() -> Option<NvencVersion> {
     match NvencLibrary::get().and_then(NvencLibrary::max_supported_version) {
         Ok(version) => Some(version),
@@ -739,6 +749,7 @@ fn version_gates(context: &Arc<Context>, version: ApiVersion) {
 /// otherwise.
 #[test]
 fn child_encode_matrix() {
+    let _gpu = gpu_lock();
     let Some(value) = std::env::var_os(API_OVERRIDE_VAR) else {
         return;
     };
@@ -754,6 +765,7 @@ fn child_encode_matrix() {
 
 #[test]
 fn encode_matrix_every_api_version() {
+    let _gpu = gpu_lock();
     let Some(driver_max) = driver_max() else {
         return;
     };
@@ -793,6 +805,7 @@ fn encode_matrix_every_api_version() {
 
 #[test]
 fn capabilities_of_this_gpu() {
+    let _gpu = gpu_lock();
     let Some(context) = context() else { return };
     let caps = Capabilities::query(&context).unwrap();
     eprintln!("{caps:#?}");
@@ -812,6 +825,7 @@ fn capabilities_of_this_gpu() {
 
 #[test]
 fn forced_idr_and_parameter_sets() {
+    let _gpu = gpu_lock();
     let Some(context) = context() else { return };
     for codec in [Codec::H264, Codec::Hevc] {
         let config = Config {
@@ -871,6 +885,7 @@ fn forced_idr_and_parameter_sets() {
 
 #[test]
 fn bitrate_reconfigure_takes_effect() {
+    let _gpu = gpu_lock();
     let Some(context) = context() else { return };
     let fps = 30;
     let (low, high) = (1_000_000, 4_000_000);
@@ -946,6 +961,7 @@ fn bitrate_reconfigure_takes_effect() {
 
 #[test]
 fn frames_in_flight_b_frames_and_lookahead_keep_order() {
+    let _gpu = gpu_lock();
     let Some(context) = context() else { return };
     let caps = Capabilities::query(&context).unwrap();
     let h264 = caps.require(Codec::H264).unwrap();
@@ -1012,6 +1028,7 @@ fn frames_in_flight_b_frames_and_lookahead_keep_order() {
 
 #[test]
 fn constant_qp_and_lossless() {
+    let _gpu = gpu_lock();
     let Some(context) = context() else { return };
     let caps = Capabilities::query(&context).unwrap();
     let source = video(WIDTH, HEIGHT, 6, 8);
@@ -1093,6 +1110,7 @@ impl Array {
 
 #[test]
 fn cuda_array_input() {
+    let _gpu = gpu_lock();
     let Some(context) = context() else { return };
     let format = InputFormat::Argb;
     let config = Config {
@@ -1156,6 +1174,7 @@ fn cuda_array_input() {
 
 #[test]
 fn steady_state_registers_nothing() {
+    let _gpu = gpu_lock();
     let Some(context) = context() else { return };
     let config = Config {
         frames_in_flight: 2,
@@ -1234,6 +1253,7 @@ fn steady_state_registers_nothing() {
 
 #[test]
 fn invalid_inputs_are_refused() {
+    let _gpu = gpu_lock();
     let Some(context) = context() else { return };
     let config = Config::low_latency(
         Codec::H264,
@@ -1279,8 +1299,37 @@ fn invalid_inputs_are_refused() {
     assert!(matches!(error, Error::Unsupported { .. }), "{error}");
 }
 
+/// Set in the child processes of [`isolated`].
+const ISOLATED_VAR: &str = "FERRICAST_NVENC_TEST_ISOLATED";
+
+/// Re-runs `test` alone in a child process and returns `true` there: for
+/// tests that must not share the driver with the others (the session limit
+/// starves them; the driver refuses sessions of different API versions open
+/// at the same time in one process).
+fn isolated(test: &str) -> bool {
+    if std::env::var_os(ISOLATED_VAR).is_some() {
+        return true;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+        .env(ISOLATED_VAR, "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("{}", stderr.trim());
+    assert!(
+        output.status.success(),
+        "{test} failed in its child process"
+    );
+    false
+}
+
 #[test]
 fn session_limit_is_recognisable() {
+    let _gpu = gpu_lock();
+    if !isolated("session_limit_is_recognisable") {
+        return;
+    }
     let Some(context) = context() else { return };
     let config = Config::low_latency(
         Codec::H264,
@@ -1309,6 +1358,7 @@ fn session_limit_is_recognisable() {
 
 #[test]
 fn throughput_1080p() {
+    let _gpu = gpu_lock();
     let Some(context) = context() else { return };
     let (width, height) = (1920, 1080);
     let frames = 240;
@@ -1376,6 +1426,10 @@ fn throughput_1080p() {
 
 #[test]
 fn every_version_loads_through_any_api() {
+    let _gpu = gpu_lock();
+    if !isolated("every_version_loads_through_any_api") {
+        return;
+    }
     let Some(driver_max) = driver_max() else {
         return;
     };
