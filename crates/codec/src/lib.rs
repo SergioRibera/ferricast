@@ -28,9 +28,7 @@ pub mod video_encoder;
 #[cfg(feature = "istmo")]
 pub mod plugin;
 
-// Planes / HDR descriptors of the Android surfaces, also tested on the host.
-#[cfg(any(test, all(target_os = "android", feature = "mediacodec")))]
-pub mod cta861;
+// Planes of the Android surfaces, also tested on the host.
 #[cfg(any(test, all(target_os = "android", feature = "mediacodec")))]
 pub mod yuv420;
 

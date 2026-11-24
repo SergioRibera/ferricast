@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ferricast_codec::android::{HardwareBuffer, ImageOutput};
-use ferricast_codec::cta861::hdr_from_cta861;
 use ferricast_codec::yuv420::{self, Crop, SemiPlanar};
 use ferricast_core::{
     BackendId, BitDepth, CapturedFrame, ChromaLocation, Codec, CodecError, CodecResult,
@@ -321,7 +320,7 @@ impl Session {
         }
         let hdr = format
             .buffer(key::HDR_STATIC_INFO)
-            .and_then(hdr_from_cta861)
+            .and_then(HdrMetadata::from_cta861)
             .or(container_hdr);
         let pixels = if native {
             None
