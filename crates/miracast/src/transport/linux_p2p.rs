@@ -237,18 +237,37 @@ impl LinuxP2pClient {
                 tokio::select! {
                     msg = gon.next() => {
                         let Some(sig) = msg else { break };
-                        let Ok((peer, pwd_id, dev_passwd)): Result<(OwnedObjectPath, u16, u8), _>
+                        // supplicant's signal body is
+                        // `(peer: o, password_id: q, go_intent: y)`.
+                        let Ok((peer, pwd_id, go_intent)): Result<(OwnedObjectPath, u16, u8), _>
                             = sig.body().deserialize() else { continue };
-                        // Map WSC password_id (RFC-stable) to supplicant's
-                        // `wps_method` string. Spec §12:
-                        //   0x0004 = Push-Button
-                        //   0x0007 = Registrar-specified
-                        //   0x0000 = Default (from label)
-                        //   Keypad / Display are driven by the DEV PasswordID.
+
+                        // WSC Device Password ID (spec §12):
+                        //   0x0000 Default / label PIN
+                        //   0x0001 User-specified (peer wants *us* to display a PIN)
+                        //   0x0004 Push-Button
+                        //   0x0005 Registrar-specified
+                        //   0x0007 NFC
                         let (wps_method, maybe_pin): (&str, Option<String>) = match pwd_id {
                             0x0004 => ("pbc", None),
                             _ => match &pairing {
-                                PairingMode::PushButton => ("pbc", None),
+                                PairingMode::PushButton => {
+                                    // Peer wants a PIN but caller asked
+                                    // for PBC. Auto-generate a Miracast
+                                    // 8-digit WPS PIN and shout it in the
+                                    // logs so the user can read it off
+                                    // the terminal and type it on the
+                                    // phone. GUI can intercept this log
+                                    // or read the PIN from the pairing
+                                    // mode after the fact.
+                                    let pin = generate_wps_pin();
+                                    tracing::warn!(
+                                        pin = %pin,
+                                        "miracast sink: peer asked for PIN pairing but PairingMode::PushButton — displaying generated PIN **{}**",
+                                        pin,
+                                    );
+                                    ("display", Some(pin))
+                                }
                                 PairingMode::DisplayPin(p) => ("display", Some(p.clone())),
                                 PairingMode::EnterPin(p) => ("keypad", Some(p.clone())),
                             },
@@ -256,8 +275,9 @@ impl LinuxP2pClient {
                         tracing::info!(
                             peer = %peer.as_str(),
                             pwd_id = format_args!("0x{:04x}", pwd_id),
-                            dev_passwd,
+                            go_intent,
                             wps_method,
+                            pin = maybe_pin.as_deref().unwrap_or("-"),
                             "sink: auto-accepting GON request"
                         );
                         let mut args: HashMap<&str, Value> = HashMap::new();
@@ -266,6 +286,10 @@ impl LinuxP2pClient {
                         if let Some(pin) = maybe_pin {
                             args.insert("pin", Value::from(pin));
                         }
+                        // Bias ourselves toward being the Group Owner —
+                        // the sink needs to run a DHCP server for the
+                        // phone and supplicant's GO mode handles that.
+                        args.insert("go_intent", Value::from(15i32));
                         if let Err(e) = p2p_owned.call_method("Connect", &(args,)).await {
                             tracing::warn!(error = %e, "sink: Connect");
                         }
@@ -341,6 +365,47 @@ impl LinuxP2pClient {
         tokio::time::timeout(Duration::from_secs(30), fut)
             .await
             .map_err(|_| TransportError::LinuxP2p("GO negotiation timed out".into()))?
+    }
+}
+
+/// Generate a valid 8-digit WPS PIN (7 random digits + mod-10 checksum).
+/// Wi-Fi Protected Setup §C.1 — supplicant rejects PINs whose checksum
+/// doesn't verify.
+fn generate_wps_pin() -> String {
+    let base: u32 = rand::random::<u32>() % 10_000_000;
+    let checksum = wps_pin_checksum(base);
+    format!("{base:07}{checksum}")
+}
+
+fn wps_pin_checksum(pin_7: u32) -> u8 {
+    let p = u64::from(pin_7) * 10;
+    let accum = 3 * ((p / 10_000_000) % 10)
+        + ((p / 1_000_000) % 10)
+        + 3 * ((p / 100_000) % 10)
+        + ((p / 10_000) % 10)
+        + 3 * ((p / 1_000) % 10)
+        + ((p / 100) % 10)
+        + 3 * ((p / 10) % 10);
+    ((10 - (accum % 10)) % 10) as u8
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn checksum_reference_vectors() {
+        // WPS spec §C.1 worked examples.
+        assert_eq!(wps_pin_checksum(1234567), 0);
+        assert_eq!(wps_pin_checksum(0), 0);
+        // Self-consistency: every generated PIN must validate.
+        for _ in 0..100 {
+            let pin = generate_wps_pin();
+            let (base, cs) = pin.split_at(7);
+            let base: u32 = base.parse().unwrap();
+            let cs: u8 = cs.parse().unwrap();
+            assert_eq!(wps_pin_checksum(base), cs);
+        }
     }
 }
 
