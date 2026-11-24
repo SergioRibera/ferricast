@@ -262,10 +262,35 @@ impl LinuxP2pClient {
                     return;
                 }
             };
+            let mut group_fail = match p2p_owned.receive_signal("GroupFormationFailure").await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sink: subscribe GroupFormationFailure");
+                    return;
+                }
+            };
+            let mut wps_fail = match p2p_owned.receive_signal("WpsFailed").await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sink: subscribe WpsFailed");
+                    return;
+                }
+            };
+            let mut gon_fail = match p2p_owned.receive_signal("GONegotiationFailure").await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sink: subscribe GONegotiationFailure");
+                    return;
+                }
+            };
             // Last PIN supplicant handed us for the pending peer — used
             // if the subsequent GONegotiationRequest asks for the same
             // method so we feed back the PIN the phone is typing.
             let mut last_prov_pin: Option<(OwnedObjectPath, String)> = None;
+            // De-dup: same (peer, pin) within this many ms is logged
+            // once. If supplicant regenerates a different PIN for the
+            // same peer we announce it as "UPDATED".
+            let mut last_prov_at: Option<std::time::Instant> = None;
             loop {
                 tokio::select! {
                     msg = prov_pin.next() => {
@@ -273,15 +298,38 @@ impl LinuxP2pClient {
                         // `ProvisionDiscoveryRequestDisplayPin(peer: o, pin: s)`.
                         let Ok((peer, pin)): Result<(OwnedObjectPath, String), _>
                             = sig.body().deserialize() else { continue };
-                        // Show the PIN prominently so the user can type it
-                        // on the phone.
-                        tracing::warn!(
-                            peer = %peer.as_str(),
-                            pin = %pin,
-                            "miracast sink: PIN to type on phone → **{}** ←",
-                            pin,
-                        );
+                        // supplicant sometimes retries ProvDisc and emits
+                        // a fresh PIN each time. Dedup same (peer,pin)
+                        // within 2s; a *different* PIN logs as UPDATED.
+                        let now = std::time::Instant::now();
+                        let same = last_prov_pin
+                            .as_ref()
+                            .is_some_and(|(p, pp)| p == &peer && pp == &pin);
+                        let too_soon = last_prov_at
+                            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(2000));
+                        if same && too_soon {
+                            continue;
+                        }
+                        let updated = last_prov_pin
+                            .as_ref()
+                            .is_some_and(|(p, pp)| p == &peer && pp != &pin);
+                        if updated {
+                            tracing::warn!(
+                                peer = %peer.as_str(),
+                                pin = %pin,
+                                "miracast sink: PIN UPDATED, type on phone → **{}** ← (ignore any earlier PIN)",
+                                pin,
+                            );
+                        } else {
+                            tracing::warn!(
+                                peer = %peer.as_str(),
+                                pin = %pin,
+                                "miracast sink: PIN to type on phone → **{}** ←",
+                                pin,
+                            );
+                        }
                         last_prov_pin = Some((peer, pin));
+                        last_prov_at = Some(now);
                     }
                     msg = prov_pbc.next() => {
                         let Some(sig) = msg else { break };
@@ -293,6 +341,28 @@ impl LinuxP2pClient {
                         let Some(sig) = msg else { break };
                         if let Ok((peer, status)) = sig.body().deserialize::<(OwnedObjectPath, i32)>() {
                             tracing::warn!(peer = %peer.as_str(), status, "sink: ProvDisc failed");
+                        }
+                    }
+                    msg = group_fail.next() => {
+                        let Some(sig) = msg else { break };
+                        if let Ok(reason) = sig.body().deserialize::<String>() {
+                            tracing::error!(reason = %reason, "miracast sink: GroupFormationFailure");
+                        } else {
+                            tracing::error!("miracast sink: GroupFormationFailure (opaque)");
+                        }
+                    }
+                    msg = wps_fail.next() => {
+                        let Some(sig) = msg else { break };
+                        if let Ok(dict) = sig.body().deserialize::<HashMap<String, OwnedValue>>() {
+                            let reason = dict.get("msg").and_then(|v| v.downcast_ref::<&str>().ok()).unwrap_or("");
+                            let error = dict.get("config_error").and_then(|v| v.downcast_ref::<u32>().ok()).unwrap_or(0);
+                            tracing::error!(reason, config_error = error, "miracast sink: WpsFailed (PIN mismatch or timeout)");
+                        }
+                    }
+                    msg = gon_fail.next() => {
+                        let Some(sig) = msg else { break };
+                        if let Ok(dict) = sig.body().deserialize::<HashMap<String, OwnedValue>>() {
+                            tracing::error!(?dict, "miracast sink: GONegotiationFailure");
                         }
                     }
                     msg = gon.next() => {
