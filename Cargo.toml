@@ -7,6 +7,7 @@ members = [
     ".",
     "crates/core",
     "crates/codec",
+    "crates/nvcodec",
     "crates/capture",
     "crates/chromecast",
     "crates/airplay",
@@ -35,6 +36,7 @@ allow_attributes_without_reason = "deny"
 ferricast = { path = ".", default-features = false }
 ferricast-core = { path = "crates/core" }
 ferricast-codec = { path = "crates/codec" }
+ferricast-nvcodec = { path = "crates/nvcodec" }
 ferricast-capture = { path = "crates/capture", default-features = false }
 ferricast-chromecast = { path = "crates/chromecast", default-features = false }
 ferricast-encoder = { path = "crates/encoder", default-features = false }
