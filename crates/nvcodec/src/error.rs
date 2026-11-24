@@ -159,6 +159,148 @@ pub enum Error {
         /// Why (which version, GPU or driver lacks it).
         reason: String,
     },
+    /// An EGL call failed (DMA-BUF interop).
+    #[error("{call} failed: {status}")]
+    Egl {
+        /// The EGL entry point.
+        call: &'static str,
+        /// `eglGetError` after the call.
+        status: EglStatus,
+    },
+    /// An operating system call failed (DMA-BUF interop).
+    #[error("{call} failed: {}", std::io::Error::from_raw_os_error(*errno))]
+    Os {
+        /// The system call.
+        call: &'static str,
+        /// `errno`.
+        errno: i32,
+    },
+    /// No EGL device of the NVIDIA driver drives the CUDA device, so its
+    /// DMA-BUFs cannot be imported.
+    #[error("no NVIDIA EGL device drives CUDA device {cuda}: {reason}")]
+    NoEglDevice {
+        /// The CUDA device's PCI address.
+        cuda: String,
+        /// What was found instead.
+        reason: String,
+    },
+    /// The DMA-BUFs come from a GPU other than the CUDA device (a hybrid
+    /// laptop's integrated GPU, a second card): they cannot be imported
+    /// without a copy through the CPU.
+    #[error(
+        "DMA-BUFs of DRM device {drm} ({drm_pci}) cannot be imported into CUDA device {cuda}: different GPUs"
+    )]
+    DeviceMismatch {
+        /// The DRM node the buffers come from.
+        drm: String,
+        /// Its PCI address, or `"unknown"`.
+        drm_pci: String,
+        /// The CUDA device's PCI address.
+        cuda: String,
+    },
+    /// A DMA-BUF pixel format the importer does not handle.
+    #[error("DRM format {} ({fourcc:#010x}) is not supported for import", fourcc_text(*fourcc))]
+    UnsupportedFormat {
+        /// The DRM fourcc.
+        fourcc: u32,
+    },
+    /// A DRM format modifier the EGL driver cannot import for this format.
+    #[error("DRM modifier {modifier:#018x} is not importable for {}", fourcc_text(*fourcc))]
+    UnsupportedModifier {
+        /// The DRM fourcc.
+        fourcc: u32,
+        /// The modifier.
+        modifier: u64,
+    },
+    /// A DMA-BUF description that cannot be right (zero size, stride too
+    /// small, plane past the end of the buffer).
+    #[error("invalid DMA-BUF: {reason}")]
+    InvalidDmaBuf {
+        /// What is wrong.
+        reason: String,
+    },
+    /// No DMA-BUF is imported under this key.
+    #[error("no DMA-BUF is imported under key {key:#x}")]
+    UnknownBuffer {
+        /// The caller's key.
+        key: u128,
+    },
+    /// The producer had not finished writing the DMA-BUF in time.
+    #[error("the DMA-BUF producer's fence did not signal within {waited:?}")]
+    FenceTimeout {
+        /// How long the wait lasted.
+        waited: std::time::Duration,
+    },
+}
+
+/// A DRM fourcc as its four characters, for messages.
+fn fourcc_text(fourcc: u32) -> String {
+    fourcc
+        .to_le_bytes()
+        .iter()
+        .map(|&byte| {
+            if byte.is_ascii_graphic() {
+                char::from(byte)
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// An EGL error code (`eglGetError`), shown by name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EglStatus(pub i32);
+
+impl EglStatus {
+    /// `EGL_SUCCESS`.
+    pub const SUCCESS: Self = Self(0x3000);
+
+    /// The enumerator name from `egl.h` / `eglext.h`, when known.
+    #[must_use]
+    pub fn name(self) -> Option<&'static str> {
+        /// `EGL_SUCCESS` (0x3000) to `EGL_CONTEXT_LOST` (0x300E), in order.
+        const CORE: [&str; 15] = [
+            "EGL_SUCCESS",
+            "EGL_NOT_INITIALIZED",
+            "EGL_BAD_ACCESS",
+            "EGL_BAD_ALLOC",
+            "EGL_BAD_ATTRIBUTE",
+            "EGL_BAD_CONFIG",
+            "EGL_BAD_CONTEXT",
+            "EGL_BAD_CURRENT_SURFACE",
+            "EGL_BAD_DISPLAY",
+            "EGL_BAD_MATCH",
+            "EGL_BAD_NATIVE_PIXMAP",
+            "EGL_BAD_NATIVE_WINDOW",
+            "EGL_BAD_PARAMETER",
+            "EGL_BAD_SURFACE",
+            "EGL_CONTEXT_LOST",
+        ];
+        match self.0 {
+            0x322B => Some("EGL_BAD_DEVICE_EXT"),
+            code => code
+                .checked_sub(Self::SUCCESS.0)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .and_then(|index| CORE.get(index))
+                .copied(),
+        }
+    }
+}
+
+impl fmt::Display for EglStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.name() {
+            Some(name) => write!(f, "{name} ({:#x})", self.0),
+            None => write!(f, "EGL error {:#x}", self.0),
+        }
+    }
+}
+
+impl fmt::Debug for EglStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 /// The list of NVENC API versions this build carries, for messages.

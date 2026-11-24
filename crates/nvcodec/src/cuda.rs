@@ -1215,6 +1215,154 @@ impl fmt::Debug for DeviceBuffer {
     }
 }
 
+/// Pitched device memory owned elsewhere (a linear EGL image of a DMA-BUF),
+/// lent for `'a`: `rows` rows of `width_bytes`, `pitch` bytes apart. NVENC
+/// takes one as input (`NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR`).
+#[derive(Debug, Clone, Copy)]
+pub struct PitchedView<'a> {
+    ptr: sys::CUdeviceptr,
+    pitch: usize,
+    width_bytes: usize,
+    rows: usize,
+    context: &'a Arc<Context>,
+}
+
+impl<'a> PitchedView<'a> {
+    /// Lends `ptr`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be device memory of `context` holding `rows` rows of
+    /// `width_bytes` bytes, `pitch` bytes apart (`pitch >= width_bytes`),
+    /// that stays allocated (and, for interop memory, mapped) for all of
+    /// `'a`.
+    #[must_use]
+    pub const unsafe fn from_raw(
+        ptr: sys::CUdeviceptr,
+        pitch: usize,
+        width_bytes: usize,
+        rows: usize,
+        context: &'a Arc<Context>,
+    ) -> Self {
+        Self {
+            ptr,
+            pitch,
+            width_bytes,
+            rows,
+            context,
+        }
+    }
+
+    /// The device address of row 0, valid for `'a`.
+    #[must_use]
+    pub const fn device_ptr(self) -> sys::CUdeviceptr {
+        self.ptr
+    }
+
+    /// Bytes from one row to the next.
+    #[must_use]
+    pub const fn pitch(self) -> usize {
+        self.pitch
+    }
+
+    /// Usable bytes per row.
+    #[must_use]
+    pub const fn width_bytes(self) -> usize {
+        self.width_bytes
+    }
+
+    /// Number of rows.
+    #[must_use]
+    pub const fn rows(self) -> usize {
+        self.rows
+    }
+
+    /// The context the memory belongs to.
+    #[must_use]
+    pub const fn context(self) -> &'a Arc<Context> {
+        self.context
+    }
+}
+
+/// Copies from borrowed CUDA arrays and pitched views into a [`DeviceBuffer`].
+///
+/// Queued copies stay safe after the view's lifetime ends because owners of
+/// lent memory synchronise before freeing it (the DMA-BUF importer waits for
+/// the context before unregistering an image).
+impl DeviceBuffer {
+    /// Queues the copy of `src_region` of the CUDA array `src`, whose
+    /// elements are `element_bytes` wide, to `dst` in this buffer on
+    /// `stream`. The region is in bytes per row and rows.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CopyOutOfBounds`] when the region leaves either side
+    /// (`element_bytes` only feeds this check: the driver bounds-checks
+    /// arrays itself), [`Error::SizeOverflow`], [`Error::Cuda`].
+    pub fn copy_from_array_async(
+        &mut self,
+        dst: Point,
+        src: ArrayView<'_>,
+        element_bytes: usize,
+        src_region: Region,
+        stream: &Stream,
+    ) -> Result<()> {
+        if src_region.is_empty() {
+            return Ok(());
+        }
+        let src_width_bytes = usize::try_from(src.width())
+            .ok()
+            .and_then(|width| width.checked_mul(element_bytes))
+            .ok_or(Error::SizeOverflow {
+                what: "a CUDA array row",
+            })?;
+        let src_rows = usize::try_from(src.height()).map_err(|_| Error::SizeOverflow {
+            what: "a CUDA array height",
+        })?;
+        src_region.check_within("source", src_width_bytes, src_rows)?;
+        let dst_region = src_region.at(dst);
+        dst_region.check_within("destination", self.width_bytes, self.rows)?;
+        let copy = sys::CUDA_MEMCPY2D {
+            srcXInBytes: src_region.origin.x_bytes,
+            srcY: src_region.origin.row,
+            srcMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_ARRAY,
+            srcArray: src.raw(),
+            ..self.device_side(Side::Destination, dst_region)
+        };
+        self.run(Some(&copy), Some(stream))
+    }
+
+    /// Queues the copy of `src_region` of the pitched memory `src` to `dst`
+    /// in this buffer on `stream`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CopyOutOfBounds`], [`Error::SizeOverflow`], [`Error::Cuda`].
+    pub fn copy_from_pitched_async(
+        &mut self,
+        dst: Point,
+        src: PitchedView<'_>,
+        src_region: Region,
+        stream: &Stream,
+    ) -> Result<()> {
+        if src_region.is_empty() {
+            return Ok(());
+        }
+        src_region.check_within("source", src.width_bytes, src.rows)?;
+        let dst_region = src_region.at(dst);
+        dst_region.check_within("destination", self.width_bytes, self.rows)?;
+        let copy = sys::CUDA_MEMCPY2D {
+            srcXInBytes: src_region.origin.x_bytes,
+            srcY: src_region.origin.row,
+            srcMemoryType: sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+            srcDevice: src.ptr,
+            srcPitch: src.pitch,
+            ..self.device_side(Side::Destination, dst_region)
+        };
+        self.run(Some(&copy), Some(stream))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
