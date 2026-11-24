@@ -11,7 +11,8 @@ use ash::vk::{self, Handle};
 use bytes::Bytes;
 use ferricast::decoder::H264Decoder;
 use ferricast::{
-    Codec, DecoderConfig, EncodedFrame, PixelFormat, RawFrame, VideoDecoder, YuvColour, YuvMatrix,
+    Codec, ColourRange, DecoderConfig, EncodedFrame, PixelFormat, RawFrame, VideoDecoder,
+    YuvColour, YuvMatrix,
 };
 use skia_safe::gpu::{self, Budgeted, DirectContext, vk as skvk};
 use skia_safe::{AlphaType, ColorType, ImageInfo, Surface};
@@ -173,8 +174,8 @@ fn the_gpu_converts_nv12_like_the_cpu_for_every_colour_space() {
         ],
     );
     for matrix in [YuvMatrix::Bt601, YuvMatrix::Bt709, YuvMatrix::Bt2020] {
-        for full_range in [false, true] {
-            let colour = YuvColour { matrix, full_range };
+        for range in [ColourRange::Limited, ColourRange::Full] {
+            let colour = YuvColour { matrix, range };
             let frame = VideoFrame {
                 width: width as u32,
                 height: height as u32,
@@ -309,6 +310,8 @@ fn receiver_video_cost(format: PixelFormat) {
             height: 1080,
             pixel_format: format,
             low_latency: true,
+            colour: None,
+            backend: ferricast::BackendSelection::default(),
         })
         .unwrap();
     let mut surface = gpu.surface(1280, 720);

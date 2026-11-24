@@ -25,9 +25,10 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 
 use bytes::Bytes;
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
-    YuvColour,
+    CapturedFrame, Codec, ColourDescription, ColourRange, DecoderConfig, EncodedFrame,
+    FerricastError, Result, VideoDecoder,
 };
 use shiguredo_nvcodec::{
     Decoder as NvDecoder, DecoderCodec, DecoderConfig as NvDecCfg, SurfaceFormat,
@@ -157,7 +158,7 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
                 (width, height),
                 self.timestamps.claim(),
                 self.format.0,
-                YuvColour::guess(height),
+                ColourDescription::unspecified(ColourRange::Limited),
             )
             .ok_or_else(|| {
                 FerricastError::Decode(format!("NVDEC ({}) returned short planes", C::NAME))
@@ -202,10 +203,8 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
 // no concurrent access.
 unsafe impl<C: NvdecCodec> Send for NvdecDecoder<C> {}
 
-impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
-    const CODEC: Codec = C::FERRICAST_CODEC;
-
-    fn configure(&mut self, config: &DecoderConfig) -> Result<()> {
+impl<C: NvdecCodec> NvdecDecoder<C> {
+    fn try_configure(&mut self, config: &DecoderConfig) -> Result<()> {
         if config.codec != C::FERRICAST_CODEC {
             return Err(FerricastError::Decode(format!(
                 "NVDEC ({}) asked to decode {:?}",
@@ -239,7 +238,7 @@ impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
         Ok(())
     }
 
-    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
         let decoder = self.decoder.as_mut().ok_or_else(|| {
             FerricastError::Decode(format!("NVDEC ({}) decode before configure()", C::NAME))
         })?;
@@ -260,7 +259,7 @@ impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
         Ok(self.ready.pop_front())
     }
 
-    fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
+    fn try_flush(&mut self) -> Result<Vec<CapturedFrame>> {
         if let Some(decoder) = self.decoder.as_mut() {
             decoder
                 .finish()
@@ -271,6 +270,29 @@ impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
         }
         self.timestamps = Timestamps::default();
         Ok(self.ready.drain(..).collect())
+    }
+}
+
+impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
+    const CODEC: Codec = C::FERRICAST_CODEC;
+
+    fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::Nvdec,
+            Operation::Configure,
+        ))
+    }
+
+    fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+        self.try_decode(frame).map_err(CodecError::from_backend(
+            BackendId::Nvdec,
+            Operation::Decode,
+        ))
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
+        self.try_flush()
+            .map_err(CodecError::from_backend(BackendId::Nvdec, Operation::Flush))
     }
 }
 

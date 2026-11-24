@@ -460,6 +460,7 @@ async fn drive_sink_m1_m7(
             width: 1280,
             height: 720,
             fps: 30,
+            colour: None,
         }),
         audio: Some(AudioStreamInfo {
             codec: AudioCodec::Aac,

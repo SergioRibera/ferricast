@@ -120,6 +120,7 @@ impl Assembler {
                     width,
                     height,
                     fps: NOMINAL_FPS,
+                    colour: None,
                 });
                 self.video_since.get_or_insert_with(Instant::now);
                 self.maybe_announce()

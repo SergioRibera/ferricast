@@ -57,6 +57,7 @@ fn decode(frames: &[Vec<u8>]) -> (u32, u16, usize) {
             codec: AudioCodec::Aac,
             sample_rate: 0,
             channels: 0,
+            backend: ferricast_core::BackendSelection::default(),
         })
         .unwrap();
     let mut shape = None;

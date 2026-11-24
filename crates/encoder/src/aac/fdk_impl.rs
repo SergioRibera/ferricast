@@ -17,7 +17,10 @@ use bytes::Bytes;
 use fdk_aac::enc::{
     AudioObjectType, BitRate, ChannelMode, EncodeInfo, Encoder, EncoderParams, Transport,
 };
-use ferricast_core::{AudioCodec, AudioEncoderConfig, AudioFrame, FerricastError, Result};
+use ferricast_core::{
+    AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame, BackendId, CodecError, CodecResult,
+    FerricastError, Operation, Result,
+};
 use tracing::{debug, info};
 
 use crate::audio_clock::{AudioClock, ClockEvent};
@@ -218,6 +221,59 @@ impl FdkAacEncoder {
     }
 }
 
+impl FdkAacEncoder {
+    /// Opens an encoder for `config`, which must ask for AAC-LC.
+    ///
+    /// # Errors
+    /// [`CodecError::UnsupportedConfig`] for another codec or a channel
+    /// count libfdk-aac is not set up for here; a backend error when
+    /// libfdk-aac refuses the parameters.
+    pub fn open(config: &AudioEncoderConfig) -> CodecResult<Self> {
+        if config.codec != AudioCodec::Aac {
+            return Err(CodecError::UnsupportedConfig {
+                backend: BackendId::FdkAac,
+                what: format!("{} in the AAC-LC encoder", config.codec),
+            });
+        }
+        if !matches!(config.channels, 1 | 2) {
+            return Err(CodecError::UnsupportedConfig {
+                backend: BackendId::FdkAac,
+                what: format!("{} channels (1 or 2 are supported)", config.channels),
+            });
+        }
+        Self::new(config).map_err(CodecError::from_backend(BackendId::FdkAac, Operation::Open))
+    }
+}
+
+impl AudioEncoder for FdkAacEncoder {
+    fn configure(&mut self, config: &AudioEncoderConfig) -> CodecResult<()> {
+        *self = Self::open(config)?;
+        Ok(())
+    }
+
+    fn encode(&mut self, frame: &AudioFrame) -> CodecResult<()> {
+        FdkAacEncoder::encode(self, frame).map_err(CodecError::from_backend(
+            BackendId::FdkAac,
+            Operation::Encode,
+        ))
+    }
+
+    fn take_output(&mut self) -> Vec<AudioFrame> {
+        FdkAacEncoder::take_output(self)
+    }
+
+    fn codec_config(&self) -> Vec<u8> {
+        FdkAacEncoder::codec_config(self)
+    }
+
+    fn flush(self) -> CodecResult<Vec<AudioFrame>> {
+        FdkAacEncoder::flush(self).map_err(CodecError::from_backend(
+            BackendId::FdkAac,
+            Operation::Flush,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +301,7 @@ mod tests {
             sample_rate: SR,
             channels: 2,
             bitrate_kbps: 128,
+            backend: ferricast_core::BackendSelection::default(),
         })
         .expect("fdk-aac");
         let frame_us = 1_000_000 * AAC_LC_FRAME_SAMPLES as u64 / u64::from(SR);

@@ -4,6 +4,7 @@
 use ferricast_core::{
     AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame, DecodedAudio, FerricastError, Result,
 };
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 
 /// Opus always decodes at 48 kHz (RFC 7845 §5.1).
 const RATE: u32 = 48_000;
@@ -11,7 +12,7 @@ const RATE: u32 = 48_000;
 const MAX_FRAME: usize = 5_760;
 
 #[derive(Default)]
-pub struct OpusDecoder {
+pub struct OpusRsDecoder {
     channels: u16,
     /// Decoder for packets coded with the stream's channel count.
     native: Option<opus_rs::OpusDecoder>,
@@ -21,13 +22,11 @@ pub struct OpusDecoder {
     mono: Option<opus_rs::OpusDecoder>,
 }
 
-impl AudioDecoder for OpusDecoder {
-    const CODEC: AudioCodec = AudioCodec::Opus;
-
-    fn configure(&mut self, config: &AudioDecoderConfig) -> Result<()> {
+impl OpusRsDecoder {
+    fn try_configure(&mut self, config: &AudioDecoderConfig) -> Result<()> {
         if config.codec != AudioCodec::Opus {
             return Err(FerricastError::Decode(format!(
-                "OpusDecoder asked to decode {:?}; only Opus supported",
+                "OpusRsDecoder asked to decode {:?}; only Opus supported",
                 config.codec
             )));
         }
@@ -43,10 +42,10 @@ impl AudioDecoder for OpusDecoder {
         Ok(())
     }
 
-    fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
+    fn try_decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
         let Some(native) = self.native.as_mut() else {
             return Err(FerricastError::Decode(
-                "OpusDecoder::decode before configure()".into(),
+                "OpusRsDecoder::decode before configure()".into(),
             ));
         };
         let Some(samples) = packet_samples(&frame.data) else {
@@ -82,8 +81,33 @@ impl AudioDecoder for OpusDecoder {
         }))
     }
 
-    fn flush(&mut self) -> Result<Vec<DecodedAudio>> {
+    fn try_flush(&mut self) -> Result<Vec<DecodedAudio>> {
         Ok(Vec::new())
+    }
+}
+
+impl AudioDecoder for OpusRsDecoder {
+    const CODEC: AudioCodec = AudioCodec::Opus;
+
+    fn configure(&mut self, config: &AudioDecoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::OpusRs,
+            Operation::Configure,
+        ))
+    }
+
+    fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>> {
+        self.try_decode(frame).map_err(CodecError::from_backend(
+            BackendId::OpusRs,
+            Operation::Decode,
+        ))
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>> {
+        self.try_flush().map_err(CodecError::from_backend(
+            BackendId::OpusRs,
+            Operation::Flush,
+        ))
     }
 }
 
@@ -122,6 +146,7 @@ mod tests {
             codec: AudioCodec::Opus,
             sample_rate: RATE,
             channels,
+            backend: ferricast_core::BackendSelection::default(),
         }
     }
 
@@ -138,7 +163,7 @@ mod tests {
     fn encoded_stereo_audio_round_trips() {
         let mut encoder =
             opus_rs::OpusEncoder::new(48_000, 2, opus_rs::Application::Audio).expect("encoder");
-        let mut decoder = OpusDecoder::default();
+        let mut decoder = OpusRsDecoder::default();
         decoder.configure(&config(2)).unwrap();
         let mut energy = 0f64;
         for n in 0..20 {
@@ -177,6 +202,6 @@ mod tests {
 
     #[test]
     fn more_than_two_channels_are_refused() {
-        assert!(OpusDecoder::default().configure(&config(6)).is_err());
+        assert!(OpusRsDecoder::default().configure(&config(6)).is_err());
     }
 }

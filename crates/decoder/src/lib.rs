@@ -1,15 +1,13 @@
 //! Receiver-side decoders.
 //!
-//! Two unrelated trees:
-//! * [`h264`] — backend-agnostic H.264 facade. Auto-selects NVDEC →
-//!   VA-API → openh264 at first `configure()`. Mirror of the
-//!   encoder's `H264Encoder` facade.
-//! * [`aac`] — AAC decoder: libfdk-aac (HE-AAC v1/v2 too) when built in,
-//!   else pure-Rust AAC-LC over symphonia.
-//! * [`PcmDecoder`] — pass-through for 16-bit PCM packets.
+//! One facade per codec ([`H264Decoder`], [`H265Decoder`], [`Vp8Decoder`],
+//! [`Vp9Decoder`], [`Av1Decoder`], [`AacDecoder`], [`AacEldDecoder`],
+//! [`AlacDecoder`], [`OpusDecoder`], [`PcmDecoder`]), each selecting its
+//! backend from its configuration's [`ferricast_core::BackendSelection`]
+//! (see [`ferricast_codec`]). `Foo::backends()` reports which backends
+//! this build has and whether each can run here.
 //!
-//! Each module re-exports its facade type; the typical receiver
-//! pipeline registers both with the manager:
+//! The typical receiver pipeline registers them with the manager:
 //!
 //! ```ignore
 //! use ferricast::prelude::*;
@@ -21,61 +19,64 @@
 //!     ...;
 //! ```
 
-pub mod h264;
-
-mod nv12;
-mod pcm;
-
-#[cfg(any(
-    feature = "nvdec-hevc-decode",
-    feature = "vaapi-hevc-decode",
-    feature = "hevc-decode"
-))]
-pub mod h265;
-
-#[cfg(feature = "nvdec-decode")]
-pub mod nvdec;
-
-#[cfg(any(feature = "nvdec-decode", feature = "vaapi-decode"))]
-mod probation;
-
 #[cfg(feature = "aac")]
 pub mod aac;
-
+#[cfg_attr(
+    not(any(
+        feature = "aac",
+        all(target_os = "android", feature = "mediacodec"),
+        all(target_os = "windows", feature = "media-foundation"),
+        all(any(target_os = "macos", target_os = "ios"), feature = "audiotoolbox")
+    )),
+    allow(dead_code, reason = "used by the AAC decoders only")
+)]
+mod adts;
 #[cfg(feature = "alac-decode")]
 mod alac;
-
 #[cfg(feature = "av1-decode")]
 mod av1;
-
+mod facades;
+pub mod h264;
+pub mod h265;
+#[allow(
+    dead_code,
+    reason = "conditional: shared by the video decoders; each backend set uses a different subset"
+)]
+mod nv12;
+#[cfg(feature = "nvdec-decode")]
+pub mod nvdec;
 #[cfg(feature = "opus-decode")]
 mod opus;
-
+mod pcm;
+mod platform;
 #[cfg(feature = "vp8-decode")]
 mod vp8;
-
 #[cfg(feature = "vp9-decode")]
 mod vp9;
 
-#[cfg(feature = "aac")]
-pub use aac::AacDecoder;
-#[cfg(feature = "fdk-aac-decode")]
-pub use aac::AacEldDecoder;
-#[cfg(feature = "alac-decode")]
-pub use alac::AlacDecoder;
-#[cfg(feature = "av1-decode")]
-pub use av1::Av1Decoder;
+pub use facades::{
+    AacDecoder, AacEldDecoder, AlacDecoder, Av1Decoder, OpusDecoder, PcmDecoder, Vp8Decoder,
+    Vp9Decoder,
+};
+pub use ferricast_codec::{Availability, BackendReport};
 pub use h264::H264Decoder;
-#[cfg(any(
-    feature = "nvdec-hevc-decode",
-    feature = "vaapi-hevc-decode",
-    feature = "hevc-decode"
-))]
 pub use h265::H265Decoder;
-#[cfg(feature = "opus-decode")]
-pub use opus::OpusDecoder;
-pub use pcm::PcmDecoder;
-#[cfg(feature = "vp8-decode")]
-pub use vp8::Vp8Decoder;
-#[cfg(feature = "vp9-decode")]
-pub use vp9::Vp9Decoder;
+
+/// Adds every decode job of this crate to an istmo codec catalog.
+#[cfg(feature = "istmo")]
+#[must_use]
+pub fn catalog(catalog: ferricast_codec::plugin::Catalog) -> ferricast_codec::plugin::Catalog {
+    use ferricast_codec::bitstream::NalSyntax;
+    use ferricast_core::{AudioCodec, Codec};
+    catalog
+        .video_decoder(Codec::H264, H264Decoder::registry, Some(NalSyntax::H264))
+        .video_decoder(Codec::H265, H265Decoder::registry, Some(NalSyntax::H265))
+        .video_decoder(Codec::Vp8, Vp8Decoder::registry, None)
+        .video_decoder(Codec::Vp9, Vp9Decoder::registry, None)
+        .video_decoder(Codec::Av1, Av1Decoder::registry, None)
+        .audio_decoder(AudioCodec::Aac, AacDecoder::registry)
+        .audio_decoder(AudioCodec::AacEld, AacEldDecoder::registry)
+        .audio_decoder(AudioCodec::Alac, AlacDecoder::registry)
+        .audio_decoder(AudioCodec::Opus, OpusDecoder::registry)
+        .audio_decoder(AudioCodec::Pcm, PcmDecoder::registry)
+}

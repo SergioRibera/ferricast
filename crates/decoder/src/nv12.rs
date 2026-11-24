@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use ferricast_core::{PixelFormat, RawFrame, YuvColour};
+use ferricast_core::{ColourDescription, PixelFormat, RawFrame};
 
 pub(crate) struct Planar<'a> {
     pub width: usize,
@@ -139,16 +139,17 @@ pub(crate) fn deliver(
     (width, height): (usize, usize),
     timestamp_us: u64,
     format: PixelFormat,
-    colour: YuvColour,
+    colour: ColourDescription,
 ) -> Option<RawFrame> {
+    let yuv = colour.yuv(height);
     let (data, stride, format, colour) = match format {
         PixelFormat::Nv12 | PixelFormat::I420 => (data, stride, PixelFormat::Nv12, Some(colour)),
         PixelFormat::Bgra => {
-            let bgra = colour.nv12_to_bgra(&data, stride, width, height)?;
+            let bgra = yuv.nv12_to_bgra(&data, stride, width, height)?;
             (Bytes::from(bgra), width * 4, PixelFormat::Bgra, None)
         }
         PixelFormat::Rgba => {
-            let mut rgba = colour.nv12_to_bgra(&data, stride, width, height)?;
+            let mut rgba = yuv.nv12_to_bgra(&data, stride, width, height)?;
             for pixel in rgba.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }
@@ -303,7 +304,7 @@ mod tests {
     #[test]
     fn delivery_converts_only_when_a_packed_format_is_asked_for() {
         let nv12 = Bytes::from_static(&[235, 235, 235, 235, 128, 128]);
-        let colour = YuvColour::guess(2);
+        let colour = ColourDescription::BT709_LIMITED;
         let kept = deliver(nv12.clone(), 2, (2, 2), 9, PixelFormat::Nv12, colour).unwrap();
         assert_eq!(
             (kept.format, kept.stride, kept.timestamp_us, kept.colour),

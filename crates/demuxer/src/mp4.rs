@@ -2,11 +2,13 @@ mod fragment;
 
 use std::io::SeekFrom;
 
-use ferricast_core::{AudioFrame, Codec, EncodedFrame, FerricastError, Result};
+use ferricast_core::{
+    AudioFrame, ChromaLocation, Codec, ColourDescription, EncodedFrame, FerricastError, Result,
+};
 
 use crate::audio::{AacConfig, AudioFormat, AudioStream, OPUS_RATE, opus_channels};
 use crate::nal::{Framing, LengthPrefixed};
-use crate::{BoxedSource, Color, Packet, TrackSelection, VideoStream, micros};
+use crate::{BoxedSource, Packet, TrackSelection, VideoStream, micros};
 
 const VISUAL_ENTRY_HEADER: usize = 78;
 /// `SampleEntry` (8 bytes) plus the version 0 `AudioSampleEntry`
@@ -113,7 +115,7 @@ struct VideoEntry {
     width: u32,
     height: u32,
     framing: Framing,
-    color: Option<Color>,
+    colour: Option<ColourDescription>,
 }
 
 struct AudioEntry {
@@ -484,7 +486,7 @@ impl Mp4Demuxer {
                         codec: entry.codec,
                         width: entry.width,
                         height: entry.height,
-                        color: entry.color,
+                        colour: entry.colour,
                         duration_us: Some(micros(
                             i64::try_from(track.duration).unwrap_or(i64::MAX),
                             track.timescale,
@@ -1434,7 +1436,7 @@ fn parse_entry(kind: [u8; 4], entry: &[u8]) -> Option<VideoEntry> {
         b"av01" => (Codec::Av1, Framing::Raw),
         _ => return None,
     };
-    let color = child(children, b"colr")
+    let colour = child(children, b"colr")
         .and_then(parse_colr)
         .or_else(|| child(children, b"vpcC").and_then(parse_vpcc));
     Some(VideoEntry {
@@ -1442,7 +1444,7 @@ fn parse_entry(kind: [u8; 4], entry: &[u8]) -> Option<VideoEntry> {
         width: u32::from(be16(entry, 24)?),
         height: u32::from(be16(entry, 26)?),
         framing,
-        color,
+        colour,
     })
 }
 
@@ -1538,25 +1540,34 @@ fn descriptor(data: &[u8]) -> Option<(u8, &[u8])> {
     Some((tag, rest.get(..len)?))
 }
 
-fn parse_colr(colr: &[u8]) -> Option<Color> {
-    let matrix = u8::try_from(be16(colr, 8)?).ok()?;
-    match colr.get(..4)? {
-        b"nclx" => Some(Color {
-            matrix_coefficients: matrix,
-            full_range: colr.get(10)? & 0x80 != 0,
-        }),
-        b"nclc" => Some(Color {
-            matrix_coefficients: matrix,
-            full_range: false,
-        }),
-        _ => None,
-    }
+/// A `colr` box: `nclx` (ISO/IEC 23001-8) or QuickTime `nclc`, both
+/// carrying 16-bit H.273 primaries, transfer and matrix codes; only
+/// `nclx` has a range flag (`nclc` is always limited).
+fn parse_colr(colr: &[u8]) -> Option<ColourDescription> {
+    let code = |offset| u8::try_from(be16(colr, offset)?).ok();
+    let (primaries, transfer, matrix) = (code(4)?, code(6)?, code(8)?);
+    let full_range = match colr.get(..4)? {
+        b"nclx" => colr.get(10)? & 0x80 != 0,
+        b"nclc" => false,
+        _ => return None,
+    };
+    Some(ColourDescription::from_codes(
+        primaries, transfer, matrix, full_range,
+    ))
 }
 
-fn parse_vpcc(vpcc: &[u8]) -> Option<Color> {
-    Some(Color {
-        matrix_coefficients: *vpcc.get(9)?,
-        full_range: vpcc.get(6)? & 1 != 0,
+/// A `vpcC` box (VP codec ISO-BMFF binding §2.2): the full-range flag
+/// is the low bit of byte 6, followed by the three H.273 codes; the
+/// chroma subsampling field (bits 1-3 of byte 6) also places 4:2:0
+/// chroma (0 vertical, 1 co-located).
+fn parse_vpcc(vpcc: &[u8]) -> Option<ColourDescription> {
+    let packed = *vpcc.get(6)?;
+    let colour =
+        ColourDescription::from_codes(*vpcc.get(7)?, *vpcc.get(8)?, *vpcc.get(9)?, packed & 1 != 0);
+    Some(match (packed >> 1) & 0b111 {
+        0 => colour.with_chroma_location(ChromaLocation::Left),
+        1 => colour.with_chroma_location(ChromaLocation::TopLeft),
+        _ => colour,
     })
 }
 
@@ -1762,6 +1773,7 @@ fn be64(data: &[u8], at: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferricast_core::{ColourRange, MatrixCoefficients};
 
     fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
         let mut out = (body.len() as u32 + 8).to_be_bytes().to_vec();
@@ -2142,18 +2154,20 @@ mod tests {
     fn nclx_range_flag_selects_full_range() {
         let mut colr = b"nclx".to_vec();
         colr.extend_from_slice(&[0, 1, 0, 1, 0, 1, 0x80]);
-        let color = parse_colr(&colr).unwrap();
-        assert_eq!(color.matrix_coefficients, 1);
-        assert!(color.full_range);
+        let colour = parse_colr(&colr).unwrap();
+        assert_eq!(
+            colour,
+            ColourDescription::BT709_LIMITED.with_range(ColourRange::Full)
+        );
     }
 
     #[test]
     fn nclc_is_always_limited_range() {
         let mut colr = b"nclc".to_vec();
         colr.extend_from_slice(&[0, 1, 0, 1, 0, 6]);
-        let color = parse_colr(&colr).unwrap();
-        assert_eq!(color.matrix_coefficients, 6);
-        assert!(!color.full_range);
+        let colour = parse_colr(&colr).unwrap();
+        assert_eq!(colour.matrix, MatrixCoefficients::Smpte170M);
+        assert_eq!(colour.range, ColourRange::Limited);
     }
 
     #[test]

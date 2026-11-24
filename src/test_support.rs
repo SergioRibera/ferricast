@@ -115,12 +115,12 @@ pub(crate) struct FakeEncoder(pub Arc<Mutex<EncoderLog>>);
 impl VideoEncoder for FakeEncoder {
     const CODEC: Codec = Codec::H264;
 
-    fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
+    fn configure(&mut self, config: &EncoderConfig) -> ferricast_core::CodecResult<()> {
         self.0.lock().unwrap().configured.push(config.clone());
         Ok(())
     }
 
-    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
+    fn encode(&mut self, frame: CapturedFrame) -> ferricast_core::CodecResult<EncodedFrame> {
         self.0
             .lock()
             .unwrap()
@@ -136,11 +136,11 @@ impl VideoEncoder for FakeEncoder {
         })
     }
 
-    fn flush(self) -> Result<Vec<EncodedFrame>> {
+    fn flush(self) -> ferricast_core::CodecResult<Vec<EncodedFrame>> {
         Ok(Vec::new())
     }
 
-    fn get_headers(&mut self) -> Result<Vec<u8>> {
+    fn get_headers(&mut self) -> ferricast_core::CodecResult<Vec<u8>> {
         Ok(Vec::new())
     }
 
@@ -148,7 +148,7 @@ impl VideoEncoder for FakeEncoder {
         self.0.lock().unwrap().keyframe_requests += 1;
     }
 
-    fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
+    fn set_bitrate_kbps(&mut self, kbps: u32) -> ferricast_core::CodecResult<()> {
         self.0.lock().unwrap().bitrates.push(kbps);
         Ok(())
     }

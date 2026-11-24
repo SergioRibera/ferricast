@@ -17,35 +17,31 @@
 //! Linux audio sink (PipeWire, ALSA, PulseAudio) accepts without
 //! further conversion.
 
-mod adts;
+use crate::adts::{self, Shape};
 #[cfg(feature = "fdk-aac-decode")]
 mod eld;
 #[cfg(feature = "fdk-aac-decode")]
 mod fdk;
 
 #[cfg(feature = "fdk-aac-decode")]
-pub use eld::AacEldDecoder;
+pub use eld::FdkEldDecoder;
+#[cfg(feature = "fdk-aac-decode")]
+pub use fdk::FdkAacDecoder;
 
 use std::collections::VecDeque;
 
 use ferricast_core::{
     AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame, DecodedAudio, FerricastError, Result,
 };
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use symphonia::core::{
     audio::{AudioBufferRef, Channels, Signal},
     codecs::{CODEC_TYPE_AAC, CodecParameters, Decoder as SymphoniaDecoder, DecoderOptions},
     formats::Packet,
 };
-use symphonia::default::codecs::AacDecoder as SymphoniaAacDecoder;
+use symphonia::default::codecs::AacDecoder as SymphoniaCodec;
 
 const MICROS_PER_SECOND: u64 = 1_000_000;
-
-/// Sample rate and channel count one decoder instance is built for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Shape {
-    sample_rate: u32,
-    channels: u16,
-}
 
 impl Shape {
     /// The configured shape, or `None` when the stream metadata left it
@@ -75,13 +71,13 @@ impl Shape {
 
     /// Without an AudioSpecificConfig symphonia takes the shape from the
     /// codec parameters, and refuses to build when channels are missing.
-    fn decoder(self) -> Result<SymphoniaAacDecoder> {
+    fn decoder(self) -> Result<SymphoniaCodec> {
         let mut params = CodecParameters::new();
         params
             .for_codec(CODEC_TYPE_AAC)
             .with_sample_rate(self.sample_rate)
             .with_channels(self.channel_mask()?);
-        SymphoniaAacDecoder::try_new(&params, &DecoderOptions::default())
+        SymphoniaCodec::try_new(&params, &DecoderOptions::default())
             .map_err(|e| FerricastError::Decode(format!("symphonia AAC init: {e}")))
     }
 
@@ -91,24 +87,20 @@ impl Shape {
 }
 
 struct Active {
-    decoder: SymphoniaAacDecoder,
+    decoder: SymphoniaCodec,
     shape: Shape,
 }
 
 #[derive(Default)]
-pub struct AacDecoder {
+pub struct SymphoniaAacDecoder {
     configured: bool,
     active: Option<Active>,
     /// Decoded runs not yet handed out: a payload whose frames change
     /// shape mid-way yields one run per shape, but `decode` returns one.
     pending: VecDeque<DecodedAudio>,
-    /// libfdk-aac, preferred when built in: it also decodes the SBR and
-    /// PS layers of HE-AAC, which symphonia skips.
-    #[cfg(feature = "fdk-aac-decode")]
-    fdk: Option<fdk::FdkAac>,
 }
 
-impl AacDecoder {
+impl SymphoniaAacDecoder {
     fn decoder_for(&mut self, shape: Option<Shape>) -> Result<&mut Active> {
         if let Some(wanted) = shape
             && self
@@ -175,23 +167,13 @@ impl AacDecoder {
     }
 }
 
-impl AudioDecoder for AacDecoder {
-    const CODEC: AudioCodec = AudioCodec::Aac;
-
-    fn configure(&mut self, config: &AudioDecoderConfig) -> Result<()> {
+impl SymphoniaAacDecoder {
+    fn try_configure(&mut self, config: &AudioDecoderConfig) -> Result<()> {
         if config.codec != AudioCodec::Aac {
             return Err(FerricastError::Decode(format!(
-                "AacDecoder asked to decode {:?}; only AAC supported",
+                "SymphoniaAacDecoder asked to decode {:?}; only AAC supported",
                 config.codec
             )));
-        }
-        #[cfg(feature = "fdk-aac-decode")]
-        if use_fdk() {
-            self.fdk = Some(fdk::FdkAac::new(config));
-            self.active = None;
-            self.pending.clear();
-            self.configured = true;
-            return Ok(());
         }
         self.active = match Shape::from_config(config)? {
             Some(shape) => Some(Active {
@@ -205,19 +187,13 @@ impl AudioDecoder for AacDecoder {
         Ok(())
     }
 
-    fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
+    fn try_decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
         if !self.configured {
             return Err(FerricastError::Decode(
-                "AacDecoder::decode before configure()".into(),
+                "SymphoniaAacDecoder::decode before configure()".into(),
             ));
         }
         let mut runs = Vec::new();
-        #[cfg(feature = "fdk-aac-decode")]
-        let decoded = match self.fdk.as_mut() {
-            Some(fdk) => fdk.decode(&frame.data, frame.timestamp_us, &mut runs),
-            None => self.decode_units(&frame, &mut runs),
-        };
-        #[cfg(not(feature = "fdk-aac-decode"))]
         let decoded = self.decode_units(&frame, &mut runs);
         // Frames decoded before a bad one in the same payload are still
         // good audio; queue them before reporting the failure.
@@ -226,18 +202,36 @@ impl AudioDecoder for AacDecoder {
         Ok(self.pending.pop_front())
     }
 
-    fn flush(&mut self) -> Result<Vec<DecodedAudio>> {
+    fn try_flush(&mut self) -> Result<Vec<DecodedAudio>> {
         // Symphonia decoders don't buffer across packets; only runs split
         // off by a mid-payload shape change can still be waiting.
         Ok(self.pending.drain(..).collect())
     }
 }
 
-/// Whether libfdk-aac decodes: always, unless
-/// `FERRICAST_AAC_DECODER=symphonia` asks for the pure-Rust decoder.
-#[cfg(feature = "fdk-aac-decode")]
-fn use_fdk() -> bool {
-    std::env::var("FERRICAST_AAC_DECODER").map_or(true, |v| !v.eq_ignore_ascii_case("symphonia"))
+impl AudioDecoder for SymphoniaAacDecoder {
+    const CODEC: AudioCodec = AudioCodec::Aac;
+
+    fn configure(&mut self, config: &AudioDecoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::Symphonia,
+            Operation::Configure,
+        ))
+    }
+
+    fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>> {
+        self.try_decode(frame).map_err(CodecError::from_backend(
+            BackendId::Symphonia,
+            Operation::Decode,
+        ))
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>> {
+        self.try_flush().map_err(CodecError::from_backend(
+            BackendId::Symphonia,
+            Operation::Flush,
+        ))
+    }
 }
 
 /// Convert a symphonia `AudioBufferRef` (whatever sample format the
@@ -290,17 +284,10 @@ pub(crate) fn interleave_s16(buf: AudioBufferRef<'_>) -> Vec<i16> {
 
 #[cfg(test)]
 mod tests {
-    fn fdk_in_use() -> bool {
-        #[cfg(feature = "fdk-aac-decode")]
-        return use_fdk();
-        #[cfg(not(feature = "fdk-aac-decode"))]
-        false
-    }
-
     use bytes::Bytes;
 
-    use super::adts::tests::frame;
     use super::*;
+    use crate::adts::tests::frame;
 
     /// A silent mono `raw_data_block()`: one SCE with max_sfb = 0, then END.
     const SILENT_MONO: [u8; 4] = [0x00, 0xC8, 0x00, 0x07];
@@ -312,6 +299,7 @@ mod tests {
             codec: AudioCodec::Aac,
             sample_rate,
             channels,
+            backend: ferricast_core::BackendSelection::default(),
         }
     }
 
@@ -328,20 +316,21 @@ mod tests {
     #[test]
     fn configure_succeeds_for_mono_and_stereo_and_with_unknown_shape() {
         for (rate, channels) in [(48_000, 1), (44_100, 2), (0, 0)] {
-            AacDecoder::default()
+            SymphoniaAacDecoder::default()
                 .configure(&config(rate, channels))
                 .unwrap();
         }
-        // symphonia decodes mono and stereo only; libfdk-aac up to 7.1.
-        assert_eq!(
-            AacDecoder::default().configure(&config(48_000, 6)).is_ok(),
-            fdk_in_use()
+        // symphonia decodes mono and stereo only (libfdk-aac goes up to 7.1).
+        assert!(
+            SymphoniaAacDecoder::default()
+                .configure(&config(48_000, 6))
+                .is_err()
         );
     }
 
     #[test]
     fn every_adts_frame_of_a_payload_is_decoded_into_one_run() {
-        let mut decoder = AacDecoder::default();
+        let mut decoder = SymphoniaAacDecoder::default();
         decoder.configure(&config(48_000, 1)).unwrap();
         let mut data = frame(RATE_48K, 1, false, &SILENT_MONO);
         data.extend(frame(RATE_48K, 1, true, &SILENT_MONO));
@@ -354,7 +343,7 @@ mod tests {
 
     #[test]
     fn raw_blocks_decode_with_the_configured_shape() {
-        let mut decoder = AacDecoder::default();
+        let mut decoder = SymphoniaAacDecoder::default();
         decoder.configure(&config(48_000, 1)).unwrap();
         let audio = decoder
             .decode(packet(SILENT_MONO.to_vec(), 0))
@@ -365,14 +354,14 @@ mod tests {
 
     #[test]
     fn raw_blocks_without_a_known_shape_are_refused() {
-        let mut decoder = AacDecoder::default();
+        let mut decoder = SymphoniaAacDecoder::default();
         decoder.configure(&config(0, 0)).unwrap();
         assert!(decoder.decode(packet(SILENT_MONO.to_vec(), 0)).is_err());
     }
 
     #[test]
     fn an_adts_header_that_disagrees_with_the_config_reconfigures() {
-        let mut decoder = AacDecoder::default();
+        let mut decoder = SymphoniaAacDecoder::default();
         decoder.configure(&config(48_000, 2)).unwrap();
         let audio = decoder
             .decode(packet(frame(RATE_44K1, 1, false, &SILENT_MONO), 0))
@@ -383,7 +372,7 @@ mod tests {
 
     #[test]
     fn a_shape_change_inside_a_payload_starts_a_new_run_at_the_right_time() {
-        let mut decoder = AacDecoder::default();
+        let mut decoder = SymphoniaAacDecoder::default();
         decoder.configure(&config(48_000, 1)).unwrap();
         let mut data = frame(RATE_48K, 1, false, &SILENT_MONO);
         data.extend(frame(RATE_44K1, 1, false, &SILENT_MONO));
@@ -400,7 +389,7 @@ mod tests {
     #[test]
     fn decode_before_configure_is_an_error() {
         assert!(
-            AacDecoder::default()
+            SymphoniaAacDecoder::default()
                 .decode(packet(SILENT_MONO.to_vec(), 0))
                 .is_err()
         );

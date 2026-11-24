@@ -24,9 +24,9 @@ use uuid::Uuid;
 
 use ferricast_core::{
     AdvertiseInfo, Advertiser, AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame,
-    CapturedFrame, Codec, ControlSession, DecodedAudio, DecoderConfig, EncodedFrame, FrameSink,
-    MediaCommand, MediaInfo, MediaPacket, MediaPuller, PlaybackStatus, PullSpec, ReceiverProtocol,
-    RemoteSender, Result, VideoDecoder,
+    CapturedFrame, Codec, CodecResult, ControlSession, DecodedAudio, DecoderConfig, EncodedFrame,
+    FrameSink, MediaCommand, MediaInfo, MediaPacket, MediaPuller, PlaybackStatus, PullSpec,
+    ReceiverProtocol, RemoteSender, Result, VideoDecoder,
 };
 
 use crate::manager::ManagerEvent;
@@ -97,37 +97,37 @@ impl<T: MediaPuller> ErasedPuller for T {
 }
 
 trait ErasedVideoDecoder: Send {
-    fn configure(&mut self, config: &DecoderConfig) -> Result<()>;
-    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>>;
-    fn flush(&mut self) -> Result<Vec<CapturedFrame>>;
+    fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()>;
+    fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>>;
+    fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>>;
 }
 
 impl<T: VideoDecoder> ErasedVideoDecoder for T {
-    fn configure(&mut self, config: &DecoderConfig) -> Result<()> {
+    fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()> {
         VideoDecoder::configure(self, config)
     }
-    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
         VideoDecoder::decode(self, frame)
     }
-    fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
+    fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
         VideoDecoder::flush(self)
     }
 }
 
 trait ErasedAudioDecoder: Send {
-    fn configure(&mut self, config: &AudioDecoderConfig) -> Result<()>;
-    fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>>;
-    fn flush(&mut self) -> Result<Vec<DecodedAudio>>;
+    fn configure(&mut self, config: &AudioDecoderConfig) -> CodecResult<()>;
+    fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>>;
+    fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>>;
 }
 
 impl<T: AudioDecoder> ErasedAudioDecoder for T {
-    fn configure(&mut self, config: &AudioDecoderConfig) -> Result<()> {
+    fn configure(&mut self, config: &AudioDecoderConfig) -> CodecResult<()> {
         AudioDecoder::configure(self, config)
     }
-    fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
+    fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>> {
         AudioDecoder::decode(self, frame)
     }
-    fn flush(&mut self) -> Result<Vec<DecodedAudio>> {
+    fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>> {
         AudioDecoder::flush(self)
     }
 }

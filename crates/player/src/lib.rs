@@ -11,7 +11,7 @@ use ferricast_demuxer::Demuxer;
 
 pub use clock::{Clock, Due};
 pub use ferricast_core::{CapturedFrame, PixelFormat, RawFrame};
-pub use ferricast_demuxer::{Color, VideoStream};
+pub use ferricast_demuxer::VideoStream;
 pub use limiter::FrameLimiter;
 
 use decoder::Decoder;
@@ -77,7 +77,7 @@ impl Player {
                             self.deliver(frame);
                         }
                     }
-                    Err(error) => self.recover(error)?,
+                    Err(error) => self.recover(error.into())?,
                 }
                 continue;
             };
@@ -92,7 +92,7 @@ impl Player {
             match self.decoder.decode(packet) {
                 Ok(Some(frame)) => self.deliver(frame),
                 Ok(None) => {}
-                Err(error) => self.recover(error)?,
+                Err(error) => self.recover(error.into())?,
             }
         }
     }
@@ -148,5 +148,10 @@ impl Player {
 }
 
 fn open_decoder(stream: &VideoStream, software_only: bool) -> Result<Decoder> {
-    Decoder::open(stream.codec, stream.width, stream.height, software_only)
+    Ok(Decoder::open(
+        stream.codec,
+        stream.width,
+        stream.height,
+        software_only,
+    )?)
 }

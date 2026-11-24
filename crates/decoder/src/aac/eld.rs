@@ -10,6 +10,7 @@ use fdk_aac_sys as sys;
 use ferricast_core::{
     AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame, DecodedAudio, FerricastError, Result,
 };
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 
 use super::fdk::{RawDecoder, fdk_error};
 
@@ -23,18 +24,16 @@ const MAX_FRAME_SAMPLES: usize = 2048 * 8;
 
 /// Decodes raw AAC-ELD access units into interleaved 16-bit PCM.
 #[derive(Default)]
-pub struct AacEldDecoder {
+pub struct FdkEldDecoder {
     decoder: Option<RawDecoder>,
     pcm: Vec<i16>,
 }
 
-impl AudioDecoder for AacEldDecoder {
-    const CODEC: AudioCodec = AudioCodec::AacEld;
-
-    fn configure(&mut self, config: &AudioDecoderConfig) -> Result<()> {
+impl FdkEldDecoder {
+    fn try_configure(&mut self, config: &AudioDecoderConfig) -> Result<()> {
         if config.codec != AudioCodec::AacEld {
             return Err(FerricastError::Decode(format!(
-                "AacEldDecoder asked to decode {:?}",
+                "FdkEldDecoder asked to decode {:?}",
                 config.codec
             )));
         }
@@ -49,9 +48,9 @@ impl AudioDecoder for AacEldDecoder {
         Ok(())
     }
 
-    fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
+    fn try_decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
         let decoder = self.decoder.as_mut().ok_or_else(|| {
-            FerricastError::Decode("AacEldDecoder::decode before configure()".into())
+            FerricastError::Decode("FdkEldDecoder::decode before configure()".into())
         })?;
         if frame.data.is_empty() {
             return Ok(None);
@@ -92,8 +91,33 @@ impl AudioDecoder for AacEldDecoder {
         }))
     }
 
-    fn flush(&mut self) -> Result<Vec<DecodedAudio>> {
+    fn try_flush(&mut self) -> Result<Vec<DecodedAudio>> {
         Ok(Vec::new())
+    }
+}
+
+impl AudioDecoder for FdkEldDecoder {
+    const CODEC: AudioCodec = AudioCodec::AacEld;
+
+    fn configure(&mut self, config: &AudioDecoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::FdkAac,
+            Operation::Configure,
+        ))
+    }
+
+    fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>> {
+        self.try_decode(frame).map_err(CodecError::from_backend(
+            BackendId::FdkAac,
+            Operation::Decode,
+        ))
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>> {
+        self.try_flush().map_err(CodecError::from_backend(
+            BackendId::FdkAac,
+            Operation::Flush,
+        ))
     }
 }
 
@@ -106,12 +130,13 @@ mod tests {
             codec,
             sample_rate,
             channels: 2,
+            backend: ferricast_core::BackendSelection::default(),
         }
     }
 
     #[test]
     fn configures_only_for_airplay_eld() {
-        let mut d = AacEldDecoder::default();
+        let mut d = FdkEldDecoder::default();
         d.configure(&config(AudioCodec::AacEld, 44_100)).unwrap();
         assert!(d.configure(&config(AudioCodec::Aac, 44_100)).is_err());
         assert!(d.configure(&config(AudioCodec::AacEld, 48_000)).is_err());
@@ -119,7 +144,7 @@ mod tests {
 
     #[test]
     fn empty_units_decode_to_nothing() {
-        let mut d = AacEldDecoder::default();
+        let mut d = FdkEldDecoder::default();
         d.configure(&config(AudioCodec::AacEld, 44_100)).unwrap();
         let frame = AudioFrame {
             codec: AudioCodec::AacEld,

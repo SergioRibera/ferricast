@@ -66,6 +66,7 @@ fn decode(bytes: Vec<u8>) -> (u16, u32, u16, Vec<i16>) {
             codec: stream.codec,
             sample_rate: stream.sample_rate,
             channels: stream.channels,
+            backend: ferricast_core::BackendSelection::default(),
         })
         .unwrap();
     let mut shape = None;

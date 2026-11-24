@@ -1,4 +1,4 @@
-use ferricast_core::{FerricastError, Result};
+use ferricast_core::{ColourDescription, FerricastError, Result};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum PocKind {
@@ -35,9 +35,8 @@ pub(super) struct Sps {
     pub num_reorder_frames: Option<u32>,
     pub max_dec_frame_buffering: Option<u32>,
     pub scaling_matrix_present: bool,
-    /// VUI `matrix_coefficients`, when the colour description is present.
-    pub matrix_coefficients: Option<u8>,
-    pub full_range: bool,
+    /// The VUI colour signalling; unspecified when the SPS has none.
+    pub colour: ColourDescription,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -678,8 +677,7 @@ pub(super) mod tests {
             num_reorder_frames: Some(2),
             max_dec_frame_buffering: Some(4),
             scaling_matrix_present: false,
-            matrix_coefficients: None,
-            full_range: false,
+            colour: ColourDescription::unspecified(ferricast_core::ColourRange::Limited),
         }
     }
 

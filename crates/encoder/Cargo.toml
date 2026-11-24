@@ -26,7 +26,17 @@ edition = "2024"
 # Disable any one you can't build on a particular host. Typical
 # fix for cros-libva ABI mismatches:
 #   ferricast = { default-features = false, features = ["x264", "nvenc", "fdk-aac"] }
-default = ["x264", "vaapi", "nvenc", "fdk-aac", "opus-rs"]
+default = [
+    "x264",
+    "vaapi",
+    "nvenc",
+    "fdk-aac",
+    "opus-rs",
+    "media-foundation",
+    "videotoolbox",
+    "audiotoolbox",
+    "mediacodec",
+]
 x264 = ["dep:x264-sys"]
 vaapi = ["dep:cros-libva"]
 nvenc = ["dep:shiguredo_nvcodec"]
@@ -56,9 +66,38 @@ fdk-aac = ["dep:fdk-aac", "dep:fdk-aac-sys"]
 # methods.
 nvenc-zero-copy = ["nvenc"]
 opus-rs = ["dep:opus-rs"]
+# The encoders in the istmo codec plugin (`ferricast_codec::plugin`).
+istmo = ["ferricast-codec/istmo"]
+# Platform codecs. Each compiles only on its own OS (its dependency is
+# target-gated), so all of them stay in the defaults: a Linux build
+# ignores them, a Windows / Apple / Android build picks up its own.
+# - `media-foundation`: Windows Media Foundation transforms (hardware
+#   MFTs first, then Microsoft's software ones).
+# - `videotoolbox`: Apple VideoToolbox (macOS, iOS) H.264 / H.265.
+# - `audiotoolbox`: Apple AudioToolbox `AudioConverter`, AAC.
+# - `mediacodec`: Android NDK `AMediaCodec` (API 28+), hardware and
+#   software codecs.
+media-foundation = ["dep:windows", "ferricast-codec/media-foundation"]
+videotoolbox = [
+    "dep:objc2",
+    "dep:block2",
+    "dep:objc2-core-foundation",
+    "dep:objc2-core-video",
+    "dep:objc2-core-media",
+    "dep:objc2-video-toolbox",
+]
+audiotoolbox = [
+    "dep:objc2",
+    "dep:block2",
+    "dep:objc2-core-foundation",
+    "dep:objc2-audio-toolbox",
+    "dep:objc2-core-audio-types",
+]
+mediacodec = ["dep:ndk", "dep:ndk-sys"]
 
 [dependencies]
 ferricast-core.workspace = true
+ferricast-codec.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 
@@ -107,3 +146,27 @@ yuv = "0.8.16"
 opus-rs = { version = "0.1.23", optional = true }
 # SIMD resampler for the encoder scaling stage (source size != output size).
 fast_image_resize = { version = "6.2", features = ["only_u8x4"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = { version = "0.9", default-features = false, features = ["media", "api-level-28"], optional = true }
+ndk-sys = { version = "0.6", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+], optional = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+block2 = { version = "0.6", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-audio-toolbox = { version = "0.3", optional = true }
+objc2-core-audio-types = { version = "0.3", optional = true }
+objc2-core-foundation = { version = "0.3", optional = true }
+objc2-core-media = { version = "0.3", optional = true }
+objc2-core-video = { version = "0.3", optional = true }
+objc2-video-toolbox = { version = "0.3", optional = true }

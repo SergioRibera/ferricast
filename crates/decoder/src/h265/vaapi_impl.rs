@@ -35,6 +35,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use cros_libva::*;
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
     CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, H265Profile, Result,
     VideoDecoder,
@@ -115,10 +116,8 @@ impl Drop for VaapiH265Decoder {
     }
 }
 
-impl VideoDecoder for VaapiH265Decoder {
-    const CODEC: Codec = Codec::H265;
-
-    fn configure(&mut self, config: &DecoderConfig) -> Result<()> {
+impl VaapiH265Decoder {
+    fn try_configure(&mut self, config: &DecoderConfig) -> Result<()> {
         let tx = self
             .tx
             .as_ref()
@@ -137,7 +136,7 @@ impl VideoDecoder for VaapiH265Decoder {
         }
     }
 
-    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
         let tx = self
             .tx
             .as_ref()
@@ -156,7 +155,7 @@ impl VideoDecoder for VaapiH265Decoder {
         }
     }
 
-    fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
+    fn try_flush(&mut self) -> Result<Vec<CapturedFrame>> {
         let tx = self
             .tx
             .as_ref()
@@ -171,6 +170,29 @@ impl VideoDecoder for VaapiH265Decoder {
                 "VA-API HEVC: worker dropped reply channel".into(),
             )),
         }
+    }
+}
+
+impl VideoDecoder for VaapiH265Decoder {
+    const CODEC: Codec = Codec::H265;
+
+    fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::Vaapi,
+            Operation::Configure,
+        ))
+    }
+
+    fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+        self.try_decode(frame).map_err(CodecError::from_backend(
+            BackendId::Vaapi,
+            Operation::Decode,
+        ))
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
+        self.try_flush()
+            .map_err(CodecError::from_backend(BackendId::Vaapi, Operation::Flush))
     }
 }
 

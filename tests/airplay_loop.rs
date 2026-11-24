@@ -327,6 +327,7 @@ impl Loop {
                 sample_rate: ELD_SAMPLE_RATE,
                 channels: 2,
                 bitrate_kbps: 128,
+                backend: ferricast_core::BackendSelection::default(),
             })
             .unwrap();
         let start_us = now_us();

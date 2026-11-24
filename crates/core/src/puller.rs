@@ -51,6 +51,9 @@ pub struct VideoStreamInfo {
     /// Nominal framerate from the stream metadata. Real cadence
     /// may vary; decoder MUST use packet PTS for timing.
     pub fps: u32,
+    /// The colour signalling of the container, when it has any;
+    /// decoders use it for pictures whose bitstream carries none.
+    pub colour: Option<crate::ColourDescription>,
 }
 
 #[derive(Debug, Clone)]

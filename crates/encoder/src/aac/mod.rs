@@ -1,6 +1,7 @@
 //! AAC audio encoder facade.
 //!
-//! Single backend today: **`fdk-aac`** — Fraunhofer FDK AAC via
+//! Backends: the platform encoders (Media Foundation, AudioToolbox,
+//! `MediaCodec`) where compiled in, then **`fdk-aac`** — Fraunhofer FDK AAC via
 //! the C library. Reference encoder for AAC; transparent quality
 //! above ~96 kbps stereo. Requires `libfdk-aac` on the link path
 //! and the `fdk-aac` cargo feature (on by default).
@@ -22,98 +23,57 @@ mod fdk_impl;
 #[cfg(feature = "fdk-aac")]
 mod resample;
 
-use ferricast_core::{
-    AudioCodec, AudioEncoder, AudioEncoderConfig, AudioFrame, FerricastError, Result,
-};
+use ferricast_codec::AudioEncoderRegistry;
+#[cfg(feature = "fdk-aac")]
+use ferricast_codec::Candidate;
+#[cfg(feature = "fdk-aac")]
+use ferricast_core::{Acceleration, AudioEncoderConfig};
+use ferricast_core::{AudioCodec, BackendId, CodecTarget};
 
 #[cfg(feature = "fdk-aac")]
 pub use eld::{ELD_AUDIO_SPECIFIC_CONFIG, ELD_FRAME_SAMPLES, ELD_SAMPLE_RATE, FdkEldEncoder};
 #[cfg(feature = "fdk-aac")]
 pub use fdk_impl::FdkAacEncoder;
 
-/// Backend-agnostic AAC encoder. `configure()` picks a backend at
-/// first call and the variant stays put until the encoder is
-/// dropped.
-#[derive(Default)]
-pub enum AacEncoder {
-    #[default]
-    Pending,
-    #[cfg(feature = "fdk-aac")]
-    Fdk(FdkAacEncoder),
+ferricast_codec::audio_encoder_facade! {
+    /// AAC-ELD encoder (480-sample granules, AirPlay mirroring audio)
+    /// over whichever backend its configuration selects.
+    pub struct AacEldEncoder, registry = eld_registry;
 }
 
-impl AacEncoder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
+/// The AAC-ELD encode backends of this build.
+fn eld_registry() -> AudioEncoderRegistry {
+    let registry = AudioEncoderRegistry::new(CodecTarget::encode(AudioCodec::AacEld));
+    let registry = crate::platform::audio(registry);
     #[cfg(feature = "fdk-aac")]
-    fn select_backend(config: &AudioEncoderConfig) -> Result<Self> {
-        let enc = FdkAacEncoder::new(config)?;
-        tracing::info!(
-            sample_rate = config.sample_rate,
-            channels = config.channels,
-            bitrate_kbps = config.bitrate_kbps,
-            "AAC encoder backend: fdk-aac (libfdk-aac)"
-        );
-        Ok(AacEncoder::Fdk(enc))
-    }
-
+    let registry = registry.candidate(Candidate::new(
+        BackendId::FdkAac,
+        Acceleration::Software,
+        ferricast_codec::open_audio_encoder::<FdkEldEncoder>,
+    ));
     #[cfg(not(feature = "fdk-aac"))]
-    fn select_backend(_config: &AudioEncoderConfig) -> Result<Self> {
-        Err(FerricastError::Encoder(
-            "AacEncoder: no backend compiled in (enable the `fdk-aac` feature)".into(),
-        ))
-    }
+    let registry = registry.missing(BackendId::FdkAac, "ferricast-encoder/fdk-aac");
+    registry
 }
 
-impl AudioEncoder for AacEncoder {
-    fn configure(&mut self, config: &AudioEncoderConfig) -> Result<()> {
-        if config.codec != AudioCodec::Aac {
-            return Err(FerricastError::Encoder(format!(
-                "AacEncoder: only AAC codec is supported, got {:?}",
-                config.codec
-            )));
-        }
-        *self = Self::select_backend(config)?;
-        Ok(())
-    }
+ferricast_codec::audio_encoder_facade! {
+    /// AAC-LC encoder over whichever backend its configuration selects.
+    pub struct AacEncoder, registry = registry;
+}
 
-    #[cfg_attr(
-        not(feature = "fdk-aac"),
-        expect(unused_variables, reason = "only the fdk-aac arm consumes the frame")
-    )]
-    fn encode(&mut self, frame: &AudioFrame) -> Result<()> {
-        match self {
-            AacEncoder::Pending => Err(FerricastError::Encoder(
-                "AacEncoder::encode called before configure()".into(),
-            )),
-            #[cfg(feature = "fdk-aac")]
-            AacEncoder::Fdk(e) => e.encode(frame),
-        }
-    }
-
-    fn take_output(&mut self) -> Vec<AudioFrame> {
-        match self {
-            AacEncoder::Pending => Vec::new(),
-            #[cfg(feature = "fdk-aac")]
-            AacEncoder::Fdk(e) => e.take_output(),
-        }
-    }
-
-    fn codec_config(&self) -> Vec<u8> {
-        match self {
-            AacEncoder::Pending => Vec::new(),
-            #[cfg(feature = "fdk-aac")]
-            AacEncoder::Fdk(e) => e.codec_config(),
-        }
-    }
-
-    fn flush(self) -> Result<Vec<AudioFrame>> {
-        match self {
-            AacEncoder::Pending => Ok(Vec::new()),
-            #[cfg(feature = "fdk-aac")]
-            AacEncoder::Fdk(e) => e.flush(),
-        }
-    }
+/// The AAC-LC encode backends of this build, in automatic order.
+fn registry() -> AudioEncoderRegistry {
+    let registry = AudioEncoderRegistry::new(CodecTarget::encode(AudioCodec::Aac));
+    let registry = crate::platform::audio(registry);
+    #[cfg(feature = "fdk-aac")]
+    let registry = registry.candidate(Candidate::new(
+        BackendId::FdkAac,
+        Acceleration::Software,
+        |config: &AudioEncoderConfig| {
+            FdkAacEncoder::open(config).map(|encoder| Box::new(encoder) as _)
+        },
+    ));
+    #[cfg(not(feature = "fdk-aac"))]
+    let registry = registry.missing(BackendId::FdkAac, "ferricast-encoder/fdk-aac");
+    registry
 }

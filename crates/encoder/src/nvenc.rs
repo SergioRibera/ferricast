@@ -26,6 +26,7 @@
 use std::marker::PhantomData;
 
 use bytes::Bytes;
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
     CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, PixelFormat, RawFrame,
     Result, VideoEncoder,
@@ -461,10 +462,8 @@ impl<C: NvencCodec> NvencEncoder<C> {
     }
 }
 
-impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
-    const CODEC: Codec = C::FERRICAST_CODEC;
-
-    fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
+impl<C: NvencCodec> NvencEncoder<C> {
+    fn try_configure(&mut self, config: &EncoderConfig) -> Result<()> {
         if self.requested.same_session_shape(config) {
             // Same session; only the bitrate may differ, and NVENC
             // retargets that live.
@@ -480,7 +479,7 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
         Ok(())
     }
 
-    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
+    fn try_encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
         let force_idr = self
             .frame_count
             .is_multiple_of(u64::from(self.cfg.keyframe_interval))
@@ -493,17 +492,13 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
         result
     }
 
-    fn flush(self) -> Result<Vec<EncodedFrame>> {
+    fn try_flush(self) -> Result<Vec<EncodedFrame>> {
         // Without B-frames there's no reorder queue, so an end-of-
         // stream flush wouldn't yield anything. Return empty.
         Ok(Vec::new())
     }
 
-    fn request_keyframe(&mut self) {
-        self.pending_keyframe = true;
-    }
-
-    fn set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
+    fn try_set_bitrate_kbps(&mut self, kbps: u32) -> Result<()> {
         // NVENC supports live bitrate reconfiguration without a GOP
         // boundary. Pass both `average_bitrate` and `max_bitrate` set
         // to the same value so the true-CBR invariant from
@@ -526,7 +521,7 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
         Ok(())
     }
 
-    fn get_headers(&mut self) -> Result<Vec<u8>> {
+    fn try_get_headers(&mut self) -> Result<Vec<u8>> {
         // NVENC builds the parameter sets inside the bitstream when we
         // ask for `output_spspps`. The HLS segmenter prepends them
         // already via this method, so we synthesise them here via
@@ -535,6 +530,48 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
         self.encoder.get_sequence_params().map_err(|e| {
             FerricastError::Encoder(format!("NVENC ({}): get_sequence_params: {e}", C::NAME))
         })
+    }
+}
+
+impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
+    const CODEC: Codec = C::FERRICAST_CODEC;
+
+    fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::Nvenc,
+            Operation::Configure,
+        ))
+    }
+
+    fn encode(&mut self, frame: CapturedFrame) -> CodecResult<EncodedFrame> {
+        self.try_encode(frame).map_err(CodecError::from_backend(
+            BackendId::Nvenc,
+            Operation::Encode,
+        ))
+    }
+
+    fn flush(self) -> CodecResult<Vec<EncodedFrame>> {
+        self.try_flush()
+            .map_err(CodecError::from_backend(BackendId::Nvenc, Operation::Flush))
+    }
+
+    fn set_bitrate_kbps(&mut self, kbps: u32) -> CodecResult<()> {
+        self.try_set_bitrate_kbps(kbps)
+            .map_err(CodecError::from_backend(
+                BackendId::Nvenc,
+                Operation::SetBitrate,
+            ))
+    }
+
+    fn get_headers(&mut self) -> CodecResult<Vec<u8>> {
+        self.try_get_headers().map_err(CodecError::from_backend(
+            BackendId::Nvenc,
+            Operation::Headers,
+        ))
+    }
+
+    fn request_keyframe(&mut self) {
+        self.pending_keyframe = true;
     }
 }
 

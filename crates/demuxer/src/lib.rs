@@ -25,7 +25,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use ferricast_core::{AudioFrame, Codec, EncodedFrame, FerricastError, Result};
+use ferricast_core::{AudioFrame, Codec, ColourDescription, EncodedFrame, FerricastError, Result};
 
 pub use adts::AdtsDemuxer;
 pub use audio::AudioStream;
@@ -45,18 +45,13 @@ impl<T: Read + Seek + Send> MediaSource for T {}
 
 pub(crate) type BoxedSource = Box<dyn MediaSource>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Color {
-    pub matrix_coefficients: u8,
-    pub full_range: bool,
-}
-
 #[derive(Debug, Clone)]
 pub struct VideoStream {
     pub codec: Codec,
     pub width: u32,
     pub height: u32,
-    pub color: Option<Color>,
+    /// The colour signalling the container carries for the track.
+    pub colour: Option<ColourDescription>,
     pub duration_us: Option<u64>,
     /// Timestamp of the first frame meant to be shown. Frames before it are
     /// pre-roll (samples ahead of an MP4 edit list's start): they must be

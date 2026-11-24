@@ -27,6 +27,7 @@ use std::rc::Rc;
 
 use bytes::Bytes;
 use cros_libva::*;
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
     CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, GpuFrame, H265Profile,
     PixelFormat, Result, VideoEncoder,
@@ -470,10 +471,8 @@ fn pick_level(width: u32, height: u32, fps: u32, bitrate_bps: u32) -> u8 {
         .map_or(186, |&(level, ..)| level)
 }
 
-impl VideoEncoder for VaapiH265Encoder {
-    const CODEC: Codec = Codec::H265;
-
-    fn configure(&mut self, config: &EncoderConfig) -> Result<()> {
+impl VaapiH265Encoder {
+    fn try_configure(&mut self, config: &EncoderConfig) -> Result<()> {
         if self.requested.same_session_shape(config)
             && self.requested.bitrate_kbps == config.bitrate_kbps
         {
@@ -485,7 +484,7 @@ impl VideoEncoder for VaapiH265Encoder {
         Ok(())
     }
 
-    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
+    fn try_encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame> {
         let result = self.encode_frame(frame);
         if result.is_err() {
             // Never predict from a picture the driver may not have
@@ -495,21 +494,51 @@ impl VideoEncoder for VaapiH265Encoder {
         result
     }
 
-    fn flush(self) -> Result<Vec<EncodedFrame>> {
+    fn try_flush(self) -> Result<Vec<EncodedFrame>> {
         Ok(Vec::new())
     }
 
-    fn request_keyframe(&mut self) {
-        self.state.borrow_mut().gop.request_idr();
-    }
-
-    fn get_headers(&mut self) -> Result<Vec<u8>> {
+    fn try_get_headers(&mut self) -> Result<Vec<u8>> {
         let mut out =
             Vec::with_capacity(self.vps_nal.len() + self.sps_nal.len() + self.pps_nal.len());
         out.extend_from_slice(&self.vps_nal);
         out.extend_from_slice(&self.sps_nal);
         out.extend_from_slice(&self.pps_nal);
         Ok(out)
+    }
+}
+
+impl VideoEncoder for VaapiH265Encoder {
+    const CODEC: Codec = Codec::H265;
+
+    fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::Vaapi,
+            Operation::Configure,
+        ))
+    }
+
+    fn encode(&mut self, frame: CapturedFrame) -> CodecResult<EncodedFrame> {
+        self.try_encode(frame).map_err(CodecError::from_backend(
+            BackendId::Vaapi,
+            Operation::Encode,
+        ))
+    }
+
+    fn flush(self) -> CodecResult<Vec<EncodedFrame>> {
+        self.try_flush()
+            .map_err(CodecError::from_backend(BackendId::Vaapi, Operation::Flush))
+    }
+
+    fn get_headers(&mut self) -> CodecResult<Vec<u8>> {
+        self.try_get_headers().map_err(CodecError::from_backend(
+            BackendId::Vaapi,
+            Operation::Headers,
+        ))
+    }
+
+    fn request_keyframe(&mut self) {
+        self.state.borrow_mut().gop.request_idr();
     }
 }
 

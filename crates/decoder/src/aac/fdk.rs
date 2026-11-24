@@ -22,9 +22,14 @@ use std::ptr::NonNull;
 
 use fdk_aac_sys as sys;
 use ferricast_core::frame::AacChannelConfig;
-use ferricast_core::{AudioDecoderConfig, DecodedAudio, FerricastError, Result};
+use std::collections::VecDeque;
 
-use super::{Shape, adts};
+use ferricast_core::{
+    AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame, BackendId, CodecError, CodecResult,
+    DecodedAudio, FerricastError, Operation, Result,
+};
+
+use crate::adts::{self, Shape};
 
 /// Most channels output: 7.1, the widest AAC channel configuration.
 const MAX_CHANNELS: usize = 8;
@@ -292,6 +297,54 @@ fn lc_config(shape: Shape) -> Result<[u8; 2]> {
 /// A raw-transport decoder for the AAC-LC core of `shape`.
 fn raw_decoder(shape: Shape) -> Result<RawDecoder> {
     RawDecoder::open(&lc_config(shape)?)
+}
+
+/// AAC decoder over libfdk-aac: AAC-LC plus the SBR and PS layers of
+/// HE-AAC v1 / v2, at full rate and channel count (symphonia decodes
+/// only the AAC-LC core of those).
+#[derive(Default)]
+pub struct FdkAacDecoder {
+    inner: Option<FdkAac>,
+    /// Decoded runs not yet handed out: a payload whose frames change
+    /// shape mid-way yields one run per shape, but `decode` returns one.
+    pending: VecDeque<DecodedAudio>,
+}
+
+impl AudioDecoder for FdkAacDecoder {
+    const CODEC: AudioCodec = AudioCodec::Aac;
+
+    fn configure(&mut self, config: &AudioDecoderConfig) -> CodecResult<()> {
+        if config.codec != AudioCodec::Aac {
+            return Err(CodecError::UnsupportedConfig {
+                backend: BackendId::FdkAac,
+                what: format!("{} in the AAC decoder", config.codec),
+            });
+        }
+        self.inner = Some(FdkAac::new(config));
+        self.pending.clear();
+        Ok(())
+    }
+
+    fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>> {
+        let inner = self.inner.as_mut().ok_or(CodecError::NotConfigured {
+            target: ferricast_core::CodecTarget::decode(AudioCodec::Aac),
+            operation: Operation::Decode,
+        })?;
+        let mut runs = Vec::new();
+        let decoded = inner.decode(&frame.data, frame.timestamp_us, &mut runs);
+        // Frames decoded before a bad one in the same payload are still
+        // good audio; queue them before reporting the failure.
+        self.pending.extend(runs);
+        decoded.map_err(CodecError::from_backend(
+            BackendId::FdkAac,
+            Operation::Decode,
+        ))?;
+        Ok(self.pending.pop_front())
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>> {
+        Ok(self.pending.drain(..).collect())
+    }
 }
 
 #[cfg(test)]

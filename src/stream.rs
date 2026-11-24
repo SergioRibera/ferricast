@@ -1169,6 +1169,7 @@ async fn pump_audio<A: AudioEncoder>(
                 sample_rate: pcm.sample_rate,
                 channels: pcm.channels,
                 bitrate_kbps: config.bitrate_kbps,
+                backend: ferricast_core::BackendSelection::default(),
             })?;
             tracing::info!(
                 sample_rate = pcm.sample_rate,

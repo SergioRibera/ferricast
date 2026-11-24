@@ -3,9 +3,10 @@ use std::marker::PhantomData;
 use std::os::raw::c_int;
 use std::ptr::{addr_of_mut, from_mut, null_mut};
 
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, PixelFormat, Result,
-    VideoDecoder, YuvColour,
+    CapturedFrame, Codec, ColourDescription, ColourRange, DecoderConfig, EncodedFrame,
+    FerricastError, PixelFormat, Result, VideoDecoder,
 };
 use h264_reader::nal::sps::SeqParameterSet;
 use h264_reader::rbsp::{BitReader, decode_nal};
@@ -87,10 +88,8 @@ fn strip_start_code(unit: &[u8]) -> Option<&[u8]> {
     (unit[one] == 1).then(|| &unit[one + 1..])
 }
 
-impl VideoDecoder for OpenH264Decoder {
-    const CODEC: Codec = Codec::H264;
-
-    fn configure(&mut self, config: &DecoderConfig) -> Result<()> {
+impl OpenH264Decoder {
+    fn try_configure(&mut self, config: &DecoderConfig) -> Result<()> {
         if config.codec != Codec::H264 {
             return Err(FerricastError::Decode(format!(
                 "OpenH264Decoder asked to decode {:?}; only H.264 supported",
@@ -110,7 +109,7 @@ impl VideoDecoder for OpenH264Decoder {
         Ok(())
     }
 
-    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
         if self.low_latency
             && let Some(release) = Release::for_packet(&frame.data)
             && release != self.release
@@ -133,7 +132,7 @@ impl VideoDecoder for OpenH264Decoder {
         Ok(None)
     }
 
-    fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
+    fn try_flush(&mut self) -> Result<Vec<CapturedFrame>> {
         let format = self.format.0;
         let Some(session) = self.session.as_mut() else {
             return Ok(Vec::new());
@@ -143,6 +142,31 @@ impl VideoDecoder for OpenH264Decoder {
             frames.extend(session.release_one()?.picture(format)?);
         }
         Ok(frames)
+    }
+}
+
+impl VideoDecoder for OpenH264Decoder {
+    const CODEC: Codec = Codec::H264;
+
+    fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::OpenH264,
+            Operation::Configure,
+        ))
+    }
+
+    fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+        self.try_decode(frame).map_err(CodecError::from_backend(
+            BackendId::OpenH264,
+            Operation::Decode,
+        ))
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
+        self.try_flush().map_err(CodecError::from_backend(
+            BackendId::OpenH264,
+            Operation::Flush,
+        ))
     }
 }
 
@@ -310,7 +334,7 @@ impl Picture<'_> {
             (width, height),
             output.info.uiOutYuvTimeStamp,
             format,
-            YuvColour::guess(height),
+            ColourDescription::unspecified(ColourRange::Limited),
         )
         .map(|raw| Some(CapturedFrame::Cpu(raw)))
         .ok_or_else(short)

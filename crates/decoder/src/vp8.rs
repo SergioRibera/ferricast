@@ -1,24 +1,23 @@
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
-    YuvColour, YuvMatrix,
+    CapturedFrame, Codec, ColourDescription, DecoderConfig, EncodedFrame, FerricastError, Result,
+    VideoDecoder,
 };
 use vp8_decoder::DecodeError;
 
 use crate::nv12::{self, OutputFormat, Planar};
 
 #[derive(Default)]
-pub struct Vp8Decoder {
+pub struct RustVp8Decoder {
     decoder: Option<vp8_decoder::Decoder>,
     format: OutputFormat,
 }
 
-impl VideoDecoder for Vp8Decoder {
-    const CODEC: Codec = Codec::Vp8;
-
-    fn configure(&mut self, config: &DecoderConfig) -> Result<()> {
+impl RustVp8Decoder {
+    fn try_configure(&mut self, config: &DecoderConfig) -> Result<()> {
         if config.codec != Codec::Vp8 {
             return Err(FerricastError::Decode(format!(
-                "Vp8Decoder asked to decode {:?}; only VP8 supported",
+                "RustVp8Decoder asked to decode {:?}; only VP8 supported",
                 config.codec
             )));
         }
@@ -27,9 +26,9 @@ impl VideoDecoder for Vp8Decoder {
         Ok(())
     }
 
-    fn decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
         let decoder = self.decoder.as_mut().ok_or_else(|| {
-            FerricastError::Decode("Vp8Decoder::decode before configure()".into())
+            FerricastError::Decode("RustVp8Decoder::decode before configure()".into())
         })?;
         let picture = match decoder.decode(&frame.data) {
             Ok(Some(picture)) => picture,
@@ -49,10 +48,8 @@ impl VideoDecoder for Vp8Decoder {
         })
         .ok_or_else(short)?;
         // VP8 is always BT.601 (RFC 6386 §9.2).
-        let colour = YuvColour {
-            matrix: YuvMatrix::Bt601,
-            full_range: false,
-        };
+        // VP8 is always BT.601 (RFC 6386 §9.2).
+        let colour = ColourDescription::BT601_LIMITED;
         nv12::deliver(
             data,
             stride,
@@ -65,7 +62,32 @@ impl VideoDecoder for Vp8Decoder {
         .ok_or_else(short)
     }
 
-    fn flush(&mut self) -> Result<Vec<CapturedFrame>> {
+    fn try_flush(&mut self) -> Result<Vec<CapturedFrame>> {
         Ok(Vec::new())
+    }
+}
+
+impl VideoDecoder for RustVp8Decoder {
+    const CODEC: Codec = Codec::Vp8;
+
+    fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::RustVp8,
+            Operation::Configure,
+        ))
+    }
+
+    fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+        self.try_decode(frame).map_err(CodecError::from_backend(
+            BackendId::RustVp8,
+            Operation::Decode,
+        ))
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
+        self.try_flush().map_err(CodecError::from_backend(
+            BackendId::RustVp8,
+            Operation::Flush,
+        ))
     }
 }

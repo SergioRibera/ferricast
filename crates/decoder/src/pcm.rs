@@ -5,19 +5,18 @@
 use ferricast_core::{
     AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame, DecodedAudio, FerricastError, Result,
 };
+use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 
 #[derive(Debug, Default)]
-pub struct PcmDecoder {
+pub struct PcmPassthrough {
     configured: bool,
 }
 
-impl AudioDecoder for PcmDecoder {
-    const CODEC: AudioCodec = AudioCodec::Pcm;
-
-    fn configure(&mut self, config: &AudioDecoderConfig) -> Result<()> {
+impl PcmPassthrough {
+    fn try_configure(&mut self, config: &AudioDecoderConfig) -> Result<()> {
         if config.codec != AudioCodec::Pcm {
             return Err(FerricastError::Decode(format!(
-                "PcmDecoder asked to decode {:?}",
+                "PcmPassthrough asked to decode {:?}",
                 config.codec
             )));
         }
@@ -25,10 +24,10 @@ impl AudioDecoder for PcmDecoder {
         Ok(())
     }
 
-    fn decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
+    fn try_decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
         if !self.configured {
             return Err(FerricastError::Decode(
-                "PcmDecoder::decode before configure()".into(),
+                "PcmPassthrough::decode before configure()".into(),
             ));
         }
         if frame.channels == 0 || frame.sample_rate == 0 {
@@ -46,8 +45,29 @@ impl AudioDecoder for PcmDecoder {
         }))
     }
 
-    fn flush(&mut self) -> Result<Vec<DecodedAudio>> {
+    fn try_flush(&mut self) -> Result<Vec<DecodedAudio>> {
         Ok(Vec::new())
+    }
+}
+
+impl AudioDecoder for PcmPassthrough {
+    const CODEC: AudioCodec = AudioCodec::Pcm;
+
+    fn configure(&mut self, config: &AudioDecoderConfig) -> CodecResult<()> {
+        self.try_configure(config).map_err(CodecError::from_backend(
+            BackendId::Pcm,
+            Operation::Configure,
+        ))
+    }
+
+    fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>> {
+        self.try_decode(frame)
+            .map_err(CodecError::from_backend(BackendId::Pcm, Operation::Decode))
+    }
+
+    fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>> {
+        self.try_flush()
+            .map_err(CodecError::from_backend(BackendId::Pcm, Operation::Flush))
     }
 }
 
@@ -59,12 +79,13 @@ mod tests {
 
     #[test]
     fn little_endian_samples_pass_through() {
-        let mut decoder = PcmDecoder::default();
+        let mut decoder = PcmPassthrough::default();
         decoder
             .configure(&AudioDecoderConfig {
                 codec: AudioCodec::Pcm,
                 sample_rate: 44_100,
                 channels: 2,
+                backend: ferricast_core::BackendSelection::default(),
             })
             .unwrap();
         let audio = decoder

@@ -1,16 +1,18 @@
 use std::io::BufReader;
 
-use ferricast_core::{AudioCodec, AudioFrame, Codec, EncodedFrame, FerricastError, Result};
+use ferricast_core::{
+    AudioCodec, AudioFrame, Codec, ColourDescription, EncodedFrame, FerricastError, Result,
+};
 use matroska_demuxer::{
     ContentCompAlgo, ContentEncAlgo, ContentEncodingValue, Frame, MatrixCoefficients, MatroskaFile,
-    Range, TrackEntry, TrackType,
+    Primaries, Range, TrackEntry, TrackType, TransferCharacteristics,
 };
 
 mod cues;
 
 use crate::audio::{AacConfig, AudioFormat, AudioStream, OPUS_RATE, opus_channels};
 use crate::nal::{Framing, LengthPrefixed};
-use crate::{BoxedSource, Color, Packet, TrackSelection, VideoStream};
+use crate::{BoxedSource, Packet, TrackSelection, VideoStream};
 
 const EBML_MAGIC: [u8; 4] = [0x1A, 0x45, 0xDF, 0xA3];
 /// How far before a seek target the keyframe search starts, tried in
@@ -131,11 +133,13 @@ impl VideoTrack {
             codec,
             width: u32::try_from(video.pixel_width().get()).unwrap_or(0),
             height: u32::try_from(video.pixel_height().get()).unwrap_or(0),
-            color: video.colour().and_then(|colour| {
-                Some(Color {
-                    matrix_coefficients: matrix_code(colour.matrix_coefficients()?),
-                    full_range: colour.range() == Some(Range::Full),
-                })
+            colour: video.colour().map(|colour| {
+                ColourDescription::from_codes(
+                    colour.primaries().map_or(2, primaries_code),
+                    colour.transfer_characteristics().map_or(2, transfer_code),
+                    colour.matrix_coefficients().map_or(2, matrix_code),
+                    colour.range() == Some(Range::Full),
+                )
             }),
             duration_us: None,
             presentation_start_us: 0,
@@ -604,6 +608,48 @@ fn framing(entry: &TrackEntry, codec: Codec) -> Option<Framing> {
         _ => return Some(Framing::Raw),
     }
     .map(Framing::LengthPrefixed)
+}
+
+/// The H.273 `colour_primaries` code of a Matroska `Primaries` value
+/// (Matroska adopts the H.273 table; `2` is "unspecified").
+fn primaries_code(primaries: Primaries) -> u8 {
+    match primaries {
+        Primaries::Unknown => 2,
+        Primaries::Bt709 => 1,
+        Primaries::Bt470m => 4,
+        Primaries::Bt601 => 5,
+        Primaries::Smpte170 => 6,
+        Primaries::Smpte240 => 7,
+        Primaries::Film => 8,
+        Primaries::Bt2020 => 9,
+        Primaries::SmpteSt428_1 => 10,
+        Primaries::SmpteRp432_2 => 11,
+        Primaries::SmpteEg432_2 => 12,
+        Primaries::JedecP22 => 22,
+    }
+}
+
+/// The H.273 `transfer_characteristics` code of a Matroska value.
+fn transfer_code(transfer: TransferCharacteristics) -> u8 {
+    match transfer {
+        TransferCharacteristics::Unknown => 2,
+        TransferCharacteristics::Bt709 => 1,
+        TransferCharacteristics::Bt407m => 4,
+        TransferCharacteristics::Bt407bg => 5,
+        TransferCharacteristics::Smpte170 => 6,
+        TransferCharacteristics::Smpte240 => 7,
+        TransferCharacteristics::Linear => 8,
+        TransferCharacteristics::Log => 9,
+        TransferCharacteristics::LogSqrt => 10,
+        TransferCharacteristics::Iec61966_2_4 => 11,
+        TransferCharacteristics::Bt1361 => 12,
+        TransferCharacteristics::Iec61966_2_1 => 13,
+        TransferCharacteristics::Bt220_10 => 14,
+        TransferCharacteristics::Bt220_12 => 15,
+        TransferCharacteristics::Bt2100 => 16,
+        TransferCharacteristics::SmpteSt428_1 => 17,
+        TransferCharacteristics::Hlg => 18,
+    }
 }
 
 fn matrix_code(matrix: MatrixCoefficients) -> u8 {

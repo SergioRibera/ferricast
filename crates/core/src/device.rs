@@ -423,6 +423,7 @@ bitflags::bitflags! {
 /// MAY fall back to Main or Baseline if the hardware doesn't
 /// support it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
 pub enum H264Profile {
     /// Baseline / Constrained Baseline. No CABAC, no B-frames.
     /// Required floor for the oldest Chromecasts and Miracast 1.0.
@@ -444,6 +445,7 @@ pub enum H264Profile {
 /// profiles — Main (8-bit 4:2:0) and Main10 (10-bit 4:2:0). Range
 /// Extensions / 4:4:4 are deliberately out of scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
 pub enum H265Profile {
     /// Main, 8-bit 4:2:0. Universally supported floor — every HEVC
     /// decoder advertises Main.

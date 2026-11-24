@@ -1,8 +1,10 @@
-use crate::error::Result;
+use crate::codec::{BackendSelection, CodecResult};
+use crate::colour::ColourDescription;
 use crate::frame::{AudioCodec, AudioFrame, CapturedFrame, EncodedFrame};
 use crate::{Codec, H264Profile, H265Profile, PixelFormat};
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
 pub struct EncoderConfig {
     pub codec: Codec,
     pub width: u32,
@@ -28,6 +30,12 @@ pub struct EncoderConfig {
     /// pipeline. `None` = encoder picks Main (8-bit 4:2:0) as the
     /// conservative floor every HEVC decoder accepts.
     pub max_h265_profile: Option<H265Profile>,
+    /// The colour the stream signals, and the matrix and range RGB
+    /// input is converted with. A backend that cannot produce it fails
+    /// `configure` with [`crate::CodecError::UnsupportedConfig`].
+    pub colour: ColourDescription,
+    /// Which backend encodes; see [`BackendSelection`].
+    pub backend: BackendSelection,
 }
 
 impl EncoderConfig {
@@ -56,6 +64,8 @@ impl Default for EncoderConfig {
             pixel_format: PixelFormat::Bgra,
             max_h264_profile: None,
             max_h265_profile: None,
+            colour: ColourDescription::BT709_LIMITED,
+            backend: BackendSelection::default(),
         }
     }
 }
@@ -63,7 +73,7 @@ impl Default for EncoderConfig {
 pub trait VideoEncoder: Send {
     const CODEC: Codec;
 
-    fn configure(&mut self, config: &EncoderConfig) -> Result<()>;
+    fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()>;
 
     /// Encode the given captured frame.
     ///
@@ -73,10 +83,10 @@ pub trait VideoEncoder: Send {
     ///   the source produced a `Gpu` frame.
     /// * VA-API — consumes the `Gpu` variant directly (zero-copy)
     ///   and uploads to a `VASurface` for the `Cpu` variant.
-    fn encode(&mut self, frame: CapturedFrame) -> Result<EncodedFrame>;
+    fn encode(&mut self, frame: CapturedFrame) -> CodecResult<EncodedFrame>;
 
-    fn flush(self) -> Result<Vec<EncodedFrame>>;
-    fn get_headers(&mut self) -> Result<Vec<u8>>;
+    fn flush(self) -> CodecResult<Vec<EncodedFrame>>;
+    fn get_headers(&mut self) -> CodecResult<Vec<u8>>;
 
     /// Ask the encoder to emit an IDR (instantaneous decoder refresh
     /// keyframe) on the next [`encode`] call, in addition to whatever
@@ -106,12 +116,13 @@ pub trait VideoEncoder: Send {
     /// best-effort basis. NVENC and x264 reconfigure live (no GOP
     /// gap); VA-API keeps the no-op. Default is no-op so existing impls don't
     /// have to opt in.
-    fn set_bitrate_kbps(&mut self, _kbps: u32) -> Result<()> {
+    fn set_bitrate_kbps(&mut self, _kbps: u32) -> CodecResult<()> {
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
 pub struct AudioEncoderConfig {
     /// Output codec. Only [`AudioCodec::Aac`] is wired through the
     /// chromecast HLS pipeline today; the field stays so future
@@ -127,6 +138,8 @@ pub struct AudioEncoderConfig {
     /// Target average bitrate in kbps. AAC-LC at 128 kbps stereo is
     /// the chromecast-friendly default (transparent above ~96 kbps).
     pub bitrate_kbps: u32,
+    /// Which backend encodes; see [`BackendSelection`].
+    pub backend: BackendSelection,
 }
 
 impl Default for AudioEncoderConfig {
@@ -136,6 +149,7 @@ impl Default for AudioEncoderConfig {
             sample_rate: 48_000,
             channels: 2,
             bitrate_kbps: 128,
+            backend: BackendSelection::default(),
         }
     }
 }
@@ -147,7 +161,7 @@ impl Default for AudioEncoderConfig {
 /// AAC-LC) before they can emit, so the first N input chunks
 /// typically return `None` while internal state warms up.
 pub trait AudioEncoder: Send {
-    fn configure(&mut self, config: &AudioEncoderConfig) -> Result<()>;
+    fn configure(&mut self, config: &AudioEncoderConfig) -> CodecResult<()>;
 
     /// Push one chunk of PCM. The encoder may produce zero, one, or
     /// more output frames per input; output frames are drained via
@@ -156,7 +170,7 @@ pub trait AudioEncoder: Send {
     /// the encoder advances its internal monotonic counter from it
     /// so subsequent output frames carry strictly-increasing PTS in
     /// the same timeline.
-    fn encode(&mut self, frame: &AudioFrame) -> Result<()>;
+    fn encode(&mut self, frame: &AudioFrame) -> CodecResult<()>;
 
     /// Drain any output frames produced by the latest `encode`
     /// (and any previously-buffered residue). Returns an empty
@@ -174,5 +188,5 @@ pub trait AudioEncoder: Send {
 
     /// Flush any internal frames and return them. Called once at
     /// shutdown.
-    fn flush(self) -> Result<Vec<AudioFrame>>;
+    fn flush(self) -> CodecResult<Vec<AudioFrame>>;
 }

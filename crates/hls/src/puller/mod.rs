@@ -432,6 +432,7 @@ impl Worker {
                         width: 0,
                         height: 0,
                         fps: 0,
+                        colour: None,
                     }),
                     ts_info.audio_codec.map(|codec| AudioStreamInfo {
                         codec,
@@ -682,6 +683,7 @@ impl Worker {
                 width: v.width,
                 height: v.height,
                 fps: 0,
+                colour: None,
             }),
             segment.audio.as_ref().map(|a| AudioStreamInfo {
                 codec: a.codec,

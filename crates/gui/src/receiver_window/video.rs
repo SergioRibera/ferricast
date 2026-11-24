@@ -9,7 +9,7 @@
 //! into a reused buffer instead.
 
 use bytes::Bytes;
-use ferricast::{FerricastError, PixelFormat, RawFrame, Result, YuvColour, YuvMatrix};
+use ferricast::{ColourRange, FerricastError, PixelFormat, RawFrame, Result, YuvColour, YuvMatrix};
 use skia_safe::gpu::{self, Mipmapped, RecordingContext};
 use skia_safe::yuva_info::{PlaneConfig, Subsampling};
 use skia_safe::{
@@ -48,10 +48,10 @@ impl TryFrom<RawFrame> for VideoFrame {
 
     fn try_from(raw: RawFrame) -> Result<Self> {
         let layout = match raw.format {
-            PixelFormat::Nv12 => Layout::Nv12(
-                raw.colour
-                    .unwrap_or_else(|| YuvColour::guess(raw.height as usize)),
-            ),
+            PixelFormat::Nv12 => Layout::Nv12(raw.colour.map_or_else(
+                || YuvColour::guess(raw.height as usize),
+                |colour| colour.yuv(raw.height as usize),
+            )),
             PixelFormat::Bgra => Layout::Bgra,
             PixelFormat::Rgba | PixelFormat::I420 => {
                 return Err(FerricastError::Decode(format!(
@@ -133,13 +133,13 @@ impl VideoFrame {
 }
 
 fn yuv_colour_space(colour: YuvColour) -> YUVColorSpace {
-    match (colour.matrix, colour.full_range) {
-        (YuvMatrix::Bt601, false) => YUVColorSpace::Rec601_Limited,
-        (YuvMatrix::Bt601, true) => YUVColorSpace::JPEG_Full,
-        (YuvMatrix::Bt709, false) => YUVColorSpace::Rec709_Limited,
-        (YuvMatrix::Bt709, true) => YUVColorSpace::Rec709_Full,
-        (YuvMatrix::Bt2020, false) => YUVColorSpace::BT2020_8bit_Limited,
-        (YuvMatrix::Bt2020, true) => YUVColorSpace::BT2020_8bit_Full,
+    match (colour.matrix, colour.range) {
+        (YuvMatrix::Bt601, ColourRange::Limited) => YUVColorSpace::Rec601_Limited,
+        (YuvMatrix::Bt601, ColourRange::Full) => YUVColorSpace::JPEG_Full,
+        (YuvMatrix::Bt709, ColourRange::Limited) => YUVColorSpace::Rec709_Limited,
+        (YuvMatrix::Bt709, ColourRange::Full) => YUVColorSpace::Rec709_Full,
+        (YuvMatrix::Bt2020, ColourRange::Limited) => YUVColorSpace::BT2020_8bit_Limited,
+        (YuvMatrix::Bt2020, ColourRange::Full) => YUVColorSpace::BT2020_8bit_Full,
     }
 }
 
@@ -240,6 +240,7 @@ mod gpu_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferricast::ColourDescription;
 
     #[test]
     fn wide_frames_are_letterboxed_and_tall_ones_pillarboxed() {
@@ -254,7 +255,7 @@ mod tests {
         assert_eq!(aspect_fit(0.0, 100.0, 1.0, 1.0), (0.0, 0.0, 0.0, 0.0));
     }
 
-    fn nv12(colour: Option<YuvColour>) -> RawFrame {
+    fn nv12(colour: Option<ColourDescription>) -> RawFrame {
         RawFrame {
             width: 2,
             height: 2,
@@ -268,12 +269,9 @@ mod tests {
 
     #[test]
     fn nv12_frames_keep_their_colour_or_get_a_guess() {
-        let full = YuvColour {
-            matrix: YuvMatrix::Bt709,
-            full_range: true,
-        };
+        let full = ColourDescription::unspecified(ColourRange::Full);
         let frame = VideoFrame::try_from(nv12(Some(full))).unwrap();
-        assert_eq!((frame.layout, frame.pts_us), (Layout::Nv12(full), 7));
+        assert_eq!((frame.layout, frame.pts_us), (Layout::Nv12(full.yuv(2)), 7));
         let guessed = VideoFrame::try_from(nv12(None)).unwrap();
         assert_eq!(guessed.layout, Layout::Nv12(YuvColour::guess(2)));
     }
