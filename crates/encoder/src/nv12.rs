@@ -25,7 +25,10 @@ impl Nv12Layout {
     /// Tightly packed NV12.
     #[cfg_attr(
         not(test),
-        allow(dead_code, reason = "conditional: only the Media Foundation encoder packs tightly")
+        allow(
+            dead_code,
+            reason = "conditional: only the Media Foundation encoder packs tightly"
+        )
     )]
     pub(crate) fn packed(width: u32, height: u32) -> Self {
         let stride = width as usize;
