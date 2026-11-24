@@ -1,13 +1,13 @@
 //! Keeps DMA-BUF `pw_buffer`s dequeued while downstream reads them.
 //!
-//! PipeWire re-queues a buffer to the compositor as soon as it is
+//! `PipeWire` re-queues a buffer to the compositor as soon as it is
 //! queued back, after which the compositor may render the next frame
 //! into the same DMA-BUF. A `GpuFrame` handed to an encoder therefore
 //! carries a [`BufferLease`] whose guard, on drop, posts the buffer's
-//! [`LeaseId`] back to the PipeWire loop thread, which re-queues it.
+//! [`LeaseId`] back to the `PipeWire` loop thread, which re-queues it.
 //! Raw buffer pointers never leave that thread.
 //!
-//! Lease ids are never reused. When PipeWire removes a buffer
+//! Lease ids are never reused. When `PipeWire` removes a buffer
 //! (renegotiation, disconnect) its entry is forgotten, so a release
 //! arriving later matches nothing and never touches freed memory.
 
@@ -24,7 +24,7 @@ use tracing::{debug, trace};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LeaseId(u64);
 
-/// Posted from a lease guard's `Drop` to the PipeWire loop.
+/// Posted from a lease guard's `Drop` to the `PipeWire` loop.
 pub(super) struct Release(LeaseId);
 
 /// The guard inside a [`BufferLease`]; carries no pointer, only the id.
@@ -45,7 +45,7 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
-/// Bookkeeping of held buffers, independent of PipeWire so it can be
+/// Bookkeeping of held buffers, independent of `PipeWire` so it can be
 /// unit-tested. `B` is the buffer handle (`NonNull<pw_buffer>`).
 #[derive(Debug)]
 pub(super) struct HeldBuffers<B> {
@@ -71,7 +71,7 @@ impl<B: Copy + PartialEq> HeldBuffers<B> {
         self.pool_size += 1;
     }
 
-    /// PipeWire is about to free `buffer`. Returns whether it was held;
+    /// `PipeWire` is about to free `buffer`. Returns whether it was held;
     /// its lease, if any, becomes a no-op.
     pub(super) fn buffer_removed(&mut self, buffer: B) -> bool {
         self.pool_size = self.pool_size.saturating_sub(1);
@@ -109,7 +109,7 @@ impl<B: Copy + PartialEq> HeldBuffers<B> {
     }
 }
 
-/// Lease side of the PipeWire worker. Lives on the loop thread only.
+/// Lease side of the `PipeWire` worker. Lives on the loop thread only.
 pub(super) struct BufferLeases {
     book: HeldBuffers<NonNull<pw::sys::pw_buffer>>,
     tx: pw::channel::Sender<Release>,
@@ -163,7 +163,7 @@ impl BufferLeases {
     }
 
     /// Re-queue the buffer behind `release`, unless it is gone.
-    pub(super) fn release(&mut self, stream: &StreamRef, release: Release) {
+    pub(super) fn release(&mut self, stream: &StreamRef, release: &Release) {
         let Some(buffer) = self.book.release(release.0) else {
             trace!(id = release.0.0, "late release of a removed buffer ignored");
             return;

@@ -85,3 +85,6 @@ futures-util = { workspace = true, optional = true }
 [dev-dependencies]
 # Log output for the `enum_thumbs` diagnostic example.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

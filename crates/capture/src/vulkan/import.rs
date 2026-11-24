@@ -1,4 +1,4 @@
-//! DmaBuf import + readback with cross-frame resource caching.
+//! `DmaBuf` import + readback with cross-frame resource caching.
 //!
 //! Hot-path layout:
 //!
@@ -40,7 +40,7 @@ fn buffer_id(fd: RawFd) -> std::io::Result<BufferId> {
     // returns -1 and leaves `errno` set, in which case we don't read
     // `st`.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let r = unsafe { libc::fstat(fd, &mut st) };
+    let r = unsafe { libc::fstat(fd, &raw mut st) };
     if r != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -76,7 +76,7 @@ pub(super) fn run_sync(
     let PlaneImport { width, height, .. } = *plane;
     let bpp = fmt::bytes_per_pixel(pixel_format)
         .ok_or_else(|| FerricastError::Capture("vulkan: format has no bpp".into()))?;
-    let staging_size = (width as u64) * (height as u64) * (bpp as u64);
+    let staging_size = u64::from(width) * u64::from(height) * u64::from(bpp);
     if staging_size == 0 {
         return Err(FerricastError::Capture(
             "vulkan: staging size is zero".into(),
@@ -121,7 +121,7 @@ fn wait_and_reset_fence(inner: &Inner, fence: vk::Fence) -> Result<()> {
             .reset_fences(&[fence])
             .map_err(|e| FerricastError::Capture(format!("vk reset_fences: {e}")))?;
     }
-    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     // Anything past one frame period (~16 ms at 60 fps) at this
     // step means GPU contention or driver weirdness — log loudly so
     // we know whether a stall is on us or upstream.
@@ -145,7 +145,10 @@ fn readback_from_staging(staging: &Staging, size: u64) -> Bytes {
     // `ensure_staging(size)` directly above), and the mapping stays
     // live for the entire lifetime of the `Staging`.
     unsafe {
-        let slice = std::slice::from_raw_parts(staging.mapped_ptr as *const u8, size as usize);
+        let slice = std::slice::from_raw_parts(
+            staging.mapped_ptr.cast_const(),
+            usize::try_from(size).expect("invariant: `size` fits the mapped staging buffer"),
+        );
         Bytes::copy_from_slice(slice)
     }
 }
@@ -241,6 +244,10 @@ fn ensure_image(inner: &Inner, state: &mut State, plane: &PlaneImport) -> Result
 
 /// SAFETY: `fd_guard` owns a valid duped dmabuf fd. On success the
 /// fd ownership transfers to Vulkan (we mark it `forget`).
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear setup or event sequence over shared state; splitting it would scatter that state"
+)]
 unsafe fn import_image(
     inner: &Inner,
     fd_guard: &mut OwnedFdGuard,
@@ -256,8 +263,8 @@ unsafe fn import_image(
         ..
     } = *plane;
     let plane_layouts = [vk::SubresourceLayout::default()
-        .offset(plane_offset as u64)
-        .row_pitch(plane_stride as u64)];
+        .offset(u64::from(plane_offset))
+        .row_pitch(u64::from(plane_stride))];
 
     let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
         .drm_format_modifier(modifier)
@@ -372,7 +379,7 @@ unsafe fn import_image(
 /// (Re)allocate the slot's staging buffer if it doesn't exist or is
 /// too small. The new buffer is mapped once and stays mapped for
 /// its lifetime — `vkMapMemory` / `vkUnmapMemory` per frame are
-/// pure overhead on HOST_COHERENT memory (the spec explicitly
+/// pure overhead on `HOST_COHERENT` memory (the spec explicitly
 /// permits leaving the mapping live across submits).
 fn ensure_staging(
     inner: &Inner,
@@ -449,7 +456,8 @@ fn ensure_staging(
             inner.device.destroy_buffer(buffer, None);
         }
         FerricastError::Capture(format!("vk map_memory (staging): {e}"))
-    })? as *mut u8;
+    })?
+    .cast::<u8>();
 
     slot.staging = Some(Staging {
         buffer,
@@ -612,7 +620,13 @@ fn export_read_fence(dmabuf_fd: RawFd) -> Option<OwnedFd> {
     // frame; `arg` matches the kernel's struct layout and outlives the
     // call. The request number's type differs between libc flavours,
     // hence the inferred cast.
-    let rc = unsafe { libc::ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE as _, &raw mut arg) };
+    let rc = unsafe {
+        libc::ioctl(
+            dmabuf_fd,
+            DMA_BUF_IOCTL_EXPORT_SYNC_FILE.into(),
+            &raw mut arg,
+        )
+    };
     if rc != 0 || arg.fd < 0 {
         trace!(
             error = %std::io::Error::last_os_error(),
@@ -737,7 +751,7 @@ mod tests {
     /// Two distinct fds for the same underlying buffer (one obtained
     /// by `dup`) must produce the same [`super::BufferId`] — that is
     /// the invariant the import cache relies on to avoid re-importing
-    /// every PipeWire frame.
+    /// every `PipeWire` frame.
     #[test]
     fn dupd_fds_share_buffer_id() {
         let a = make_memfd("ferricast-buffer-id-a");

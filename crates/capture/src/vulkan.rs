@@ -1,7 +1,7 @@
-//! Vulkan-backed DmaBuf importer, shared by the capture backends.
+//! Vulkan-backed `DmaBuf` importer, shared by the capture backends.
 //!
-//! Why this module exists: PipeWire's screencast on Mutter / KWin
-//! prefers DmaBuf for performance, but the buffers come back with
+//! Why this module exists: `PipeWire`'s screencast on Mutter / `KWin`
+//! prefers `DmaBuf` for performance, but the buffers come back with
 //! GPU-vendor-specific DRM format modifiers (tiled, compressed). We
 //! can't `mmap` those for CPU read — every byte we'd see would be
 //! garbage. The fix is to import the dmabuf into a `VkImage`, blit it
@@ -14,10 +14,10 @@
 //! * [`VulkanImporter::new`] — try to bring up Vulkan. Returns `Err`
 //!   on systems without a loader / driver / required extensions, in
 //!   which case the capture backend falls back to CPU frames (the
-//!   PipeWire worker to SHM-only EnumFormat advertising).
+//!   `PipeWire` worker to SHM-only `EnumFormat` advertising).
 //! * [`VulkanImporter::supported_modifiers`] — the actual DRM
 //!   modifiers the GPU can produce/consume for a given pixel format.
-//!   Used to populate the EnumFormat pod's `VideoModifier` choice.
+//!   Used to populate the `EnumFormat` pod's `VideoModifier` choice.
 //! * [`VulkanImporter::import_and_readback`] — import a single dmabuf
 //!   plane and copy its decoded pixels back to a CPU [`bytes::Bytes`].
 //! * [`VulkanImporter::reset_cache`] — invalidate per-frame caches
@@ -25,7 +25,7 @@
 //!
 //! Performance note: the importer keeps a `RING_DEPTH`-slot ring of
 //! `(command_buffer, fence, staging)` plus a `HashMap<BufferId,
-//! VkImage>` cache. PipeWire reuses the same handful of underlying
+//! VkImage>` cache. `PipeWire` reuses the same handful of underlying
 //! dmabuf objects from a small pool, but every frame carries its own
 //! `dup`'d fd, so the `RawFd` number is not stable. We key the cache
 //! on `(st_dev, st_ino)` of the fd instead, which is invariant across
@@ -70,7 +70,10 @@ pub(super) struct Inner {
     /// Entry must outlive `instance` — it owns the `libvulkan.so`
     /// dlopen handle. Kept here so the loader stays mapped for as
     /// long as we have any Vulkan state.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "owns the loaded Vulkan library for as long as any Vulkan state lives"
+    )]
     pub(super) entry: ash::Entry,
     pub(super) instance: ash::Instance,
     pub(super) physical_device: vk::PhysicalDevice,
@@ -83,9 +86,9 @@ pub(super) struct Inner {
     /// Currently unused (we hand Vulkan an explicit modifier on
     /// import so we don't need to query it back) but cheap to keep
     /// loaded.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "keeps the DRM format modifier extension loaded")]
     pub(super) drm_modifier: ash::ext::image_drm_format_modifier::Device,
-    #[allow(dead_code)] // used for the future GPU-handoff encoder path
+    #[allow(dead_code, reason = "for the GPU-handoff encoder path")]
     pub(super) external_memory_fd: ash::khr::external_memory_fd::Device,
     /// `Some` when the device can import a `sync_file` into a
     /// semaphore; used to wait on the dmabuf's implicit write fence.
@@ -97,7 +100,7 @@ pub(super) struct Inner {
     pub(super) memory_props: vk::PhysicalDeviceMemoryProperties,
 }
 
-/// Stable identity for a dmabuf-backed buffer. PipeWire's screencast
+/// Stable identity for a dmabuf-backed buffer. `PipeWire`'s screencast
 /// portal frequently `dup`s the same underlying dmabuf and hands us a
 /// fresh fd number, but `(st_dev, st_ino)` is the same for every dup
 /// of the same buffer — so it is a safe key for our import cache.
@@ -107,7 +110,7 @@ pub(super) struct BufferId {
     pub(super) ino: u64,
 }
 
-/// Cap on how many imported `VkImage`s we keep cached. Real PipeWire
+/// Cap on how many imported `VkImage`s we keep cached. Real `PipeWire`
 /// pools are 4-8 buffers; this cap exists only as a safety net for
 /// pathological compositors that mint a new buffer every frame. When
 /// exceeded, the oldest entry (by insertion order) is destroyed.
@@ -158,7 +161,7 @@ pub(super) struct Staging {
     pub(super) capacity: u64,
     /// Persistent host-visible mapping. Mapped once at creation,
     /// unmapped only on destruction — `vkMapMemory` / `vkUnmapMemory`
-    /// per frame is pointless overhead for HOST_COHERENT memory and
+    /// per frame is pointless overhead for `HOST_COHERENT` memory and
     /// the spec explicitly allows leaving the mapping live.
     ///
     /// Stored as raw `*mut u8` so we don't fight Rust's lifetime
@@ -214,8 +217,8 @@ impl VulkanImporter {
     }
 
     /// DRM modifiers the GPU can import and read back for the given
-    /// pixel format. PipeWire passes these to its `VideoModifier`
-    /// choice in the EnumFormat pod.
+    /// pixel format. `PipeWire` passes these to its `VideoModifier`
+    /// choice in the `EnumFormat` pod.
     pub(crate) fn supported_modifiers(&self, format: PixelFormat) -> Vec<u64> {
         let Some(vk_format) = format::pixel_format_to_vk(format) else {
             debug!(?format, "no VkFormat mapping, treating as unsupported");
@@ -261,7 +264,7 @@ impl VulkanImporter {
         import::run_sync(&self.inner, &mut state, &import, format)
     }
 
-    /// Wipe the imported-image cache. Called when PipeWire
+    /// Wipe the imported-image cache. Called when `PipeWire`
     /// renegotiates: the old buffers are about to be released and
     /// any new stream may pick a different format, so cached
     /// `VkImage`s would be stale.
@@ -321,7 +324,9 @@ impl State {
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(inner.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(RING_DEPTH as u32);
+            .command_buffer_count(
+                u32::try_from(RING_DEPTH).expect("invariant: the ring holds a handful of buffers"),
+            );
         let cmd_buffers = unsafe { inner.device.allocate_command_buffers(&cmd_alloc) }
             .map_err(|e| FerricastError::Capture(format!("vk allocate_command_buffers: {e}")))?;
 

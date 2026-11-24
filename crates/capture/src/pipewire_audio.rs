@@ -1,7 +1,7 @@
-//! PipeWire audio capture backend.
+//! `PipeWire` audio capture backend.
 //!
 //! Symmetric counterpart to [`crate::PipeWireCapture`]: a dedicated
-//! PipeWire main loop runs on its own OS thread, pulls audio buffers
+//! `PipeWire` main loop runs on its own OS thread, pulls audio buffers
 //! from either the system's default sink monitor (when [`AudioSource
 //! ::DefaultMonitor`] is selected) or a caller-picked node id (when
 //! [`AudioSource::Node`] is used), and forwards them as PCM frames
@@ -79,12 +79,13 @@ impl Drop for AudioWorkerHandle {
     }
 }
 
-/// PipeWire audio capture. Implements [`AudioCapture`].
+/// `PipeWire` audio capture. Implements [`AudioCapture`].
 pub struct PipeWireAudioCapture {
     worker: Option<AudioWorkerHandle>,
 }
 
 impl PipeWireAudioCapture {
+    #[must_use]
     pub fn new() -> Self {
         Self { worker: None }
     }
@@ -150,15 +151,13 @@ impl AudioCapture for PipeWireAudioCapture {
     fn sample_rate(&self) -> u32 {
         self.worker
             .as_ref()
-            .map(|w| w.negotiated.sample_rate.load(Ordering::Relaxed))
-            .unwrap_or(0)
+            .map_or(0, |w| w.negotiated.sample_rate.load(Ordering::Relaxed))
     }
 
     fn channels(&self) -> u16 {
-        self.worker
-            .as_ref()
-            .map(|w| w.negotiated.channels.load(Ordering::Relaxed) as u16)
-            .unwrap_or(0)
+        self.worker.as_ref().map_or(0, |w| {
+            u16::try_from(w.negotiated.channels.load(Ordering::Relaxed)).unwrap_or(u16::MAX)
+        })
     }
 }
 
@@ -185,13 +184,13 @@ fn spawn_worker(
         .name("ferricast-pw-audio".into())
         .spawn(move || {
             if let Err(e) = run_loop(
-                source,
+                &source,
                 config,
-                mute,
-                frame_tx,
+                &mute,
+                &frame_tx,
                 &error_tx,
                 term_rx,
-                neg_for_thread,
+                &neg_for_thread,
             ) {
                 error!(error = %e, "PipeWire audio worker exited with error");
                 let _ = error_tx.try_send(e.to_string());
@@ -215,10 +214,10 @@ struct UserData {
     negotiated: Arc<NegotiatedAudio>,
     first_frame_logged: bool,
     /// Sample count we've processed so far. Logged periodically so
-    /// the operator can sanity-check that PipeWire's delivered
+    /// the operator can sanity-check that `PipeWire`'s delivered
     /// sample-rate matches our claimed `sample_rate` field. After 5 s
     /// of wall time, we should have `≈ 5 × sample_rate` samples; a
-    /// significant deviation means PipeWire is either resampling
+    /// significant deviation means `PipeWire` is either resampling
     /// behind our back (wrong) or being throttled by the consumer
     /// (drops we should hear).
     log_sample_counter: u64,
@@ -265,28 +264,25 @@ impl PtsClock {
     fn stamp(&mut self, samples: u64, sample_rate: u32, now_us: u64) -> Stamp {
         let rate = u64::from(sample_rate.max(1));
         let mut reanchored_from_drift_us = None;
-        let timestamp_us = match self.anchor_us {
-            Some(anchor) => {
-                let counted = anchor
-                    .saturating_add(self.samples_since_anchor.saturating_mul(1_000_000) / rate);
-                let drift = i128::from(counted) - i128::from(now_us);
-                if drift.unsigned_abs() > u128::from(PTS_REANCHOR_THRESHOLD_US) {
-                    reanchored_from_drift_us = Some(i64::try_from(drift).unwrap_or(if drift > 0 {
-                        i64::MAX
-                    } else {
-                        i64::MIN
-                    }));
-                    self.anchor_us = Some(now_us);
-                    self.samples_since_anchor = 0;
-                    now_us
+        let timestamp_us = if let Some(anchor) = self.anchor_us {
+            let counted =
+                anchor.saturating_add(self.samples_since_anchor.saturating_mul(1_000_000) / rate);
+            let drift = i128::from(counted) - i128::from(now_us);
+            if drift.unsigned_abs() > u128::from(PTS_REANCHOR_THRESHOLD_US) {
+                reanchored_from_drift_us = Some(i64::try_from(drift).unwrap_or(if drift > 0 {
+                    i64::MAX
                 } else {
-                    counted
-                }
-            }
-            None => {
+                    i64::MIN
+                }));
                 self.anchor_us = Some(now_us);
+                self.samples_since_anchor = 0;
                 now_us
+            } else {
+                counted
             }
+        } else {
+            self.anchor_us = Some(now_us);
+            now_us
         };
         self.samples_since_anchor = self.samples_since_anchor.saturating_add(samples);
         Stamp {
@@ -297,13 +293,13 @@ impl PtsClock {
 }
 
 fn run_loop(
-    source: AudioSource,
+    source: &AudioSource,
     config: AudioCaptureConfig,
-    mute: AudioMuteHandle,
-    frame_tx: mpsc::Sender<AudioFrame>,
+    mute: &AudioMuteHandle,
+    frame_tx: &mpsc::Sender<AudioFrame>,
     error_tx: &mpsc::Sender<String>,
     term_rx: pw::channel::Receiver<Terminate>,
-    negotiated: Arc<NegotiatedAudio>,
+    negotiated: &Arc<NegotiatedAudio>,
 ) -> Result<()> {
     pw::init();
 
@@ -361,7 +357,7 @@ fn run_loop(
                 info!(?old, ?new, "audio stream state changed");
                 if let StreamState::Error(msg) = new {
                     error!(%msg, "audio stream entered Error state");
-                    let _ = error_tx.try_send(msg.to_string());
+                    let _ = error_tx.try_send(msg.clone());
                     mainloop.quit();
                 }
             }
@@ -429,7 +425,7 @@ fn handle_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
         return;
     }
     let negotiated_rate = info.rate();
-    let negotiated_channels = info.channels() as u16;
+    let negotiated_channels = u16::try_from(info.channels()).unwrap_or(u16::MAX);
     let negotiated_format = info.format();
 
     // Sanity check: with MANDATORY flags on the format pod PipeWire
@@ -462,9 +458,13 @@ fn handle_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
         .store(negotiated_rate, Ordering::Relaxed);
     ud.negotiated
         .channels
-        .store(negotiated_channels as u32, Ordering::Relaxed);
+        .store(u32::from(negotiated_channels), Ordering::Relaxed);
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear setup or event sequence over shared state; splitting it would scatter that state"
+)]
 fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender<AudioFrame>) {
     let Some(mut buffer) = stream.dequeue_buffer() else {
         trace!("audio process tick with no buffer");
@@ -518,7 +518,8 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
     // chunk delivered before the format callback, unusual but cheap
     // to guard).
     let negotiated_rate = ud.negotiated.sample_rate.load(Ordering::Relaxed);
-    let negotiated_channels = ud.negotiated.channels.load(Ordering::Relaxed) as u16;
+    let negotiated_channels =
+        u16::try_from(ud.negotiated.channels.load(Ordering::Relaxed)).unwrap_or(u16::MAX);
     let frame_rate = if negotiated_rate > 0 {
         negotiated_rate
     } else {
@@ -565,10 +566,17 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
             // they diverge by > 1% something is wrong (PipeWire
             // backpressure dropping chunks, hidden resample,
             // sample-counting bug, etc.).
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss,
+                reason = "a log-only rate estimate; sample counts stay far below 2^52"
+            )]
             let effective_rate = (ud.log_sample_counter as f64 / elapsed.as_secs_f64()) as u32;
             let expected = ud.sample_rate;
             let deviation_pct = if expected > 0 {
-                ((effective_rate as f64 - expected as f64).abs() / expected as f64) * 100.0
+                ((f64::from(effective_rate) - f64::from(expected)).abs() / f64::from(expected))
+                    * 100.0
             } else {
                 0.0
             };
@@ -578,7 +586,7 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
                     effective_sample_rate = effective_rate,
                     deviation_pct,
                     samples_observed = ud.log_sample_counter,
-                    elapsed_ms = elapsed.as_millis() as u64,
+                    elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                     "audio: effective sample rate deviates from configured rate \
                      — either PipeWire is silently delivering a different rate \
                      or some chunks were dropped"
@@ -587,7 +595,7 @@ fn handle_process(stream: &StreamRef, ud: &mut UserData, frame_tx: &mpsc::Sender
                 debug!(
                     sample_rate = effective_rate,
                     samples = ud.log_sample_counter,
-                    elapsed_ms = elapsed.as_millis() as u64,
+                    elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                     "audio: 5 s sample-rate health check"
                 );
             }
@@ -623,7 +631,7 @@ fn pod_view(bytes: &[u8]) -> &Pod {
 
 /// Build a fixed audio format pod: S16LE @ `sample_rate` × `channels`.
 ///
-/// Properties go in with `flags::empty()` — PipeWire treats them as
+/// Properties go in with `flags::empty()` — `PipeWire` treats them as
 /// hints rather than hard constraints, so its audioconvert graph
 /// can resample / remix transparently when the upstream sink runs at
 /// a different rate (44.1 kHz hardware against our 48 kHz request,
@@ -633,12 +641,12 @@ fn pod_view(bytes: &[u8]) -> &Pod {
 /// caller (`run_audio_pipeline` in the binary) reads the first PCM
 /// chunk's `AudioFrame::sample_rate` and configures the AAC encoder
 /// to match, so the emitted ADTS header carries the right
-/// sf_index and the chromecast plays at the correct pitch even
+/// `sf_index` and the chromecast plays at the correct pitch even
 /// when our requested rate didn't survive negotiation verbatim.
 ///
 /// (An earlier attempt at `MANDATORY` flags on every property
 /// turned out to wedge the chromecast in a permanent "LOADING"
-/// state on at least one PipeWire / sink combination — whatever
+/// state on at least one `PipeWire` / sink combination — whatever
 /// the precise mechanism, the constraint was too tight to be
 /// safe across hardware.)
 fn build_audio_format_pod(sample_rate: u32, channels: u16) -> Vec<u8> {
@@ -680,12 +688,12 @@ fn build_audio_format_pod(sample_rate: u32, channels: u16) -> Vec<u8> {
             Property {
                 key: FormatProperties::AudioRate.as_raw(),
                 flags: PropertyFlags::empty(),
-                value: Value::Int(sample_rate as i32),
+                value: Value::Int(sample_rate.cast_signed()),
             },
             Property {
                 key: FormatProperties::AudioChannels.as_raw(),
                 flags: PropertyFlags::empty(),
-                value: Value::Int(channels as i32),
+                value: Value::Int(i32::from(channels)),
             },
             Property {
                 key: FormatProperties::AudioPosition.as_raw(),
@@ -710,7 +718,9 @@ fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_micros() as u64
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

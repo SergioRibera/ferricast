@@ -1,9 +1,9 @@
-//! xdg-desktop-portal ScreenCast handshake.
+//! xdg-desktop-portal `ScreenCast` handshake.
 //!
-//! Hands back a [`PortalStream`] containing the global PipeWire `node_id`
+//! Hands back a [`PortalStream`] containing the global `PipeWire` `node_id`
 //! and size hints. Unlike the `OpenPipeWireRemote` flow, we do NOT take
 //! the portal's private fd — once the portal has authorized the source
-//! the node is also visible on the user's regular PipeWire daemon, so
+//! the node is also visible on the user's regular `PipeWire` daemon, so
 //! we can `Context::connect(None)` from `stream.rs`. Avoiding the fd
 //! sidesteps the variations in how each portal implementation
 //! (gnome / wlroots / kwin) handles the private socket — which is
@@ -27,11 +27,14 @@ pub(super) struct PortalStream {
     /// Hint of the source position on the virtual desktop. Currently
     /// unused; kept here so the future window-cropping path can read it
     /// without re-doing the portal handshake.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "kept for restoring a stream without re-doing the portal handshake"
+    )]
     pub position_hint: Option<(i32, i32)>,
 }
 
-/// Live xdg-desktop-portal ScreenCast session. The compositor keeps
+/// Live xdg-desktop-portal `ScreenCast` session. The compositor keeps
 /// the cast (and its "sharing" indicator) alive until the session is
 /// closed, so the owner must call [`PortalSession::close`] on stop;
 /// dropping it only drops the D-Bus proxy.
@@ -130,7 +133,9 @@ async fn negotiate(
 
     let portal_stream = PortalStream {
         node_id: stream.pipe_wire_node_id(),
-        size_hint: stream.size().map(|(w, h)| (w as u32, h as u32)),
+        size_hint: stream
+            .size()
+            .map(|(w, h)| (w.cast_unsigned(), h.cast_unsigned())),
         position_hint: stream.position(),
     };
 

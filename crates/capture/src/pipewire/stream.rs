@@ -1,23 +1,23 @@
-//! PipeWire stream worker.
+//! `PipeWire` stream worker.
 //!
 //! Mirrors the wlx-capture flow as closely as possible — that is the
-//! production-tested reference for screencast on Mutter / KWin / wlroots:
+//! production-tested reference for screencast on Mutter / `KWin` / wlroots:
 //!
-//! * `Context::connect(None)` — the user's regular PipeWire daemon, NOT
+//! * `Context::connect(None)` — the user's regular `PipeWire` daemon, NOT
 //!   `OpenPipeWireRemote`'s private fd. Once the portal authorizes the
 //!   source, the node is also visible on the regular daemon, and going
 //!   through the regular daemon avoids the per-portal-implementation
 //!   quirks of the private fd.
 //! * `MainLoop` cloned by value into closures (it has an internal Rc).
-//! * EnumFormat list with one pod per format carrying a
+//! * `EnumFormat` list with one pod per format carrying a
 //!   `MANDATORY | DONT_FIXATE` modifier choice + a SHM-only fallback pod.
 //! * `param_changed` unconditionally `update_params`'s `[Buffers, Meta]`
 //!   without branching on `MODIFIER_FIXATION_REQUIRED`.
 //! * `process` drains stale buffers and processes only the newest.
 //!
-//! Buffer reading: CPU-mapped (MemFd / MemPtr) buffers and DmaBuf
+//! Buffer reading: CPU-mapped (`MemFd` / `MemPtr`) buffers and `DmaBuf`
 //! with a LINEAR / INVALID modifier are copied out before the buffer
-//! goes back to the compositor. Tiled / compressed DmaBufs are emitted
+//! goes back to the compositor. Tiled / compressed `DmaBufs` are emitted
 //! as `GpuFrame`s that keep their buffer dequeued until downstream
 //! drops them (see [`super::lease`]).
 
@@ -57,7 +57,11 @@ pub(super) type SharedFormat = Arc<RwLock<Option<NegotiatedFormat>>>;
 /// Sent over `pipewire::channel` to wake the PW main loop and stop it.
 struct Terminate;
 
-/// Per-stream state shared between PipeWire callbacks.
+/// Per-stream state shared between `PipeWire` callbacks.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent one-shot log latches, not a state machine"
+)]
 struct UserData {
     video_info: VideoInfoRaw,
     /// Last fully-fixated negotiation, mirrored into `shared` for
@@ -70,13 +74,13 @@ struct UserData {
     /// Set when we've logged the first non-empty frame forwarded
     /// downstream — the moment capture is actually working.
     first_frame_logged: bool,
-    /// Set once we've logged hitting the DmaBuf hold limit.
+    /// Set once we've logged hitting the `DmaBuf` hold limit.
     lease_limit_logged: bool,
     /// Target frame period derived from `CaptureConfig::fps`. Used
     /// to throttle Vulkan readback so we don't waste CPU on
     /// memcpy'ing 8 MB at 60 fps when the consumer only encodes at
     /// 30 fps. Without this, the worker dutifully runs the full
-    /// Vulkan import + blit + memcpy for every buffer PipeWire
+    /// Vulkan import + blit + memcpy for every buffer `PipeWire`
     /// delivers (which on a 60 Hz compositor is 60/s = ~480 MB/s of
     /// memory bandwidth) even though the downstream encoder only
     /// consumes every second frame.
@@ -92,7 +96,7 @@ struct UserData {
     /// `Some` when Vulkan came up successfully and we can import
     /// the dmabuf modifiers we advertised. The PW worker thread
     /// invokes `importer.readback(...)` directly inside
-    /// `handle_process` for non-linear DmaBuf frames so the GPU
+    /// `handle_process` for non-linear `DmaBuf` frames so the GPU
     /// blit-and-copy overlaps with the encoder doing CPU work on the
     /// previous frame. `None` collapses the dmabuf path to a warning
     /// + drop and we rely on the SHM fallback.
@@ -135,7 +139,7 @@ impl WorkerHandle {
 
 impl Drop for WorkerHandle {
     /// Asks the worker to exit and detaches it, so dropping a capture
-    /// never blocks the dropping thread on the PipeWire main loop.
+    /// never blocks the dropping thread on the `PipeWire` main loop.
     fn drop(&mut self) {
         let _ = self.terminator.send(Terminate);
     }
@@ -160,7 +164,7 @@ pub(super) fn spawn(
     let join = std::thread::Builder::new()
         .name("ferricast-pw".into())
         .spawn(move || {
-            if let Err(e) = run(portal, config, shared, frame_tx, &error_tx, term_rx) {
+            if let Err(e) = run(&portal, &config, &shared, &frame_tx, &error_tx, term_rx) {
                 error!(error = %e, "PipeWire worker exited with error");
                 let _ = error_tx.try_send(e.to_string());
             }
@@ -175,11 +179,15 @@ pub(super) fn spawn(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear setup or event sequence over shared state; splitting it would scatter that state"
+)]
 fn run(
-    portal: PortalStream,
-    config: CaptureConfig,
-    shared: SharedFormat,
-    frame_tx: mpsc::Sender<CapturedFrame>,
+    portal: &PortalStream,
+    config: &CaptureConfig,
+    shared: &SharedFormat,
+    frame_tx: &mpsc::Sender<CapturedFrame>,
     error_tx: &mpsc::Sender<String>,
     term_rx: pw::channel::Receiver<Terminate>,
 ) -> Result<()> {
@@ -211,9 +219,9 @@ fn run(
     );
 
     let enum_params = EnumFormatParams {
-        default_width: portal.size_hint.map(|(w, _)| w).unwrap_or(1920),
-        default_height: portal.size_hint.map(|(_, h)| h).unwrap_or(1080),
-        default_fps: config.fps.max(1),
+        width: portal.size_hint.map_or(1920, |(w, _)| w),
+        height: portal.size_hint.map_or(1080, |(_, h)| h),
+        fps: config.fps.max(1),
     };
 
     // Try to bring Vulkan up — gives us GPU-supported DRM modifiers
@@ -257,7 +265,7 @@ fn run(
     let user_data = Rc::new(RefCell::new(UserData {
         video_info: VideoInfoRaw::default(),
         negotiated: None,
-        shared: Arc::clone(&shared),
+        shared: Arc::clone(shared),
         first_buffer_logged: false,
         first_frame_logged: false,
         lease_limit_logged: false,
@@ -266,7 +274,7 @@ fn run(
         // 0.95 of the period so a buffer that arrives ~one
         // refresh tick early still gets processed instead of
         // being dropped by a hair.
-        frame_period: Duration::from_secs_f64(0.95 / (config.fps.max(1) as f64)),
+        frame_period: Duration::from_secs_f64(0.95 / f64::from(config.fps.max(1))),
         last_processed_at: None,
         deferred: false,
         importer,
@@ -374,7 +382,7 @@ fn run(
     let _release_attach = release_rx.attach(mainloop.loop_(), {
         let stream = Rc::clone(&stream);
         let leases = Rc::clone(&leases);
-        move |release| leases.borrow_mut().release(&stream, release)
+        move |release| leases.borrow_mut().release(&stream, &release)
     });
 
     let _term_attach = term_rx.attach(mainloop.loop_(), {
@@ -488,6 +496,10 @@ fn handle_param_changed(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear setup or event sequence over shared state; splitting it would scatter that state"
+)]
 fn handle_process(
     stream: &StreamRef,
     ud: &mut UserData,
@@ -547,14 +559,19 @@ fn handle_process(
     };
 
     let chunk = plane.chunk();
-    let mut stride = chunk.stride() as u32;
+    let mut stride = chunk.stride().cast_unsigned();
     let chunk_size = chunk.size();
     let chunk_offset = chunk.offset();
     let plane_type = plane.type_();
     let plane_fd = plane.as_raw().fd;
     let plane_maxsize = plane.as_raw().maxsize;
 
-    if !ud.first_buffer_logged {
+    if ud.first_buffer_logged {
+        trace!(
+            ?plane_type,
+            chunk_size, chunk_offset, stride, "buffer dequeued"
+        );
+    } else {
         info!(
             ?plane_type,
             chunk_size,
@@ -565,11 +582,6 @@ fn handle_process(
             "first buffer received from PipeWire"
         );
         ud.first_buffer_logged = true;
-    } else {
-        trace!(
-            ?plane_type,
-            chunk_size, chunk_offset, stride, "buffer dequeued"
-        );
     }
 
     if chunk_size == 0 {
@@ -843,9 +855,9 @@ fn read_cpu_buffer(
     slice.get(range).map(Bytes::copy_from_slice)
 }
 
-/// Linear / INVALID-modifier DmaBuf: we can read the bytes directly
+/// Linear / INVALID-modifier `DmaBuf`: we can read the bytes directly
 /// via `mmap`. Used for the trivial case (Mutter falling back to
-/// LINEAR even though it negotiated DmaBuf).
+/// LINEAR even though it negotiated `DmaBuf`).
 fn read_dmabuf_mmap(
     plane: &mut pw::spa::buffer::Data,
     chunk_offset: u32,
@@ -853,13 +865,13 @@ fn read_dmabuf_mmap(
 ) -> Option<Bytes> {
     let raw = plane.as_raw();
 
-    let fd = raw.fd as RawFd;
+    let fd = RawFd::try_from(raw.fd).unwrap_or(-1);
     if fd < 0 {
         warn!("DmaBuf plane has invalid fd");
         return None;
     }
 
-    let mapoffset = raw.mapoffset as i64;
+    let mapoffset = i64::from(raw.mapoffset);
     let maxsize = raw.maxsize as usize;
     if maxsize == 0 {
         warn!("DmaBuf plane has zero maxsize");
@@ -884,15 +896,14 @@ fn read_dmabuf_mmap(
 
     let bytes = unsafe {
         let slice = std::slice::from_raw_parts(ptr as *const u8, maxsize);
-        match layout.frame_range(slice.len(), chunk_offset) {
-            Some(range) => slice.get(range).map(Bytes::copy_from_slice),
-            None => {
-                warn!(
-                    ?layout,
-                    maxsize, chunk_offset, "DmaBuf plane too small for frame"
-                );
-                None
-            }
+        if let Some(range) = layout.frame_range(slice.len(), chunk_offset) {
+            slice.get(range).map(Bytes::copy_from_slice)
+        } else {
+            warn!(
+                ?layout,
+                maxsize, chunk_offset, "DmaBuf plane too small for frame"
+            );
+            None
         }
     };
 
@@ -907,7 +918,9 @@ fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_micros() as u64
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
