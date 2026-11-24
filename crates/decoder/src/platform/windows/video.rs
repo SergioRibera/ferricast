@@ -4,27 +4,36 @@
 //! the MFT carries to the picture decoded from it through its own
 //! reordering. A call returns at most one picture; pictures that came
 //! out together wait for the next calls, and `flush` drains the rest.
+//!
+//! Hardware transforms decode into Direct3D 11 textures (a device of
+//! their own, handed over with `MFT_MESSAGE_SET_D3D_MANAGER`): those
+//! go out as [`CapturedFrame::Native`] for [`FrameMemory::Native`] and
+//! are read back otherwise. Software transforms decode to system memory.
+//! 10-bit streams come out as P010 when the configuration asks for it
+//! (`pixel_format`), downshifted to NV12 on the CPU path otherwise.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use ferricast_codec::{OpenFn, ProbeFn, VideoDecoderSession};
 use ferricast_core::{
     CapturedFrame, Codec, CodecError, CodecResult, CodecTarget, ColourDescription, ColourRange,
-    DecoderConfig, EncodedFrame, Operation, PixelFormat,
+    DecoderConfig, EncodedFrame, FrameMemory, HdrMetadata, NativeFrame, Operation, PixelFormat,
+    RawFrame,
 };
 use windows::Win32::Media::MediaFoundation::{
     IMFMediaType, IMFTransform, MF_E_INVALIDMEDIATYPE, MF_E_UNSUPPORTED_D3D_TYPE,
     MF_E_UNSUPPORTED_FORMAT, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE,
     MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE, MFMediaType_Video, MFT_CATEGORY_VIDEO_DECODER,
     MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_NV12,
-    MFVideoFormat_VP80, MFVideoFormat_VP90,
+    MFVideoFormat_P010, MFVideoFormat_VP80, MFVideoFormat_VP90,
 };
 use windows::core::GUID;
 
 use super::mf::{
-    self, BACKEND, Kind, MfResult, Output, Search, Transform, Worker, colour_of, hns, media_type,
-    micros, pack, unpack,
+    self, BACKEND, D3d11Texture, Device, Kind, MfResult, Output, Rect, Search, Transform, Worker,
+    colour_of, hdr_of, hns, media_type, micros, pack, unpack,
 };
 use crate::nv12;
 
@@ -126,7 +135,7 @@ impl MfVideoDecoder {
     fn open(search: Search, config: &DecoderConfig) -> CodecResult<Self> {
         let config = config.clone();
         let worker = Worker::spawn("ferricast-mf-video-decoder", move || {
-            search.open(|transform| Session::setup(transform, &config))
+            search.open(|transform| Session::setup(transform, &config, search.kind))
         })?;
         Ok(Self { search, worker })
     }
@@ -148,9 +157,11 @@ impl VideoDecoderSession for MfVideoDecoder {
     }
 }
 
-/// Where the planes of the MFT's NV12 output are.
+/// Where the planes of the MFT's NV12 / P010 output are.
 #[derive(Debug, Clone, Copy)]
 struct Picture {
+    /// `Nv12` or `P010`: the output subtype.
+    format: PixelFormat,
     /// Visible size.
     width: usize,
     height: usize,
@@ -163,31 +174,91 @@ struct Picture {
     /// Bytes per row, when the type states it.
     stride: Option<usize>,
     colour: Option<ColourDescription>,
+    hdr: Option<HdrMetadata>,
+}
+
+impl Picture {
+    /// Bytes per sample.
+    fn sample_bytes(&self) -> usize {
+        if self.format == PixelFormat::P010 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// The visible area, for a texture.
+    fn visible(&self) -> Option<Rect> {
+        let to = |v: usize| u32::try_from(v).ok();
+        Some(Rect {
+            x: to(self.x)?,
+            y: to(self.y)?,
+            width: to(self.width)?,
+            height: to(self.height)?,
+        })
+    }
 }
 
 struct Session {
     transform: Transform,
     format: PixelFormat,
+    memory: FrameMemory,
     fallback_colour: ColourDescription,
+    fallback_hdr: Option<HdrMetadata>,
     picture: Picture,
+    /// The Direct3D device the transform decodes on, when it took one;
+    /// its outputs are then textures.
+    device: Option<Device>,
     ready: VecDeque<CapturedFrame>,
     /// Timestamps of packets fed but not yet decoded into a picture.
     in_flight: Timestamps,
 }
 
-/// Picks the MFT's NV12 output type (initially and after a stream change).
-fn select_nv12(mft: &IMFTransform) -> windows::core::Result<()> {
+/// Output samples a Direct3D decoder keeps spare for frames consumers
+/// still hold.
+const SPARE_SURFACES: u32 = 6;
+
+/// Picks the first offered output type among `preferred`, in that order.
+fn select_output(mft: &IMFTransform, preferred: [GUID; 2]) -> windows::core::Result<()> {
+    let mut offered = Vec::new();
     for index in 0.. {
         // SAFETY: plain COM calls on the live transform; the loop ends
         // when the MFT runs out of types (an error).
-        let offered = unsafe { mft.GetOutputAvailableType(0, index)? };
+        let Ok(media) = (unsafe { mft.GetOutputAvailableType(0, index) }) else {
+            break;
+        };
         // SAFETY: plain attribute read.
-        if unsafe { offered.GetGUID(&MF_MT_SUBTYPE)? } == MFVideoFormat_NV12 {
-            // SAFETY: as above.
-            return unsafe { mft.SetOutputType(0, &offered, 0) };
+        let subtype = unsafe { media.GetGUID(&MF_MT_SUBTYPE)? };
+        offered.push((subtype, media));
+    }
+    for wanted in preferred {
+        if let Some((_, media)) = offered.iter().find(|(subtype, _)| *subtype == wanted) {
+            // SAFETY: plain COM call on the live transform.
+            return unsafe { mft.SetOutputType(0, media, 0) };
         }
     }
     Err(MF_E_INVALIDMEDIATYPE.into())
+}
+
+/// NV12, else P010 (downshifted to 8 bits on the CPU path).
+fn select_nv12(mft: &IMFTransform) -> windows::core::Result<()> {
+    select_output(mft, [MFVideoFormat_NV12, MFVideoFormat_P010])
+}
+
+/// P010 for 10-bit streams (an 8-bit stream offers no P010), else NV12.
+fn select_p010(mft: &IMFTransform) -> windows::core::Result<()> {
+    select_output(mft, [MFVideoFormat_P010, MFVideoFormat_NV12])
+}
+
+/// The high byte of every 16-bit sample: P010 as NV12, rows packed.
+fn downshift_p010(data: &[u8], stride: usize, width: usize, height: usize) -> (Vec<u8>, usize) {
+    let row = width.div_ceil(2) * 2;
+    let rows = height + height.div_ceil(2);
+    let mut out = Vec::with_capacity(row * rows);
+    for line in data.chunks(stride).take(rows) {
+        out.extend(line.iter().skip(1).step_by(2).take(row));
+    }
+    (out, row)
 }
 
 /// A failed decode call: a stream the MFT does not implement can go to
@@ -211,7 +282,11 @@ fn decode_failure(call: &str, error: &windows::core::Error) -> CodecError {
 }
 
 impl Session {
-    fn setup(mut transform: Transform, config: &DecoderConfig) -> CodecResult<Self> {
+    /// `kind` decides the memory: a hardware transform decodes into
+    /// Direct3D 11 textures when it can (handed out as they are for
+    /// [`FrameMemory::Native`], read back otherwise), a software one into
+    /// system memory.
+    fn setup(mut transform: Transform, config: &DecoderConfig, kind: Kind) -> CodecResult<Self> {
         let op = Operation::Open;
         let subtype = search(config.codec, false)
             .input
@@ -219,6 +294,25 @@ impl Session {
         if config.low_latency {
             transform.request_low_latency();
         }
+        let device = match kind {
+            Kind::Software => None,
+            Kind::Hardware => match Device::hardware() {
+                Ok(device) => transform.attach_d3d11(&device)?.then_some(device),
+                Err(error) => {
+                    tracing::info!(transform = transform.name(), %error, "decoding to system memory");
+                    None
+                }
+            },
+        };
+        if device.is_some() {
+            transform.reserve_output_samples(SPARE_SURFACES);
+        }
+        let (select, wanted): (mf::Renegotiate, &str) = if config.pixel_format == PixelFormat::P010
+        {
+            (select_p010, "P010 or NV12")
+        } else {
+            (select_nv12, "NV12 or P010")
+        };
         let input = media_type(&MFMediaType_Video, &subtype, op)?;
         if config.width > 0 && config.height > 0 {
             // SAFETY: plain attribute write.
@@ -228,32 +322,40 @@ impl Session {
         // SAFETY: plain COM call on the live transform.
         unsafe { transform.mft().SetInputType(0, &input, 0) }
             .mf(op, "IMFTransform::SetInputType")?;
-        select_nv12(transform.mft()).map_err(|error| CodecError::UnsupportedConfig {
+        select(transform.mft()).map_err(|error| CodecError::UnsupportedConfig {
             backend: BACKEND,
             what: format!(
-                "system-memory NV12 output from {} (HRESULT {:#010X})",
+                "{wanted} {} output from {} (HRESULT {:#010X})",
+                if device.is_some() {
+                    "Direct3D"
+                } else {
+                    "system-memory"
+                },
                 transform.name(),
                 error.code().0
             ),
         })?;
-        transform.set_renegotiate(select_nv12);
+        transform.set_renegotiate(select);
+        // P010 worst case: two bytes per sample, 4:2:0.
         transform.set_default_output_size(
             config
                 .width
                 .max(64)
                 .saturating_mul(config.height.max(64))
-                .saturating_mul(3)
-                / 2,
+                .saturating_mul(3),
         );
         transform.start()?;
         let picture = picture_of(transform.mft(), (config.width, config.height))?;
         Ok(Self {
             transform,
             format: config.pixel_format,
+            memory: config.memory,
             fallback_colour: config
                 .colour
                 .unwrap_or(ColourDescription::unspecified(ColourRange::Limited)),
+            fallback_hdr: config.hdr,
             picture,
+            device,
             ready: VecDeque::new(),
             in_flight: Timestamps::default(),
         })
@@ -319,29 +421,95 @@ impl Session {
             let timestamp_us = self
                 .in_flight
                 .take(unsafe { sample.GetSampleTime() }.ok().map(micros));
-            let data = mf::sample_bytes(&sample, op)?;
-            let (packed, stride) = self.pack(&data)?;
             let picture = self.picture;
             let colour = picture.colour.unwrap_or(self.fallback_colour);
-            let raw = nv12::deliver(
-                Bytes::from(packed),
-                stride,
-                (picture.width, picture.height),
-                timestamp_us,
-                self.format,
-                colour,
-            )
-            .ok_or_else(|| {
-                CodecError::backend(BACKEND, op, "converting the decoded NV12 picture failed")
-            })?;
+            let hdr = self.fallback_hdr.or(picture.hdr);
+            let texture = match (&self.device, picture.visible()) {
+                (Some(_), Some(visible)) => D3d11Texture::from_sample(&sample, visible)?,
+                _ => None,
+            };
+            let (data, stride, format) = match texture {
+                Some(texture) => {
+                    let frame = NativeFrame {
+                        width: u32::try_from(picture.width).unwrap_or(u32::MAX),
+                        height: u32::try_from(picture.height).unwrap_or(u32::MAX),
+                        timestamp_us,
+                        colour: Some(colour),
+                        hdr,
+                        surface: Arc::new(texture),
+                    };
+                    if self.memory == FrameMemory::Native {
+                        self.ready.push_back(CapturedFrame::Native(frame));
+                        continue;
+                    }
+                    let raw = frame
+                        .into_cpu()
+                        .map_err(|error| CodecError::backend(BACKEND, op, error))?;
+                    (raw.data.to_vec(), raw.stride as usize, raw.format)
+                }
+                None => {
+                    let (packed, stride) = self.pack(&mf::sample_bytes(&sample, op)?)?;
+                    (packed, stride, picture.format)
+                }
+            };
+            let raw = self.deliver(data, stride, format, timestamp_us, colour, hdr)?;
             self.ready.push_back(CapturedFrame::Cpu(raw));
         }
         Ok(())
     }
 
-    /// The visible picture of a decoded surface as NV12 with the chroma
-    /// plane right after the luma rows (the layout `nv12::deliver`
-    /// reads), and its stride.
+    /// A CPU picture (NV12 or P010, chroma right after the luma rows) in
+    /// the format the configuration asks for: P010 stays P010 only when
+    /// asked for, and is downshifted to 8 bits otherwise.
+    fn deliver(
+        &self,
+        data: Vec<u8>,
+        stride: usize,
+        format: PixelFormat,
+        timestamp_us: u64,
+        colour: ColourDescription,
+        hdr: Option<HdrMetadata>,
+    ) -> CodecResult<RawFrame> {
+        let (width, height) = (self.picture.width, self.picture.height);
+        let failed = || {
+            CodecError::backend(
+                BACKEND,
+                Operation::Decode,
+                format!("converting the decoded {format:?} picture failed"),
+            )
+        };
+        if format == PixelFormat::P010 && self.format == PixelFormat::P010 {
+            return Ok(RawFrame {
+                width: u32::try_from(width).map_err(|_| failed())?,
+                height: u32::try_from(height).map_err(|_| failed())?,
+                stride: u32::try_from(stride).map_err(|_| failed())?,
+                format,
+                data: Bytes::from(data),
+                timestamp_us,
+                colour: Some(colour),
+                hdr,
+            });
+        }
+        let (data, stride) = if format == PixelFormat::P010 {
+            downshift_p010(&data, stride, width, height)
+        } else {
+            (data, stride)
+        };
+        let mut raw = nv12::deliver(
+            Bytes::from(data),
+            stride,
+            (width, height),
+            timestamp_us,
+            self.format,
+            colour,
+        )
+        .ok_or_else(failed)?;
+        raw.hdr = hdr;
+        Ok(raw)
+    }
+
+    /// The visible picture of a decoded surface as NV12 / P010 with the
+    /// chroma plane right after the luma rows, and its stride.
     fn pack(&self, surface: &[u8]) -> CodecResult<(Vec<u8>, usize)> {
         let p = self.picture;
         let fail = |what: &str| {
@@ -356,7 +524,8 @@ impl Session {
                 ),
             )
         };
-        let coded_width = p.x + p.width;
+        let bytes = p.sample_bytes();
+        let coded_width = (p.x + p.width) * bytes;
         let stride = p.stride.unwrap_or(coded_width).max(coded_width);
         if stride == 0 || p.width == 0 || p.height == 0 || p.coded_height < p.y + p.height {
             return Err(fail(
@@ -369,9 +538,9 @@ impl Session {
         if surface.len() < chroma + stride * p.coded_height.div_ceil(2) {
             return Err(fail("decoded surface smaller than its picture"));
         }
-        let width = p.width;
-        let row_bytes = width.div_ceil(2) * 2;
-        let x = p.x / 2 * 2;
+        let width = p.width * bytes;
+        let row_bytes = p.width.div_ceil(2) * 2 * bytes;
+        let x = p.x / 2 * 2 * bytes;
         let mut out = vec![0; row_bytes * p.height + row_bytes * p.height.div_ceil(2)];
         let (luma_out, chroma_out) = out.split_at_mut(row_bytes * p.height);
         for (row, line) in luma_out.chunks_exact_mut(row_bytes).enumerate() {
@@ -399,25 +568,33 @@ fn picture_of(mft: &IMFTransform, fallback: (u32, u32)) -> CodecResult<Picture> 
     let current: IMFMediaType = unsafe { mft.GetOutputCurrentType(0) }
         .mf(Operation::Decode, "IMFTransform::GetOutputCurrentType")?;
     // SAFETY: plain attribute reads on the live media type.
-    let (size, stride) = unsafe {
+    let (size, stride, subtype) = unsafe {
         (
             current.GetUINT64(&MF_MT_FRAME_SIZE).ok().map(unpack),
             current.GetUINT32(&MF_MT_DEFAULT_STRIDE).ok(),
+            current.GetGUID(&MF_MT_SUBTYPE).ok(),
         )
     };
     let (coded_width, coded_height) = size.unwrap_or(fallback);
     let mut picture = Picture {
+        format: if subtype == Some(MFVideoFormat_P010) {
+            PixelFormat::P010
+        } else {
+            PixelFormat::Nv12
+        },
         width: coded_width as usize,
         height: coded_height as usize,
         x: 0,
         y: 0,
         coded_height: coded_height as usize,
-        // A negative stride means a bottom-up image, which NV12 never is.
+        // A negative stride means a bottom-up image, which NV12 / P010
+        // never is.
         stride: stride
             .and_then(|stride| i32::from_ne_bytes(stride.to_ne_bytes()).checked_abs())
             .and_then(|stride| usize::try_from(stride).ok())
             .filter(|&stride| stride > 0),
         colour: colour_of(&current),
+        hdr: hdr_of(&current),
     };
     if let Some(area) = aperture(&current) {
         picture.x = area.0;
