@@ -354,6 +354,13 @@ impl LinuxP2pClient {
             // InterfaceAdded, so the Connect watchdog can distinguish
             // "peer stalled" from "group already up".
             let group_formed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // Suppress the periodic Find re-arm during an in-flight
+            // GON exchange. Calling `Find` while supplicant is in
+            // `P2P_PROVISIONING` or `P2P_GO_NEG` cancels the state
+            // and the peer sees a dropped session — Android then
+            // closes its connect dialog ("died"). Set true on
+            // ProvDisc or GON, cleared on any terminal signal.
+            let gon_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             // When set, a background branch logs the PIN after an
             // 800 ms quiet period so phone retries collapse to one
             // display event.
@@ -416,6 +423,8 @@ impl LinuxP2pClient {
                         // final value so the user sees one PIN.
                         let Ok((peer, pin)): Result<(OwnedObjectPath, String), _>
                             = sig.body().deserialize() else { continue };
+                        // Peer started provisioning — suspend Find re-arm.
+                        gon_in_flight.store(true, std::sync::atomic::Ordering::Release);
                         last_prov_pin = Some((peer, pin));
                         pending_pin_display = Some(std::time::Instant::now());
                     }
@@ -451,6 +460,7 @@ impl LinuxP2pClient {
                         if let Ok((peer, status)) = sig.body().deserialize::<(OwnedObjectPath, i32)>() {
                             tracing::warn!(peer = %peer.as_str(), status, "sink: ProvDisc failed");
                         }
+                        gon_in_flight.store(false, std::sync::atomic::Ordering::Release);
                         rearm_find_from_task(&p2p_owned).await;
                     }
                     msg = group_fail.next() => {
@@ -460,6 +470,7 @@ impl LinuxP2pClient {
                         } else {
                             tracing::error!("miracast sink: GroupFormationFailure (opaque)");
                         }
+                        gon_in_flight.store(false, std::sync::atomic::Ordering::Release);
                         rearm_find_from_task(&p2p_owned).await;
                     }
                     msg = wps_fail.next() => {
@@ -469,6 +480,7 @@ impl LinuxP2pClient {
                             let error = dict.get("config_error").and_then(|v| v.downcast_ref::<u32>().ok()).unwrap_or(0);
                             tracing::error!(reason, config_error = error, "miracast sink: WpsFailed (PIN mismatch or timeout)");
                         }
+                        gon_in_flight.store(false, std::sync::atomic::Ordering::Release);
                         rearm_find_from_task(&p2p_owned).await;
                     }
                     msg = gon_fail.next() => {
@@ -476,6 +488,7 @@ impl LinuxP2pClient {
                         if let Ok(dict) = sig.body().deserialize::<HashMap<String, OwnedValue>>() {
                             tracing::error!(?dict, "miracast sink: GONegotiationFailure");
                         }
+                        gon_in_flight.store(false, std::sync::atomic::Ordering::Release);
                         rearm_find_from_task(&p2p_owned).await;
                     }
                     msg = gon_ok.next() => {
@@ -483,12 +496,14 @@ impl LinuxP2pClient {
                         tracing::info!(?sig, "sink: GONegotiationSuccess");
                     }
                     _ = rearm.tick() => {
+                        gon_in_flight.store(false, std::sync::atomic::Ordering::Release);
                         rearm_find_from_task(&p2p_owned).await;
                     }
                     msg = group_finished.next() => {
                         let Some(_sig) = msg else { break };
                         tracing::info!("sink: GroupFinished — re-arming Find");
                         group_formed.store(false, std::sync::atomic::Ordering::Release);
+                        gon_in_flight.store(false, std::sync::atomic::Ordering::Release);
                         rearm_find_from_task(&p2p_owned).await;
                     }
                     msg = iface_added.next() => {
@@ -529,6 +544,7 @@ impl LinuxP2pClient {
                         // `(peer: o, password_id: q, go_intent: y)`.
                         let Ok((peer, pwd_id, go_intent)): Result<(OwnedObjectPath, u16, u8), _>
                             = sig.body().deserialize() else { continue };
+                        gon_in_flight.store(true, std::sync::atomic::Ordering::Release);
                         // Skip if we Connect-ed to this peer recently;
                         // doubling up aborts the first attempt.
                         let now = std::time::Instant::now();
