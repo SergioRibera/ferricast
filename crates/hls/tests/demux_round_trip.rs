@@ -3,6 +3,11 @@
 //! also accept the stream — and any drift between this and ffmpeg's
 //! demuxer surfaces immediately as a failing assertion.
 
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "fixture streams are a few kilobytes; sizes and counters fit"
+)]
+
 use bytes::Bytes;
 use ferricast_core::{Codec, EncodedFrame};
 use ferricast_muxer::Muxer;
@@ -159,7 +164,7 @@ fn demux(bytes: &[u8]) -> Demux {
 fn crc32_mpeg2(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
-        crc ^= (b as u32) << 24;
+        crc ^= u32::from(b) << 24;
         for _ in 0..8 {
             crc = if crc & 0x8000_0000 != 0 {
                 (crc << 1) ^ 0x04C1_1DB7
@@ -174,11 +179,11 @@ fn crc32_mpeg2(data: &[u8]) -> u32 {
 /// Decode 33-bit timestamp from a 5-byte PES PTS/DTS field.
 fn decode_ts(b: &[u8]) -> u64 {
     assert!(b[0] & 0x01 == 0x01 && b[2] & 0x01 == 0x01 && b[4] & 0x01 == 0x01);
-    ((b[0] as u64 & 0x0E) << 29)
-        | ((b[1] as u64) << 22)
-        | ((b[2] as u64 & 0xFE) << 14)
-        | ((b[3] as u64) << 7)
-        | ((b[4] as u64 & 0xFE) >> 1)
+    ((u64::from(b[0]) & 0x0E) << 29)
+        | (u64::from(b[1]) << 22)
+        | ((u64::from(b[2]) & 0xFE) << 14)
+        | (u64::from(b[3]) << 7)
+        | ((u64::from(b[4]) & 0xFE) >> 1)
 }
 
 #[test]
@@ -326,7 +331,7 @@ fn cc_continues_across_segment_boundaries() {
     joined.extend_from_slice(&seg1);
     joined.extend_from_slice(&seg2);
 
-    let mut last_cc: std::collections::HashMap<u16, u8> = Default::default();
+    let mut last_cc = std::collections::HashMap::<u16, u8>::default();
     for off in (0..joined.len()).step_by(TS) {
         let pkt = &joined[off..off + TS];
         assert_eq!(pkt[0], 0x47);

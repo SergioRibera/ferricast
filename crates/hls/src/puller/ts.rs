@@ -6,8 +6,8 @@
 //!
 //! - 188-byte packets, sync byte `0x47`.
 //! - One PAT (PID 0) pointing to one PMT PID.
-//! - One PMT listing a video ES (stream_type `0x1B` = H.264,
-//!   `0x24` = H.265) and an audio ES (stream_type `0x0F` = AAC ADTS).
+//! - One PMT listing a video ES (`stream_type` `0x1B` = H.264,
+//!   `0x24` = H.265) and an audio ES (`stream_type` `0x0F` = AAC ADTS).
 //! - Each ES carries PES packets; PES headers carry PTS (and
 //!   sometimes DTS) at 90 kHz.
 //!
@@ -42,7 +42,7 @@ pub struct TsStreamInfo {
     pub audio_codec: Option<AudioCodec>,
     /// Audio sample rate parsed from the first ADTS header. Filled
     /// in lazily during demux, not at PMT time, because the PMT
-    /// only carries stream_type and not codec parameters.
+    /// only carries `stream_type` and not codec parameters.
     pub audio_sample_rate: u32,
     pub audio_channels: u16,
 }
@@ -91,7 +91,7 @@ struct SectionAssembly {
 }
 
 impl SectionAssembly {
-    /// Feeds one TS payload; returns a complete section (table_id up
+    /// Feeds one TS payload; returns a complete section (`table_id` up
     /// to and including the CRC) once all of it has arrived.
     fn push(&mut self, payload: &[u8], pusi: bool) -> Option<Vec<u8>> {
         if pusi {
@@ -224,7 +224,7 @@ impl TsDemuxer {
         // Other PIDs (NIT, SDT, ECM, etc.) are ignored.
     }
 
-    /// `section` spans table_id … CRC_32 inclusive.
+    /// `section` spans `table_id` … `CRC_32` inclusive.
     fn parse_pat(&mut self, section: &[u8]) {
         // table_id(1) | flags + section_length(2) | transport_stream_id(2)
         // | version(1) | section_number(1) | last_section_number(1)
@@ -242,7 +242,7 @@ impl TsDemuxer {
         }
     }
 
-    /// `section` spans table_id … CRC_32 inclusive.
+    /// `section` spans `table_id` … `CRC_32` inclusive.
     fn parse_pmt(&mut self, section: &[u8]) {
         // table_id(1) | flags + section_length(2) | program_number(2)
         // | version(1) | section_number(1) | last_section_number(1)
@@ -454,6 +454,11 @@ fn parse_adts_header(buf: &[u8]) -> Option<(u32, u16)> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "fixture packets pack masked fields into bytes"
+)]
 mod tests {
     use super::*;
 
@@ -533,16 +538,13 @@ mod tests {
 
     fn pes(pts: i64, dts: Option<i64>, body: &[u8]) -> Vec<u8> {
         let mut p = vec![0, 0, 1, 0xE0, 0, 0, 0x80];
-        match dts {
-            Some(dts) => {
-                p.extend_from_slice(&[0xC0, 10]);
-                p.extend_from_slice(&timestamp_bytes(3, pts));
-                p.extend_from_slice(&timestamp_bytes(1, dts));
-            }
-            None => {
-                p.extend_from_slice(&[0x80, 5]);
-                p.extend_from_slice(&timestamp_bytes(2, pts));
-            }
+        if let Some(dts) = dts {
+            p.extend_from_slice(&[0xC0, 10]);
+            p.extend_from_slice(&timestamp_bytes(3, pts));
+            p.extend_from_slice(&timestamp_bytes(1, dts));
+        } else {
+            p.extend_from_slice(&[0x80, 5]);
+            p.extend_from_slice(&timestamp_bytes(2, pts));
         }
         p.extend_from_slice(body);
         p

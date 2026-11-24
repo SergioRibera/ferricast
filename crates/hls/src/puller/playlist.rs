@@ -87,6 +87,10 @@ pub(super) fn check_supported(pl: &MediaPlaylist) -> Result<()> {
 /// that starts at least three target durations before the end of the
 /// playlist (RFC 8216 §6.3.3).
 pub(super) fn live_start_index(pl: &MediaPlaylist) -> usize {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "target durations are a few seconds"
+    )]
     let window = 3.0 * pl.target_duration as f64;
     let mut tail = 0.0;
     for (idx, seg) in pl.segments.iter().enumerate().rev() {
@@ -122,7 +126,13 @@ pub(super) fn total_duration_us(pl: &MediaPlaylist) -> Option<u64> {
 
 fn secs_to_us(secs: f64) -> u64 {
     // Durations are non-negative and far below u64::MAX µs.
-    (secs.max(0.0) * 1_000_000.0) as u64
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped non-negative; the float-to-int cast saturates"
+    )]
+    let micros = (secs.max(0.0) * 1_000_000.0) as u64;
+    micros
 }
 
 /// Encryption parameters of one segment.
@@ -355,6 +365,8 @@ pub(super) fn decrypt_aes128(key: &[u8; 16], iv: &[u8; 16], data: &[u8]) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
     use aes::cipher::BlockEncrypt;
 
@@ -366,7 +378,7 @@ mod tests {
     fn live_start_is_three_target_durations_from_the_end() {
         let mut text = String::from("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:40\n");
         for i in 0..12 {
-            text.push_str(&format!("#EXTINF:2.0,\ns{i}.ts\n"));
+            writeln!(text, "#EXTINF:2.0,\ns{i}.ts").unwrap();
         }
         let pl = media(&text);
         // 3 × 2 s = 6 s → the last three segments.
@@ -493,7 +505,7 @@ mod tests {
         // Encrypt with PKCS#7 by hand.
         let mut padded = plain.clone();
         let pad = 16 - plain.len() % 16;
-        padded.extend(std::iter::repeat_n(pad as u8, pad));
+        padded.extend(std::iter::repeat_n(u8::try_from(pad).unwrap(), pad));
         let cipher = Aes128::new(GenericArray::from_slice(&key));
         let mut prev = iv;
         let mut enc = Vec::new();

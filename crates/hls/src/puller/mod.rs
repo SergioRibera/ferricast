@@ -341,6 +341,10 @@ async fn run_worker(
 impl Worker {
     /// Resolves `url` to a media playlist and demuxes the first
     /// segment to learn the codecs.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one resolution sequence: master playlist, media playlist, first segment"
+    )]
     async fn open(mut io: Io, url: &str) -> Step<(Self, MediaInfo, Vec<MediaPacket>)> {
         let request_url = Url::parse(url)
             .map_err(|e| Stop::Failed(FerricastError::Pull(format!("URL parse {url}: {e}"))))?;
@@ -420,29 +424,28 @@ impl Worker {
             Stop::Ended => Stop::Failed(FerricastError::Pull("HLS playlist has no media".into())),
             other => other,
         })?;
-        let (video, audio) = match worker.fmp4_streams.clone() {
-            Some(streams) => streams,
-            None => {
-                let ts_info = worker.demuxer.info();
-                (
-                    ts_info.video_codec.map(|codec| VideoStreamInfo {
-                        hdr: None,
-                        codec,
-                        // Not carried in the PMT; decoders read the real
-                        // dimensions from the SPS.
-                        width: 0,
-                        height: 0,
-                        fps: 0,
-                        colour: None,
-                    }),
-                    ts_info.audio_codec.map(|codec| AudioStreamInfo {
-                        codec,
-                        sample_rate: ts_info.audio_sample_rate,
-                        channels: ts_info.audio_channels,
-                        source: None,
-                    }),
-                )
-            }
+        let (video, audio) = if let Some(streams) = worker.fmp4_streams.clone() {
+            streams
+        } else {
+            let ts_info = worker.demuxer.info();
+            (
+                ts_info.video_codec.map(|codec| VideoStreamInfo {
+                    hdr: None,
+                    codec,
+                    // Not carried in the PMT; decoders read the real
+                    // dimensions from the SPS.
+                    width: 0,
+                    height: 0,
+                    fps: 0,
+                    colour: None,
+                }),
+                ts_info.audio_codec.map(|codec| AudioStreamInfo {
+                    codec,
+                    sample_rate: ts_info.audio_sample_rate,
+                    channels: ts_info.audio_channels,
+                    source: None,
+                }),
+            )
         };
         if video.is_none() && audio.is_none() {
             return Err(Stop::Failed(FerricastError::Pull(
@@ -458,6 +461,10 @@ impl Worker {
         Ok((worker, info, probe))
     }
 
+    #[expect(
+        clippy::similar_names,
+        reason = "`step` and `stop` read as what they are"
+    )]
     async fn run(mut self, probe: Vec<MediaPacket>) {
         let mut pending = probe;
         loop {
@@ -725,6 +732,10 @@ impl Worker {
 
     /// Sleeps the RFC 8216 §6.3.4 reload interval, then reloads.
     async fn wait_and_reload(&mut self) -> Step<()> {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "target durations are a few seconds"
+        )]
         let target = self.playlist.target_duration as f64;
         let secs = if self.last_reload_changed {
             target

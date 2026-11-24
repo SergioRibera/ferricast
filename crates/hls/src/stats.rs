@@ -73,7 +73,9 @@ impl PeerStats {
             self.probe_samples_mbps.push(mbps);
             (self.probe_samples_mbps.len() >= SessionStats::PROBE_SAMPLES).then(|| {
                 self.probe_done = true;
-                self.probe_samples_mbps.iter().sum::<f64>() / self.probe_samples_mbps.len() as f64
+                #[expect(clippy::cast_precision_loss, reason = "a handful of probe samples")]
+                let count = self.probe_samples_mbps.len() as f64;
+                self.probe_samples_mbps.iter().sum::<f64>() / count
             })
         };
         SegmentGetTelemetry {

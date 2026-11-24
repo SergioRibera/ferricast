@@ -139,6 +139,10 @@ impl Fetcher {
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "shaped for `map_err`, which hands the error over by value"
+)]
 fn classify_reqwest(e: reqwest::Error) -> FetchError {
     if e.is_builder() || e.is_redirect() {
         FetchError::Fatal(e.to_string())

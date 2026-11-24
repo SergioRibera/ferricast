@@ -26,12 +26,16 @@ use ferricast_core::{FerricastError, Result};
 /// Alternative Names list so a strict-validating client wouldn't
 /// reject the cert outright on hostname mismatch — though in
 /// practice every Cast sender just accepts the presented cert.
+///
+/// # Errors
+/// [`FerricastError::Hls`] when generating the keypair or certificate, or
+/// building the rustls configuration, fails.
 pub fn build_self_signed_server_config(
     advertised_ips: &[std::net::IpAddr],
 ) -> Result<Arc<ServerConfig>> {
     let mut params = CertificateParams::new(
         std::iter::once("localhost".to_string())
-            .chain(advertised_ips.iter().map(|ip| ip.to_string()))
+            .chain(advertised_ips.iter().map(std::string::ToString::to_string))
             .collect::<Vec<_>>(),
     )
     .map_err(|e| FerricastError::Hls(format!("rcgen params: {e}")))?;

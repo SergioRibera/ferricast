@@ -69,7 +69,7 @@ pub const PROBE_SAMPLES_FOR_DOC: usize = stats::SessionStats::PROBE_SAMPLES;
 /// keyframe-delay tail never violates RFC 8216 §4.3.3.1.
 ///
 /// The ring is sized generously — players (ffplay, hls.js, native
-/// AVPlayer) typically start playback 3 segments behind the live
+/// `AVPlayer`) typically start playback 3 segments behind the live
 /// edge, and the small drift between segment wall-clock production
 /// (~2.0-2.1 s, includes encode overhead) and player PTS-paced
 /// consumption (exactly 2.000 s with the synthetic 60 fps PTS
@@ -100,7 +100,7 @@ pub struct HlsConfig {
     /// Frames-per-second target the segmenter paces to. Must agree
     /// with the encoder's configured fps. Used to:
     /// 1. Synthesise duplicate frames when the upstream capture
-    ///    stalls (PipeWire on idle GNOME desktops can pause for
+    ///    stalls (`PipeWire` on idle GNOME desktops can pause for
     ///    hundreds of ms — without this the segmenter would block
     ///    inside `next_frame().await` and the HLS playlist would
     ///    stop advancing).
@@ -249,7 +249,13 @@ impl HlsConfig {
         let ceil = if self.segment_target_secs.is_finite() && self.segment_target_secs > 0.0 {
             // Saturating float→int cast: a nonsensical huge target
             // pins to u8::MAX instead of wrapping.
-            self.segment_target_secs.ceil() as u8
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "positive and finite (checked above); the cast saturates"
+            )]
+            let ceil = self.segment_target_secs.ceil() as u8;
+            ceil
         } else {
             1
         };
@@ -287,8 +293,7 @@ impl HlsServer {
         let listener = TcpListener::bind(addr).await?;
         let local = listener
             .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "?".into());
+            .map_or_else(|_| "?".into(), |a| a.to_string());
 
         let ring = Arc::new(RwLock::new(SegmentRing::new(
             config.keep_segments,
@@ -579,6 +584,10 @@ impl HlsFrameSink {
     ///
     /// Invalid configuration, or the listener's address cannot be
     /// queried.
+    #[expect(
+        clippy::unused_async,
+        reason = "async like the other constructors, so callers need not change when it awaits"
+    )]
     pub async fn start_on_listener(
         listener: TcpListener,
         frames: mpsc::Receiver<EncodedFrame>,

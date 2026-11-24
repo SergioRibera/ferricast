@@ -16,6 +16,7 @@
 //! parse the few headers we care about (`Connection`, `Range`)
 //! manually.
 
+use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -64,7 +65,13 @@ impl UrlToken {
         ring::rand::SystemRandom::new()
             .fill(&mut bytes)
             .map_err(|_| FerricastError::Hls("system RNG failed to produce a URL token".into()))?;
-        Ok(Self(bytes.iter().map(|b| format!("{b:02x}")).collect()))
+        Ok(Self(bytes.iter().fold(
+            String::with_capacity(32),
+            |mut hex, b| {
+                let _ = write!(hex, "{b:02x}");
+                hex
+            },
+        )))
     }
 
     /// Path of the media playlist, e.g. `/<token>/index.m3u8`.
@@ -176,6 +183,14 @@ impl ServerState {
 /// and `peer_addr` work happens in the caller (the accept loop in
 /// [`crate::HlsFrameSink`] / [`crate::HlsServer`]) so this layer
 /// stays IO-agnostic.
+#[expect(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "one request loop; the float and integer casts only feed log and telemetry fields, saturating"
+)]
 pub(crate) async fn handle<I>(peer: SocketAddr, io: I, state: Arc<ServerState>) -> Result<()>
 where
     I: AsyncRead + AsyncWrite + Unpin + Send,
@@ -295,37 +310,34 @@ where
                     let g = ring.read().await;
                     g.get_part(seg_seq, part_idx).cloned()
                 };
-                match part {
-                    Some(p) => {
-                        let send_body = request.method == "GET";
-                        let len = p.data.len();
-                        write_ok(
-                            &mut write_half,
-                            "video/mp2t",
-                            &p.data,
-                            send_body,
-                            /* cacheable */ true,
-                            /* range_supported */ false,
-                            /* keep_alive */ !client_wants_close,
-                        )
+                if let Some(p) = part {
+                    let send_body = request.method == "GET";
+                    let len = p.data.len();
+                    write_ok(
+                        &mut write_half,
+                        "video/mp2t",
+                        &p.data,
+                        send_body,
+                        /* cacheable */ true,
+                        /* range_supported */ false,
+                        /* keep_alive */ !client_wants_close,
+                    )
+                    .await?;
+                    if send_body && len > 0 {
+                        tracing::debug!(
+                            %peer,
+                            seg_seq,
+                            part_idx,
+                            bytes = len,
+                            independent = p.independent,
+                            "HLS part delivered"
+                        );
+                    }
+                    (200, len)
+                } else {
+                    write_status(&mut write_half, 404, "Not Found", b"", !client_wants_close)
                         .await?;
-                        if send_body && len > 0 {
-                            tracing::debug!(
-                                %peer,
-                                seg_seq,
-                                part_idx,
-                                bytes = len,
-                                independent = p.independent,
-                                "HLS part delivered"
-                            );
-                        }
-                        (200, len)
-                    }
-                    None => {
-                        write_status(&mut write_half, 404, "Not Found", b"", !client_wants_close)
-                            .await?;
-                        (404, 0)
-                    }
+                    (404, 0)
                 }
             }
             ("GET" | "HEAD", path) if is_segment_path(path) => {
@@ -354,165 +366,162 @@ where
                     let g = ring.read().await;
                     g.get(seq).cloned()
                 };
-                match segment {
-                    Some(s) => {
-                        let send_body = request.method == "GET";
-                        let total_len = s.data.len();
-                        let seg_dur = s.duration_secs;
-                        let produced_at = s.produced_at;
-                        // Resolve any Range request. Clients that don't
-                        // ask just get the full body.
-                        let reply = resolve_range(request.range, total_len);
-                        let (start, end) = match reply {
-                            RangeReply::Partial { start, end } => (start, end),
-                            RangeReply::Full | RangeReply::Unsatisfiable => (0, total_len),
-                        };
-                        let slice = s.data.get(start..end).unwrap_or_default();
-                        let len = slice.len();
-                        if reply == RangeReply::Unsatisfiable {
-                            write_range_not_satisfiable(
-                                &mut write_half,
-                                total_len,
-                                !client_wants_close,
-                            )
-                            .await?;
-                            tracing::info!(%peer, path = %request.path, status = 416, "HLS");
-                            if client_wants_close {
-                                break;
-                            }
-                            continue;
-                        } else if let RangeReply::Partial { .. } = reply {
-                            write_partial_content(
-                                &mut write_half,
-                                slice,
-                                send_body,
-                                start,
-                                end,
-                                total_len,
-                                !client_wants_close,
-                            )
-                            .await?;
-                        } else {
-                            write_ok(
-                                &mut write_half,
-                                "video/mp2t",
-                                slice,
-                                send_body,
-                                /* cacheable */ true,
-                                /* range_supported */ true,
-                                /* keep_alive */ !client_wants_close,
-                            )
-                            .await?;
+                if let Some(s) = segment {
+                    let send_body = request.method == "GET";
+                    let total_len = s.data.len();
+                    let seg_dur = s.duration_secs;
+                    let produced_at = s.produced_at;
+                    // Resolve any Range request. Clients that don't
+                    // ask just get the full body.
+                    let reply = resolve_range(request.range, total_len);
+                    let (start, end) = match reply {
+                        RangeReply::Partial { start, end } => (start, end),
+                        RangeReply::Full | RangeReply::Unsatisfiable => (0, total_len),
+                    };
+                    let slice = s.data.get(start..end).unwrap_or_default();
+                    let len = slice.len();
+                    if reply == RangeReply::Unsatisfiable {
+                        write_range_not_satisfiable(
+                            &mut write_half,
+                            total_len,
+                            !client_wants_close,
+                        )
+                        .await?;
+                        tracing::info!(%peer, path = %request.path, status = 416, "HLS");
+                        if client_wants_close {
+                            break;
                         }
-                        if send_body && len > 0 {
-                            suppress_generic_log = true;
-                            let elapsed = send_start.elapsed();
-                            let elapsed_s = elapsed.as_secs_f64().max(0.001);
-                            let mbps = (len as f64 * 8.0) / 1_000_000.0 / elapsed_s;
-                            let staleness = send_start
-                                .checked_duration_since(produced_at)
-                                .unwrap_or_default();
-                            let budget_ratio = elapsed.as_secs_f32() / seg_dur.max(0.001);
-                            let pct = (budget_ratio * 100.0) as u32;
-                            let encoded_kbps =
-                                ((total_len as f64 * 8.0) / 1000.0 / seg_dur.max(0.001) as f64)
-                                    as u32;
+                        continue;
+                    } else if let RangeReply::Partial { .. } = reply {
+                        write_partial_content(
+                            &mut write_half,
+                            slice,
+                            send_body,
+                            start,
+                            end,
+                            total_len,
+                            !client_wants_close,
+                        )
+                        .await?;
+                    } else {
+                        write_ok(
+                            &mut write_half,
+                            "video/mp2t",
+                            slice,
+                            send_body,
+                            /* cacheable */ true,
+                            /* range_supported */ true,
+                            /* keep_alive */ !client_wants_close,
+                        )
+                        .await?;
+                    }
+                    if send_body && len > 0 {
+                        suppress_generic_log = true;
+                        let elapsed = send_start.elapsed();
+                        let elapsed_s = elapsed.as_secs_f64().max(0.001);
+                        let mbps = (len as f64 * 8.0) / 1_000_000.0 / elapsed_s;
+                        let staleness = send_start
+                            .checked_duration_since(produced_at)
+                            .unwrap_or_default();
+                        let budget_ratio = elapsed.as_secs_f32() / seg_dur.max(0.001);
+                        let pct = (budget_ratio * 100.0) as u32;
+                        let encoded_kbps =
+                            ((total_len as f64 * 8.0) / 1000.0 / f64::from(seg_dur.max(0.001)))
+                                as u32;
 
-                            let tele = stats.record_segment_get(peer_ip, seq, mbps, Instant::now());
-                            // Only the cast receiver's deliveries steer
-                            // the encoder bitrate; other viewers are
-                            // just logged.
-                            let adaptive_for_peer =
-                                adaptive.filter(|_| state.drives_adaptive(peer_ip));
-                            let gap_ms = tele.inter_request_gap.map(|d| d.as_millis() as u64);
-                            let seq_jump = tele
-                                .prev_seq
-                                .and_then(|p| if seq > p { Some(seq - p) } else { None });
+                        let tele = stats.record_segment_get(peer_ip, seq, mbps, Instant::now());
+                        // Only the cast receiver's deliveries steer
+                        // the encoder bitrate; other viewers are
+                        // just logged.
+                        let adaptive_for_peer = adaptive.filter(|_| state.drives_adaptive(peer_ip));
+                        let gap_ms = tele.inter_request_gap.map(|d| d.as_millis() as u64);
+                        let seq_jump = tele
+                            .prev_seq
+                            .and_then(|p| if seq > p { Some(seq - p) } else { None });
 
-                            tracing::info!(
-                                %peer,
-                                seq,
-                                bytes = len,
-                                encoded_kbps,
-                                elapsed_ms = elapsed.as_millis() as u64,
-                                staleness_ms = staleness.as_millis() as u64,
-                                mbps = format_args!("{mbps:.2}"),
-                                seg_duration_s = seg_dur,
-                                budget_used_pct = pct,
-                                inter_request_gap_ms = ?gap_ms,
-                                seq_jump = ?seq_jump,
-                                count = tele.count_so_far,
-                                "HLS segment delivered"
-                            );
+                        tracing::info!(
+                            %peer,
+                            seq,
+                            bytes = len,
+                            encoded_kbps,
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            staleness_ms = staleness.as_millis() as u64,
+                            mbps = format_args!("{mbps:.2}"),
+                            seg_duration_s = seg_dur,
+                            budget_used_pct = pct,
+                            inter_request_gap_ms = ?gap_ms,
+                            seq_jump = ?seq_jump,
+                            count = tele.count_so_far,
+                            "HLS segment delivered"
+                        );
 
-                            if let (Some(avg_mbps), Some(state)) =
-                                (tele.probe_avg_mbps, adaptive_for_peer.map(Arc::as_ref))
-                            {
-                                let avg_kbps = (avg_mbps * 1000.0) as u32;
-                                match state.observe_link_capacity_kbps(avg_kbps) {
-                                    Some(new_target) => tracing::warn!(
-                                        measured_avg_mbps = format_args!("{avg_mbps:.2}"),
-                                        measured_avg_kbps = avg_kbps,
-                                        new_target_kbps = new_target,
-                                        samples = SessionStats::PROBE_SAMPLES,
-                                        "bandwidth probe complete — adjusted target"
-                                    ),
-                                    None => tracing::info!(
-                                        measured_avg_mbps = format_args!("{avg_mbps:.2}"),
-                                        measured_avg_kbps = avg_kbps,
-                                        samples = SessionStats::PROBE_SAMPLES,
-                                        "bandwidth probe complete — link comfortably above target, no adjustment"
-                                    ),
-                                }
-                            }
-
-                            if let Some(controller) = adaptive_for_peer
-                                && let Some(new_kbps) = controller.record_pressure(pct)
-                            {
+                        if let (Some(avg_mbps), Some(state)) =
+                            (tele.probe_avg_mbps, adaptive_for_peer.map(Arc::as_ref))
+                        {
+                            let avg_kbps = (avg_mbps * 1000.0) as u32;
+                            if let Some(new_target) = state.observe_link_capacity_kbps(avg_kbps) {
+                                tracing::warn!(
+                                    measured_avg_mbps = format_args!("{avg_mbps:.2}"),
+                                    measured_avg_kbps = avg_kbps,
+                                    new_target_kbps = new_target,
+                                    samples = SessionStats::PROBE_SAMPLES,
+                                    "bandwidth probe complete — adjusted target"
+                                );
+                            } else {
                                 tracing::info!(
-                                    new_target_kbps = new_kbps,
-                                    ema_pct = controller.pressure_pct(),
-                                    sample_pct = pct,
-                                    "adaptive bitrate adjustment requested"
+                                    measured_avg_mbps = format_args!("{avg_mbps:.2}"),
+                                    measured_avg_kbps = avg_kbps,
+                                    samples = SessionStats::PROBE_SAMPLES,
+                                    "bandwidth probe complete — link comfortably above target, no adjustment"
                                 );
                             }
+                        }
 
-                            if budget_ratio >= 0.7 {
-                                delivery_warning =
-                                    Some((seq, elapsed.as_millis() as u64, mbps, seg_dur, pct));
-                            }
-                            let stale_ratio = staleness.as_secs_f32() / seg_dur.max(0.001);
-                            if stale_ratio >= 2.0 {
+                        if let Some(controller) = adaptive_for_peer
+                            && let Some(new_kbps) = controller.record_pressure(pct)
+                        {
+                            tracing::info!(
+                                new_target_kbps = new_kbps,
+                                ema_pct = controller.pressure_pct(),
+                                sample_pct = pct,
+                                "adaptive bitrate adjustment requested"
+                            );
+                        }
+
+                        if budget_ratio >= 0.7 {
+                            delivery_warning =
+                                Some((seq, elapsed.as_millis() as u64, mbps, seg_dur, pct));
+                        }
+                        let stale_ratio = staleness.as_secs_f32() / seg_dur.max(0.001);
+                        if stale_ratio >= 2.0 {
+                            tracing::warn!(
+                                %peer,
+                                seq,
+                                staleness_ms = staleness.as_millis() as u64,
+                                seg_duration_s = seg_dur,
+                                stale_ratio = format_args!("{stale_ratio:.1}x"),
+                                "HLS segment was stale on fetch — receiver paused, will likely trip 301 soon"
+                            );
+                        }
+                        if let Some(gap) = tele.inter_request_gap {
+                            let gap_ratio = gap.as_secs_f32() / seg_dur.max(0.001);
+                            if gap_ratio >= 2.0 {
                                 tracing::warn!(
                                     %peer,
                                     seq,
-                                    staleness_ms = staleness.as_millis() as u64,
+                                    gap_ms = gap.as_millis() as u64,
                                     seg_duration_s = seg_dur,
-                                    stale_ratio = format_args!("{stale_ratio:.1}x"),
-                                    "HLS segment was stale on fetch — receiver paused, will likely trip 301 soon"
+                                    gap_ratio = format_args!("{gap_ratio:.1}x"),
+                                    "HLS receiver fetch cadence slowed past 2× EXTINF — buffer is draining"
                                 );
                             }
-                            if let Some(gap) = tele.inter_request_gap {
-                                let gap_ratio = gap.as_secs_f32() / seg_dur.max(0.001);
-                                if gap_ratio >= 2.0 {
-                                    tracing::warn!(
-                                        %peer,
-                                        seq,
-                                        gap_ms = gap.as_millis() as u64,
-                                        seg_duration_s = seg_dur,
-                                        gap_ratio = format_args!("{gap_ratio:.1}x"),
-                                        "HLS receiver fetch cadence slowed past 2× EXTINF — buffer is draining"
-                                    );
-                                }
-                            }
                         }
-                        (200, len)
                     }
-                    None => {
-                        write_status(&mut write_half, 404, "Not Found", b"", !client_wants_close)
-                            .await?;
-                        (404, 0)
-                    }
+                    (200, len)
+                } else {
+                    write_status(&mut write_half, 404, "Not Found", b"", !client_wants_close)
+                        .await?;
+                    (404, 0)
                 }
             }
             _ => {
@@ -727,8 +736,16 @@ fn resolve_range(range: Option<(u64, Option<u64>)>, total: usize) -> RangeReply 
     }
 }
 
+/// Whether `path` names a `.ts` file. Our URLs are lowercase; the check
+/// is case-insensitive like file systems that serve the same names.
+fn has_ts_extension(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
+}
+
 fn is_segment_path(path: &str) -> bool {
-    path.starts_with("/segment-") && path.ends_with(".ts")
+    path.starts_with("/segment-") && has_ts_extension(path)
 }
 
 fn parse_segment_seq(path: &str) -> Option<u64> {
@@ -738,7 +755,7 @@ fn parse_segment_seq(path: &str) -> Option<u64> {
 }
 
 fn is_part_path(path: &str) -> bool {
-    path.starts_with("/part-") && path.ends_with(".ts")
+    path.starts_with("/part-") && has_ts_extension(path)
 }
 
 /// `/part-{seg}.{idx}.ts` → `(seg, idx)`.
@@ -848,9 +865,8 @@ async fn wait_for_msn(
             Some(r) if !r.is_zero() => r,
             _ => return false,
         };
-        match timeout(remaining, notified).await {
-            Ok(()) => continue,
-            Err(_) => return false,
+        if timeout(remaining, notified).await.is_err() {
+            return false;
         }
     }
 }
@@ -864,6 +880,10 @@ async fn build_playlist(ring: &Arc<RwLock<SegmentRing>>) -> Result<String> {
 // Response writers
 // ---------------------------------------------------------------------
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "each flag toggles one independent header"
+)]
 async fn write_ok<W>(
     w: &mut W,
     content_type: &str,
@@ -912,12 +932,11 @@ where
     let mut head = String::with_capacity(384);
     head.push_str("HTTP/1.1 206 Partial Content\r\n");
     write_common(&mut head, "video/mp2t", body.len(), true, true, keep_alive);
-    head.push_str(&format!(
-        "Content-Range: bytes {}-{}/{}\r\n",
-        start,
-        end.saturating_sub(1),
-        total
-    ));
+    let _ = write!(
+        head,
+        "Content-Range: bytes {start}-{}/{total}\r\n",
+        end.saturating_sub(1)
+    );
     head.push_str("\r\n");
     w.write_all(head.as_bytes()).await?;
     if send_body {
@@ -935,7 +954,7 @@ where
     let mut head = String::with_capacity(256);
     head.push_str("HTTP/1.1 416 Range Not Satisfiable\r\n");
     write_common(&mut head, "text/plain", 0, false, true, keep_alive);
-    head.push_str(&format!("Content-Range: bytes */{total}\r\n\r\n"));
+    let _ = write!(head, "Content-Range: bytes */{total}\r\n\r\n");
     w.write_all(head.as_bytes()).await?;
     Ok(())
 }
@@ -951,7 +970,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut head = String::with_capacity(192);
-    head.push_str(&format!("HTTP/1.1 {} {}\r\n", code, reason));
+    let _ = write!(head, "HTTP/1.1 {code} {reason}\r\n");
     write_common(
         &mut head,
         "text/plain",
@@ -996,13 +1015,14 @@ fn write_common(
     // §7.1.1.2. Some CAF receivers correlate it with the playlist's
     // EXT-X-PROGRAM-DATE-TIME for live-edge tracking; missing Date
     // is at best a missed signal, at worst (rare) a 500.
-    head.push_str(&format!("Date: {}\r\n", http_date(SystemTime::now())));
-    head.push_str(&format!("Content-Type: {}\r\n", content_type));
-    head.push_str(&format!("Content-Length: {}\r\n", content_length));
+    let _ = write!(head, "Date: {}\r\n", http_date(SystemTime::now()));
+    let _ = write!(head, "Content-Type: {content_type}\r\n");
+    let _ = write!(head, "Content-Length: {content_length}\r\n");
     if cacheable {
-        head.push_str(&format!(
+        let _ = write!(
+            head,
             "Cache-Control: public, max-age={SEGMENT_MAX_AGE_SECS}\r\n"
-        ));
+        );
     } else {
         head.push_str("Cache-Control: no-cache, no-store, must-revalidate\r\n");
     }
@@ -1043,7 +1063,16 @@ fn write_cors(head: &mut String) {
 /// civil-from-days algorithm so it's correct across the entire
 /// proleptic Gregorian range — no special-casing of leap years or
 /// century boundaries.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "seconds since 1970 fit i64; seconds of a day, weekday and month are small"
+)]
 fn http_date(t: SystemTime) -> String {
+    const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MO: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     let secs = t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let secs_per_day: u64 = 86_400;
     let days = (secs / secs_per_day) as i64;
@@ -1054,11 +1083,6 @@ fn http_date(t: SystemTime) -> String {
     // 1970-01-01 was a Thursday; days since then.
     let weekday = ((days + 4).rem_euclid(7)) as usize;
     let (year, month, day) = civil_from_days(days);
-
-    const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MO: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
     format!(
         "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
         WD[weekday],
@@ -1074,6 +1098,12 @@ fn http_date(t: SystemTime) -> String {
 /// Days since 1970-01-01 → (year, month [1-12], day [1-31]).
 /// Howard Hinnant's `civil_from_days`. Year is always positive in
 /// practical use (we feed it `SystemTime::now()`).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "Hinnant's algorithm keeps day-of-era and year-of-era in range"
+)]
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -1149,7 +1179,7 @@ mod tests {
     fn http_date_leap_year() {
         // 2024-02-29 is valid (leap year). Seconds since epoch:
         // 2024-02-29 00:00:00 UTC = 1_709_164_800.
-        let t = UNIX_EPOCH + Duration::from_secs(1_709_164_800);
+        let t = UNIX_EPOCH + Duration::from_hours(474_768);
         assert_eq!(http_date(t), "Thu, 29 Feb 2024 00:00:00 GMT");
     }
 
@@ -1468,7 +1498,7 @@ mod stall_tests {
             sink.len()
         });
         let mut w = StallTimeout::new(writer, Duration::from_secs(1));
-        w.write_all(&[0u8; 64 * 1024]).await.unwrap();
+        w.write_all(&vec![0u8; 64 * 1024]).await.unwrap();
         w.shutdown().await.unwrap();
         drop(w);
         assert_eq!(drain.await.unwrap(), 64 * 1024);
