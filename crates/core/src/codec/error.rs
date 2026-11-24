@@ -55,6 +55,8 @@ pub struct BackendAttempt {
     /// The rejection, rendered: an attempt holds the message of the
     /// [`CodecError`] the backend returned.
     pub reason: String,
+    /// How long the attempt took, probe and open together, in microseconds.
+    pub elapsed_us: u64,
 }
 
 impl fmt::Display for BackendAttempt {
@@ -225,10 +227,12 @@ mod tests {
                 BackendAttempt {
                     backend: BackendId::Nvenc,
                     reason: "libcuda.so.1 not found".into(),
+                    elapsed_us: 120,
                 },
                 BackendAttempt {
                     backend: BackendId::Vaapi,
                     reason: "no render node".into(),
+                    elapsed_us: 3_400,
                 },
             ],
         };
