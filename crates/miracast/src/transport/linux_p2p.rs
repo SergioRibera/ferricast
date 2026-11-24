@@ -27,8 +27,10 @@ use crate::ie::{DeviceRole, SubelementId, WFD_OUI_TYPE, WIFI_ALLIANCE_OUI, WfdIe
 const SUPPLICANT_BUS: &str = "fi.w1.wpa_supplicant1";
 const SUPPLICANT_ROOT_PATH: &str = "/fi/w1/wpa_supplicant1";
 const ROOT_IFACE: &str = "fi.w1.wpa_supplicant1";
+const INTERFACE_IFACE: &str = "fi.w1.wpa_supplicant1.Interface";
 const P2P_IFACE: &str = "fi.w1.wpa_supplicant1.Interface.P2PDevice";
 const PEER_IFACE: &str = "fi.w1.wpa_supplicant1.Peer";
+const BSS_IFACE: &str = "fi.w1.wpa_supplicant1.BSS";
 
 /// A peer discovered on the Wi-Fi Direct bus.
 #[derive(Debug, Clone)]
@@ -200,23 +202,29 @@ impl LinuxP2pClient {
         let mut cfg: HashMap<&str, Value> = HashMap::new();
         cfg.insert("DeviceName", name_val);
         cfg.insert("PrimaryDeviceType", pdt_val);
-        // Pin P2P to social channel 1 (2.4 GHz, reg class 81). Without
-        // this, supplicant picks a random listen channel each run; the
-        // peer's probe lands on 1/6/11, so GO-Negotiation-Response
-        // frames miss entirely when the two sides disagree. MiracleCast
-        // forces the same values via `wpa_supplicant.conf`; we set
-        // them per-session via D-Bus so we don't need a config file
-        // change. Supplicant parses these as DBUS_TYPE_UINT32.
-        cfg.insert("ListenRegClass", Value::from(81u32));
-        cfg.insert("ListenChannel", Value::from(1u32));
-        cfg.insert("OperRegClass", Value::from(81u32));
-        cfg.insert("OperChannel", Value::from(1u32));
+        // Pin P2P to a channel compatible with the current STA
+        // association. mt7925e-class drivers can't do STA + P2P on
+        // different bands; if STA sits on 5 GHz "Rico 5G" and P2P
+        // listens on 2.4 GHz ch 1, group formation silently dies
+        // after GO-Nego-Success. We read `CurrentBSS.Frequency` via
+        // D-Bus and pick a matching P2P channel + reg class. No STA
+        // → fall back to social channel 1 / reg class 81.
+        let iface_ref = self.interface_path.as_ref();
+        let (ch, reg) = detect_sta_channel(&self.conn, &iface_ref)
+            .await
+            .unwrap_or((1, 81));
+        cfg.insert("ListenRegClass", Value::from(reg));
+        cfg.insert("ListenChannel", Value::from(ch));
+        cfg.insert("OperRegClass", Value::from(reg));
+        cfg.insert("OperChannel", Value::from(ch));
         if let Err(e) = p2p.set_property("P2PDeviceConfig", Value::from(cfg)).await {
             tracing::error!(error = %e, "miracast sink: P2PDeviceConfig set FAILED — peers will see us as unnamed");
         } else {
             tracing::info!(
                 name = %device_name,
-                "miracast sink: P2PDeviceConfig set (listen/oper channel pinned to 1)"
+                p2p_channel = ch,
+                reg_class = reg,
+                "miracast sink: P2PDeviceConfig set (channel matched to STA band)"
             );
         }
 
@@ -701,6 +709,65 @@ mod pin_tests {
             let base: u32 = base.parse().unwrap();
             let cs: u8 = cs.parse().unwrap();
             assert_eq!(wps_pin_checksum(base), cs);
+        }
+    }
+}
+
+/// Read the current STA association's channel + Wi-Fi Alliance
+/// regulatory class via wpa_supplicant D-Bus. Returns `None` when the
+/// interface isn't associated to an infrastructure Wi-Fi.
+async fn detect_sta_channel(
+    conn: &Connection,
+    interface_path: &ObjectPath<'_>,
+) -> Option<(u32, u32)> {
+    let iface = Proxy::new(
+        conn,
+        SUPPLICANT_BUS,
+        interface_path.to_owned(),
+        INTERFACE_IFACE,
+    )
+    .await
+    .ok()?;
+    let bss_path: OwnedObjectPath = iface.get_property("CurrentBSS").await.ok()?;
+    if bss_path.as_str() == "/" {
+        tracing::info!("sink: STA not associated — defaulting P2P to 2.4 GHz social ch 1");
+        return None;
+    }
+    let bss = Proxy::new(conn, SUPPLICANT_BUS, bss_path.clone(), BSS_IFACE)
+        .await
+        .ok()?;
+    let freq: u16 = bss.get_property("Frequency").await.ok()?;
+    let (ch, reg) = freq_to_channel_class(freq);
+    tracing::info!(
+        bss = %bss_path.as_str(),
+        freq_mhz = freq,
+        channel = ch,
+        reg_class = reg,
+        "sink: STA current channel detected — pinning P2P to match band"
+    );
+    Some((ch, reg))
+}
+
+/// Map centre frequency in MHz to (channel, Wi-Fi Alliance regulatory
+/// class). Picks the P2P-usable class for each band — DFS channels
+/// (52-144) are deliberately excluded because P2P can't use them.
+fn freq_to_channel_class(freq: u16) -> (u32, u32) {
+    match freq {
+        // 2.4 GHz: channels 1-13. Reg class 81 (global).
+        2412..=2472 => (u32::from((freq - 2407) / 5), 81),
+        // 5 GHz UNII-1 (36/40/44/48). Reg class 115.
+        5180..=5240 => (u32::from((freq - 5000) / 5), 115),
+        // 5 GHz UNII-3 (149/153/157/161/165). Reg class 124 (US) /
+        // 125 (global). Pick 125 so the regdomain check doesn't drop
+        // the whole group on non-US hosts.
+        5745..=5825 => (u32::from((freq - 5000) / 5), 125),
+        // Anything else (DFS, 6 GHz): fall back to social ch 1.
+        _ => {
+            tracing::warn!(
+                freq_mhz = freq,
+                "sink: STA on a channel P2P can't share (DFS or 6 GHz); forcing 2.4 GHz ch 1"
+            );
+            (1, 81)
         }
     }
 }
