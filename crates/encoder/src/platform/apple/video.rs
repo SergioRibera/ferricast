@@ -9,6 +9,13 @@
 //! Output is Annex B. VideoToolbox emits length-prefixed NAL units and
 //! keeps the parameter sets in the sample's format description; they are
 //! copied in front of every keyframe, as x264 repeats them in-band.
+//!
+//! A native frame holding a [`PixelBuffer`] of the configured size and
+//! bit depth (a VideoToolbox decoder's output, say) is encoded as is,
+//! with no copy. [`BitDepth::Ten`] encodes HEVC Main10 from P010 buffers
+//! (P010 input is copied, NV12 and RGB input widened); the stream's HDR
+//! metadata goes into the mastering display and content light level
+//! properties, which VideoToolbox writes as SEI.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -16,16 +23,17 @@ use std::ptr::{self, NonNull};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
+use ferricast_codec::apple::{BiPlanarFormat, PixelBuffer};
 use ferricast_codec::bitstream::{length_prefixed_to_annex_b, split_annex_b};
 use ferricast_codec::{Candidate, VideoEncoderRegistry};
 use ferricast_core::{
-    Acceleration, BackendId, CapturedFrame, Codec, CodecError, CodecKind, CodecResult,
+    Acceleration, BackendId, BitDepth, CapturedFrame, Codec, CodecError, CodecKind, CodecResult,
     ColourDescription, ColourPrimaries, ColourRange, EncodedFrame, EncoderConfig, H264Profile,
     H265Profile, MatrixCoefficients, Operation, PixelFormat, RawFrame, TransferCharacteristics,
     VideoEncoder,
 };
 use objc2_core_foundation::{
-    CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, kCFAllocatorDefault,
+    CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType, kCFAllocatorDefault,
 };
 use objc2_core_media::{
     CMFormatDescription, CMSampleBuffer, CMTime, CMTimeFlags, CMVideoCodecType,
@@ -36,16 +44,17 @@ use objc2_core_media::{
 use objc2_core_video::{
     CVColorPrimariesGetStringForIntegerCodePoint, CVPixelBuffer, CVPixelBufferCreate,
     CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRow,
-    CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-    CVPixelBufferUnlockBaseAddress, CVTransferFunctionGetStringForIntegerCodePoint,
-    CVYCbCrMatrixGetStringForIntegerCodePoint, kCVPixelBufferIOSurfacePropertiesKey,
-    kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeightOfPlane,
+    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    CVTransferFunctionGetStringForIntegerCodePoint, CVYCbCrMatrixGetStringForIntegerCodePoint,
+    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelFormatType_32BGRA,
 };
 use objc2_video_toolbox::{
     VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty,
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-    kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_ExpectedFrameRate,
+    kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_ContentLightLevelInfo,
+    kVTCompressionPropertyKey_ExpectedFrameRate,
+    kVTCompressionPropertyKey_MasteringDisplayColorVolume,
     kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel,
     kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_TransferFunction,
@@ -305,21 +314,36 @@ fn codec_type(codec: Codec) -> CodecResult<CMVideoCodecType> {
     }
 }
 
-/// The `ProfileLevel` value for the configuration's profile cap.
-fn profile_level(config: &EncoderConfig) -> &'static CFString {
+/// The `ProfileLevel` value for the configuration's bit depth and
+/// profile cap: HEVC Main for 8-bit streams, Main10 for 10-bit ones.
+///
+/// # Errors
+/// [`CodecError::UnsupportedConfig`] for 10-bit H.264, or 10-bit HEVC
+/// capped at Main.
+fn profile_level(config: &EncoderConfig) -> CodecResult<&'static CFString> {
+    let unsupported = |what: &str| CodecError::UnsupportedConfig {
+        backend: BACKEND,
+        what: what.to_owned(),
+    };
     // SAFETY: VideoToolbox exports these constants for the life of the process.
     unsafe {
-        match config.codec {
-            Codec::H265 => match config.max_h265_profile {
-                Some(H265Profile::Main10) => kVTProfileLevel_HEVC_Main10_AutoLevel,
-                Some(H265Profile::Main) | None => kVTProfileLevel_HEVC_Main_AutoLevel,
+        Ok(match (config.codec, config.bit_depth) {
+            (Codec::H265, BitDepth::Eight) => kVTProfileLevel_HEVC_Main_AutoLevel,
+            (Codec::H265, BitDepth::Ten) => match config.max_h265_profile {
+                Some(H265Profile::Main10) | None => kVTProfileLevel_HEVC_Main10_AutoLevel,
+                Some(H265Profile::Main) => {
+                    return Err(unsupported(
+                        "10-bit HEVC for a receiver capped at the Main profile",
+                    ));
+                }
             },
-            _ => match config.max_h264_profile {
+            (_, BitDepth::Ten) => return Err(unsupported("10-bit H.264")),
+            (_, BitDepth::Eight) => match config.max_h264_profile {
                 Some(H264Profile::Baseline) => kVTProfileLevel_H264_Baseline_AutoLevel,
                 Some(H264Profile::Main) => kVTProfileLevel_H264_Main_AutoLevel,
                 Some(H264Profile::High) | None => kVTProfileLevel_H264_High_AutoLevel,
             },
-        }
+        })
     }
 }
 
@@ -438,6 +462,20 @@ impl Session {
         Ok(session)
     }
 
+    /// Whether `pixels` can be encoded as is: the configured size and bit
+    /// depth (NV12 for 8-bit, P010 for 10-bit).
+    fn takes(&self, pixels: &PixelBuffer) -> bool {
+        let depth = match pixels.format().format {
+            PixelFormat::P010 => BitDepth::Ten,
+            PixelFormat::Nv12 | PixelFormat::Bgra | PixelFormat::Rgba | PixelFormat::I420 => {
+                BitDepth::Eight
+            }
+        };
+        pixels.width() == self.config.width
+            && pixels.height() == self.config.height
+            && depth == self.config.bit_depth
+    }
+
     fn set(&self, key: &CFString, value: &CFType) -> i32 {
         // SAFETY: the session is live and `value` has the type the key
         // documents (callers pair them).
@@ -499,7 +537,7 @@ impl Session {
         )?;
         self.require(
             profile,
-            profile_level(config).as_ref(),
+            profile_level(config)?.as_ref(),
             "the requested profile",
         )?;
         self.set_bitrate(config.bitrate_kbps)?;
@@ -526,6 +564,24 @@ impl Session {
                 self.require(key, value.as_ref(), what)?;
             }
         }
+        if let Some(hdr) = config.hdr {
+            // SAFETY: VideoToolbox exports these keys for the life of the process.
+            let (display_key, light_key) = unsafe {
+                (
+                    kVTCompressionPropertyKey_MasteringDisplayColorVolume,
+                    kVTCompressionPropertyKey_ContentLightLevelInfo,
+                )
+            };
+            // Both take the big-endian SEI payloads.
+            if let Some(display) = hdr.mastering_display {
+                let data = CFData::from_bytes(&display.to_sei());
+                self.require(display_key, data.as_ref(), "the mastering display")?;
+            }
+            if let Some(light) = hdr.content_light {
+                let data = CFData::from_bytes(&light.to_sei());
+                self.require(light_key, data.as_ref(), "the content light level")?;
+            }
+        }
         Ok(())
     }
 
@@ -538,17 +594,27 @@ impl Session {
 
     /// A CoreVideo buffer holding `view`: BGRA as is when the stream
     /// signals limited range (VideoToolbox converts it with the
-    /// configured matrix in hardware), anything else as NV12 in the
-    /// configured range.
+    /// configured matrix in hardware), anything else as NV12 (P010 for a
+    /// 10-bit stream) in the configured range.
     fn pixel_buffer(&mut self, view: &FrameView<'_>) -> CodecResult<CFRetained<CVPixelBuffer>> {
         let colour = self.config.colour;
         let direct = view.format() == PixelFormat::Bgra && colour.range == ColourRange::Limited;
+        let planar = BiPlanarFormat {
+            format: match self.config.bit_depth {
+                BitDepth::Eight => PixelFormat::Nv12,
+                BitDepth::Ten => PixelFormat::P010,
+            },
+            range: colour.range,
+        };
         let format = if direct {
             kCVPixelFormatType_32BGRA
-        } else if colour.range == ColourRange::Full {
-            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         } else {
-            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            planar.os_type().ok_or_else(|| {
+                fail(
+                    Operation::Encode,
+                    format!("no Core Video format for {planar:?}"),
+                )
+            })?
         };
         // An empty IOSurface dictionary asks for IOSurface backing, which
         // the hardware encoder reads without a copy.
@@ -580,7 +646,7 @@ impl Session {
         let filled = if direct {
             fill_bgra(&buffer, view)
         } else {
-            self.fill_nv12(&buffer, view)
+            self.fill_planar(&buffer, view, planar.format)
         };
         // SAFETY: locked just above with the same flags.
         let status = unsafe { CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags(0)) };
@@ -589,38 +655,113 @@ impl Session {
         Ok(buffer)
     }
 
-    fn fill_nv12(&mut self, buffer: &CVPixelBuffer, view: &FrameView<'_>) -> CodecResult<()> {
+    /// Writes `view` into the planes of a locked NV12 / P010 (`format`)
+    /// buffer: P010 into P010 row by row; anything else through 8-bit
+    /// NV12 in the configured colour, widened for a P010 buffer.
+    fn fill_planar(
+        &mut self,
+        buffer: &CVPixelBuffer,
+        view: &FrameView<'_>,
+        format: PixelFormat,
+    ) -> CodecResult<()> {
+        let rows = view.height() as usize;
+        let chroma_rows = rows.div_ceil(2);
+        if view.format() == PixelFormat::P010 && format == PixelFormat::P010 {
+            let data = view.data();
+            let chroma = &data[view.chroma_offset()..];
+            let chroma_bytes = view.width().div_ceil(2) as usize * 4;
+            write_plane(buffer, 0, rows, view.row_bytes(), |row, dst| {
+                dst.copy_from_slice(&data[row * view.stride()..][..dst.len()]);
+            })?;
+            return write_plane(buffer, 1, chroma_rows, chroma_bytes, |row, dst| {
+                dst.copy_from_slice(&chroma[row * view.chroma_stride()..][..dst.len()]);
+            });
+        }
         let layout = Nv12Layout::packed(view.width(), view.height());
         self.nv12.resize(layout.len(), 0);
-        nv12::write(view, self.config.colour, layout, &mut self.nv12, BACKEND)?;
+        if view.format() == PixelFormat::P010 {
+            narrow_p010(view, layout, &mut self.nv12);
+        } else {
+            nv12::write(view, self.config.colour, layout, &mut self.nv12, BACKEND)?;
+        }
         let (luma, chroma) = self.nv12.split_at(layout.chroma_offset);
-        let rows = view.height() as usize;
-        copy_plane(buffer, 0, luma, layout.stride, rows)?;
-        copy_plane(buffer, 1, chroma, layout.stride, rows.div_ceil(2))
+        let wide = format == PixelFormat::P010;
+        let row_bytes = if wide {
+            layout.stride * 2
+        } else {
+            layout.stride
+        };
+        for (plane, source, plane_rows) in [(0, luma, rows), (1, chroma, chroma_rows)] {
+            write_plane(buffer, plane, plane_rows, row_bytes, |row, dst| {
+                let line = &source[row * layout.stride..][..layout.stride];
+                if wide {
+                    // 8-bit samples in the high bits of 16-bit ones.
+                    for (pair, &sample) in dst.chunks_exact_mut(2).zip(line) {
+                        pair.copy_from_slice(&(u16::from(sample) << 8).to_le_bytes());
+                    }
+                } else {
+                    dst.copy_from_slice(line);
+                }
+            })?;
+        }
+        Ok(())
     }
 }
 
-/// Copies `rows` rows of `stride` bytes into plane `plane` of a locked
-/// buffer.
-fn copy_plane(
+/// P010 `view` as packed NV12 (`layout`) in `out`: the high byte of each
+/// sample.
+fn narrow_p010(view: &FrameView<'_>, layout: Nv12Layout, out: &mut [u8]) {
+    let data = view.data();
+    let width = view.width() as usize;
+    let chroma_samples = view.width().div_ceil(2) as usize * 2;
+    let (luma, chroma) = out.split_at_mut(layout.chroma_offset);
+    let planes = [
+        (luma, 0, view.stride(), width, view.height() as usize),
+        (
+            chroma,
+            view.chroma_offset(),
+            view.chroma_stride(),
+            chroma_samples,
+            view.chroma_rows(),
+        ),
+    ];
+    for (dst, offset, stride, samples, rows) in planes {
+        for (row, line) in dst.chunks_exact_mut(layout.stride).take(rows).enumerate() {
+            let source = &data[offset + row * stride..][..samples * 2];
+            for (sample, pair) in line[..samples].iter_mut().zip(source.chunks_exact(2)) {
+                *sample = pair[1];
+            }
+        }
+    }
+}
+
+/// Fills `rows` rows of `row_bytes` bytes of plane `plane` of a locked
+/// buffer, handing `fill` each row's index and bytes.
+fn write_plane(
     buffer: &CVPixelBuffer,
     plane: usize,
-    src: &[u8],
-    stride: usize,
     rows: usize,
+    row_bytes: usize,
+    mut fill: impl FnMut(usize, &mut [u8]),
 ) -> CodecResult<()> {
     let base = CVPixelBufferGetBaseAddressOfPlane(buffer, plane).cast::<u8>();
     let pitch = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane);
-    if base.is_null() || pitch < stride {
+    let height = CVPixelBufferGetHeightOfPlane(buffer, plane);
+    if base.is_null() || pitch < row_bytes || height < rows {
         return Err(fail(
             Operation::Encode,
-            format!("pixel buffer plane {plane} is unusable"),
+            format!(
+                "pixel buffer plane {plane} is unusable ({height} rows of {pitch} bytes, \
+                 {rows} of {row_bytes} needed)"
+            ),
         ));
     }
-    for (row, line) in src.chunks(stride).take(rows).enumerate() {
-        // SAFETY: the buffer is locked; plane `plane` has at least `rows`
-        // rows of `pitch >= stride` bytes, so row `row` holds `line`.
-        unsafe { ptr::copy_nonoverlapping(line.as_ptr(), base.add(row * pitch), line.len()) };
+    for row in 0..rows {
+        // SAFETY: the buffer is locked; plane `plane` has `height >= rows`
+        // rows of `pitch >= row_bytes` bytes, and nothing else refers to
+        // them while this slice lives.
+        let dst = unsafe { std::slice::from_raw_parts_mut(base.add(row * pitch), row_bytes) };
+        fill(row, dst);
     }
     Ok(())
 }
@@ -686,14 +827,13 @@ impl VtEncoder {
     /// the callback delivered meanwhile (normally that one output).
     fn submit(
         &mut self,
-        view: &FrameView<'_>,
+        buffer: &CVPixelBuffer,
         pts_us: i64,
         keyframe: bool,
     ) -> CodecResult<Vec<Output>> {
         let session = self.session(Operation::Encode)?;
         let codec = session.config.codec;
         let fps = i64::from(session.config.fps.max(1));
-        let buffer = session.pixel_buffer(view)?;
         // SAFETY: VideoToolbox exports this key for the life of the process.
         let force = unsafe { kVTEncodeFrameOptionKey_ForceKeyFrame };
         let options = keyframe.then(|| {
@@ -709,7 +849,7 @@ impl VtEncoder {
         // pointer.
         let status = unsafe {
             session.session.encode_frame(
-                &buffer,
+                buffer,
                 pts,
                 cm_time(i64::from(MICROS) / fps),
                 options.as_deref().map(AsRef::as_ref),
@@ -763,6 +903,17 @@ impl VtEncoder {
             session.config.height,
             session.config.fps,
         );
+        if let CapturedFrame::Native(native) = &frame
+            && let Some(pixels) = native.surface::<PixelBuffer>()
+            && session.takes(pixels)
+        {
+            let pts_us = i64::try_from(native.timestamp_us)
+                .map_err(|_| fail(Operation::Encode, "timestamp exceeds i64"))?;
+            let outputs = self.submit(pixels.buffer(), pts_us, self.pending_keyframe)?;
+            self.pending_keyframe = false;
+            self.queued.extend(outputs);
+            return self.next_frame(codec, fps, native.timestamp_us);
+        }
         let raw: RawFrame = frame
             .into_cpu()
             .map_err(|error| fail(Operation::Encode, error))?;
@@ -774,7 +925,8 @@ impl VtEncoder {
             .map_err(CodecError::from_backend(BACKEND, Operation::Encode))?;
         let pts_us = i64::try_from(raw.timestamp_us)
             .map_err(|_| fail(Operation::Encode, "timestamp exceeds i64"))?;
-        let outputs = self.submit(&view, pts_us, self.pending_keyframe)?;
+        let buffer = self.session(Operation::Encode)?.pixel_buffer(&view)?;
+        let outputs = self.submit(&buffer, pts_us, self.pending_keyframe)?;
         self.pending_keyframe = false;
         self.queued.extend(outputs);
         self.next_frame(codec, fps, raw.timestamp_us)
@@ -843,7 +995,8 @@ impl VtEncoder {
         // Everything the priming submission yields is discarded; only the
         // parameter sets are kept.
         let mut failure = None;
-        for output in self.submit(&view, 0, true)? {
+        let buffer = self.session(Operation::Headers)?.pixel_buffer(&view)?;
+        for output in self.submit(&buffer, 0, true)? {
             match output {
                 Output::Frame { parameter_sets, .. } if !parameter_sets.is_empty() => {
                     self.headers = parameter_sets;
@@ -881,7 +1034,9 @@ impl VideoEncoder for VtEncoder {
                     == config.keyframe_interval_secs.to_bits()
                 && current.max_h264_profile == config.max_h264_profile
                 && current.max_h265_profile == config.max_h265_profile
-                && current.colour == config.colour;
+                && current.colour == config.colour
+                && current.bit_depth == config.bit_depth
+                && current.hdr == config.hdr;
             if same_shape {
                 session.set_bitrate(config.bitrate_kbps)?;
                 session.config = config.clone();
