@@ -1,12 +1,12 @@
 //! Apple Lossless (ALAC) decoder over `symphonia`, for AirPlay audio
 //! streams set up with `ct = 2` (music playback from iOS / macOS).
 //!
-//! AirPlay never sends the ALAC "magic cookie" in-band: senders use the
-//! fixed configuration of the RAOP `fmtp` line (352 samples per frame,
-//! 16-bit, 44.1 kHz stereo, `pb = 40`, `mb = 10`, `kb = 14`). The cookie
-//! is built from the configured sample rate and channel count with those
-//! parameters.
+//! The ALAC "magic cookie" comes from `extra_data` when the container
+//! carries one; AirPlay never sends it, so otherwise it is the fixed
+//! configuration of the RAOP `fmtp` line for the configured sample rate
+//! and channel count (see [`ferricast_codec::alac`]).
 
+use ferricast_codec::alac::AlacConfig;
 use ferricast_core::{
     AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame, DecodedAudio, FerricastError, Result,
 };
@@ -17,19 +17,20 @@ use symphonia::default::codecs::AlacDecoder as SymphoniaAlac;
 
 use crate::aac::interleave_s16;
 
-/// Samples per channel in one AirPlay ALAC frame.
-pub const AIRPLAY_ALAC_FRAME_SAMPLES: u32 = 352;
-
-/// The 24-byte `ALACSpecificConfig` AirPlay senders assume.
-fn magic_cookie(sample_rate: u32, channels: u8) -> [u8; 24] {
-    let mut cookie = [0_u8; 24];
-    cookie[..4].copy_from_slice(&AIRPLAY_ALAC_FRAME_SAMPLES.to_be_bytes());
-    // compatible version 0, bit depth, pb, mb, kb, channels
-    cookie[4..10].copy_from_slice(&[0, 16, 40, 10, 14, channels]);
-    cookie[10..12].copy_from_slice(&255_u16.to_be_bytes());
-    // max frame bytes and average bit rate unknown (0).
-    cookie[20..24].copy_from_slice(&sample_rate.to_be_bytes());
-    cookie
+/// The cookie of `config`: its `extra_data` (normalised to the bare
+/// 24-byte config), or the AirPlay one.
+fn cookie(config: &AudioDecoderConfig, channels: u8) -> Result<[u8; AlacConfig::LEN]> {
+    match &config.extra_data {
+        Some(extra) => AlacConfig::parse(extra)
+            .map(AlacConfig::cookie)
+            .ok_or_else(|| {
+                FerricastError::Decode(format!(
+                    "ALAC extra_data of {} bytes is not an ALACSpecificConfig",
+                    extra.len()
+                ))
+            }),
+        None => Ok(AlacConfig::airplay(config.sample_rate, channels).cookie()),
+    }
 }
 
 /// Decodes AirPlay ALAC frames into interleaved 16-bit PCM.
@@ -56,7 +57,7 @@ impl SymphoniaAlacDecoder {
         params
             .for_codec(CODEC_TYPE_ALAC)
             .with_sample_rate(config.sample_rate)
-            .with_extra_data(Box::new(magic_cookie(config.sample_rate, channels)));
+            .with_extra_data(Box::new(cookie(config, channels)?));
         self.decoder = Some(
             SymphoniaAlac::try_new(&params, &DecoderOptions::default())
                 .map_err(|e| FerricastError::Decode(format!("symphonia ALAC init: {e}")))?,

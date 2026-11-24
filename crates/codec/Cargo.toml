@@ -24,6 +24,10 @@ media-foundation = ["dep:windows"]
 # `AImageReader` outputs) the Android encoders and decoders share.
 # Android-only dependencies; inert elsewhere.
 mediacodec = ["dep:ndk", "dep:ndk-sys", "dep:libc"]
+# The CoreVideo pixel buffers (`apple`) the VideoToolbox encoders and
+# decoders hand each other as native frames. Apple-only dependency;
+# inert elsewhere.
+videotoolbox = ["dep:objc2-core-foundation", "dep:objc2-core-video"]
 
 [dependencies]
 ferricast-core = { path = "../core", default-features = false }
@@ -57,8 +61,13 @@ libc = { version = "0.2", optional = true }
 ndk = { version = "0.9", default-features = false, features = ["media", "api-level-28"], optional = true }
 ndk-sys = { version = "0.6", optional = true }
 
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2-core-foundation = { version = "0.3", optional = true }
+objc2-core-video = { version = "0.3", optional = true }
+
 [lints.rust]
-# `deny`, not `forbid`: the Windows `mf` module opts in locally.
+# `deny`, not `forbid`: the Windows `mf` and Apple `apple` modules opt
+# in locally.
 unsafe_code = "deny"
 unreachable_pub = "warn"
 missing_debug_implementations = "warn"
