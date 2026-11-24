@@ -109,7 +109,7 @@ pub fn open_picker_for_dto(platform: Platform, reply_tx: oneshot::Sender<Option<
 /// Launch the picker and start the stream in-process when the user
 /// confirms. Convenience wrapper used by the main app's share
 /// buttons. The daemon path uses [`open_picker_for_dto`] directly
-/// because it does the start_stream work itself.
+/// because it does the `start_stream` work itself.
 pub fn open_picker(
     platform: Platform,
     stream_manager: SharedManager,
@@ -195,7 +195,9 @@ async fn start_stream_with_dto(
 fn dto_to_capture_source(s: &SourceDto) -> CaptureSource {
     fn str_arg(s: &SourceDto, key: &str) -> Option<String> {
         let v = s.args.get(key)?;
-        v.downcast_ref::<&str>().ok().map(|s| s.to_string())
+        v.downcast_ref::<&str>()
+            .ok()
+            .map(std::string::ToString::to_string)
     }
     match s.kind.as_str() {
         "monitor" | "screen" => CaptureSource::FullScreen {
@@ -206,8 +208,7 @@ fn dto_to_capture_source(s: &SourceDto) -> CaptureSource {
             if let Some(id) = id {
                 let identifier = id
                     .parse::<u64>()
-                    .map(WindowIdentifier::Id)
-                    .unwrap_or_else(|_| WindowIdentifier::Title(id));
+                    .map_or_else(|_| WindowIdentifier::Title(id), WindowIdentifier::Id);
                 return CaptureSource::Window {
                     identifier: Some(identifier),
                 };
@@ -314,7 +315,7 @@ impl Component for SourcePicker {
 
         // List the sources on mount and again whenever the daemon
         // reports a change, for as long as the picker is open.
-        use_side_effect_with_deps(&(), move |_: &()| {
+        use_side_effect_with_deps(&(), move |(): &()| {
             spawn(watch_entries(entries));
         });
 
@@ -619,8 +620,8 @@ fn empty_msg(text: &str) -> Label {
 
 // ── Cards ─────────────────────────────────────────────────────────
 
-const THUMB_W: f32 = 220.;
-const THUMB_H: f32 = 124.;
+const THUMB_W: u16 = 220;
+const THUMB_H: u16 = 124;
 
 #[derive(Clone)]
 struct MonitorCard {
@@ -651,10 +652,10 @@ impl Component for MonitorCard {
         card_shell(
             label_text,
             geom,
-            id.clone(),
+            &id,
             "monitor",
-            THUMB_W as u32,
-            THUMB_H as u32,
+            THUMB_W,
+            THUMB_H,
             move |_| (on_select)(SourceDto::monitor(id_for_select.clone())),
         )
     }
@@ -688,15 +689,9 @@ impl Component for WindowCard {
         let on_select = self.on_select.clone();
         let id_for_select = id.clone();
 
-        card_shell(
-            title,
-            app_id,
-            id,
-            "window",
-            THUMB_W as u32,
-            THUMB_H as u32,
-            move |_| (on_select)(SourceDto::window_by_id(id_for_select.clone())),
-        )
+        card_shell(title, app_id, &id, "window", THUMB_W, THUMB_H, move |_| {
+            (on_select)(SourceDto::window_by_id(id_for_select.clone()));
+        })
     }
 }
 
@@ -778,19 +773,19 @@ impl Component for WindowRow {
 fn card_shell(
     title: String,
     subtitle: String,
-    cache_key: String,
+    cache_key: &str,
     kind: &'static str,
-    thumb_w: u32,
-    thumb_h: u32,
+    thumb_w: u16,
+    thumb_h: u16,
     on_press: impl Fn(Event<PressEventData>) + 'static,
 ) -> Rect {
     let thumb = use_state(|| Thumbnail::Loading);
-    let cache_key_for_effect = cache_key.clone();
+    let cache_key_for_effect = cache_key.to_owned();
     use_side_effect_with_deps(&cache_key_for_effect, move |key: &String| {
         let mut thumb = thumb;
         let k = key.clone();
         spawn(async move {
-            thumb.set(Thumbnail::fetch(kind, &k, thumb_w, thumb_h).await);
+            thumb.set(Thumbnail::fetch(kind, &k, u32::from(thumb_w), u32::from(thumb_h)).await);
         });
     });
 
@@ -805,18 +800,18 @@ fn card_shell(
     // frame instead of being stretched horizontally; landscape
     // monitors fill the frame; square monitors land in the middle.
     let preview_frame = rect()
-        .width(Size::px(thumb_w as f32))
-        .height(Size::px(thumb_h as f32))
+        .width(Size::px(f32::from(thumb_w)))
+        .height(Size::px(f32::from(thumb_h)))
         .corner_radius(6.)
         .background((10, 10, 16))
         .center()
         .overflow(Overflow::Clip)
         .child(match thumb.read().clone() {
             Thumbnail::Ready(bytes) => {
-                let source: ImageSource = ((kind, cache_key.clone()), bytes).into();
+                let source: ImageSource = ((kind, cache_key.to_owned()), bytes).into();
                 let viewer: Element = ImageViewer::new(source)
-                    .width(Size::px(thumb_w as f32))
-                    .height(Size::px(thumb_h as f32))
+                    .width(Size::px(f32::from(thumb_w)))
+                    .height(Size::px(f32::from(thumb_h)))
                     .aspect_ratio(AspectRatio::Min)
                     .image_cover(ImageCover::Center)
                     .into();
@@ -837,7 +832,7 @@ fn card_shell(
                 let big = if kind == "window" && subtitle != "—" {
                     subtitle.clone()
                 } else {
-                    cache_key.clone()
+                    cache_key.to_owned()
                 };
                 rect()
                     .expanded()
@@ -864,7 +859,7 @@ fn card_shell(
     // at the same width and the row reflows by reflowing whole
     // cards, not by resizing them.
     rect()
-        .width(Size::px(thumb_w as f32 + 12.))
+        .width(Size::px(f32::from(thumb_w) + 12.))
         .background((28, 28, 38))
         .corner_radius(10.)
         .padding(6.)

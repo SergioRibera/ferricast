@@ -25,7 +25,7 @@ use crate::WaylandDirectCapture;
 ///
 /// The chain is evaluated at `start()` time: if `WaylandDirectCapture`
 /// can't bind the protocols or the source can't be resolved, the
-/// outer wrapper transparently retries on PipeWire (when its feature
+/// outer wrapper transparently retries on `PipeWire` (when its feature
 /// is enabled).
 pub enum NativeCapture {
     #[cfg(feature = "wayland-direct")]

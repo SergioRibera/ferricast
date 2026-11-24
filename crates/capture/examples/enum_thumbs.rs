@@ -25,7 +25,7 @@ struct Tally {
 }
 
 impl Tally {
-    fn record<T>(&mut self, started: Instant, outcome: Option<Result<T, String>>, empty: bool) {
+    fn record<T>(&mut self, started: Instant, outcome: Option<&Result<T, String>>, empty: bool) {
         self.slowest = self.slowest.max(started.elapsed());
         match outcome {
             None => self.hung += 1,
@@ -108,7 +108,7 @@ async fn fresh_enumerators(iterations: usize) {
             .and_then(|r| r.as_ref().ok())
             .is_some_and(|ms| ms.iter().any(|m| m.geometry.width == 0));
         counts.push((n, zero_geometry));
-        monitors.record(started, listed, n == 0 || zero_geometry);
+        monitors.record(started, listed.as_ref(), n == 0 || zero_geometry);
     }
     monitors.print("fresh enumerator monitors");
     counts.sort_unstable();
@@ -134,7 +134,7 @@ async fn thumbnails(enumerator: &Arc<dyn SourceEnumerator>, iterations: usize) {
             .and_then(|r| r.as_ref().ok())
             .cloned()
             .unwrap_or_default();
-        lists.record(started, monitors, mons.is_empty());
+        lists.record(started, monitors.as_ref(), mons.is_empty());
 
         // Every card requests its preview at once, like the picker.
         let mut set = tokio::task::JoinSet::new();
@@ -158,9 +158,9 @@ async fn thumbnails(enumerator: &Arc<dyn SourceEnumerator>, iterations: usize) {
             let (is_monitor, started, r) = joined.expect("thumbnail task panicked");
             let empty = matches!(&r, Some(Ok(b)) if b.is_empty());
             if is_monitor {
-                monitor_thumbs.record(started, r, empty);
+                monitor_thumbs.record(started, r.as_ref(), empty);
             } else {
-                window_thumbs.record(started, r, empty);
+                window_thumbs.record(started, r.as_ref(), empty);
             }
         }
     }
@@ -191,7 +191,7 @@ async fn direct_capture(enumerator: &Arc<dyn SourceEnumerator>) {
         println!(
             "direct start {}: {:?} in {:?}",
             monitor.id,
-            r.as_ref().map(|r| r.is_ok()),
+            r.as_ref().map(std::result::Result::is_ok),
             started.elapsed()
         );
         if matches!(r, Some(Ok(()))) {
@@ -200,7 +200,7 @@ async fn direct_capture(enumerator: &Arc<dyn SourceEnumerator>) {
                 let f = bounded("next_frame", capture.next_frame()).await;
                 println!(
                     "  frame: {:?} in {:?}",
-                    f.as_ref().map(|r| r.is_ok()),
+                    f.as_ref().map(std::result::Result::is_ok),
                     started.elapsed()
                 );
             }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use clap::Parser;
 use ferricast::ManagerEvent;
 use ferricast::prelude::*;
-use freya::{prelude::*, radio::*};
+use freya::{prelude::*, radio::RadioStation};
 use tokio::sync::mpsc;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -21,7 +21,7 @@ mod pairing;
 mod picker;
 mod receiver_window;
 
-use crate::app::*;
+use crate::app::{AppChannel, AppState, FerricastApp, UiCommand};
 use crate::cli::{Cli, Command};
 
 fn main() -> anyhow::Result<()> {
@@ -65,6 +65,10 @@ struct Daemon {
 
 /// Sets up the manager, the D-Bus service, discovery and receivers, or
 /// runs a client subcommand (returning `None`).
+#[expect(
+    clippy::too_many_lines,
+    reason = "the daemon start-up sequence reads top to bottom"
+)]
 async fn start() -> anyhow::Result<Option<Daemon>> {
     let args = Cli::parse();
 
@@ -250,7 +254,7 @@ async fn start() -> anyhow::Result<Option<Daemon>> {
     // bursts higher than that mean a buggy client.
     let (picker_tx, picker_rx) = mpsc::channel::<PickerRequest>(4);
 
-    let _conn = daemon::start(
+    let bus_conn = daemon::start(
         manager.clone(),
         enumerator,
         manager_events,
@@ -308,7 +312,7 @@ async fn start() -> anyhow::Result<Option<Daemon>> {
         picker_rx,
         receiver_window_rx,
         hidden: args.background,
-        _bus: _conn,
+        _bus: bus_conn,
     }))
 }
 
@@ -319,17 +323,14 @@ async fn shutdown_manager(manager: &SharedManager) {
     tracing::info!("shutting down streams, receivers and discovery");
     // Cancels in-flight starts too, which releases their read locks.
     manager.read().await.stop_all_streams().await;
-    match tokio::time::timeout(WRITE_LOCK_GRACE, manager.write()).await {
-        Ok(mut m) => {
-            if let Err(e) = m.shutdown().await {
-                tracing::warn!(%e, "manager shutdown");
-            }
+    if let Ok(mut m) = tokio::time::timeout(WRITE_LOCK_GRACE, manager.write()).await {
+        if let Err(e) = m.shutdown().await {
+            tracing::warn!(%e, "manager shutdown");
         }
-        Err(_) => {
-            tracing::warn!("manager still busy; stopping discovery only");
-            if let Err(e) = manager.read().await.stop_discovery().await {
-                tracing::warn!(%e, "stop discovery");
-            }
+    } else {
+        tracing::warn!("manager still busy; stopping discovery only");
+        if let Err(e) = manager.read().await.stop_discovery().await {
+            tracing::warn!(%e, "stop discovery");
         }
     }
 }
@@ -561,7 +562,7 @@ fn default_trace_log_path() -> Option<std::path::PathBuf> {
         // the binary the user launched.
         std::env::current_exe()
             .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))?
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))?
     } else if cfg!(target_os = "macos") {
         let home = std::env::var_os("HOME")?;
         std::path::PathBuf::from(home).join("Library/Caches/ferricast")

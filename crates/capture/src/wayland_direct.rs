@@ -7,7 +7,7 @@
 //! Vulkan importer ([`crate::vulkan`]) is attached for x264-style
 //! readback fallback.
 //!
-//! ## Why a separate backend from PipeWire?
+//! ## Why a separate backend from `PipeWire`?
 //!
 //! The portal owns source selection (it pops its own dialog). When
 //! the user pick already happened in our in-process picker, going
@@ -40,7 +40,7 @@
 //!   when the output needs re-orienting (rotated / y-inverted — GPU
 //!   frames can't be), the bo is read back and emits as
 //!   `CapturedFrame::Cpu`.
-//! - **Fallback**: `buffer` event (wl_shm). Allocates a memfd pool,
+//! - **Fallback**: `buffer` event (`wl_shm`). Allocates a memfd pool,
 //!   reads back. Emits `CapturedFrame::Cpu`. Used when the
 //!   compositor doesn't advertise `linux_dmabuf` for the frame
 //!   (rare on modern hardware but possible on llvmpipe / nested),
@@ -119,6 +119,8 @@ impl DmabufAllocator {
     /// path so the dmabuf attempt at least happens on single-GPU
     /// hosts.
     fn open(main_device_dev_t: Option<u64>) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
         let nodes: Vec<String> = render_node_paths();
 
         if let Some(target_dev_t) = main_device_dev_t {
@@ -127,23 +129,19 @@ impl DmabufAllocator {
                 let Ok(meta) = std::fs::metadata(path) else {
                     continue;
                 };
-                use std::os::unix::fs::MetadataExt;
                 if meta.rdev() != target_dev_t {
                     continue;
                 }
-                match Self::try_open(path, node) {
-                    Some(d) => {
-                        info!(
-                            node,
-                            main_device = format!("0x{target_dev_t:016x}"),
-                            "gbm device opened for direct-capture allocation (matched feedback main_device)"
-                        );
-                        return Ok(DmabufAllocator {
-                            device: d,
-                            accepted: HashMap::new(),
-                        });
-                    }
-                    None => continue,
+                if let Some(d) = Self::try_open(path, node) {
+                    info!(
+                        node,
+                        main_device = format!("0x{target_dev_t:016x}"),
+                        "gbm device opened for direct-capture allocation (matched feedback main_device)"
+                    );
+                    return Ok(DmabufAllocator {
+                        device: d,
+                        accepted: HashMap::new(),
+                    });
                 }
             }
             warn!(
@@ -193,6 +191,10 @@ impl DmabufAllocator {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear setup or event sequence over shared state; splitting it would scatter that state"
+    )]
     fn alloc(
         &self,
         width: u32,
@@ -227,8 +229,7 @@ impl DmabufAllocator {
             advertised_modifiers = self
                 .accepted
                 .get(&(fourcc as u32))
-                .map(|v| v.len())
-                .unwrap_or(0),
+                .map_or(0, std::vec::Vec::len),
             "gbm: attempting dmabuf alloc"
         );
 
@@ -346,9 +347,7 @@ impl DmabufAllocator {
             }
         }
         let bo = bo_opt.ok_or_else(|| {
-            let cause = last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "no modifier worked".into());
+            let cause = last_err.map_or_else(|| "no modifier worked".into(), |e| e.to_string());
             FerricastError::Capture(format!(
                 "gbm alloc (fourcc={fourcc:?}, {width}x{height}): {cause}"
             ))
@@ -372,11 +371,11 @@ impl DmabufAllocator {
 }
 
 /// One DMA-BUF the compositor writes into. Keeps the `gbm` BO alive
-/// (drop releases the memory) and exposes the fd for wl_buffer
+/// (drop releases the memory) and exposes the fd for `wl_buffer`
 /// wrapping + downstream consumption.
 struct AllocatedBuffer {
     /// Never read: held so the memory stays alive while the
-    /// wl_buffer and the exported `fd` reference it (readback goes
+    /// `wl_buffer` and the exported `fd` reference it (readback goes
     /// through the fd, see `mmap_bo_to_raw`).
     _bo: gbm::BufferObject<()>,
     fd: OwnedFd,
@@ -486,7 +485,7 @@ impl ScreenCapture for WaylandDirectCapture {
         let join = std::thread::Builder::new()
             .name("ferricast-wl-direct".into())
             .spawn(move || {
-                if let Err(e) = run_worker(output_name_clone, fps, frame_tx, stop_rx, size_tx) {
+                if let Err(e) = run_worker(&output_name_clone, fps, &frame_tx, &stop_rx, size_tx) {
                     warn!(%e, "wayland-direct worker exited");
                 }
             })
@@ -577,11 +576,19 @@ impl ScreenCapture for WaylandDirectCapture {
 /// frame period.
 const FRAME_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Consecutive dmabuf failures (allocation or compositor rejection)
+/// after which the worker stays on SHM for the rest of the session.
+const DMABUF_FAILURE_THRESHOLD: u32 = 3;
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear setup or event sequence over shared state; splitting it would scatter that state"
+)]
 fn run_worker(
-    output_name: String,
+    output_name: &str,
     fps: u32,
-    frame_tx: mpsc::Sender<CapturedFrame>,
-    stop_rx: std::sync::mpsc::Receiver<()>,
+    frame_tx: &mpsc::Sender<CapturedFrame>,
+    stop_rx: &std::sync::mpsc::Receiver<()>,
     size_tx: tokio::sync::oneshot::Sender<(u32, u32)>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env()
@@ -635,7 +642,7 @@ fn run_worker(
     let target = state
         .outputs
         .iter()
-        .find(|o| o.name.as_deref() == Some(output_name.as_str()))
+        .find(|o| o.name.as_deref() == Some(output_name))
         .map(|o| o.proxy.clone())
         .ok_or_else(|| FerricastError::Capture(format!("no output named {output_name:?}")))?;
     state.target = Some(target.clone());
@@ -695,7 +702,7 @@ fn run_worker(
     let mut pool: BufferPool<PooledBuffer> = BufferPool::default();
     let mut pool_exhausted_warned = false;
 
-    let frame_period = Duration::from_micros(1_000_000 / fps as u64);
+    let frame_period = Duration::from_micros(1_000_000 / u64::from(fps));
     let mut next_capture = Instant::now();
     // Sticky-disable knob for the dmabuf path. The compositor can
     // accept a `params.add` with `create_immed` (no synchronous
@@ -709,7 +716,6 @@ fn run_worker(
     // it can't.
     let mut dmabuf_disabled = false;
     let mut dmabuf_consecutive_failures: u32 = 0;
-    const DMABUF_FAILURE_THRESHOLD: u32 = 3;
     let mut gpu_orientation_warned = false;
 
     loop {
@@ -1200,8 +1206,8 @@ fn make_dmabuf_buffer(
         (buf.modifier & 0xffff_ffff) as u32,
     );
     let wl_buf = params.create_immed(
-        buf.width as i32,
-        buf.height as i32,
+        buf.width.cast_signed(),
+        buf.height.cast_signed(),
         offer.format,
         zwp_linux_buffer_params_v1::Flags::empty(),
         qh,
@@ -1214,7 +1220,7 @@ fn make_dmabuf_buffer(
     })
 }
 
-/// One-shot wl_shm buffer; its `wl_buffer` is destroyed on drop.
+/// One-shot `wl_shm` buffer; its `wl_buffer` is destroyed on drop.
 struct ShmBuffer {
     wl_buffer: WlBuffer,
     _fd: OwnedFd,
@@ -1252,12 +1258,12 @@ fn make_shm_buffer(
         ));
     }
     let (fd, mmap) = alloc_memfd(size as usize)?;
-    let pool = shm.create_pool(fd.as_fd(), size as i32, qh, ());
+    let pool = shm.create_pool(fd.as_fd(), size.cast_signed(), qh, ());
     let wl_buf = pool.create_buffer(
         0,
-        info.width as i32,
-        info.height as i32,
-        stride as i32,
+        info.width.cast_signed(),
+        info.height.cast_signed(),
+        stride.cast_signed(),
         wl_format,
         qh,
         (),
@@ -1278,8 +1284,7 @@ fn now_us() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
 /// Read a freshly-captured dmabuf back to host bytes. Used when the
@@ -1364,7 +1369,8 @@ fn mmap_bo_to_raw(alloc: &AllocatedBuffer) -> std::result::Result<RawFrame, Ferr
         colour: None,
         width: alloc.width,
         height: alloc.height,
-        stride: dst_stride as u32,
+        stride: u32::try_from(dst_stride)
+            .map_err(|_| FerricastError::Capture("readback stride exceeds u32".into()))?,
         format,
         data,
         timestamp_us: now_us(),
@@ -1374,7 +1380,7 @@ fn mmap_bo_to_raw(alloc: &AllocatedBuffer) -> std::result::Result<RawFrame, Ferr
 // `linux/dma-buf.h` constants. Hardcoded because `libc` doesn't
 // expose them and adding a `nix` dep for one ioctl is overkill.
 const DMA_BUF_SYNC_READ: u64 = 1 << 0;
-#[allow(dead_code)]
+#[allow(dead_code, reason = "completes the DMA_BUF_IOCTL_SYNC flag set")]
 const DMA_BUF_SYNC_WRITE: u64 = 1 << 1;
 const DMA_BUF_SYNC_START: u64 = 0;
 const DMA_BUF_SYNC_END: u64 = 1 << 2;
@@ -1382,7 +1388,7 @@ const DMA_BUF_SYNC_END: u64 = 1 << 2;
 // arch we target. struct size = 8 bytes, dir = WRITE (userspace
 // writes the request struct), type = 'b' = 0x62, nr = 0. The
 // ioctl value is ABI-stable across kernel versions.
-const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
+const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x4008_6200;
 
 fn dma_buf_sync(fd: std::os::fd::RawFd, flags: u64) -> std::io::Result<()> {
     #[repr(C)]
@@ -1394,7 +1400,7 @@ fn dma_buf_sync(fd: std::os::fd::RawFd, flags: u64) -> std::io::Result<()> {
         libc::ioctl(
             fd,
             DMA_BUF_IOCTL_SYNC,
-            &req as *const DmaBufSync as *const _,
+            std::ptr::from_ref(&req).cast::<libc::c_void>(),
         )
     };
     if res < 0 {
@@ -1508,7 +1514,7 @@ impl Dispatch<WlOutput, ()> for WorkerState {
         state: &mut Self,
         proxy: &WlOutput,
         event: <WlOutput as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -1534,7 +1540,7 @@ impl Dispatch<ZxdgOutputManagerV1, ()> for WorkerState {
         _: &mut Self,
         _: &ZxdgOutputManagerV1,
         _: <ZxdgOutputManagerV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -1545,7 +1551,7 @@ impl Dispatch<ZxdgOutputV1, ()> for WorkerState {
         state: &mut Self,
         _: &ZxdgOutputV1,
         event: <ZxdgOutputV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -1564,7 +1570,7 @@ impl Dispatch<WlShm, ()> for WorkerState {
         _: &mut Self,
         _: &WlShm,
         _: <WlShm as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -1575,7 +1581,7 @@ impl Dispatch<WlShmPool, ()> for WorkerState {
         _: &mut Self,
         _: &WlShmPool,
         _: <WlShmPool as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -1586,7 +1592,7 @@ impl Dispatch<WlBuffer, ()> for WorkerState {
         _: &mut Self,
         _: &WlBuffer,
         _: <WlBuffer as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -1597,7 +1603,7 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for WorkerState {
         state: &mut Self,
         _: &ZwpLinuxDmabufV1,
         event: <ZwpLinuxDmabufV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -1622,7 +1628,7 @@ impl Dispatch<ZwpLinuxBufferParamsV1, ()> for WorkerState {
         _: &mut Self,
         _: &ZwpLinuxBufferParamsV1,
         _: <ZwpLinuxBufferParamsV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -1633,7 +1639,7 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for WorkerState {
         _: &mut Self,
         _: &ZwlrScreencopyManagerV1,
         _: <ZwlrScreencopyManagerV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -1645,7 +1651,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for WorkerState {
         state: &mut Self,
         _: &ZwlrScreencopyFrameV1,
         event: <ZwlrScreencopyFrameV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -1730,7 +1736,7 @@ fn alloc_memfd(size: usize) -> Result<(OwnedFd, MmapRegion)> {
     let raw = unsafe {
         libc::syscall(
             libc::SYS_memfd_create,
-            name.as_ptr() as *const libc::c_char,
+            name.as_ptr().cast::<libc::c_char>(),
             libc::MFD_CLOEXEC,
         )
     };
@@ -1740,8 +1746,12 @@ fn alloc_memfd(size: usize) -> Result<(OwnedFd, MmapRegion)> {
             std::io::Error::last_os_error()
         )));
     }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
-    if unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) } != 0 {
+    let raw = i32::try_from(raw)
+        .map_err(|_| FerricastError::Capture(format!("memfd_create returned fd {raw}")))?;
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let length = libc::off_t::try_from(size)
+        .map_err(|_| FerricastError::Capture(format!("memfd of {size} bytes exceeds off_t")))?;
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), length) } != 0 {
         return Err(FerricastError::Capture(format!(
             "ftruncate: {}",
             std::io::Error::last_os_error()
@@ -1766,7 +1776,7 @@ fn alloc_memfd(size: usize) -> Result<(OwnedFd, MmapRegion)> {
     Ok((
         fd,
         MmapRegion {
-            ptr: ptr as *mut u8,
+            ptr: ptr.cast::<u8>(),
             len: size,
         },
     ))
@@ -1788,7 +1798,7 @@ impl MmapRegion {
 impl Drop for MmapRegion {
     fn drop(&mut self) {
         unsafe {
-            libc::munmap(self.ptr as *mut _, self.len);
+            libc::munmap(self.ptr.cast(), self.len);
         }
     }
 }
@@ -1820,7 +1830,7 @@ impl Drop for MmapRegion {
 // optimisations we don't care about, and using them would defeat
 // the "same GPU as compositor" guarantee.
 
-/// What `query_feedback` returns. `main_device` is the dev_t of the
+/// What `query_feedback` returns. `main_device` is the `dev_t` of the
 /// compositor's primary GPU as a `u64` (matches `st_rdev` from
 /// `stat()`). `accepted` is the map of fourcc → modifiers the
 /// compositor will import on that device.
@@ -1938,7 +1948,7 @@ struct FeedbackState {
 #[derive(Default, Clone)]
 struct TrancheState {
     target_device: Option<u64>,
-    /// u16 indices into the format_table.
+    /// u16 indices into the `format_table`.
     indices: Vec<u16>,
 }
 
@@ -1947,7 +1957,7 @@ impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for FeedbackState {
         state: &mut Self,
         _: &ZwpLinuxDmabufFeedbackV1,
         event: <ZwpLinuxDmabufFeedbackV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -1973,17 +1983,15 @@ impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for FeedbackState {
                     cur.indices.push(u16::from_ne_bytes([chunk[0], chunk[1]]));
                 }
             }
-            Event::TrancheFlags { .. } => {
-                // We don't filter on `scanout` here — screencopy
-                // doesn't care, and excluding scanout-only tranches
-                // would lose perfectly importable LINEAR layouts
-                // on some compositors.
-            }
             Event::TrancheDone => {
                 if let Some(t) = state.current.take() {
                     state.tranches.push(t);
                 }
             }
+            // `TrancheFlags` included: we don't filter on `scanout` —
+            // screencopy doesn't care, and excluding scanout-only tranches
+            // would lose perfectly importable LINEAR layouts on some
+            // compositors.
             _ => {}
         }
     }
@@ -1999,7 +2007,7 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for FeedbackState {
         _: &mut Self,
         _: &ZwpLinuxDmabufV1,
         _: <ZwpLinuxDmabufV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {

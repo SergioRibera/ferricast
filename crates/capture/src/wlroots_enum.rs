@@ -7,7 +7,7 @@
 //!   `output_leave` / window state.
 //! - `ext_foreign_toplevel_list_v1` (niri, KDE Plasma 6, future
 //!   wlroots). Standard upstream protocol, intentionally minimal:
-//!   title / app_id / a globally-stable identifier and nothing else.
+//!   title / `app_id` / a globally-stable identifier and nothing else.
 //!
 //! `try_new` tries them in that order — wlr first because the extra
 //! metadata is genuinely useful for pickers — and falls back to the
@@ -59,14 +59,14 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
 
 #[derive(Default)]
 struct OutputData {
-    /// wl_output `name` (since v4) — when missing falls back to
+    /// `wl_output` `name` (since v4) — when missing falls back to
     /// the xdg-output `name` event. Stable per compositor restart.
     name: Option<String>,
     description: Option<String>,
     make: Option<String>,
     model: Option<String>,
-    /// Logical position from xdg_output. We deliberately ignore the
-    /// wl_output `geometry` x/y (which is in raw compositor pixels)
+    /// Logical position from `xdg_output`. We deliberately ignore the
+    /// `wl_output` `geometry` x/y (which is in raw compositor pixels)
     /// because pickers always want logical coords.
     logical_x: i32,
     logical_y: i32,
@@ -79,13 +79,13 @@ struct OutputData {
     /// event; we wait for it before publishing.
     ready: bool,
     /// Whether xdg-output reported the logical size. It arrives one
-    /// round-trip after the wl_output events because the xdg-output
+    /// round-trip after the `wl_output` events because the xdg-output
     /// object is only created once the output is known.
     logical_size_known: bool,
 }
 
 impl OutputData {
-    /// Whether the output can be shown to pickers: its wl_output state
+    /// Whether the output can be shown to pickers: its `wl_output` state
     /// is complete and, when xdg-output is bound, so is its geometry.
     /// Publishing earlier would list the monitor as 0×0.
     fn is_publishable(&self, needs_logical_size: bool) -> bool {
@@ -97,7 +97,7 @@ impl OutputData {
 struct ToplevelData {
     title: String,
     app_id: Option<String>,
-    /// wl_output protocol_ids this toplevel is currently on. Empty
+    /// `wl_output` `protocol_ids` this toplevel is currently on. Empty
     /// on the `ext-foreign-toplevel-list-v1` backend because that
     /// protocol intentionally omits output tracking — clients are
     /// expected to compose it with `ext-foreign-toplevel-state-v1`
@@ -105,9 +105,9 @@ struct ToplevelData {
     outputs: HashSet<u32>,
     /// Stable string id from `ext_foreign_toplevel_handle_v1.identifier`.
     /// Only populated on the ext backend; wlr toplevels fall back to
-    /// the wayland protocol_id stringified. We prefer this when
+    /// the wayland `protocol_id` stringified. We prefer this when
     /// publishing because the ext spec guarantees it's a globally
-    /// unique, compositor-stable id, while protocol_id is per-
+    /// unique, compositor-stable id, while `protocol_id` is per-
     /// connection.
     identifier: Option<String>,
     closed: bool,
@@ -121,12 +121,12 @@ struct Snapshot {
 }
 
 struct State {
-    /// wl_output object id → its data. We key on `id()` (a u32)
+    /// `wl_output` object id → its data. We key on `id()` (a u32)
     /// rather than the `WlOutput` proxy itself because it's `Copy`
     /// and lets us cross-reference from toplevel `output_enter`
     /// events without juggling proxy lifetimes.
     outputs: HashMap<u32, (WlOutput, OutputData)>,
-    /// Registry global name → wl_output protocol id, so a
+    /// Registry global name → `wl_output` protocol id, so a
     /// `global_remove` (monitor unplugged) can find the entry to drop.
     output_globals: HashMap<u32, u32>,
     xdg_outputs: HashMap<u32, ZxdgOutputV1>,
@@ -142,11 +142,11 @@ struct State {
     xdg_output_manager: Option<ZxdgOutputManagerV1>,
     /// Held for their side effect: dropping the manager proxy makes
     /// the compositor stop sending `toplevel` events. Only one of
-    /// the two is `Some` at any time — try_new picks wlr first
+    /// the two is `Some` at any time — `try_new` picks wlr first
     /// (richer info) and falls back to ext.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "the bound global must stay alive for its events")]
     foreign_manager: Option<ZwlrForeignToplevelManagerV1>,
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "the bound global must stay alive for its events")]
     ext_manager: Option<ExtForeignToplevelListV1>,
 
     snapshot: Arc<Mutex<Snapshot>>,
@@ -161,7 +161,7 @@ struct State {
 }
 
 impl State {
-    /// Drop the wl_output bound from registry global `name` (monitor
+    /// Drop the `wl_output` bound from registry global `name` (monitor
     /// unplugged / disabled). Unknown names belong to other globals
     /// and are ignored.
     fn remove_output_global(&mut self, name: u32) {
@@ -222,12 +222,12 @@ impl State {
                 geometry: Geometry {
                     x: o.logical_x,
                     y: o.logical_y,
-                    width: o.logical_w.max(0) as u32,
-                    height: o.logical_h.max(0) as u32,
+                    width: o.logical_w.max(0).cast_unsigned(),
+                    height: o.logical_h.max(0).cast_unsigned(),
                 },
-                scale: o.scale.max(1) as f32,
+                scale: f32::from(i16::try_from(o.scale.max(1)).unwrap_or(i16::MAX)),
                 refresh_mhz: if o.refresh_mhz > 0 {
-                    Some(o.refresh_mhz as u32)
+                    Some(o.refresh_mhz.cast_unsigned())
                 } else {
                     None
                 },
@@ -286,7 +286,7 @@ impl State {
     }
 }
 
-/// Round-trips `try_new` spends at most on the initial state: wl_output
+/// Round-trips `try_new` spends at most on the initial state: `wl_output`
 /// and toplevel state arrive on the first, xdg-output geometry on the
 /// second (its objects are created while handling the first).
 const INITIAL_STATE_ROUNDTRIPS: usize = 4;
@@ -346,8 +346,10 @@ pub struct WaylandSourceEnumerator {
 
 impl WaylandSourceEnumerator {
     /// Connect to the running Wayland compositor and bind the
-    /// available foreign-toplevel + xdg-output globals. Returns an
-    /// error if:
+    /// available foreign-toplevel + xdg-output globals.
+    ///
+    /// # Errors
+    /// [`SourceError::Backend`] if:
     ///
     /// - `WAYLAND_DISPLAY` isn't set / can't connect, or
     /// - the compositor exposes **neither**
@@ -358,7 +360,7 @@ impl WaylandSourceEnumerator {
     ///
     /// Binding precedence is wlr first because it carries strictly
     /// more information (per-output presence + window state). The
-    /// ext fallback is intentionally minimal: title / app_id /
+    /// ext fallback is intentionally minimal: title / `app_id` /
     /// stable identifier and nothing else.
     pub fn try_new() -> Result<Self, SourceError> {
         let conn = Connection::connect_to_env()
@@ -487,7 +489,11 @@ fn run_loop(_conn: Connection, mut queue: wayland_client::EventQueue<State>, mut
                 let msg = panic
                     .downcast_ref::<String>()
                     .cloned()
-                    .or_else(|| panic.downcast_ref::<&'static str>().map(|s| s.to_string()))
+                    .or_else(|| {
+                        panic
+                            .downcast_ref::<&'static str>()
+                            .map(std::string::ToString::to_string)
+                    })
                     .unwrap_or_else(|| "<non-string panic>".into());
                 warn!(%msg, "wlroots dispatch panicked — exiting enumerator thread");
                 return;
@@ -593,7 +599,7 @@ impl Dispatch<WlOutput, ()> for State {
         state: &mut Self,
         proxy: &WlOutput,
         event: <WlOutput as wayland_client::Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
@@ -655,7 +661,7 @@ impl Dispatch<ZxdgOutputManagerV1, ()> for State {
         _: &mut Self,
         _: &ZxdgOutputManagerV1,
         _: <ZxdgOutputManagerV1 as wayland_client::Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -704,7 +710,7 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for State {
         state: &mut Self,
         _: &ZwlrForeignToplevelManagerV1,
         event: <ZwlrForeignToplevelManagerV1 as wayland_client::Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -745,15 +751,16 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
         state: &mut Self,
         proxy: &ZwlrForeignToplevelHandleV1,
         event: <ZwlrForeignToplevelHandleV1 as wayland_client::Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        use zwlr_foreign_toplevel_handle_v1::Event;
+
         let id = proxy.id().protocol_id();
         let Some((_, data)) = state.wlr_toplevels.get_mut(&id) else {
             return;
         };
-        use zwlr_foreign_toplevel_handle_v1::Event;
         match event {
             Event::Title { title } => {
                 data.title = title;
@@ -799,7 +806,7 @@ impl Dispatch<ExtForeignToplevelListV1, ()> for State {
         state: &mut Self,
         _: &ExtForeignToplevelListV1,
         event: <ExtForeignToplevelListV1 as wayland_client::Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -833,15 +840,16 @@ impl Dispatch<ExtForeignToplevelHandleV1, ()> for State {
         state: &mut Self,
         proxy: &ExtForeignToplevelHandleV1,
         event: <ExtForeignToplevelHandleV1 as wayland_client::Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        use ext_foreign_toplevel_handle_v1::Event;
+
         let id = proxy.id().protocol_id();
         let Some((_, data)) = state.ext_toplevels.get_mut(&id) else {
             return;
         };
-        use ext_foreign_toplevel_handle_v1::Event;
         match event {
             Event::Title { title } => {
                 data.title = title;

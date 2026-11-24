@@ -155,9 +155,8 @@ fn supports_sync_fd_import(instance: &ash::Instance, dev: vk::PhysicalDevice) ->
     if props.api_version < vk::API_VERSION_1_1 {
         return false;
     }
-    let exts = match unsafe { instance.enumerate_device_extension_properties(dev) } {
-        Ok(exts) => exts,
-        Err(_) => return false,
+    let Ok(exts) = (unsafe { instance.enumerate_device_extension_properties(dev) }) else {
+        return false;
     };
     if !has_extension(&exts, ash::khr::external_semaphore_fd::NAME) {
         debug!("no VK_KHR_external_semaphore_fd: dmabuf implicit-sync wait disabled");
@@ -432,13 +431,13 @@ fn pick_queue_family(instance: &ash::Instance, physical_device: vk::PhysicalDevi
         .iter()
         .enumerate()
         .find(|(_, q)| q.queue_flags.contains(vk::QueueFlags::TRANSFER))
-        .map(|(i, _)| i as u32)
+        .and_then(|(i, _)| u32::try_from(i).ok())
         .or_else(|| {
             families
                 .iter()
                 .enumerate()
                 .find(|(_, q)| q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-                .map(|(i, _)| i as u32)
+                .and_then(|(i, _)| u32::try_from(i).ok())
         })
 }
 

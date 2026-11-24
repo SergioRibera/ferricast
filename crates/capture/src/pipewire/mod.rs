@@ -1,13 +1,13 @@
-//! PipeWire screen capture backend.
+//! `PipeWire` screen capture backend.
 //!
 //! Talks to `xdg-desktop-portal.ScreenCast` (via `ashpd`) to obtain a
-//! PipeWire socket and node id, then runs a dedicated PipeWire main loop
+//! `PipeWire` socket and node id, then runs a dedicated `PipeWire` main loop
 //! on its own OS thread to pull video buffers and ferry them to the
 //! async [`ferricast_core::ScreenCapture`] trait.
 //!
 //! Module layout:
 //! * [`portal`]    — D-Bus portal handshake.
-//! * [`stream`]    — PipeWire main-loop worker.
+//! * [`stream`]    — `PipeWire` main-loop worker.
 //! * [`format`]    — SPA pod construction & format conversion.
 //! * [`lease`]     — keeps DMA-BUF buffers dequeued while consumers read them.
 
@@ -28,7 +28,7 @@ use tracing::{info, warn};
 use self::portal::PortalSession;
 use self::stream::{SharedFormat, WorkerHandle};
 
-/// Screen capture backend using PipeWire via `xdg-desktop-portal`.
+/// Screen capture backend using `PipeWire` via `xdg-desktop-portal`.
 ///
 /// ```ignore
 /// let mut cap = PipeWireCapture::new();
@@ -56,30 +56,27 @@ struct ActivePortal {
     /// ("Stop sharing", compositor revoked the cast).
     closed: watch::Receiver<bool>,
     /// `None` when `start()` ran outside a Tokio runtime, in which
-    /// case only the PipeWire stream state reports the end of the cast.
+    /// case only the `PipeWire` stream state reports the end of the cast.
     watcher: Option<JoinHandle<()>>,
 }
 
 impl ActivePortal {
     fn new(session: PortalSession) -> Self {
         let (closed_tx, closed) = watch::channel(false);
-        let watcher = match tokio::runtime::Handle::try_current() {
-            Ok(rt) => {
-                let session = session.clone();
-                Some(rt.spawn(async move {
-                    match session.closed().await {
-                        Ok(()) => {
-                            info!("portal session closed by the compositor or user");
-                            closed_tx.send_replace(true);
-                        }
-                        Err(e) => warn!(error = %e, "can't watch portal session Closed signal"),
+        let watcher = if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let session = session.clone();
+            Some(rt.spawn(async move {
+                match session.closed().await {
+                    Ok(()) => {
+                        info!("portal session closed by the compositor or user");
+                        closed_tx.send_replace(true);
                     }
-                }))
-            }
-            Err(_) => {
-                warn!("no Tokio runtime; portal Closed signal not watched");
-                None
-            }
+                    Err(e) => warn!(error = %e, "can't watch portal session Closed signal"),
+                }
+            }))
+        } else {
+            warn!("no Tokio runtime; portal Closed signal not watched");
+            None
         };
         Self {
             session,
@@ -97,6 +94,7 @@ impl ActivePortal {
 }
 
 impl PipeWireCapture {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             worker: None,
@@ -124,7 +122,7 @@ impl Drop for PipeWireCapture {
                 rt.spawn(portal.close());
             }
             Err(_) => {
-                warn!("PipeWireCapture dropped outside a Tokio runtime; portal session left open")
+                warn!("PipeWireCapture dropped outside a Tokio runtime; portal session left open");
             }
         }
     }
@@ -239,16 +237,12 @@ impl ScreenCapture for PipeWireCapture {
 
     fn get_pixel_format(&self) -> PixelFormat {
         self.snapshot()
-            .map(|n| n.pixel_format)
-            // Reasonable default before negotiation finishes; matches what
-            // most Wayland compositors produce.
-            .unwrap_or(PixelFormat::Bgra)
+            .map_or(PixelFormat::Bgra, |n| n.pixel_format)
     }
 
     fn get_screen_size(&self) -> (usize, usize) {
         self.snapshot()
-            .map(|n| (n.width as usize, n.height as usize))
-            .unwrap_or((0, 0))
+            .map_or((0, 0), |n| (n.width as usize, n.height as usize))
     }
 
     /// Returns the framerate the compositor agreed on. The negotiated
@@ -262,6 +256,7 @@ impl ScreenCapture for PipeWireCapture {
             return 0;
         }
         // Round-to-nearest so 24000/1001 surfaces as 24, not 23.
-        ((f.num as u64 + (f.denom as u64 / 2)) / f.denom as u64) as u32
+        u32::try_from((u64::from(f.num) + (u64::from(f.denom) / 2)) / u64::from(f.denom))
+            .unwrap_or(u32::MAX)
     }
 }

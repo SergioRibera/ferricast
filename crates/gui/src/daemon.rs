@@ -60,7 +60,9 @@ fn device_to_dto(d: &Device) -> DeviceDto {
 /// we expect a string shouldn't crash discovery.
 fn str_arg(s: &SourceDto, key: &str) -> Option<String> {
     let v = s.args.get(key)?;
-    v.downcast_ref::<&str>().ok().map(|s| s.to_owned())
+    v.downcast_ref::<&str>()
+        .ok()
+        .map(std::borrow::ToOwned::to_owned)
 }
 
 /// Translate a wire [`SourceDto`] into a [`CaptureSource`], resolving
@@ -78,8 +80,8 @@ fn str_arg(s: &SourceDto, key: &str) -> Option<String> {
 /// - `"window"` with `id: s` → look the window up in the enumerator,
 ///   prefer `WindowIdentifier::Id` when the id parses as a u64
 ///   (X11 case), fall back to its current title (wlroots case
-///   where ids are wayland protocol_ids and don't survive a fresh
-///   wl_display connection — title is the only handle the capture
+///   where ids are wayland `protocol_ids` and don't survive a fresh
+///   `wl_display` connection — title is the only handle the capture
 ///   backend can re-resolve).
 /// - `"window"` with `title: s` → exact title; no enumerator lookup.
 ///
@@ -185,7 +187,7 @@ fn monitor_to_dto(m: ferricast::MonitorInfo) -> MonitorInfoDto {
         y: m.geometry.y,
         width: m.geometry.width,
         height: m.geometry.height,
-        scale: m.scale as f64,
+        scale: f64::from(m.scale),
         refresh_mhz: m.refresh_mhz.unwrap_or(0),
         primary: m.primary,
         extra: HashMap::new(),
@@ -437,7 +439,7 @@ impl ManagerService {
         let m = self.manager.read().await;
         m.registered_protocols()
             .into_iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect()
     }
 
@@ -468,6 +470,10 @@ impl ManagerService {
     }
 
     #[zbus(property)]
+    #[expect(
+        clippy::unused_async,
+        reason = "zbus property getters; async keeps them on the executor like the rest of the interface"
+    )]
     async fn enumeration_capabilities(&self) -> Vec<String> {
         self.enumerator
             .capabilities()
@@ -484,9 +490,9 @@ impl ManagerService {
     /// Resolution rules (no probe — derived from session type):
     ///
     /// - `XDG_SESSION_TYPE=x11`     → `["monitor", "window"]`
-    ///   (X11Capture supports both via XID + XRandR rect)
+    ///   (`X11Capture` supports both via XID + `XRandR` rect)
     /// - `WAYLAND_DISPLAY` set      → `["monitor"]` only.
-    ///   WaylandDirect can stream a chosen monitor via wlr-screencopy
+    ///   `WaylandDirect` can stream a chosen monitor via wlr-screencopy
     ///   but doesn't capture toplevels yet — needs
     ///   `ext_foreign_toplevel_image_capture_source_manager_v1` which
     ///   no major compositor exposes today.
@@ -494,9 +500,13 @@ impl ManagerService {
     ///
     /// Once a Wayland compositor adds the toplevel image-capture
     /// protocol, this method gains a real probe (try-bind from the
-    /// auto_capture path) and returns `"window"` accordingly without
+    /// `auto_capture` path) and returns `"window"` accordingly without
     /// any picker change needed on the client side.
     #[zbus(property)]
+    #[expect(
+        clippy::unused_async,
+        reason = "zbus property getters; async keeps them on the executor like the rest of the interface"
+    )]
     async fn capture_capabilities(&self) -> Vec<String> {
         let on_x11 =
             std::env::var_os("DISPLAY").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_none();
@@ -717,6 +727,10 @@ async fn source_signal_loop(
     }
 }
 
+#[expect(
+    clippy::match_same_arms,
+    reason = "each ignored event keeps its own reason next to it"
+)]
 async fn signal_loop(
     conn: zbus::Connection,
     mut event_rx: mpsc::Receiver<ManagerEvent>,

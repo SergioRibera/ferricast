@@ -166,7 +166,7 @@ async fn print_monitors(p: &ManagerProxy<'_>) -> anyhow::Result<()> {
             (mk, md) => format!("{mk} {md}"),
         };
         let refresh = if m.refresh_mhz > 0 {
-            format!("{:.3}Hz", m.refresh_mhz as f64 / 1000.0)
+            format!("{:.3}Hz", f64::from(m.refresh_mhz) / 1000.0)
         } else {
             "-".into()
         };

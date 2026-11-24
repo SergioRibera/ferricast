@@ -23,6 +23,7 @@ use clap::{Parser, Subcommand, ValueEnum};
                   Use --background for a headless daemon, or one of the subcommands \
                   to act as a client of a running daemon."
 )]
+#[expect(clippy::struct_excessive_bools, reason = "independent clap flags")]
 pub struct Cli {
     /// Run as a headless daemon without opening the desktop window.
     #[arg(long)]
@@ -41,22 +42,22 @@ pub struct Cli {
     #[arg(long, requires = "port_min")]
     pub port_max: Option<u16>,
 
-    /// Name this machine shows in AirPlay menus.
+    /// Name this machine shows in `AirPlay` menus.
     #[arg(long, default_value = "Ferricast")]
     pub receiver_name: String,
 
-    /// AirPlay senders must type a 4-digit PIN shown on this machine the
+    /// `AirPlay` senders must type a 4-digit PIN shown on this machine the
     /// first time they connect.
     #[arg(long)]
     pub airplay_pin: bool,
 
-    /// Do not act as an AirPlay receiver. Otherwise it listens on TCP 7000
+    /// Do not act as an `AirPlay` receiver. Otherwise it listens on TCP 7000
     /// (control) and 7100 (mirroring), UDP 6000-6001 (audio) and 7011
     /// (timing), which the firewall must let in from the LAN.
     #[arg(long)]
     pub no_airplay_receiver: bool,
 
-    /// Do not play the videos AirPlay senders hand over by URL (AirPlay
+    /// Do not play the videos `AirPlay` senders hand over by URL (`AirPlay`
     /// video, what apps that cast videos rather than the screen use);
     /// only screen mirroring and audio are offered.
     #[arg(long)]

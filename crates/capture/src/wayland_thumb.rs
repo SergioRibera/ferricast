@@ -1,14 +1,14 @@
 //! One-shot Wayland thumbnail capture.
 //!
 //! Two protocols, two flows, one file because they share most of
-//! the support code (wl_shm pool allocation, format conversion,
+//! the support code (`wl_shm` pool allocation, format conversion,
 //! PNG encode, output lookup).
 //!
 //! ### Monitor thumbnails — `zwlr_screencopy_unstable_v1`
 //!
-//! Bind the screencopy manager, find the wl_output that matches
+//! Bind the screencopy manager, find the `wl_output` that matches
 //! the picker-issued id, call `capture_output`, wait for the
-//! `buffer` event to know the pixel format, allocate a wl_shm
+//! `buffer` event to know the pixel format, allocate a `wl_shm`
 //! buffer of that size, `copy()` into it, wait for `ready` (or
 //! `failed`), mmap the fd, swizzle to RGBA, downscale, PNG-encode.
 //!
@@ -171,12 +171,12 @@ pub fn monitor_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceEr
     };
 
     let (fd, mmap) = alloc_shm(info.size())?;
-    let pool = shm.create_pool(fd.as_fd(), info.size() as i32, &qh, ());
+    let pool = shm.create_pool(fd.as_fd(), pool_size(info.size())?, &qh, ());
     let buffer = pool.create_buffer(
         0,
-        info.width as i32,
-        info.height as i32,
-        info.stride as i32,
+        info.width.cast_signed(),
+        info.height.cast_signed(),
+        info.stride.cast_signed(),
         wl_shm_format(info.format)?,
         &qh,
         (),
@@ -232,7 +232,7 @@ struct MonitorState {
     /// applied as a vertical flip on the captured buffer before
     /// the output transform.
     frame_flags: u32,
-    /// The wl_output transform of the chosen target. Captured pixels
+    /// The `wl_output` transform of the chosen target. Captured pixels
     /// are in the framebuffer's pre-transform orientation; we apply
     /// this transform on the way out so the thumbnail matches what
     /// the user sees on the monitor (rotated displays come out
@@ -281,7 +281,7 @@ impl Dispatch<WlOutput, ()> for MonitorState {
         state: &mut Self,
         proxy: &WlOutput,
         event: <WlOutput as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -320,7 +320,7 @@ impl Dispatch<WlShm, ()> for MonitorState {
         _: &mut Self,
         _: &WlShm,
         _: <WlShm as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -331,7 +331,7 @@ impl Dispatch<WlShmPool, ()> for MonitorState {
         _: &mut Self,
         _: &WlShmPool,
         _: <WlShmPool as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -342,7 +342,7 @@ impl Dispatch<WlBuffer, ()> for MonitorState {
         _: &mut Self,
         _: &WlBuffer,
         _: <WlBuffer as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -353,7 +353,7 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for MonitorState {
         _: &mut Self,
         _: &ZwlrScreencopyManagerV1,
         _: <ZwlrScreencopyManagerV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -365,7 +365,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for MonitorState {
         state: &mut Self,
         _: &ZwlrScreencopyFrameV1,
         event: <ZwlrScreencopyFrameV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -406,6 +406,10 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for MonitorState {
 
 // ── Window thumbnails (ext-image-copy-capture) ────────────────────
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear setup or event sequence over shared state; splitting it would scatter that state"
+)]
 pub fn window_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceError> {
     let conn = Connection::connect_to_env()
         .map_err(|e| SourceError::Backend(format!("wayland connect: {e}")))?;
@@ -477,12 +481,12 @@ pub fn window_png(id: &str, max_w: u32, max_h: u32) -> Result<Vec<u8>, SourceErr
     let info = BufferInfo { format, ..size };
 
     let (fd, mmap) = alloc_shm(info.size())?;
-    let pool = shm.create_pool(fd.as_fd(), info.size() as i32, &qh, ());
+    let pool = shm.create_pool(fd.as_fd(), pool_size(info.size())?, &qh, ());
     let buffer = pool.create_buffer(
         0,
-        info.width as i32,
-        info.height as i32,
-        info.stride as i32,
+        info.width.cast_signed(),
+        info.height.cast_signed(),
+        info.stride.cast_signed(),
         wl_shm_format(info.format)?,
         &qh,
         (),
@@ -534,7 +538,7 @@ struct WindowState {
     /// Size announced by `buffer_size`; `format` is filled from
     /// `shm_format` once the session's `done` arrives.
     buffer: Option<BufferInfo>,
-    /// First advertised wl_shm format we support.
+    /// First advertised `wl_shm` format we support.
     shm_format: Option<u32>,
     formats_done: bool,
     status: FrameStatus,
@@ -556,7 +560,7 @@ impl Dispatch<WlShm, ()> for WindowState {
         _: &mut Self,
         _: &WlShm,
         _: <WlShm as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -567,7 +571,7 @@ impl Dispatch<WlShmPool, ()> for WindowState {
         _: &mut Self,
         _: &WlShmPool,
         _: <WlShmPool as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -578,7 +582,7 @@ impl Dispatch<WlBuffer, ()> for WindowState {
         _: &mut Self,
         _: &WlBuffer,
         _: <WlBuffer as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -589,7 +593,7 @@ impl Dispatch<ExtForeignToplevelImageCaptureSourceManagerV1, ()> for WindowState
         _: &mut Self,
         _: &ExtForeignToplevelImageCaptureSourceManagerV1,
         _: <ExtForeignToplevelImageCaptureSourceManagerV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -600,7 +604,7 @@ impl Dispatch<ExtOutputImageCaptureSourceManagerV1, ()> for WindowState {
         _: &mut Self,
         _: &ExtOutputImageCaptureSourceManagerV1,
         _: <ExtOutputImageCaptureSourceManagerV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -611,7 +615,7 @@ impl Dispatch<ExtImageCaptureSourceV1, ()> for WindowState {
         _: &mut Self,
         _: &ExtImageCaptureSourceV1,
         _: <ExtImageCaptureSourceV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -622,7 +626,7 @@ impl Dispatch<ExtImageCopyCaptureManagerV1, ()> for WindowState {
         _: &mut Self,
         _: &ExtImageCopyCaptureManagerV1,
         _: <ExtImageCopyCaptureManagerV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -634,7 +638,7 @@ impl Dispatch<ExtForeignToplevelListV1, ()> for WindowState {
         state: &mut Self,
         _: &ExtForeignToplevelListV1,
         event: <ExtForeignToplevelListV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -660,7 +664,7 @@ impl Dispatch<ExtForeignToplevelHandleV1, ()> for WindowState {
         state: &mut Self,
         proxy: &ExtForeignToplevelHandleV1,
         event: <ExtForeignToplevelHandleV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -679,7 +683,7 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for WindowState {
         state: &mut Self,
         _: &ExtImageCopyCaptureSessionV1,
         event: <ExtImageCopyCaptureSessionV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -728,7 +732,7 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for WindowState {
         state: &mut Self,
         _: &ExtImageCopyCaptureFrameV1,
         event: <ExtImageCopyCaptureFrameV1 as Proxy>::Event,
-        _: &(),
+        (): &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
@@ -827,6 +831,12 @@ impl<S> EventQueueExt<S> for EventQueue<S> {
 
 // ── Shared support: shm allocation + format → RGBA + PNG ──────────
 
+/// `size` as the `i32` a `wl_shm_pool` takes.
+fn pool_size(size: usize) -> Result<i32, SourceError> {
+    i32::try_from(size)
+        .map_err(|_| SourceError::Backend(format!("shm buffer of {size} bytes exceeds i32")))
+}
+
 fn alloc_shm(size: usize) -> Result<(OwnedFd, MmapRegion), SourceError> {
     use std::os::fd::FromRawFd;
     let name = b"ferricast-thumb\0";
@@ -835,7 +845,7 @@ fn alloc_shm(size: usize) -> Result<(OwnedFd, MmapRegion), SourceError> {
     let raw = unsafe {
         libc::syscall(
             libc::SYS_memfd_create,
-            name.as_ptr() as *const libc::c_char,
+            name.as_ptr().cast::<libc::c_char>(),
             libc::MFD_CLOEXEC,
         )
     };
@@ -845,8 +855,12 @@ fn alloc_shm(size: usize) -> Result<(OwnedFd, MmapRegion), SourceError> {
             std::io::Error::last_os_error()
         )));
     }
-    let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
-    if unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) } != 0 {
+    let raw = i32::try_from(raw)
+        .map_err(|_| SourceError::Backend(format!("memfd_create returned fd {raw}")))?;
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let length = libc::off_t::try_from(size)
+        .map_err(|_| SourceError::Backend(format!("memfd of {size} bytes exceeds off_t")))?;
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), length) } != 0 {
         return Err(SourceError::Backend(format!(
             "ftruncate failed: {}",
             std::io::Error::last_os_error()
@@ -871,7 +885,7 @@ fn alloc_shm(size: usize) -> Result<(OwnedFd, MmapRegion), SourceError> {
     Ok((
         fd,
         MmapRegion {
-            ptr: ptr as *mut u8,
+            ptr: ptr.cast::<u8>(),
             len: size,
         },
     ))
@@ -893,7 +907,7 @@ impl MmapRegion {
 impl Drop for MmapRegion {
     fn drop(&mut self) {
         unsafe {
-            libc::munmap(self.ptr as *mut _, self.len);
+            libc::munmap(self.ptr.cast(), self.len);
         }
     }
 }
@@ -908,8 +922,8 @@ fn wl_shm_format(raw: u32) -> Result<wl_shm::Format, SourceError> {
     match raw {
         0 => Ok(wl_shm::Format::Argb8888),
         1 => Ok(wl_shm::Format::Xrgb8888),
-        0x34325258 => Ok(wl_shm::Format::Xbgr8888),
-        0x34324241 => Ok(wl_shm::Format::Abgr8888),
+        0x3432_5258 => Ok(wl_shm::Format::Xbgr8888),
+        0x3432_4241 => Ok(wl_shm::Format::Abgr8888),
         other => Err(SourceError::Backend(format!(
             "unsupported wl_shm format 0x{other:08x} for thumbnails"
         ))),
@@ -917,7 +931,7 @@ fn wl_shm_format(raw: u32) -> Result<wl_shm::Format, SourceError> {
 }
 
 /// How a captured output framebuffer must be re-oriented to match
-/// what the user sees. `transform` is the wl_output transform of the
+/// what the user sees. `transform` is the `wl_output` transform of the
 /// captured monitor (rotated displays come out sideways from the
 /// framebuffer otherwise); `y_invert` is the `Y_INVERT` bit from the
 /// screencopy `flags` event (some compositors emit pixels bottom-up).
@@ -955,7 +969,7 @@ impl Orientation {
     }
 
     /// Apply `Y_INVERT` first (it's defined on the buffer's
-    /// framebuffer axis), then the wl_output transform — the
+    /// framebuffer axis), then the `wl_output` transform — the
     /// composition the compositor applies before scanning out to the
     /// user's eye, so rotated + inverted captures come out the way
     /// the user sees them.
@@ -972,6 +986,10 @@ impl Orientation {
     }
 }
 
+#[expect(
+    clippy::many_single_char_names,
+    reason = "w, h and the r, g, b, a channel offsets read as the pixel math they are"
+)]
 fn encode_png(
     info: BufferInfo,
     mmap: MmapRegion,
@@ -1007,7 +1025,7 @@ fn encode_png(
     }
     drop(mmap);
 
-    let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+    let img = image::RgbaImage::from_raw(info.width, info.height, rgba)
         .ok_or_else(|| SourceError::Backend("rgba from_raw failed".into()))?;
     let img = orientation.apply(img);
 
@@ -1030,10 +1048,14 @@ fn encode_png(
     Ok(out)
 }
 
-/// Apply the wl_output transform to a captured framebuffer so the
+/// Apply the `wl_output` transform to a captured framebuffer so the
 /// thumbnail matches what the user sees on the monitor. The
 /// `Flipped*` variants are "flip horizontal then rotate by N"
 /// per the wayland spec — same operation order as wlroots' renderer.
+#[expect(
+    clippy::match_same_arms,
+    reason = "unknown future variants deliberately render like `Normal`"
+)]
 fn apply_wl_transform(img: image::RgbaImage, transform: wl_output::Transform) -> image::RgbaImage {
     use image::imageops as ops;
     use wl_output::Transform;
@@ -1053,7 +1075,7 @@ fn apply_wl_transform(img: image::RgbaImage, transform: wl_output::Transform) ->
     }
 }
 
-/// Byte offsets within a 4-byte wl_shm pixel for `(R, G, B, A)`,
+/// Byte offsets within a 4-byte `wl_shm` pixel for `(R, G, B, A)`,
 /// plus whether the format ignores alpha (force `0xFF` on output).
 ///
 /// `Argb8888` little-endian wire = `[B, G, R, A]` in memory.
@@ -1062,10 +1084,10 @@ fn apply_wl_transform(img: image::RgbaImage, transform: wl_output::Transform) ->
 /// `Xbgr8888` little-endian wire = `[R, G, B, X]` in memory.
 fn channels(format: u32) -> (usize, usize, usize, usize, bool) {
     match format {
-        0 => (2, 1, 0, 3, false),          // Argb8888
-        1 => (2, 1, 0, 3, true),           // Xrgb8888
-        0x34324241 => (0, 1, 2, 3, false), // Abgr8888
-        0x34325258 => (0, 1, 2, 3, true),  // Xbgr8888
+        0 => (2, 1, 0, 3, false),           // Argb8888
+        1 => (2, 1, 0, 3, true),            // Xrgb8888
+        0x3432_4241 => (0, 1, 2, 3, false), // Abgr8888
+        // Xbgr8888 (0x3432_5258), and the opaque RGBA reading for any other code.
         _ => (0, 1, 2, 3, true),
     }
 }

@@ -3,7 +3,7 @@
 //! Owns:
 //! * The conversion table between `pipewire::spa::param::video::VideoFormat`
 //!   and our public [`PixelFormat`].
-//! * Builders for every SPA pod we exchange with PipeWire:
+//! * Builders for every SPA pod we exchange with `PipeWire`:
 //!     - The list of `EnumFormat` pods (one per dmabuf format with
 //!       modifier-choice + a SHM fallback) sent at `connect()`.
 //!     - The fixated `EnumFormat` list re-sent from `param_changed`
@@ -53,7 +53,10 @@ pub(super) const SUPPORTED_FORMATS: &[VideoFormat] = &[
 
 /// Modifiers we can `mmap` for CPU read without GPU help. Anything tiled
 /// or compressed needs the Vulkan import path.
-#[allow(dead_code)] // referenced from `modifier_is_cpu_readable`
+#[allow(
+    dead_code,
+    reason = "referenced from `modifier_is_cpu_readable`, which only some feature sets compile"
+)]
 const CPU_READABLE_MODIFIERS: &[u64] = &[DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR];
 
 /// Map a SPA [`VideoFormat`] to the public [`PixelFormat`].
@@ -67,7 +70,7 @@ pub(super) fn pixel_format(spa: VideoFormat) -> Option<PixelFormat> {
     })
 }
 
-/// What the compositor finally agreed on after the EnumFormat exchange.
+/// What the compositor finally agreed on after the `EnumFormat` exchange.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct NegotiatedFormat {
     pub width: u32,
@@ -79,7 +82,7 @@ pub(super) struct NegotiatedFormat {
     /// delivers (e.g. 24 / 30 / 60 / 144) rather than the
     /// configured-fps hint, which is only a preference.
     pub framerate: Fraction,
-    /// DRM modifier when the negotiated buffer is a DmaBuf, `None` for shm.
+    /// DRM modifier when the negotiated buffer is a `DmaBuf`, `None` for shm.
     pub modifier: Option<u64>,
 }
 
@@ -113,13 +116,13 @@ impl NegotiatedFormat {
     }
 }
 
-/// Default size / fps for the EnumFormat ranges. Width/height come from
+/// Default size / fps for the `EnumFormat` ranges. Width/height come from
 /// the portal hint when available so the compositor doesn't have to
 /// renegotiate for the actual monitor resolution.
 pub(super) struct EnumFormatParams {
-    pub default_width: u32,
-    pub default_height: u32,
-    pub default_fps: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
 }
 
 // --------------------------------------------------------------------------
@@ -133,7 +136,7 @@ fn serialize(obj: Object) -> Vec<u8> {
         .into_inner()
 }
 
-/// Wrap a serialized pod buffer into the `&Pod` view PipeWire wants on
+/// Wrap a serialized pod buffer into the `&Pod` view `PipeWire` wants on
 /// `Stream::connect` / `update_params`. Caller must keep the backing
 /// `Vec<u8>` alive.
 pub(super) fn pod_view(bytes: &[u8]) -> &Pod {
@@ -206,8 +209,8 @@ fn property_video_modifier(modifiers: &[u64]) -> Property {
         value: Value::Choice(ChoiceValue::Long(Choice(
             ChoiceFlags::empty(),
             ChoiceEnum::Enum {
-                default: modifiers[0] as i64,
-                alternatives: modifiers.iter().map(|m| *m as i64).collect(),
+                default: modifiers[0].cast_signed(),
+                alternatives: modifiers.iter().map(|m| (*m).cast_signed()).collect(),
             },
         ))),
     }
@@ -233,8 +236,8 @@ fn enum_format_skeleton(params: &EnumFormatParams) -> Object {
             property_choice_range_rect(
                 FormatProperties::VideoSize.as_raw(),
                 Rectangle {
-                    width: params.default_width.max(1),
-                    height: params.default_height.max(1),
+                    width: params.width.max(1),
+                    height: params.height.max(1),
                 },
                 Rectangle {
                     width: 1,
@@ -248,7 +251,7 @@ fn enum_format_skeleton(params: &EnumFormatParams) -> Object {
             property_choice_range_fraction(
                 FormatProperties::VideoFramerate.as_raw(),
                 Fraction {
-                    num: params.default_fps.max(1),
+                    num: params.fps.max(1),
                     denom: 1,
                 },
                 Fraction { num: 0, denom: 1 },
@@ -286,7 +289,7 @@ fn enum_format_shm(params: &EnumFormatParams) -> Vec<u8> {
     obj.properties.push(property_choice_enum_id(
         FormatProperties::VideoFormat.as_raw(),
         SUPPORTED_FORMATS[0].as_raw(),
-        SUPPORTED_FORMATS.iter().map(|f| f.as_raw()).collect(),
+        SUPPORTED_FORMATS.iter().map(VideoFormat::as_raw).collect(),
     ));
     serialize(obj)
 }
@@ -299,14 +302,14 @@ pub(super) struct GpuFormat {
     pub modifiers: Vec<u64>,
 }
 
-/// Build the EnumFormat list to send at `connect()`.
+/// Build the `EnumFormat` list to send at `connect()`.
 ///
 /// * For each `GpuFormat` we emit a pod with that format pinned and
 ///   `VideoModifier = Choice/Enum` over the GPU-supported modifiers,
 ///   `MANDATORY | DONT_FIXATE`.
 /// * After those, the SHM fallback pod (no modifier, multi-format
 ///   choice). The compositor walks the list and picks the first
-///   entry it can satisfy — when DmaBuf works, it picks one of the
+///   entry it can satisfy — when `DmaBuf` works, it picks one of the
 ///   modifier pods; when it can't, it falls back to SHM.
 ///
 /// `gpu_formats` empty (Vulkan unavailable / no compatible GPU
@@ -329,12 +332,12 @@ pub(super) fn initial_enum_format_list(
 // Buffers + Meta pods (sent from `param_changed` once format is fixated)
 // --------------------------------------------------------------------------
 
-/// `ParamBuffers` pod: tells PipeWire what shapes of buffers we accept.
+/// `ParamBuffers` pod: tells `PipeWire` what shapes of buffers we accept.
 ///
-/// The bitmask covers shm (MemFd / MemPtr) and DmaBuf so the source can
+/// The bitmask covers shm (`MemFd` / `MemPtr`) and `DmaBuf` so the source can
 /// pick whichever it can produce cheaply. We deliberately don't lock
 /// down `BUFFERS_size` / `_stride` — letting the source pick those is
-/// what wlx-capture does and is what Mutter / KWin expect;
+/// what wlx-capture does and is what Mutter / `KWin` expect;
 /// over-specifying them sometimes leaves the source with no satisfying
 /// answer and it never starts producing frames.
 ///
@@ -380,7 +383,7 @@ pub(super) fn param_buffers_bytes() -> Vec<u8> {
     serialize(obj)
 }
 
-/// `ParamMeta(Header)` pod: asks PipeWire to attach a `spa_meta_header`
+/// `ParamMeta(Header)` pod: asks `PipeWire` to attach a `spa_meta_header`
 /// (PTS / sequence / corruption flag) to every buffer.
 pub(super) fn param_meta_header_bytes() -> Vec<u8> {
     let obj = Object {
@@ -395,7 +398,10 @@ pub(super) fn param_meta_header_bytes() -> Vec<u8> {
             Property {
                 key: SPA_PARAM_META_size,
                 flags: PropertyFlags::empty(),
-                value: Value::Int(std::mem::size_of::<pw::spa::sys::spa_meta_header>() as i32),
+                value: Value::Int(
+                    i32::try_from(std::mem::size_of::<pw::spa::sys::spa_meta_header>())
+                        .expect("invariant: spa_meta_header is a few bytes"),
+                ),
             },
         ],
     };

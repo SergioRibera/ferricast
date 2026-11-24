@@ -7,7 +7,7 @@
 //!    the stream: video frames go to a video mpsc; PCM s16le audio
 //!    goes to an audio mpsc.
 //! 2. [`ReceiverWindowApp`] — the Freya `App` that owns the audio
-//!    output (rodio `Sink` over PipeWire), the latest video frame
+//!    output (rodio `Sink` over `PipeWire`), the latest video frame
 //!    slot, and a render callback that draws that frame with Skia
 //!    each render pass.
 //! 3. Window opener ([`open_receiver_window`]) — wires the rx ends
@@ -96,6 +96,10 @@ impl ReceiverCounters {
 
     /// Audio queued for the device but not played yet, once a device is
     /// open and the format is known.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a sample backlog, far below 2^52"
+    )]
     fn audio_backlog(&self) -> Option<Duration> {
         let rate = self.audio_rate.load(Ordering::Relaxed);
         if rate == 0 || !self.audio_output.load(Ordering::Relaxed) {
@@ -252,6 +256,10 @@ impl StereoDownmix {
     }
 
     /// Mixes interleaved `pcm` down to interleaved stereo.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "clamped to the i16 range first"
+    )]
     fn apply(&self, pcm: &[i16]) -> Vec<i16> {
         let to_i16 = |s: f32| s.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
         pcm.chunks_exact(self.gains.len())
@@ -397,6 +405,10 @@ impl ReceiverWindowApp {
 }
 
 impl App for ReceiverWindowApp {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the window's layout reads top to bottom"
+    )]
     fn render(&self) -> impl IntoElement {
         let remote = self.remote.clone();
         let info = self.info.clone();
@@ -546,15 +558,13 @@ impl App for ReceiverWindowApp {
         } else {
             (200, 200, 220)
         };
-        let video_meta = info
-            .video
-            .as_ref()
-            .map(|v| format!("{} — {} frames", codec_label_video(v.codec), video_n))
-            .unwrap_or_else(|| "no video".to_string());
-        let audio_meta = info
-            .audio
-            .as_ref()
-            .map(|a| {
+        let video_meta = info.video.as_ref().map_or_else(
+            || "no video".to_string(),
+            |v| format!("{} — {} frames", codec_label_video(v.codec), video_n),
+        );
+        let audio_meta = info.audio.as_ref().map_or_else(
+            || "no audio".to_string(),
+            |a| {
                 format!(
                     "{} {}Hz/{}ch — {} frames",
                     a.source.map_or(codec_label_audio(a.codec), |s| s.label()),
@@ -562,8 +572,8 @@ impl App for ReceiverWindowApp {
                     a.channels,
                     audio_n
                 )
-            })
-            .unwrap_or_else(|| "no audio".to_string());
+            },
+        );
 
         let audio_only = info.video.is_none();
         // One renderer per window, kept across renders so a frame is
@@ -666,6 +676,7 @@ fn receiver_title(remote: &RemoteSender, info: &MediaInfo) -> String {
     }
 }
 
+#[expect(clippy::cast_precision_loss, reason = "a display-only duration")]
 fn codec_line(info: &MediaInfo) -> String {
     let live = if info.is_live { "live" } else { "VOD" };
     let dur = match info.duration_us {
@@ -740,6 +751,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the gains keep both values inside i16"
+    )]
     fn surround_downmix_follows_itu_gains_without_clipping() {
         let downmix = StereoDownmix::new(6).unwrap();
         let scale = 1.0 / (1.0 + 2.0 * std::f32::consts::FRAC_1_SQRT_2);

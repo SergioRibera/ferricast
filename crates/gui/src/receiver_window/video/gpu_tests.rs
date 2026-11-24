@@ -2,6 +2,14 @@
 //! the backend Freya prefers on Linux. They skip (pass) on machines
 //! without a Vulkan device.
 
+#![expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::similar_names,
+    reason = "test fixtures are a few pixels wide; paired names mirror the planes they hold"
+)]
+
 use std::ffi::c_char;
 use std::mem::ManuallyDrop;
 use std::path::Path;

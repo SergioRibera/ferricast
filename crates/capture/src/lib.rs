@@ -36,13 +36,24 @@ pub(crate) fn fit_box(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u
     if src_w == 0 || src_h == 0 || max_w == 0 || max_h == 0 {
         return (1, 1);
     }
-    let scale = (max_w as f32 / src_w as f32).min(max_h as f32 / src_h as f32);
-    if scale >= 1.0 {
+    if src_w <= max_w && src_h <= max_h {
         return (src_w, src_h);
     }
-    let w = ((src_w as f32 * scale).round() as u32).max(1);
-    let h = ((src_h as f32 * scale).round() as u32).max(1);
-    (w, h)
+    // Integer form of `scale = min(max_w / src_w, max_h / src_h)`, rounded
+    // to nearest; the scaled side is at most `max_*`, so it fits `u32`.
+    let (sw, sh, mw, mh) = (
+        u64::from(src_w),
+        u64::from(src_h),
+        u64::from(max_w),
+        u64::from(max_h),
+    );
+    let (w, h) = if mw * sh <= mh * sw {
+        (mw, (sh * mw + sw / 2) / sw)
+    } else {
+        ((sw * mh + sh / 2) / sh, mh)
+    };
+    let fit = |v: u64| u32::try_from(v).unwrap_or(u32::MAX).max(1);
+    (fit(w), fit(h))
 }
 
 #[cfg(feature = "pipewire")]
@@ -80,9 +91,7 @@ pub fn auto_enumerator() -> Arc<dyn SourceEnumerator> {
     #[cfg(feature = "wlroots")]
     {
         let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
-            || std::env::var("XDG_SESSION_TYPE")
-                .map(|v| v.eq_ignore_ascii_case("wayland"))
-                .unwrap_or(false);
+            || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"));
         if is_wayland {
             match WaylandSourceEnumerator::try_new() {
                 Ok(e) => return Arc::new(e),

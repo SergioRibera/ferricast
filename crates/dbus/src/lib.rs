@@ -49,7 +49,7 @@ pub const INTROSPECTION_XML: &str = include_str!("../xml/rs.sergioribera.ferrica
 /// index).
 ///
 /// `capabilities` is a free-form `a{sv}` so we can add new fields
-/// (max_fps, max_bitrate_kbps, max_h264_profile, requires_audio…)
+/// (`max_fps`, `max_bitrate_kbps`, `max_h264_profile`, `requires_audio`…)
 /// without bumping the interface version every time.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct DeviceDto {
@@ -88,11 +88,13 @@ pub struct SourceDto {
 impl SourceDto {
     /// Daemon-chosen default. The daemon decides what this means
     /// based on the active session.
+    #[must_use]
     pub fn auto() -> Self {
         Self::default()
     }
 
     /// Full-screen, daemon-chosen monitor.
+    #[must_use]
     pub fn screen() -> Self {
         Self {
             kind: "screen".into(),
@@ -117,6 +119,7 @@ impl SourceDto {
     }
 
     /// Empty `kind="window"` — daemon picks (portal flow).
+    #[must_use]
     pub fn window() -> Self {
         Self {
             kind: "window".into(),
@@ -159,6 +162,7 @@ impl SourceDto {
     /// chains fluently with the constructors above.
     ///
     /// Defaults to absent → daemon treats it as `false` (no audio).
+    #[must_use]
     pub fn with_audio(mut self, audio: bool) -> Self {
         if let Ok(v) = OwnedValue::try_from(zvariant::Value::from(audio)) {
             self.args.insert("audio".into(), v);
@@ -169,6 +173,7 @@ impl SourceDto {
     /// Read the `audio` flag previously set with `with_audio`. Used
     /// by the daemon to decide whether to wire an audio capture
     /// pipeline alongside video. Defaults to `false` when absent.
+    #[must_use]
     pub fn audio(&self) -> bool {
         self.args
             .get("audio")
@@ -280,7 +285,7 @@ pub trait Manager {
     fn list_monitors(&self) -> zbus::Result<Vec<MonitorInfoDto>>;
 
     /// Snapshot of every streamable top-level window in the local
-    /// session. Same NotSupported semantics as `ListMonitors`.
+    /// session. Same `NotSupported` semantics as `ListMonitors`.
     fn list_windows(&self) -> zbus::Result<Vec<WindowInfoDto>>;
 
     /// What the daemon's enumerator can publish. Each entry is one
