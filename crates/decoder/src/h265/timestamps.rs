@@ -5,7 +5,7 @@
 //! picture, which say whether the picture is shown, which coded video
 //! sequence it belongs to, its POC LSBs and whether a decoder skips it.
 //!
-//! rust_h265 releases pictures in display order but carries no
+//! `rust_h265` releases pictures in display order but carries no
 //! timestamps, only each picture's POC. Every packet's pictures are noted
 //! with the POC LSBs their first slice segment carries, and a released
 //! picture takes the timestamp of the pending picture whose LSBs match.

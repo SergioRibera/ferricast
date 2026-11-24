@@ -1,7 +1,10 @@
 //! 5.1 AAC from ffmpeg's native encoder, in ADTS and MP4, demuxed and
 //! decoded to six channels. Skipped without ffmpeg
 //! (`FERRICAST_FFMPEG`, else `PATH`).
-
+#![allow(
+    clippy::cast_precision_loss,
+    reason = "tone-level analysis over short PCM buffers (the file only compiles with `fdk-aac-decode`)"
+)]
 #![cfg(feature = "fdk-aac-decode")]
 
 use std::io::Cursor;

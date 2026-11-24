@@ -1,5 +1,5 @@
 //! Decoders that come with an operating system: Media Foundation on
-//! Windows, VideoToolbox / AudioToolbox on Apple platforms, the NDK
+//! Windows, `VideoToolbox` / `AudioToolbox` on Apple platforms, the NDK
 //! `AMediaCodec` on Android.
 //!
 //! [`video`] and [`audio`] append this platform's backends for the job

@@ -77,7 +77,7 @@ impl Rav1dDecoder {
         }
     }
 
-    fn try_decode(&mut self, frame: EncodedFrame) -> Result<Option<CapturedFrame>> {
+    fn try_decode(&mut self, frame: &EncodedFrame) -> Result<Option<CapturedFrame>> {
         let context = self.context.ok_or_else(|| {
             FerricastError::Decode("Rav1dDecoder::decode before configure()".into())
         })?;
@@ -91,7 +91,7 @@ impl Rav1dDecoder {
         }
         // SAFETY: `buffer` has room for `frame.data.len()` bytes and cannot overlap `frame.data`.
         unsafe { std::ptr::copy_nonoverlapping(frame.data.as_ptr(), buffer, frame.data.len()) };
-        data.m.timestamp = frame.timestamp_us as i64;
+        data.m.timestamp = frame.timestamp_us.cast_signed();
         let result = self.feed(context, &mut data);
         // SAFETY: `data` was filled by dav1d_data_create and is unreferenced exactly once, here.
         unsafe { dav1d_data_unref(Some(NonNull::from(&mut data))) };
@@ -99,8 +99,8 @@ impl Rav1dDecoder {
         Ok(self.ready.pop_front())
     }
 
-    fn try_flush(&mut self) -> Result<Vec<CapturedFrame>> {
-        Ok(self.ready.drain(..).collect())
+    fn take_ready(&mut self) -> Vec<CapturedFrame> {
+        self.ready.drain(..).collect()
     }
 }
 
@@ -115,15 +115,14 @@ impl VideoDecoder for Rav1dDecoder {
     }
 
     fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
-        self.try_decode(frame).map_err(CodecError::from_backend(
+        self.try_decode(&frame).map_err(CodecError::from_backend(
             BackendId::Rav1d,
             Operation::Decode,
         ))
     }
 
     fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
-        self.try_flush()
-            .map_err(CodecError::from_backend(BackendId::Rav1d, Operation::Flush))
+        Ok(self.take_ready())
     }
 }
 

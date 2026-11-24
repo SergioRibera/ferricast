@@ -66,7 +66,9 @@ impl RawDecoder {
         decoder.set_limiter(false)?;
         decoder.set_param(
             sys::AACDEC_PARAM_AAC_PCM_MAX_OUTPUT_CHANNELS,
-            MAX_CHANNELS as i32,
+            i32::try_from(MAX_CHANNELS).map_err(|_| {
+                FerricastError::Decode("libfdk-aac: channel limit exceeds c_int".into())
+            })?,
         )?;
         let mut conf = asc.as_ptr().cast_mut();
         let len = u32::try_from(asc.len())
@@ -290,7 +292,8 @@ fn lc_config(shape: Shape) -> Result<[u8; 2]> {
         .position(|&r| r == shape.sample_rate)
         .ok_or_else(unsupported)?;
     let config = AacChannelConfig::from_channels(shape.channels).ok_or_else(unsupported)?;
-    let asc = (2u16 << 11) | ((index as u16) << 7) | (u16::from(config.code()) << 3);
+    let index = u16::try_from(index).map_err(|_| unsupported())?;
+    let asc = (2u16 << 11) | (index << 7) | (u16::from(config.code()) << 3);
     Ok(asc.to_be_bytes())
 }
 
@@ -348,6 +351,10 @@ impl AudioDecoder for FdkAacDecoder {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "libfdk-aac frame lengths are positive"
+)]
 mod tests {
     use fdk_aac::enc::{AudioObjectType, BitRate, ChannelMode, Encoder, EncoderParams, Transport};
 

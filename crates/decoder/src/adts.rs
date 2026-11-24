@@ -204,6 +204,10 @@ pub(crate) mod tests {
     use super::*;
 
     /// Builds an ADTS frame around `payload` (AAC-LC, no CRC unless asked).
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "frame_len is split into its 13-bit ADTS field, each piece masked to its width"
+    )]
     pub(crate) fn frame(rate_index: u8, channels: u8, crc: bool, payload: &[u8]) -> Vec<u8> {
         let header_len = if crc { 9 } else { 7 };
         let frame_len = header_len + payload.len();

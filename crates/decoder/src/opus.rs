@@ -1,4 +1,4 @@
-//! Pure-Rust Opus decoder over `opus-rs`, for Opus tracks in WebM,
+//! Pure-Rust Opus decoder over `opus-rs`, for Opus tracks in `WebM`,
 //! Matroska and MP4.
 
 use ferricast_core::{
@@ -42,7 +42,11 @@ impl OpusRsDecoder {
         Ok(())
     }
 
-    fn try_decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "samples are clamped to [-1, 1] before scaling to i16"
+    )]
+    fn try_decode(&mut self, frame: &AudioFrame) -> Result<Option<DecodedAudio>> {
         let Some(native) = self.native.as_mut() else {
             return Err(FerricastError::Decode(
                 "OpusRsDecoder::decode before configure()".into(),
@@ -80,10 +84,6 @@ impl OpusRsDecoder {
             timestamp_us: frame.timestamp_us,
         }))
     }
-
-    fn try_flush(&mut self) -> Result<Vec<DecodedAudio>> {
-        Ok(Vec::new())
-    }
 }
 
 impl AudioDecoder for OpusRsDecoder {
@@ -97,22 +97,19 @@ impl AudioDecoder for OpusRsDecoder {
     }
 
     fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>> {
-        self.try_decode(frame).map_err(CodecError::from_backend(
+        self.try_decode(&frame).map_err(CodecError::from_backend(
             BackendId::OpusRs,
             Operation::Decode,
         ))
     }
 
     fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>> {
-        self.try_flush().map_err(CodecError::from_backend(
-            BackendId::OpusRs,
-            Operation::Flush,
-        ))
+        Ok(Vec::new())
     }
 }
 
 fn new_decoder(channels: u16) -> Result<opus_rs::OpusDecoder> {
-    opus_rs::OpusDecoder::new(RATE as i32, usize::from(channels))
+    opus_rs::OpusDecoder::new(RATE.cast_signed(), usize::from(channels))
         .map_err(|e| FerricastError::Decode(format!("Opus decoder: {e}")))
 }
 
@@ -136,6 +133,12 @@ fn packet_samples(packet: &[u8]) -> Option<usize> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::similar_names,
+    reason = "test signal generation over small positive packet indices"
+)]
 mod tests {
     use bytes::Bytes;
 

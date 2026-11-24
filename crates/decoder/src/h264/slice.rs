@@ -14,6 +14,7 @@ pub(super) enum PocKind {
     FrameNum,
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "mirrors the H.264 SPS flags")]
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Sps {
     pub profile_idc: u8,
@@ -39,6 +40,7 @@ pub(super) struct Sps {
     pub colour: ColourDescription,
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "mirrors the H.264 PPS flags")]
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Pps {
     pub sps_id: u32,
@@ -358,10 +360,24 @@ impl<'a> BitReader<'a> {
     pub(super) fn read_se(&mut self) -> Result<i32> {
         let code = self.read_ue()?;
         Ok(if code & 1 == 1 {
-            (code / 2 + 1) as i32
+            (code / 2 + 1).cast_signed()
         } else {
-            -((code / 2) as i32)
+            -((code / 2).cast_signed())
         })
+    }
+
+    /// A `ue(v)` syntax element that must fit `T` (`what` names it in the error).
+    pub(super) fn read_ue_as<T: TryFrom<u32>>(&mut self, what: &str) -> Result<T> {
+        let value = self.read_ue()?;
+        T::try_from(value)
+            .map_err(|_| FerricastError::Decode(format!("H.264 {what} {value} is out of range")))
+    }
+
+    /// An `se(v)` syntax element that must fit `T` (`what` names it in the error).
+    pub(super) fn read_se_as<T: TryFrom<i32>>(&mut self, what: &str) -> Result<T> {
+        let value = self.read_se()?;
+        T::try_from(value)
+            .map_err(|_| FerricastError::Decode(format!("H.264 {what} {value} is out of range")))
     }
 }
 
@@ -471,7 +487,7 @@ pub(super) fn parse(rbsp: &[u8], nal_header: u8, sps: &Sps, pps: &Pps) -> Result
         header.marking = parse_marking(&mut r, header.idr)?;
     }
     if pps.entropy_cabac && slice_type.is_inter() {
-        header.cabac_init_idc = r.read_ue()? as u8;
+        header.cabac_init_idc = r.read_ue_as("cabac_init_idc")?;
     }
     header.slice_qp_delta = r.read_se()?;
     if matches!(slice_type, SliceType::Sp | SliceType::Si) {
@@ -481,13 +497,14 @@ pub(super) fn parse(rbsp: &[u8], nal_header: u8, sps: &Sps, pps: &Pps) -> Result
         r.read_se()?;
     }
     if pps.deblocking_control_present {
-        header.disable_deblocking_filter_idc = r.read_ue()? as u8;
+        header.disable_deblocking_filter_idc = r.read_ue_as("disable_deblocking_filter_idc")?;
         if header.disable_deblocking_filter_idc != 1 {
-            header.alpha_c0_offset_div2 = (r.read_se()?) as i8;
-            header.beta_offset_div2 = (r.read_se()?) as i8;
+            header.alpha_c0_offset_div2 = r.read_se_as("slice_alpha_c0_offset_div2")?;
+            header.beta_offset_div2 = r.read_se_as("slice_beta_offset_div2")?;
         }
     }
-    header.header_bits = r.bit_pos() as u32;
+    header.header_bits = u32::try_from(r.bit_pos())
+        .map_err(|_| FerricastError::Decode("H.264 slice header is too long".into()))?;
     Ok(header)
 }
 
@@ -523,12 +540,12 @@ fn parse_ref_mods(r: &mut BitReader, slice_type: SliceType) -> Result<[Vec<RefMo
 
 fn parse_weights(r: &mut BitReader, sps: &Sps, header: &SliceHeader) -> Result<Weights> {
     let mut weights = Weights {
-        luma_log2_denom: r.read_ue()? as u8,
+        luma_log2_denom: r.read_ue_as("luma_log2_weight_denom")?,
         has_chroma: sps.chroma_array_type() != 0,
         ..Weights::default()
     };
     if weights.has_chroma {
-        weights.chroma_log2_denom = r.read_ue()? as u8;
+        weights.chroma_log2_denom = r.read_ue_as("chroma_log2_weight_denom")?;
     }
     if weights.luma_log2_denom > 7 || weights.chroma_log2_denom > 7 {
         return Err(FerricastError::Decode(
@@ -544,13 +561,17 @@ fn parse_weights(r: &mut BitReader, sps: &Sps, header: &SliceHeader) -> Result<W
         for entry in 0..header.num_ref_idx_active[list] as usize {
             weights.luma[list][entry] = (1 << weights.luma_log2_denom, 0);
             if r.read_flag()? {
-                weights.luma[list][entry] = (r.read_se()? as i16, r.read_se()? as i16);
+                weights.luma[list][entry] =
+                    (r.read_se_as("luma_weight")?, r.read_se_as("luma_offset")?);
             }
             if weights.has_chroma {
                 weights.chroma[list][entry] = [(1 << weights.chroma_log2_denom, 0); 2];
                 if r.read_flag()? {
                     for plane in &mut weights.chroma[list][entry] {
-                        *plane = (r.read_se()? as i16, r.read_se()? as i16);
+                        *plane = (
+                            r.read_se_as("chroma_weight")?,
+                            r.read_se_as("chroma_offset")?,
+                        );
                     }
                 }
             }
@@ -634,9 +655,9 @@ pub(super) mod tests {
 
         pub(in crate::h264) fn se(&mut self, value: i32) -> &mut Self {
             let code = if value > 0 {
-                value as u32 * 2 - 1
+                value.cast_unsigned() * 2 - 1
             } else {
-                (-value) as u32 * 2
+                (-value).cast_unsigned() * 2
             };
             self.ue(code)
         }

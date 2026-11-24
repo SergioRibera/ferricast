@@ -1,5 +1,9 @@
 use super::slice::{MAX_DPB_FRAMES, Mmco, PocKind, RefMod, SliceHeader, SliceType, Sps};
 
+#[expect(
+    clippy::struct_field_names,
+    reason = "`frame_num` is the H.264 syntax element's name"
+)]
 #[derive(Debug, Clone)]
 pub(super) struct Frame {
     /// Surface holding the picture; `None` for a "non-existing" frame
@@ -157,6 +161,11 @@ impl Dpb {
     ///
     /// POC arithmetic wraps instead of panicking; conforming streams
     /// never get near the `i32` edges (8.2.1).
+    #[expect(
+        clippy::too_many_lines,
+        clippy::similar_names,
+        reason = "8.2.1 picture order count, one arm per POC type, with the spec's msb / lsb names"
+    )]
     pub(super) fn start(&mut self, header: &SliceHeader) -> Option<(Current, Released)> {
         let mut released = Released::default();
         if header.idr {
@@ -192,9 +201,9 @@ impl Dpb {
                 let (prev_msb, prev_lsb) = if header.idr {
                     (0, 0)
                 } else {
-                    (self.prev_poc_msb, self.prev_poc_lsb as i32)
+                    (self.prev_poc_msb, self.prev_poc_lsb.cast_signed())
                 };
-                let lsb = header.pic_order_cnt_lsb as i32;
+                let lsb = header.pic_order_cnt_lsb.cast_signed();
                 current.poc_msb = if lsb < prev_lsb && prev_lsb - lsb >= max_lsb / 2 {
                     prev_msb.wrapping_add(max_lsb)
                 } else if lsb > prev_lsb && lsb - prev_lsb > max_lsb / 2 {
@@ -214,9 +223,12 @@ impl Dpb {
                 ..
             } => {
                 current.frame_num_offset = self.frame_num_offset(header.idr, header.frame_num);
-                let cycle_len = offsets_for_ref_frame.len() as i32;
+                let cycle_len = i32::try_from(offsets_for_ref_frame.len()).unwrap_or(i32::MAX);
                 let mut absolute = if cycle_len != 0 {
-                    current.frame_num_offset.wrapping_add(header.frame_num) as i32
+                    current
+                        .frame_num_offset
+                        .wrapping_add(header.frame_num)
+                        .cast_signed()
                 } else {
                     0
                 };
@@ -231,7 +243,7 @@ impl Dpb {
                 let mut expected = 0i32;
                 if absolute > 0 {
                     let cycle = (absolute - 1) / cycle_len;
-                    let in_cycle = ((absolute - 1) % cycle_len) as usize;
+                    let in_cycle = usize::try_from((absolute - 1) % cycle_len).unwrap_or(0);
                     let per_cycle = sum(offsets_for_ref_frame);
                     let partial = offsets_for_ref_frame.get(..=in_cycle).map_or(0, sum);
                     expected = cycle.wrapping_mul(per_cycle).wrapping_add(partial);
@@ -247,7 +259,10 @@ impl Dpb {
             }
             PocKind::FrameNum => {
                 current.frame_num_offset = self.frame_num_offset(header.idr, header.frame_num);
-                let base = (current.frame_num_offset.wrapping_add(header.frame_num) as i32)
+                let base = current
+                    .frame_num_offset
+                    .wrapping_add(header.frame_num)
+                    .cast_signed()
                     .wrapping_mul(2);
                 let poc = if header.idr {
                     0
@@ -334,7 +349,7 @@ impl Dpb {
         }
         if header.nal_ref_idc != 0 {
             (self.prev_poc_msb, self.prev_poc_lsb) = if cleared {
-                (0, frame.top_poc as u32)
+                (0, frame.top_poc.cast_unsigned())
             } else {
                 (current.poc_msb, header.pic_order_cnt_lsb)
             };
@@ -423,9 +438,9 @@ impl Dpb {
 
     fn frame_num_wrap(&self, frame_num: u32, current_frame_num: u32) -> i32 {
         if frame_num > current_frame_num {
-            frame_num as i32 - self.max_frame_num as i32
+            frame_num.cast_signed() - self.max_frame_num.cast_signed()
         } else {
-            frame_num as i32
+            frame_num.cast_signed()
         }
     }
 
@@ -449,7 +464,8 @@ impl Dpb {
     }
 
     fn slide(&mut self, current_frame_num: u32) {
-        let referenced = self.frames.iter().filter(|frame| frame.referenced).count() as u32;
+        let referenced = u32::try_from(self.frames.iter().filter(|frame| frame.referenced).count())
+            .unwrap_or(u32::MAX);
         if referenced < self.max_num_ref_frames.max(1) {
             return;
         }
@@ -655,6 +671,7 @@ impl Dpb {
 }
 
 #[cfg(test)]
+#[expect(clippy::cast_possible_truncation, reason = "test indices are tiny")]
 mod tests {
     use super::super::slice::tests::sps;
     use super::*;

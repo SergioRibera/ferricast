@@ -1,4 +1,4 @@
-//! AAC-ELD decoder (libfdk-aac) for AirPlay screen-mirroring audio.
+//! AAC-ELD decoder (libfdk-aac) for `AirPlay` screen-mirroring audio.
 //!
 //! Mirroring senders send raw AAC-ELD access units, 44.1 kHz stereo with
 //! 480-sample frames, and never signal the configuration in-band: it is
@@ -48,7 +48,7 @@ impl FdkEldDecoder {
         Ok(())
     }
 
-    fn try_decode(&mut self, frame: AudioFrame) -> Result<Option<DecodedAudio>> {
+    fn try_decode(&mut self, frame: &AudioFrame) -> Result<Option<DecodedAudio>> {
         let decoder = self.decoder.as_mut().ok_or_else(|| {
             FerricastError::Decode("FdkEldDecoder::decode before configure()".into())
         })?;
@@ -90,10 +90,6 @@ impl FdkEldDecoder {
             timestamp_us: frame.timestamp_us,
         }))
     }
-
-    fn try_flush(&mut self) -> Result<Vec<DecodedAudio>> {
-        Ok(Vec::new())
-    }
 }
 
 impl AudioDecoder for FdkEldDecoder {
@@ -107,17 +103,14 @@ impl AudioDecoder for FdkEldDecoder {
     }
 
     fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>> {
-        self.try_decode(frame).map_err(CodecError::from_backend(
+        self.try_decode(&frame).map_err(CodecError::from_backend(
             BackendId::FdkAac,
             Operation::Decode,
         ))
     }
 
     fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>> {
-        self.try_flush().map_err(CodecError::from_backend(
-            BackendId::FdkAac,
-            Operation::Flush,
-        ))
+        Ok(Vec::new())
     }
 }
 

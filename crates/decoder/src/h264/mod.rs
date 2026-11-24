@@ -8,7 +8,7 @@
 //! 2. **VA-API** — Intel / AMD hardware on Linux. A stream using a
 //!    feature it does not implement (interlacing, 4:2:2, high bit depth,
 //!    scaling matrices, FMO) hands over to the next backend mid-stream.
-//! 3. The platform decoders (Media Foundation, VideoToolbox,
+//! 3. The platform decoders (Media Foundation, `VideoToolbox`,
 //!    `MediaCodec`) where compiled in.
 //! 4. **openh264** — software; works everywhere it is compiled in.
 //!

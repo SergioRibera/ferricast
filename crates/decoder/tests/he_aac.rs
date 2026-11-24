@@ -1,7 +1,11 @@
 //! HE-AAC (SBR) and HE-AAC v2 (PS) decode at their full output rate and
 //! channel count. The streams are encoded with libfdk-aac, the only
 //! HE-AAC encoder at hand.
-
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "test tone generation: bounded sample values (the file only compiles with `fdk-aac-decode`)"
+)]
 #![cfg(feature = "fdk-aac-decode")]
 
 use bytes::Bytes;

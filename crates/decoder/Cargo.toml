@@ -160,3 +160,6 @@ objc2-video-toolbox = { version = "0.3", optional = true }
 [[bench]]
 name = "selection"
 harness = false
+
+[lints]
+workspace = true
