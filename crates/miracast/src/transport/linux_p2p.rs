@@ -217,6 +217,16 @@ impl LinuxP2pClient {
         cfg.insert("ListenChannel", Value::from(ch));
         cfg.insert("OperRegClass", Value::from(reg));
         cfg.insert("OperChannel", Value::from(ch));
+        // `GOIntent` is part of the persisted config too — supplicant
+        // reuses it when it auto-responds before we get a chance to
+        // override in Connect(). 14 keeps the sink preferred-but-not-
+        // forced (phone with hard 15 wins).
+        cfg.insert("GOIntent", Value::from(14u32));
+        // Reuse STA iface for the P2P group instead of spawning a
+        // p2p-wlp7s0-N virtual. mt7925e sometimes can't bring up the
+        // virtual iface while STA is active on the same radio; the
+        // group formation then silently stalls after GON-Success.
+        cfg.insert("NoGroupIface", Value::from(true));
         if let Err(e) = p2p.set_property("P2PDeviceConfig", Value::from(cfg)).await {
             tracing::error!(error = %e, "miracast sink: P2PDeviceConfig set FAILED — peers will see us as unnamed");
         } else {
