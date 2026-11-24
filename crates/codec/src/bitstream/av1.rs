@@ -7,25 +7,30 @@ use ferricast_core::{ColourDescription, ColourRange};
 use super::bits::{Bits, leb128, to_leb128};
 
 /// `OBU_SEQUENCE_HEADER`.
-pub(crate) const SEQUENCE_HEADER: u8 = 1;
+pub const SEQUENCE_HEADER: u8 = 1;
 /// `OBU_TEMPORAL_DELIMITER`.
-pub(crate) const TEMPORAL_DELIMITER: u8 = 2;
+pub const TEMPORAL_DELIMITER: u8 = 2;
+/// `OBU_METADATA`.
+pub const METADATA: u8 = 5;
 /// `OBU_PADDING`.
-const PADDING: u8 = 15;
+pub const PADDING: u8 = 15;
 
 /// One OBU of a packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Obu<'a> {
-    pub(crate) kind: u8,
+pub struct Obu<'a> {
+    /// `obu_type`.
+    pub kind: u8,
     /// The header byte(s): type, extension flag, and the extension.
     header: &'a [u8],
-    pub(crate) payload: &'a [u8],
+    /// The payload, after the header and size field.
+    pub payload: &'a [u8],
 }
 
 impl Obu<'_> {
     /// The OBU with `obu_has_size_field` set, as ISO-BMFF samples and
     /// `av1C` carry it.
-    pub(crate) fn sized(&self) -> Vec<u8> {
+    #[must_use]
+    pub fn sized(&self) -> Vec<u8> {
         let size = to_leb128(self.payload.len() as u64);
         let mut out = Vec::with_capacity(self.header.len() + size.len() + self.payload.len());
         out.extend_from_slice(self.header);
@@ -38,11 +43,34 @@ impl Obu<'_> {
     }
 }
 
-/// The OBUs of a low-overhead-format packet; `None` when it is malformed.
-pub(crate) fn obus(packet: &[u8]) -> Option<Vec<Obu<'_>>> {
-    let mut out = Vec::new();
-    let mut rest = packet;
-    while let Some(&first) = rest.first() {
+/// The OBUs of a low-overhead-format packet, in order. Iteration stops
+/// at the first malformed OBU (forbidden bit set, size past the end);
+/// [`Self::is_malformed`] then says so.
+#[derive(Debug, Clone)]
+pub struct Obus<'a> {
+    rest: &'a [u8],
+    malformed: bool,
+}
+
+impl<'a> Obus<'a> {
+    /// Iterates the OBUs of `packet`.
+    #[must_use]
+    pub fn new(packet: &'a [u8]) -> Self {
+        Self {
+            rest: packet,
+            malformed: false,
+        }
+    }
+
+    /// Whether iteration stopped at a malformed OBU.
+    #[must_use]
+    pub fn is_malformed(&self) -> bool {
+        self.malformed
+    }
+
+    fn parse(&mut self) -> Option<Obu<'a>> {
+        let rest = self.rest;
+        let &first = rest.first()?;
         if first & 0x80 != 0 {
             return None;
         }
@@ -58,19 +86,43 @@ pub(crate) fn obus(packet: &[u8]) -> Option<Vec<Obu<'_>>> {
         } else {
             (after_header, &after_header[after_header.len()..])
         };
-        out.push(Obu {
+        self.rest = next;
+        Some(Obu {
             kind,
             header,
             payload,
-        });
-        rest = next;
+        })
     }
-    Some(out)
+}
+
+impl<'a> Iterator for Obus<'a> {
+    type Item = Obu<'a>;
+
+    fn next(&mut self) -> Option<Obu<'a>> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        let obu = self.parse();
+        if obu.is_none() {
+            self.malformed = true;
+            self.rest = &[];
+        }
+        obu
+    }
+}
+
+/// The OBUs of a low-overhead-format packet; `None` when it is malformed.
+#[must_use]
+pub fn obus(packet: &[u8]) -> Option<Vec<Obu<'_>>> {
+    let mut iter = Obus::new(packet);
+    let out = iter.by_ref().collect();
+    (!iter.is_malformed()).then_some(out)
 }
 
 /// The packet as a decoder sample: every OBU sized, without temporal
 /// delimiters and padding.
-pub(crate) fn sample(obus: &[Obu<'_>]) -> Vec<u8> {
+#[must_use]
+pub fn sample(obus: &[Obu<'_>]) -> Vec<u8> {
     obus.iter()
         .filter(|obu| !matches!(obu.kind, TEMPORAL_DELIMITER | PADDING))
         .flat_map(Obu::sized)
@@ -79,23 +131,39 @@ pub(crate) fn sample(obus: &[Obu<'_>]) -> Vec<u8> {
 
 /// What a sequence header says about the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SequenceHeader {
-    pub(crate) profile: u8,
-    pub(crate) level: u8,
-    pub(crate) tier: bool,
-    pub(crate) bit_depth: u8,
-    pub(crate) monochrome: bool,
-    pub(crate) subsampling_x: bool,
-    pub(crate) subsampling_y: bool,
-    pub(crate) chroma_sample_position: u8,
-    pub(crate) max_width: u32,
-    pub(crate) max_height: u32,
-    pub(crate) colour: ColourDescription,
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors the sequence header flags `av1C` copies one to one"
+)]
+pub struct SequenceHeader {
+    /// `seq_profile`.
+    pub profile: u8,
+    /// `seq_level_idx` of the first operating point.
+    pub level: u8,
+    /// `seq_tier` of the first operating point (`true` = high).
+    pub tier: bool,
+    /// Bits per sample: 8, 10 or 12.
+    pub bit_depth: u8,
+    /// `mono_chrome`.
+    pub monochrome: bool,
+    /// `subsampling_x`: chroma halved horizontally.
+    pub subsampling_x: bool,
+    /// `subsampling_y`: chroma halved vertically.
+    pub subsampling_y: bool,
+    /// `chroma_sample_position` (0 when not 4:2:0).
+    pub chroma_sample_position: u8,
+    /// `max_frame_width_minus_1 + 1`.
+    pub max_width: u32,
+    /// `max_frame_height_minus_1 + 1`.
+    pub max_height: u32,
+    /// The colour the header signals, in its range.
+    pub colour: ColourDescription,
 }
 
 impl SequenceHeader {
     /// Reads a sequence header OBU payload.
-    pub(crate) fn parse(payload: &[u8]) -> Option<Self> {
+    #[must_use]
+    pub fn parse(payload: &[u8]) -> Option<Self> {
         let mut bits = Bits::new(payload);
         let profile = u8::try_from(bits.read(3)?).ok()?;
         // still_picture.
@@ -139,7 +207,8 @@ impl SequenceHeader {
 
     /// The `av1C` box body, with `sequence_obu` (the sized sequence
     /// header OBU) as its `configOBUs`.
-    pub(crate) fn av1c(&self, sequence_obu: &[u8]) -> Vec<u8> {
+    #[must_use]
+    pub fn av1c(&self, sequence_obu: &[u8]) -> Vec<u8> {
         let high_bitdepth = self.bit_depth > 8;
         let twelve_bit = self.bit_depth == 12;
         let mut out = vec![
@@ -314,8 +383,8 @@ impl ColourConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::super::bits::Writer;
     use super::*;
-    use crate::headers::bits::Writer;
     use ferricast_core::TransferCharacteristics;
 
     /// A non-reduced Main (profile 0) sequence header, one operating

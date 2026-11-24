@@ -8,6 +8,8 @@
 
 use ferricast_core::{ContentLightLevel, HdrMetadata, MasteringDisplay};
 
+use super::av1::{self, Obus};
+use super::bits::{escape, leb128, unescape};
 use super::{NalSyntax, START_CODE, split_annex_b};
 
 /// SEI `payloadType` of `mastering_display_colour_volume`.
@@ -20,44 +22,9 @@ const H264_SEI: u8 = 6;
 /// H.265 `nal_unit_type` of a prefix SEI NAL unit.
 const H265_PREFIX_SEI: u8 = 39;
 
-/// AV1 `obu_type` of a metadata OBU.
-const OBU_METADATA: u8 = 5;
 /// AV1 `metadata_type` codes.
 const METADATA_HDR_CLL: u64 = 1;
 const METADATA_HDR_MDCV: u64 = 2;
-
-/// `nal` (header included) with emulation-prevention bytes removed.
-#[must_use]
-pub fn unescape(nal: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(nal.len());
-    let mut zeros = 0;
-    for &byte in nal {
-        if zeros >= 2 && byte == 3 {
-            zeros = 0;
-            continue;
-        }
-        zeros = if byte == 0 { zeros + 1 } else { 0 };
-        out.push(byte);
-    }
-    out
-}
-
-/// `rbsp` with emulation-prevention bytes inserted, so no `00 00 0x`
-/// (x ≤ 3) sequence appears in the NAL unit.
-#[must_use]
-pub fn escape(rbsp: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rbsp.len() + rbsp.len() / 64 + 1);
-    let mut zeros = 0;
-    for &byte in rbsp {
-        if zeros >= 2 && byte <= 3 {
-            out.push(3);
-            zeros = 0;
-        }
-        zeros = if byte == 0 { zeros + 1 } else { 0 };
-        out.push(byte);
-    }
-    out
-}
 
 /// Merges the halves `update` carries into `into`.
 fn merge(into: &mut HdrMetadata, update: HdrMetadata) {
@@ -145,32 +112,8 @@ pub fn from_annex_b(access_unit: &[u8], syntax: NalSyntax) -> HdrMetadata {
 #[must_use]
 pub fn from_av1_obus(temporal_unit: &[u8]) -> HdrMetadata {
     let mut found = HdrMetadata::default();
-    let mut rest = temporal_unit;
-    while let Some((&header, tail)) = rest.split_first() {
-        let obu_type = (header >> 3) & 0x0f;
-        let has_extension = header & 0b100 != 0;
-        let has_size = header & 0b10 != 0;
-        let Some(tail) = tail.get(usize::from(has_extension)..) else {
-            break;
-        };
-        let (payload, next) = if has_size {
-            let Some((size, tail)) = leb128(tail) else {
-                break;
-            };
-            let Some(split) = usize::try_from(size)
-                .ok()
-                .and_then(|size| tail.split_at_checked(size))
-            else {
-                break;
-            };
-            split
-        } else {
-            (tail, &[][..])
-        };
-        if obu_type == OBU_METADATA {
-            merge(&mut found, av1_metadata(payload));
-        }
-        rest = next;
+    for obu in Obus::new(temporal_unit).filter(|obu| obu.kind == av1::METADATA) {
+        merge(&mut found, av1_metadata(obu.payload));
     }
     found
 }
@@ -178,7 +121,9 @@ pub fn from_av1_obus(temporal_unit: &[u8]) -> HdrMetadata {
 /// One AV1 `metadata_obu()` payload.
 fn av1_metadata(payload: &[u8]) -> HdrMetadata {
     let mut found = HdrMetadata::default();
-    let Some((metadata_type, body)) = leb128(payload) else {
+    let Some((metadata_type, body)) =
+        leb128(payload).and_then(|(value, len)| Some((value, payload.get(len..)?)))
+    else {
         return found;
     };
     let u16_at = |at: usize| {
@@ -212,18 +157,6 @@ fn av1_metadata(payload: &[u8]) -> HdrMetadata {
         _ => {}
     }
     found
-}
-
-/// An unsigned LEB128 value (AV1 `leb128()`, at most 8 bytes).
-fn leb128(bytes: &[u8]) -> Option<(u64, &[u8])> {
-    let mut value = 0_u64;
-    for (index, &byte) in bytes.iter().enumerate().take(8) {
-        value |= u64::from(byte & 0x7f) << (index * 7);
-        if byte & 0x80 == 0 {
-            return Some((value, &bytes[index + 1..]));
-        }
-    }
-    None
 }
 
 /// An Annex B SEI NAL unit (start code included) carrying `hdr` as
@@ -396,14 +329,6 @@ mod tests {
     }
 
     #[test]
-    fn escaping_removes_start_code_emulation_and_round_trips() {
-        let rbsp = [0x4E, 1, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0x80];
-        let escaped = escape(&rbsp);
-        assert_eq!(escaped, [0x4E, 1, 0, 0, 3, 0, 0, 3, 0, 1, 0, 0, 3, 3, 0x80]);
-        assert_eq!(unescape(&escaped), rbsp);
-    }
-
-    #[test]
     fn hand_written_hevc_sei_with_an_unrelated_message_first() {
         // Prefix SEI: a 2-byte user_data payload (type 5), then CLL.
         let nal = [
@@ -438,10 +363,10 @@ mod tests {
             0x90,
         ];
         let mut unit = vec![0x12, 0]; // temporal delimiter, size 0
-        unit.push((OBU_METADATA << 3) | 0b10);
+        unit.push((av1::METADATA << 3) | 0b10);
         unit.push(u8::try_from(mdcv.len()).unwrap());
         unit.extend(&mdcv);
-        unit.push(OBU_METADATA << 3); // no size field: runs to the end
+        unit.push(av1::METADATA << 3); // no size field: runs to the end
         unit.extend(cll);
         let found = from_av1_obus(&unit);
         assert_eq!(found.content_light, Some(LIGHT));

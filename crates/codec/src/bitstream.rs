@@ -1,11 +1,17 @@
-//! Annex B byte-stream helpers shared by the H.264 / H.265 encoders,
-//! decoders and the backend hand-over, and the HDR metadata they carry
-//! ([`hdr`]).
+//! Elementary-stream parsing shared by the encoders, decoders and the
+//! backend hand-over: Annex B framing (here), the bit-level primitives
+//! ([`bits`]), H.264 / H.265 SPS bit depths ([`h264`], [`hevc`]), AV1 OBUs
+//! and sequence headers ([`av1`]), VP9 keyframe headers ([`vp9`]) and the
+//! HDR metadata streams carry ([`hdr`]).
 
 use bytes::Bytes;
 
+pub mod av1;
+pub mod bits;
+pub mod h264;
 pub mod hdr;
 pub mod hevc;
+pub mod vp9;
 
 /// The 4-byte Annex B start code.
 pub const START_CODE: [u8; 4] = [0, 0, 0, 1];

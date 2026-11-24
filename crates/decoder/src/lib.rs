@@ -39,11 +39,6 @@ mod facades;
 // Header fields the VideoToolbox decoder has to spell out itself.
 pub mod h264;
 pub mod h265;
-#[cfg(any(
-    test,
-    all(any(target_os = "macos", target_os = "ios"), feature = "videotoolbox")
-))]
-mod headers;
 #[allow(
     dead_code,
     reason = "conditional: shared by the video decoders; each backend set uses a different subset"

@@ -24,8 +24,8 @@ use objc2_core_media::{
 use tracing::debug;
 
 use super::{BACKEND, fail};
-use crate::headers::{av1, h26x, vp9};
 use crate::platform::apple::os_status;
+use ferricast_codec::bitstream::{av1, h264, hevc, vp9};
 
 /// The VideoToolbox codec type of `codec`.
 pub(super) fn codec_type(codec: Codec) -> CodecResult<CMVideoCodecType> {
@@ -183,8 +183,8 @@ impl Nal {
         if self.format.is_none() || self.built_from != sets {
             let sps = &sets[if self.codec == Codec::H265 { 1 } else { 0 }];
             let depth = match self.codec {
-                Codec::H265 => h26x::h265_bit_depth(sps),
-                _ => h26x::h264_bit_depth(sps),
+                Codec::H265 => hevc::sps_bit_depth(sps).map(|(luma, _)| luma),
+                _ => h264::sps_bit_depth(sps),
             }
             .unwrap_or(8);
             self.format = Some(Format {

@@ -8,26 +8,34 @@ use super::bits::Bits;
 
 /// `frame_sync_code` of keyframes and intra-only frames.
 const SYNC_CODE: u32 = 0x49_83_42;
-/// `color_space` CS_RGB.
+/// `color_space` `CS_RGB`.
 const CS_RGB: u32 = 7;
 
 /// What a keyframe's uncompressed header says about the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Keyframe {
-    pub(crate) profile: u8,
-    pub(crate) bit_depth: u8,
+pub struct Keyframe {
+    /// `profile` (0 to 3).
+    pub profile: u8,
+    /// Bits per sample: 8, 10 or 12.
+    pub bit_depth: u8,
     /// `color_space`, the VP9 matrix code.
-    pub(crate) colour_space: u8,
-    pub(crate) full_range: bool,
-    pub(crate) subsampling_x: bool,
-    pub(crate) subsampling_y: bool,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
+    pub colour_space: u8,
+    /// `color_range`: full-range samples.
+    pub full_range: bool,
+    /// `subsampling_x`: chroma halved horizontally.
+    pub subsampling_x: bool,
+    /// `subsampling_y`: chroma halved vertically.
+    pub subsampling_y: bool,
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
 }
 
 impl Keyframe {
     /// The H.273 matrix `colour_space` names.
-    pub(crate) fn matrix(self) -> MatrixCoefficients {
+    #[must_use]
+    pub fn matrix(self) -> MatrixCoefficients {
         match self.colour_space {
             1 | 3 => MatrixCoefficients::Smpte170M,
             2 => MatrixCoefficients::Bt709,
@@ -42,7 +50,8 @@ impl Keyframe {
     /// the frame size, bit depth, chroma subsampling, range, and the
     /// colour codes of `colour` (the container's, since VP9 itself only
     /// signals the matrix).
-    pub(crate) fn vpcc(self, colour: Option<ColourDescription>) -> [u8; 12] {
+    #[must_use]
+    pub fn vpcc(self, colour: Option<ColourDescription>) -> [u8; 12] {
         // 4:2:0 co-located with luma (1), 4:2:2 (2), 4:4:4 (3).
         let subsampling = match (self.subsampling_x, self.subsampling_y) {
             (true, true) => 1,
@@ -93,7 +102,8 @@ impl Keyframe {
     }
 
     /// The colour the header signals, in its range.
-    pub(crate) fn colour(self, container: Option<ColourDescription>) -> ColourDescription {
+    #[must_use]
+    pub fn colour(self, container: Option<ColourDescription>) -> ColourDescription {
         let range = if self.full_range {
             ColourRange::Full
         } else {
@@ -110,7 +120,8 @@ impl Keyframe {
 
 /// The frames of a packet: the frames of a superframe (§B.3), or the
 /// packet itself.
-pub(crate) fn frames(packet: &[u8]) -> Vec<&[u8]> {
+#[must_use]
+pub fn frames(packet: &[u8]) -> Vec<&[u8]> {
     let Some(&marker) = packet.last() else {
         return Vec::new();
     };
@@ -146,7 +157,8 @@ pub(crate) fn frames(packet: &[u8]) -> Vec<&[u8]> {
 }
 
 /// The keyframe header of the first keyframe in `packet`, if it has one.
-pub(crate) fn keyframe(packet: &[u8]) -> Option<Keyframe> {
+#[must_use]
+pub fn keyframe(packet: &[u8]) -> Option<Keyframe> {
     frames(packet).into_iter().find_map(parse_keyframe)
 }
 
@@ -212,8 +224,8 @@ fn parse_keyframe(frame: &[u8]) -> Option<Keyframe> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::bits::Writer;
     use super::*;
-    use crate::headers::bits::Writer;
 
     /// A keyframe header of `profile` at `width`x`height`.
     fn keyframe_bytes(profile: u32, ten_bit: bool, width: u32, height: u32) -> Vec<u8> {
