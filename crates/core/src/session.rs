@@ -92,6 +92,7 @@ impl AudioStreamConfig {
     /// call site doesn't need to know how to derive it. `mute` is
     /// caller-supplied because the handle has to be shared with the
     /// UI side.
+    #[must_use]
     pub fn for_device(caps: &crate::DeviceCapabilities, mute: AudioMuteHandle) -> Self {
         let default = Self::default();
         Self {

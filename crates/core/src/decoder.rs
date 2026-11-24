@@ -64,8 +64,22 @@ pub enum FrameMemory {
 pub trait VideoDecoder: Send {
     const CODEC: Codec;
 
+    /// Opens the decoder for `config`.
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] naming why no backend can decode the stream.
     fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()>;
+
+    /// Decodes one access unit; `None` while no picture is ready.
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] for a packet the backend cannot decode.
     fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>>;
+
+    /// Drains the pictures still held at the end of the stream.
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] when the backend fails to drain.
     fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>>;
 }
 
@@ -108,7 +122,21 @@ pub struct DecodedAudio {
 pub trait AudioDecoder: Send {
     const CODEC: AudioCodec;
 
+    /// Opens the decoder for `config`.
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] naming why no backend can decode the stream.
     fn configure(&mut self, config: &AudioDecoderConfig) -> CodecResult<()>;
+
+    /// Decodes one packet; `None` while no PCM is ready.
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] for a packet the backend cannot decode.
     fn decode(&mut self, frame: AudioFrame) -> CodecResult<Option<DecodedAudio>>;
+
+    /// Drains the PCM still held at the end of the stream.
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] when the backend fails to drain.
     fn flush(&mut self) -> CodecResult<Vec<DecodedAudio>>;
 }

@@ -50,6 +50,13 @@ impl EncoderConfig {
     /// Resolved GOP length in frames at the configured framerate.
     /// Clamped to at least 1 so `idr_period`/`gop_length` parameters
     /// passed to the underlying codec are always valid.
+    #[must_use]
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "framerates are far below f32's exact range, and the result is checked finite and ≥ 1 before the saturating cast"
+    )]
     pub fn keyframe_interval_frames(&self) -> u32 {
         let frames = (self.keyframe_interval_secs * self.fps as f32).round();
         if frames.is_finite() && frames >= 1.0 {
@@ -83,6 +90,10 @@ impl Default for EncoderConfig {
 pub trait VideoEncoder: Send {
     const CODEC: Codec;
 
+    /// Opens the encoder for `config`.
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] naming why no backend can produce the stream.
     fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()>;
 
     /// Encode the given captured frame.
@@ -93,9 +104,21 @@ pub trait VideoEncoder: Send {
     ///   the source produced a `Gpu` frame.
     /// * VA-API — consumes the `Gpu` variant directly (zero-copy)
     ///   and uploads to a `VASurface` for the `Cpu` variant.
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] for a frame the backend cannot encode.
     fn encode(&mut self, frame: CapturedFrame) -> CodecResult<EncodedFrame>;
 
+    /// Drains the packets still held at the end of the stream.
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] when the backend fails to drain.
     fn flush(self) -> CodecResult<Vec<EncodedFrame>>;
+
+    /// The stream's parameter sets (Annex B).
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] when the backend cannot produce them yet.
     fn get_headers(&mut self) -> CodecResult<Vec<u8>>;
 
     /// Ask the encoder to emit an IDR (instantaneous decoder refresh
@@ -126,6 +149,10 @@ pub trait VideoEncoder: Send {
     /// best-effort basis. NVENC and x264 reconfigure live (no GOP
     /// gap); VA-API keeps the no-op. Default is no-op so existing impls don't
     /// have to opt in.
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] when a reconfiguration the backend accepted
+    /// fails.
     fn set_bitrate_kbps(&mut self, _kbps: u32) -> CodecResult<()> {
         Ok(())
     }
@@ -171,6 +198,10 @@ impl Default for AudioEncoderConfig {
 /// AAC-LC) before they can emit, so the first N input chunks
 /// typically return `None` while internal state warms up.
 pub trait AudioEncoder: Send {
+    /// Opens the encoder for `config`.
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] naming why no backend can produce the stream.
     fn configure(&mut self, config: &AudioEncoderConfig) -> CodecResult<()>;
 
     /// Push one chunk of PCM. The encoder may produce zero, one, or
@@ -180,6 +211,9 @@ pub trait AudioEncoder: Send {
     /// the encoder advances its internal monotonic counter from it
     /// so subsequent output frames carry strictly-increasing PTS in
     /// the same timeline.
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] for PCM the backend cannot encode.
     fn encode(&mut self, frame: &AudioFrame) -> CodecResult<()>;
 
     /// Drain any output frames produced by the latest `encode`
@@ -188,7 +222,7 @@ pub trait AudioEncoder: Send {
     fn take_output(&mut self) -> Vec<AudioFrame>;
 
     /// Optional codec-specific configuration descriptor (e.g. the
-    /// 2-byte AudioSpecificConfig that the MPEG-TS muxer can use
+    /// 2-byte `AudioSpecificConfig` that the MPEG-TS muxer can use
     /// for the AAC ADTS header). Returns empty when the codec doesn't
     /// need an out-of-band header (every output frame is self-
     /// describing — true for ADTS-framed AAC).
@@ -198,5 +232,8 @@ pub trait AudioEncoder: Send {
 
     /// Flush any internal frames and return them. Called once at
     /// shutdown.
+    ///
+    /// # Errors
+    /// A [`crate::CodecError`] when the backend fails to drain.
     fn flush(self) -> CodecResult<Vec<AudioFrame>>;
 }

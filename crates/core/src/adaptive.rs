@@ -92,6 +92,7 @@ impl AdaptiveBitrateState {
     /// Default lower bound for the target bitrate.
     pub const DEFAULT_FLOOR_KBPS: u32 = 500;
 
+    #[must_use]
     pub fn new(initial_kbps: u32) -> Arc<Self> {
         Arc::new(Self {
             target_kbps: AtomicU32::new(initial_kbps),
@@ -208,7 +209,7 @@ impl AdaptiveBitrateState {
             return None;
         } else if measured_kbps >= current {
             // 70 % of measured, clamped to the controller's bounds.
-            self.bounded((u64::from(measured_kbps) * 7 / 10) as u32)
+            self.bounded(u32::try_from(u64::from(measured_kbps) * 7 / 10).unwrap_or(u32::MAX))
         } else {
             // Already over-budget. Drop to measured.
             self.bounded(measured_kbps)
@@ -228,13 +229,13 @@ impl AdaptiveBitrateState {
 
 fn monotonic_ns() -> u64 {
     // `Instant` doesn't expose nanos directly across platforms; use
-    // a process-local anchor and return ns since it. Wraps on
-    // overflow after ~584 years — fine.
+    // a process-local anchor and return ns since it. Saturates after
+    // ~584 years — fine.
     use std::sync::OnceLock;
     use std::time::Instant;
     static ANCHOR: OnceLock<Instant> = OnceLock::new();
     let anchor = ANCHOR.get_or_init(Instant::now);
-    anchor.elapsed().as_nanos() as u64
+    u64::try_from(anchor.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

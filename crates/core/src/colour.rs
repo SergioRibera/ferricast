@@ -80,6 +80,10 @@ impl YuvColour {
     /// [`Self::nv12_to_bgra`] into `out`, reusing its allocation.
     /// Returns `None`, leaving `out` unspecified, when `data` is too
     /// short for the picture.
+    #[expect(
+        clippy::similar_names,
+        reason = "the Cb / Cr weights are named after the channels they mix"
+    )]
     pub fn nv12_to_bgra_into(
         self,
         data: &[u8],
@@ -108,14 +112,19 @@ impl YuvColour {
                 let y = gain * (i32::from(luma_row[column]) - black) + 128;
                 let cb = i32::from(*chroma_row.get(column / 2 * 2)?) - 128;
                 let cr = i32::from(*chroma_row.get(column / 2 * 2 + 1)?) - 128;
-                pixel[0] = ((y + cb_b * cb) >> 8).clamp(0, 255) as u8;
-                pixel[1] = ((y - cb_g * cb - cr_g * cr) >> 8).clamp(0, 255) as u8;
-                pixel[2] = ((y + cr_r * cr) >> 8).clamp(0, 255) as u8;
+                pixel[0] = to_byte((y + cb_b * cb) >> 8);
+                pixel[1] = to_byte((y - cb_g * cb - cr_g * cr) >> 8);
+                pixel[2] = to_byte((y + cr_r * cr) >> 8);
                 pixel[3] = 255;
             }
         }
         Some(())
     }
+}
+
+/// A fixed-point channel value as an 8-bit sample, clamped.
+fn to_byte(value: i32) -> u8 {
+    u8::try_from(value.clamp(0, 255)).unwrap_or(u8::MAX)
 }
 
 #[cfg(test)]

@@ -311,6 +311,10 @@ impl AacChannelConfig {
 
     /// The configuration that carries `channels` channels.
     #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "only the matched 1..=6 is cast; `u8::try_from` is not const"
+    )]
     pub const fn from_channels(channels: u16) -> Option<Self> {
         match channels {
             1..=6 => Some(Self(channels as u8)),
