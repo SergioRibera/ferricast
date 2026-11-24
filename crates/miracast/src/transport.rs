@@ -18,6 +18,8 @@
 pub mod mice;
 
 #[cfg(target_os = "linux")]
+pub mod dhcp;
+#[cfg(target_os = "linux")]
 pub mod linux_p2p;
 
 #[cfg(target_os = "windows")]

@@ -241,18 +241,29 @@ async fn start_linux_p2p_sink(
         .map_err(|e| FerricastError::Receiver(format!("Listen: {e}")))?;
 
     let handle = tokio::spawn(async move {
-        let _client = client; // keep WFDIEs live for the session
         while let Some(group) = groups.recv().await {
             tracing::info!(
                 iface = %group.interface_path,
                 role = ?group.role,
-                "miracast sink: Wi-Fi Direct group formed; RTSP listener on 7236"
+                "miracast sink: Wi-Fi Direct group formed"
             );
-            // The existing `MiracastReceiverControl` listens on
-            // `0.0.0.0:7236`, so the new group iface (which the kernel
-            // already owns) picks up inbound WFD RTSP automatically.
-            // Nothing extra to do per group; log for diagnostics.
+            match client.resolve_group_ifname(&group.interface_path).await {
+                Ok(kernel_ifname) => {
+                    tracing::info!(iface = %kernel_ifname, "miracast sink: running DHCP on group iface");
+                    match crate::transport::dhcp::acquire_on(&kernel_ifname).await {
+                        Ok(lease) => tracing::info!(
+                            addr = %lease.addr,
+                            mask = %lease.mask,
+                            router = lease.router.map(|r| r.to_string()).unwrap_or_else(|| "-".into()),
+                            "miracast sink: DHCP lease installed; RTSP on 7236 now reachable"
+                        ),
+                        Err(e) => tracing::error!(error = %e, "miracast sink: DHCP failed — phone cannot reach RTSP"),
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "miracast sink: cannot resolve group ifname"),
+            }
         }
+        drop(client); // keep WFDIEs live until stream ends
     });
     Ok(handle)
 }

@@ -247,10 +247,16 @@ impl LinuxP2pClient {
             );
         }
 
-        // `Listen(timeout)` with 0 = until explicitly stopped.
-        p2p.call_method("Listen", &(0i32,))
-            .await
-            .map_err(|e| TransportError::LinuxP2p(format!("Listen: {e}")))?;
+        // `Find({Timeout: 0})` cycles scan + listen states internally,
+        // keeping the sink discoverable in the phone's picker. `Listen`
+        // alone parks the radio for at most `max_remain_on_chan` (5 s
+        // default) and then supplicant goes idle; `Connect` also clears
+        // `p2p_long_listen`, so after a single GON attempt the radio
+        // would go dark and Android's picker would lose us. MiracleCast
+        // (`wifid-supplicant.c:2019-2062`) and gnome-network-displays
+        // (`nd-wfd-p2p-provider.c:195-208`) both re-issue `Find` on a
+        // timer for this reason.
+        arm_find(&p2p).await?;
 
         let (tx, rx) = mpsc::channel(4);
         let conn = self.conn.clone();
@@ -266,6 +272,13 @@ impl LinuxP2pClient {
                         return;
                     }
                 };
+            // 20 s re-arm ticker: supplicant's own P2PState is
+            // unreliable (per MiracleCast's `start_scan` comment at
+            // `wifid-supplicant.c:2036-2041`). Belt-and-suspenders
+            // re-arm keeps the sink visible across driver quirks.
+            let mut rearm = tokio::time::interval(std::time::Duration::from_secs(20));
+            rearm.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            rearm.tick().await; // consume the immediate first tick
             let mut gon = match p2p_owned.receive_signal("GONegotiationRequest").await {
                 Ok(s) => s,
                 Err(e) => {
@@ -383,6 +396,13 @@ impl LinuxP2pClient {
                     return;
                 }
             };
+            let mut group_finished = match p2p_owned.receive_signal("GroupFinished").await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sink: subscribe GroupFinished");
+                    return;
+                }
+            };
             loop {
                 tokio::select! {
                     msg = prov_pin.next() => {
@@ -431,6 +451,7 @@ impl LinuxP2pClient {
                         if let Ok((peer, status)) = sig.body().deserialize::<(OwnedObjectPath, i32)>() {
                             tracing::warn!(peer = %peer.as_str(), status, "sink: ProvDisc failed");
                         }
+                        rearm_find_from_task(&p2p_owned).await;
                     }
                     msg = group_fail.next() => {
                         let Some(sig) = msg else { break };
@@ -439,6 +460,7 @@ impl LinuxP2pClient {
                         } else {
                             tracing::error!("miracast sink: GroupFormationFailure (opaque)");
                         }
+                        rearm_find_from_task(&p2p_owned).await;
                     }
                     msg = wps_fail.next() => {
                         let Some(sig) = msg else { break };
@@ -447,16 +469,27 @@ impl LinuxP2pClient {
                             let error = dict.get("config_error").and_then(|v| v.downcast_ref::<u32>().ok()).unwrap_or(0);
                             tracing::error!(reason, config_error = error, "miracast sink: WpsFailed (PIN mismatch or timeout)");
                         }
+                        rearm_find_from_task(&p2p_owned).await;
                     }
                     msg = gon_fail.next() => {
                         let Some(sig) = msg else { break };
                         if let Ok(dict) = sig.body().deserialize::<HashMap<String, OwnedValue>>() {
                             tracing::error!(?dict, "miracast sink: GONegotiationFailure");
                         }
+                        rearm_find_from_task(&p2p_owned).await;
                     }
                     msg = gon_ok.next() => {
                         let Some(sig) = msg else { break };
                         tracing::info!(?sig, "sink: GONegotiationSuccess");
+                    }
+                    _ = rearm.tick() => {
+                        rearm_find_from_task(&p2p_owned).await;
+                    }
+                    msg = group_finished.next() => {
+                        let Some(_sig) = msg else { break };
+                        tracing::info!("sink: GroupFinished — re-arming Find");
+                        group_formed.store(false, std::sync::atomic::Ordering::Release);
+                        rearm_find_from_task(&p2p_owned).await;
                     }
                     msg = iface_added.next() => {
                         let Some(sig) = msg else { break };
@@ -752,6 +785,33 @@ mod pin_tests {
     }
 }
 
+/// Issue `P2PDevice.Find({Timeout: 0})`. Idempotent — supplicant drops
+/// a duplicate with `AlreadyExists` which we log at debug level.
+async fn arm_find(p2p: &Proxy<'_>) -> Result<(), TransportError> {
+    let args: HashMap<&str, Value> = HashMap::new();
+    match p2p.call_method("Find", &(args,)).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("AlreadyExists") || msg.contains("in progress") {
+                tracing::debug!(error = %e, "sink: Find already active, skipping");
+                Ok(())
+            } else {
+                tracing::warn!(error = %e, "sink: Find rearm failed");
+                Err(TransportError::LinuxP2p(format!("Find: {e}")))
+            }
+        }
+    }
+}
+
+/// Re-arm Find from inside the task loop. Logs on failure but doesn't
+/// propagate — losing re-arm once is better than killing the loop.
+async fn rearm_find_from_task(p2p: &Proxy<'_>) {
+    if let Err(e) = arm_find(p2p).await {
+        tracing::debug!(error = %e, "sink: re-arm Find deferred to next ticker");
+    }
+}
+
 /// Read the current STA association's channel + Wi-Fi Alliance
 /// regulatory class via wpa_supplicant D-Bus. Returns `None` when the
 /// interface isn't associated to an infrastructure Wi-Fi.
@@ -833,6 +893,22 @@ fn parse_group_started(dict: &HashMap<String, OwnedValue>) -> Option<GroupStarte
 }
 
 impl LinuxP2pClient {
+
+    /// Read `fi.w1.wpa_supplicant1.Interface.Ifname` from the given
+    /// supplicant interface path. For a Miracast group that reused
+    /// `wlp7s0` (NoGroupIface=true) this returns `"wlp7s0"`; for a
+    /// virtual group iface it returns `"p2p-wlp7s0-0"` and so on.
+    pub async fn resolve_group_ifname(&self, interface_path: &str) -> Result<String, TransportError> {
+        let path = ObjectPath::try_from(interface_path.to_string())
+            .map_err(|e| TransportError::LinuxP2p(format!("bad iface path: {e}")))?;
+        let iface = Proxy::new(&self.conn, SUPPLICANT_BUS, path, INTERFACE_IFACE)
+            .await
+            .map_err(|e| TransportError::LinuxP2p(format!("iface proxy: {e}")))?;
+        iface
+            .get_property::<String>("Ifname")
+            .await
+            .map_err(|e| TransportError::LinuxP2p(format!("Ifname: {e}")))
+    }
 
     async fn p2p_proxy(&self) -> Result<Proxy<'_>, TransportError> {
         Proxy::new(

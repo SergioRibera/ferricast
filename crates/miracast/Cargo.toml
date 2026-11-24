@@ -27,9 +27,12 @@ futures-util = { workspace = true }
 # hosts; on other targets the module isn't compiled. Runtime failure
 # modes (no P2P-Device iftype, IWD-managed radio, NM-exclusive lock)
 # are surfaced via `MiracastHandler::availability()` so callers can
-# keep offering the MICE fallback.
+# keep offering the MICE fallback. `dhcproto` + `rtnetlink` run the
+# post-GroupStarted DHCP lease without shelling out.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { workspace = true }
+dhcproto = "0.12"
+rtnetlink = "0.14"
 
 # Windows-native Miracast enumerator via WinRT. `CastingConnection`
 # itself has to live in a COM-STA window the GUI owns; this crate
