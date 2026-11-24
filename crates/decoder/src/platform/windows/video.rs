@@ -157,6 +157,9 @@ struct Picture {
     /// Visible origin inside the decoded surface.
     x: usize,
     y: usize,
+    /// Rows of the luma plane (`MF_MT_FRAME_SIZE`; 1088 for 1080p
+    /// H.264): the chroma plane starts after them.
+    coded_height: usize,
     /// Bytes per row, when the type states it.
     stride: Option<usize>,
     colour: Option<ColourDescription>,
@@ -168,6 +171,8 @@ struct Session {
     fallback_colour: ColourDescription,
     picture: Picture,
     ready: VecDeque<CapturedFrame>,
+    /// Timestamps of packets fed but not yet decoded into a picture.
+    in_flight: Timestamps,
 }
 
 /// Picks the MFT's NV12 output type (initially and after a stream change).
@@ -250,6 +255,7 @@ impl Session {
                 .unwrap_or(ColourDescription::unspecified(ColourRange::Limited)),
             picture,
             ready: VecDeque::new(),
+            in_flight: Timestamps::default(),
         })
     }
 
@@ -277,6 +283,7 @@ impl Session {
         self.transform
             .pull(&mut outputs, None)
             .map_err(|error| decode_failure("IMFTransform::ProcessOutput", &error))?;
+        self.in_flight.push(frame.timestamp_us);
         self.collect(outputs)?;
         Ok(self.ready.pop_front())
     }
@@ -298,7 +305,7 @@ impl Session {
                 Output::FormatChanged => {
                     let known = (
                         self.picture.x + self.picture.width,
-                        self.picture.y + self.picture.height,
+                        self.picture.coded_height,
                     );
                     let known = (
                         u32::try_from(known.0).unwrap_or(0),
@@ -309,7 +316,9 @@ impl Session {
                 }
             };
             // SAFETY: plain attribute read on the output sample.
-            let timestamp_us = unsafe { sample.GetSampleTime() }.map_or(0, micros);
+            let timestamp_us = self
+                .in_flight
+                .take(unsafe { sample.GetSampleTime() }.ok().map(micros));
             let data = mf::sample_bytes(&sample, op)?;
             let (packed, stride) = self.pack(&data)?;
             let picture = self.picture;
@@ -348,15 +357,18 @@ impl Session {
             )
         };
         let coded_width = p.x + p.width;
-        let coded_height = p.y + p.height;
         let stride = p.stride.unwrap_or(coded_width).max(coded_width);
-        // The surface may be taller than the picture (1088 rows for
-        // 1080p): its luma plane fills two thirds of it.
-        let surface_rows = surface.len() / stride * 2 / 3;
-        if surface_rows < coded_height || stride == 0 {
+        if stride == 0 || p.width == 0 || p.height == 0 || p.coded_height < p.y + p.height {
+            return Err(fail(
+                "the decoder reported an empty or inconsistent picture size",
+            ));
+        }
+        // The chroma plane follows the coded luma rows, whatever padding
+        // the buffer carries after it.
+        let chroma = stride * p.coded_height;
+        if surface.len() < chroma + stride * p.coded_height.div_ceil(2) {
             return Err(fail("decoded surface smaller than its picture"));
         }
-        let chroma = stride * surface_rows;
         let width = p.width;
         let row_bytes = width.div_ceil(2) * 2;
         let x = p.x / 2 * 2;
@@ -399,6 +411,7 @@ fn picture_of(mft: &IMFTransform, fallback: (u32, u32)) -> CodecResult<Picture> 
         height: coded_height as usize,
         x: 0,
         y: 0,
+        coded_height: coded_height as usize,
         // A negative stride means a bottom-up image, which NV12 never is.
         stride: stride
             .and_then(|stride| i32::from_ne_bytes(stride.to_ne_bytes()).checked_abs())
@@ -433,4 +446,66 @@ fn aperture(media: &IMFMediaType) -> Option<(usize, usize, usize, usize)> {
     };
     let (x, y, width, height) = (offset(0)?, offset(4)?, size(8)?, size(12)?);
     (width > 0 && height > 0).then_some((x, y, width, height))
+}
+
+/// Timestamps of the packets an MFT holds. MFTs carry each packet's
+/// sample time to its picture; one that drops it gets the earliest
+/// pending timestamp (pictures leave in presentation order) instead of
+/// a made-up zero.
+#[derive(Debug, Default)]
+struct Timestamps {
+    pending: std::collections::BTreeMap<u64, usize>,
+    /// The last timestamp handed out.
+    last: u64,
+    warned: bool,
+}
+
+impl Timestamps {
+    /// More than any decoder's reorder window; beyond it the oldest
+    /// entries belong to packets the MFT dropped.
+    const LIMIT: usize = 64;
+
+    fn push(&mut self, timestamp_us: u64) {
+        *self.pending.entry(timestamp_us).or_default() += 1;
+        if self.pending.values().sum::<usize>() > Self::LIMIT {
+            self.pending.pop_first();
+        }
+    }
+
+    /// The timestamp of a picture whose sample says `reported`.
+    fn take(&mut self, reported: Option<u64>) -> u64 {
+        let key = match reported {
+            Some(time) if self.pending.contains_key(&time) => Some(time),
+            Some(time) => {
+                self.last = time;
+                return time;
+            }
+            None => {
+                if !self.warned {
+                    self.warned = true;
+                    tracing::warn!(
+                        "Media Foundation decoder output carries no sample time; using the \
+                         earliest pending packet timestamp"
+                    );
+                }
+                self.pending.keys().next().copied()
+            }
+        };
+        let Some(key) = key else {
+            tracing::warn!(
+                last_us = self.last,
+                "Media Foundation decoder output matches no pending packet timestamp; repeating \
+                 the last one"
+            );
+            return self.last;
+        };
+        if let Some(count) = self.pending.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                self.pending.remove(&key);
+            }
+        }
+        self.last = key;
+        key
+    }
 }

@@ -37,17 +37,18 @@ use ferricast_core::{
     BackendId, ChromaLocation, CodecError, CodecResult, ColourDescription, ColourPrimaries,
     ColourRange, MatrixCoefficients, Operation, TransferCharacteristics,
 };
+use windows::Win32::Foundation::RPC_E_TIMEOUT;
 use windows::Win32::Media::MediaFoundation::{
     ICodecAPI, IMFActivate, IMFMediaBuffer, IMFMediaEventGenerator, IMFMediaType, IMFSample,
     IMFTransform, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
     MF_E_NO_EVENTS_AVAILABLE, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_EVENT_FLAG_NONE, MF_EVENT_TYPE,
-    MF_LOW_LATENCY, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
-    MF_MT_VIDEO_CHROMA_SITING, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX,
-    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateAlignedMemoryBuffer,
-    MFCreateMediaType, MFCreateSample, MFSTARTUP_NOSOCKET, MFStartup, MFT_ENUM_FLAG,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
-    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_EVENT_TYPE, MF_LOW_LATENCY,
+    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_CHROMA_SITING,
+    MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_VIDEO_PRIMARIES, MF_MT_YUV_MATRIX, MF_TRANSFORM_ASYNC,
+    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION, MFCreateAlignedMemoryBuffer, MFCreateMediaType,
+    MFCreateSample, MFSTARTUP_NOSOCKET, MFStartup, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_FRIENDLY_NAME_Attribute,
+    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MFT_REGISTER_TYPE_INFO, MFTEnumEx,
@@ -57,6 +58,13 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4};
 use windows::core::{GUID, Interface, PWSTR};
+
+/// How long an asynchronous MFT may go without sending an event the
+/// session waits for before the call fails.
+pub const EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long dropping a session waits for its worker to finish.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The backend every Media Foundation codec reports.
 pub const BACKEND: BackendId = BackendId::MediaFoundation;
@@ -241,9 +249,24 @@ impl<S: 'static> Worker<S> {
 impl<S> Drop for Worker<S> {
     fn drop(&mut self) {
         drop(self.jobs.take());
-        if let Some(thread) = self.thread.take()
-            && thread.join().is_err()
-        {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        // Every wait inside a job is bounded, but a driver call that never
+        // returns must not hang the session owner: past the timeout the
+        // thread is left to finish (and free its COM objects) on its own.
+        let deadline = Instant::now() + JOIN_TIMEOUT;
+        while !thread.is_finished() {
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    "a Media Foundation worker thread did not stop within {} s; detaching it",
+                    JOIN_TIMEOUT.as_secs()
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if thread.join().is_err() {
             tracing::warn!("a Media Foundation worker thread panicked");
         }
     }
@@ -581,7 +604,7 @@ impl Transform {
     ) -> windows::core::Result<()> {
         if self.events.is_some() {
             while self.need_input == 0 {
-                self.next_event(true, outputs)?;
+                self.wait_event("METransformNeedInput", outputs)?;
             }
             self.need_input -= 1;
             // SAFETY: the MFT asked for input; plain COM call.
@@ -617,7 +640,7 @@ impl Transform {
         let deadline = wait.map(|wait| Instant::now() + wait);
         loop {
             let before = (outputs.len(), self.need_input);
-            if !self.next_event(false, outputs)? {
+            if !self.next_event(outputs)? {
                 let waiting = deadline.is_some_and(|deadline| Instant::now() < deadline);
                 if outputs.is_empty() && self.need_input == 0 && waiting {
                     std::thread::sleep(Duration::from_millis(1));
@@ -654,7 +677,7 @@ impl Transform {
         }
         self.drained = false;
         while !self.drained {
-            self.next_event(true, outputs)?;
+            self.wait_event("METransformDrainComplete", outputs)?;
         }
         self.restart()
     }
@@ -668,23 +691,41 @@ impl Transform {
         }
     }
 
-    /// Handles one event of an asynchronous MFT; `false` when none was
-    /// pending and `block` is off.
-    fn next_event(
+    /// Handles the next event of an asynchronous MFT, polling for up to
+    /// [`EVENT_TIMEOUT`]: a hardware MFT that stops sending events (a
+    /// driver hang) fails the call instead of blocking the worker forever.
+    fn wait_event(
         &mut self,
-        block: bool,
+        awaited: &str,
         outputs: &mut Vec<Output>,
-    ) -> windows::core::Result<bool> {
+    ) -> windows::core::Result<()> {
+        let deadline = Instant::now() + EVENT_TIMEOUT;
+        loop {
+            if self.next_event(outputs)? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(windows::core::Error::new(
+                    RPC_E_TIMEOUT,
+                    format!(
+                        "{} sent no {awaited} event within {} ms",
+                        self.name,
+                        EVENT_TIMEOUT.as_millis()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Handles one pending event of an asynchronous MFT; `false` when
+    /// none was pending.
+    fn next_event(&mut self, outputs: &mut Vec<Output>) -> windows::core::Result<bool> {
         let Some(events) = &self.events else {
             return Ok(false);
         };
-        let flags = if block {
-            MF_EVENT_FLAG_NONE
-        } else {
-            MF_EVENT_FLAG_NO_WAIT
-        };
         // SAFETY: plain COM calls on the live event generator.
-        let event = match unsafe { events.GetEvent(flags) } {
+        let event = match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
             Ok(event) => event,
             Err(error) if error.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(false),
             Err(error) => return Err(error),

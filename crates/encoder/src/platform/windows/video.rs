@@ -8,7 +8,9 @@
 //! every later call returns the oldest finished packet, so the stream
 //! runs a constant number of frames behind instead of losing any.
 //!
-//! Parameter sets: every keyframe carries them in-band (as x264 is set
+//! Parameter sets: `configure` encodes one black frame (discarded) so
+//! they are known before the first real frame, which is then forced to
+//! an IDR. Every keyframe carries them in-band (as x264 is set
 //! up to do): when the MFT emits an IDR without them, the latest ones
 //! (from `MF_MT_MPEG_SEQUENCE_HEADER` or an earlier keyframe) are put
 //! in front.
@@ -199,6 +201,10 @@ struct Session {
     parameter_sets: ParameterSets,
     ready: VecDeque<EncodedFrame>,
     packets: u64,
+    /// `(sample time set, capture timestamp)` of the frames fed and not
+    /// yet out, oldest first: an MFT that rewrites or drops sample
+    /// times still gets each packet the capture time of its frame.
+    in_flight: VecDeque<(i64, u64)>,
 }
 
 impl Session {
@@ -361,7 +367,7 @@ impl Session {
             stride,
             chroma_offset: stride * config.height as usize,
         };
-        Ok(Self {
+        let mut session = Self {
             transform,
             codec_api,
             codec: config.codec,
@@ -375,7 +381,70 @@ impl Session {
             parameter_sets,
             ready: VecDeque::new(),
             packets: 0,
-        })
+            in_flight: VecDeque::new(),
+        };
+        session.prime()?;
+        Ok(session)
+    }
+
+    /// Encodes one black frame and throws its packet away, so the
+    /// parameter sets are known before the first real frame (the HLS
+    /// segmenter asks for them up front, and `MF_MT_MPEG_SEQUENCE_HEADER`
+    /// is usually empty); the next frame is forced to an IDR.
+    fn prime(&mut self) -> CodecResult<()> {
+        if !self.parameter_sets.annex_b().is_empty() {
+            return Ok(());
+        }
+        let op = Operation::Open;
+        let layout = self.layout;
+        let (black, neutral) = (
+            if self.colour.range == ferricast_core::ColourRange::Full {
+                0
+            } else {
+                16
+            },
+            128,
+        );
+        let sample = mf::sample_with(layout.len(), self.alignment, op, |dst| {
+            let (luma, chroma) = dst.split_at_mut(layout.chroma_offset);
+            luma.fill(black);
+            chroma.fill(neutral);
+            Ok(())
+        })?;
+        // SAFETY: plain attribute writes on the new sample.
+        unsafe {
+            sample.SetSampleTime(0).mf(op, "IMFSample::SetSampleTime")?;
+            sample
+                .SetSampleDuration(hns(1_000_000 / u64::from(self.fps)))
+                .mf(op, "IMFSample::SetSampleDuration")?;
+        }
+        let mut outputs = Vec::new();
+        self.transform
+            .push(&sample, &mut outputs)
+            .mf(op, "IMFTransform::ProcessInput (priming)")?;
+        self.transform
+            .pull(&mut outputs, Some(OUTPUT_WAIT))
+            .mf(op, "IMFTransform::ProcessOutput (priming)")?;
+        if outputs.is_empty() {
+            // A pipelining MFT holds the frame: drain it out.
+            self.transform
+                .drain(&mut outputs)
+                .mf(op, "draining the priming frame")?;
+        }
+        for output in outputs {
+            if let Output::Sample(sample) = output {
+                self.parameter_sets
+                    .remember(&annex_b(mf::sample_bytes(&sample, op)?));
+            }
+        }
+        if self.parameter_sets.annex_b().is_empty() {
+            tracing::warn!(
+                transform = self.transform.name(),
+                "the priming frame produced no parameter sets; headers come with the first keyframe"
+            );
+        }
+        self.keyframe_requested = true;
+        Ok(())
     }
 
     /// An NV12 input type the MFT offers, completed with the picture.
@@ -428,6 +497,7 @@ impl Session {
             sample
                 .SetSampleTime(hns(timestamp_us))
                 .mf(op, "IMFSample::SetSampleTime")?;
+            self.in_flight.push_back((hns(timestamp_us), timestamp_us));
             sample
                 .SetSampleDuration(hns(duration_us))
                 .mf(op, "IMFSample::SetSampleDuration")?;
@@ -461,6 +531,35 @@ impl Session {
         Ok(self.ready.drain(..).collect())
     }
 
+    /// The capture timestamp of the frame a packet with sample time
+    /// `time` encodes: the submitted frame with that sample time, else
+    /// (an MFT that dropped or rewrote it) the oldest frame in flight,
+    /// as frames leave in input order without B-frames.
+    fn capture_time(&mut self, time: Option<i64>) -> u64 {
+        if let Some(time) = time
+            && let Some(at) = self.in_flight.iter().position(|&(fed, _)| fed == time)
+        {
+            let (_, capture) = self.in_flight[at];
+            self.in_flight.drain(..=at);
+            return capture;
+        }
+        match self.in_flight.pop_front() {
+            Some((_, capture)) => {
+                tracing::debug!(
+                    ?time,
+                    capture,
+                    "packet sample time matches no frame; using the oldest in flight"
+                );
+                capture
+            }
+            None => {
+                let fallback = time.map_or(0, micros);
+                tracing::warn!(?time, fallback, "packet with no frame in flight");
+                fallback
+            }
+        }
+    }
+
     /// Turns MFT output into packets on the ready queue.
     fn collect(&mut self, outputs: Vec<Output>) -> CodecResult<()> {
         let op = Operation::Encode;
@@ -478,6 +577,11 @@ impl Session {
                 }
             };
             let data = annex_b(mf::sample_bytes(&sample, op)?);
+            if data.is_empty() {
+                // Some MFTs hand back an empty sample (e.g. while
+                // reconfiguring): no packet, and no frame consumed.
+                continue;
+            }
             // SAFETY: plain attribute reads on the output sample.
             let (time, keyframe) = unsafe {
                 (
@@ -500,10 +604,11 @@ impl Session {
             };
             let index = self.packets;
             self.packets += 1;
+            let timestamp_us = self.capture_time(time);
             self.ready.push_back(EncodedFrame {
                 codec: self.codec,
                 data,
-                timestamp_us: time.map_or(0, micros),
+                timestamp_us,
                 is_keyframe: keyframe,
                 duration_us: Some(1_000_000 / u64::from(self.fps)),
                 // No B-frames: decode order is presentation order.

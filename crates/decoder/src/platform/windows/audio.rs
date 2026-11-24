@@ -68,6 +68,7 @@ impl MfAacDecoder {
                 configured,
                 active: None,
                 ready: VecDeque::new(),
+                in_flight: VecDeque::new(),
             };
             // Fail at open, not on the first packet, when the shape is
             // known and the MFT refuses it (or none is installed).
@@ -103,6 +104,9 @@ struct Session {
     /// The MFT and the shape it was opened for.
     active: Option<(Shape, Transform)>,
     ready: VecDeque<DecodedAudio>,
+    /// Timestamps of the access units fed, oldest first: the fallback
+    /// for output the MFT does not stamp.
+    in_flight: VecDeque<u64>,
 }
 
 impl Session {
@@ -156,6 +160,10 @@ impl Session {
             // SAFETY: plain attribute write on the new sample.
             unsafe { sample.SetSampleTime(hns(frame.timestamp_us + offset_us)) }
                 .mf(op, "IMFSample::SetSampleTime")?;
+            self.in_flight.push_back(frame.timestamp_us + offset_us);
+            if self.in_flight.len() > 64 {
+                self.in_flight.pop_front();
+            }
             decoded += FRAME_SAMPLES;
             let Some((_, transform)) = &mut self.active else {
                 continue;
@@ -200,7 +208,27 @@ impl Session {
                 continue;
             };
             // SAFETY: plain attribute read on the output sample.
-            let timestamp_us = unsafe { sample.GetSampleTime() }.map_or(0, micros);
+            let reported = unsafe { sample.GetSampleTime() }.ok().map(micros);
+            let timestamp_us = match reported {
+                Some(time) => {
+                    // Units up to this one are decoded.
+                    while self.in_flight.front().is_some_and(|&fed| fed <= time) {
+                        self.in_flight.pop_front();
+                    }
+                    time
+                }
+                None => {
+                    let fallback = self.in_flight.pop_front();
+                    tracing::warn!(
+                        ?fallback,
+                        "Media Foundation AAC output carries no sample time; using the oldest \
+                         pending access unit timestamp"
+                    );
+                    fallback
+                        .or(self.ready.back().map(|last| last.timestamp_us))
+                        .unwrap_or(0)
+                }
+            };
             let bytes = mf::sample_bytes(&sample, op)?;
             let pcm: Vec<i16> = bytes
                 .chunks_exact(2)
