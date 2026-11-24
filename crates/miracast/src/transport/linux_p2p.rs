@@ -200,10 +200,24 @@ impl LinuxP2pClient {
         let mut cfg: HashMap<&str, Value> = HashMap::new();
         cfg.insert("DeviceName", name_val);
         cfg.insert("PrimaryDeviceType", pdt_val);
+        // Pin P2P to social channel 1 (2.4 GHz, reg class 81). Without
+        // this, supplicant picks a random listen channel each run; the
+        // peer's probe lands on 1/6/11, so GO-Negotiation-Response
+        // frames miss entirely when the two sides disagree. MiracleCast
+        // forces the same values via `wpa_supplicant.conf`; we set
+        // them per-session via D-Bus so we don't need a config file
+        // change. Supplicant parses these as DBUS_TYPE_UINT32.
+        cfg.insert("ListenRegClass", Value::from(81u32));
+        cfg.insert("ListenChannel", Value::from(1u32));
+        cfg.insert("OperRegClass", Value::from(81u32));
+        cfg.insert("OperChannel", Value::from(1u32));
         if let Err(e) = p2p.set_property("P2PDeviceConfig", Value::from(cfg)).await {
             tracing::error!(error = %e, "miracast sink: P2PDeviceConfig set FAILED — peers will see us as unnamed");
         } else {
-            tracing::info!(name = %device_name, "miracast sink: P2PDeviceConfig set");
+            tracing::info!(
+                name = %device_name,
+                "miracast sink: P2PDeviceConfig set (listen/oper channel pinned to 1)"
+            );
         }
 
         // `Listen(timeout)` with 0 = until explicitly stopped.
