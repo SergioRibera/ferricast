@@ -445,17 +445,15 @@ impl LinuxP2pClient {
                         }
                         // Bias ourselves toward being the Group Owner —
                         // the sink needs to run a DHCP server for the
-                        // phone. supplicant's property is u32; sending
-                        // i32 silently dropped the key, so both ends
-                        // ran with default intent 7 → tie-breaker bug.
-                        args.insert("go_intent", Value::from(14u32));
-                        match p2p_owned.call_method("Connect", &(args,)).await {
-                            Ok(_) => {
-                                last_connect_at = Some((peer.clone(), now));
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "sink: Connect");
-                            }
+                        // phone. supplicant parses `go_intent` as
+                        // `DBUS_TYPE_INT32` (`i`), not u32 — a u32
+                        // triggers InvalidArgs on the whole call.
+                        args.insert("go_intent", Value::from(14i32));
+                        // Record BEFORE Connect so dedupe fires even
+                        // when Connect itself errored out.
+                        last_connect_at = Some((peer.clone(), now));
+                        if let Err(e) = p2p_owned.call_method("Connect", &(args,)).await {
+                            tracing::warn!(error = %e, "sink: Connect");
                         }
                     }
                     msg = started.next() => {

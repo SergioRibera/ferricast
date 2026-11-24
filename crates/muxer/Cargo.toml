@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 tracing.workspace = true
 ferricast-core.workspace = true
+
+[lints]
+workspace = true

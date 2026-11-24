@@ -13,6 +13,7 @@ pub struct FrameLimiter {
 
 impl FrameLimiter {
     /// Creates a limiter for `fps` frames a second (0 is treated as 1).
+    #[must_use]
     pub fn new(fps: u32) -> Self {
         Self {
             min_spacing_us: 750_000 / u64::from(fps.max(1)),

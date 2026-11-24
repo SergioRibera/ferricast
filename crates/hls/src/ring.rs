@@ -111,6 +111,7 @@ impl SegmentRing {
     /// What MSN the next segment will be assigned. The HTTP handler
     /// uses this to evaluate blocking-reload requests against the
     /// "current build" segment that doesn't have its body yet.
+    #[must_use]
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }
@@ -144,12 +145,13 @@ impl SegmentRing {
         }
     }
 
+    #[must_use]
     pub fn pending_parts(&self) -> &[Part] {
         &self.pending_parts
     }
 
     /// LL-HLS: add a freshly-flushed part to the in-progress segment.
-    /// Returns the (msn, part_idx) tuple the client would use to
+    /// Returns the (msn, `part_idx`) tuple the client would use to
     /// reach it. Wakes everyone blocked on `notify`.
     pub fn push_pending_part(
         &mut self,
@@ -193,7 +195,7 @@ impl SegmentRing {
 
     /// LL-HLS variant: along with the full segment body, store the
     /// parts that were flushed during its build. Parts share their
-    /// produced_at with the time they were originally flushed so the
+    /// `produced_at` with the time they were originally flushed so the
     /// HTTP handler's staleness metric stays meaningful per part.
     pub fn push_with_parts(
         &mut self,
@@ -253,16 +255,19 @@ impl SegmentRing {
         self.push_with_parts(duration_secs, discontinuity, body, parts)
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
     }
 
+    #[must_use]
     pub fn get(&self, seq: u64) -> Option<&Segment> {
         self.segments.iter().find(|s| s.seq == seq)
     }
 
-    /// Retrieve a part by (segment_msn, part_idx). Looks first in the
+    /// Retrieve a part by (`segment_msn`, `part_idx`). Looks first in the
     /// completed segments, then in the in-progress one.
+    #[must_use]
     pub fn get_part(&self, seq: u64, idx: u32) -> Option<&Part> {
         if let Some(seg) = self.get(seq) {
             return seg.parts.iter().find(|p| p.idx == idx);
@@ -275,13 +280,13 @@ impl SegmentRing {
 
     /// Whether the ring has reached at least `(msn, part)`. Used by
     /// the blocking-reload HTTP handler.
+    #[must_use]
     pub fn has_reached(&self, msn: u64, part: Option<u32>) -> bool {
         // The msn parameter may name a finished segment (any seg in
         // self.segments with that seq), or the in-progress one (==
         // self.next_seq, possibly with a pending part).
         if let Some(seg) = self.get(msn) {
             return match part {
-                None => true,
                 // A part index past the last part of a completed
                 // segment names part 0 of the next one (rfc8216bis
                 // §6.2.5.2). Classic segments have no parts at all:
@@ -289,7 +294,7 @@ impl SegmentRing {
                 Some(p) if !seg.parts.is_empty() && p as usize >= seg.parts.len() => {
                     self.has_reached(msn.saturating_add(1), Some(0))
                 }
-                Some(_) => true,
+                None | Some(_) => true,
             };
         }
         if msn == self.next_seq {
@@ -346,7 +351,7 @@ impl SegmentRing {
     pub fn build_playlist(&self) -> Result<String, FerricastError> {
         let target = self.target_duration;
 
-        let first_seq = self.segments.front().map(|s| s.seq).unwrap_or(0);
+        let first_seq = self.segments.front().map_or(0, |s| s.seq);
 
         // Bump playlist version to 6 when LL-HLS is in play — Apple's
         // spec requires >= 6 for EXT-X-PART. Classic HLS sticks to 3.

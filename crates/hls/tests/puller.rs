@@ -1,6 +1,8 @@
 //! HLS puller against real ffmpeg-generated streams served over a
 //! local HTTP server. Skips when ffmpeg is unavailable.
 
+#![expect(clippy::cast_possible_truncation, reason = "fixture counters are tiny")]
+
 #[path = "../../../tests/support/mod.rs"]
 mod support;
 
@@ -15,7 +17,7 @@ use support::{Reply, TestServer, live_server};
 fn spec(url: String) -> PullSpec {
     PullSpec {
         url,
-        headers: Default::default(),
+        headers: std::collections::HashMap::default(),
     }
 }
 
@@ -156,7 +158,7 @@ async fn transient_server_errors_are_retried() {
     let failures = Arc::new(AtomicU32::new(0));
     let failures_srv = failures.clone();
     let server = TestServer::start(Arc::new(move |path: &str| {
-        if path.ends_with(".ts") && failures_srv.fetch_add(1, Ordering::SeqCst) < 2 {
+        if is_ts(path) && failures_srv.fetch_add(1, Ordering::SeqCst) < 2 {
             Reply::Status(503)
         } else {
             files(path)
@@ -381,7 +383,7 @@ async fn live_starts_near_the_edge_and_follows_reloads() {
     // Started 3 target durations from the end of a 6-segment window:
     // the first segment fetched is index 3 (seg 3.ts).
     let log = server.log.lock().unwrap().clone();
-    let first_segment = log.iter().find(|p| p.ends_with(".ts")).unwrap();
+    let first_segment = log.iter().find(|p| is_ts(p)).unwrap();
     assert_eq!(first_segment, "/index3.ts", "{log:?}");
     // Kept following the live playlist without gaps: DTS advances by
     // one frame (33.3 ms) at a time.
@@ -416,4 +418,11 @@ async fn restarted_live_source_is_followed_with_a_discontinuity() {
     }
     assert!(discontinuities >= 1);
     assert!(frames_after > 30, "{frames_after}");
+}
+
+/// Whether `path` names a segment (`.ts`, as the fixtures write it).
+fn is_ts(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ts"))
 }

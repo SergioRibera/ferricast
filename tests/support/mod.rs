@@ -84,8 +84,8 @@ impl TestServer {
                                 let part = &body[start.min(body.len())..=end];
                                 let mut r = format!(
                                     "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
-                                     Content-Range: bytes {start}-{end}/{}\r\n\
-                                     Connection: close\r\n\r\n",
+                                 Content-Range: bytes {start}-{end}/{}\r\n\
+                                 Connection: close\r\n\r\n",
                                     part.len(),
                                     body.len()
                                 )
@@ -95,7 +95,7 @@ impl TestServer {
                             } else {
                                 let mut r = format!(
                                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
-                                     Connection: close\r\n\r\n",
+                                 Connection: close\r\n\r\n",
                                     body.len()
                                 )
                                 .into_bytes();
@@ -246,11 +246,19 @@ impl LiveSim {
     pub fn playlist(&self) -> String {
         let elapsed = self.started.elapsed();
         let elapsed = match self.restart_at {
+<<<<<<< HEAD
             Some(at) if elapsed >= at => elapsed.saturating_sub(at),
             _ => elapsed,
         };
         let head = usize::try_from(elapsed.as_secs())
             .unwrap_or(usize::MAX)
+=======
+            Some(at) if elapsed >= at => elapsed.checked_sub(at).unwrap(),
+            _ => elapsed,
+        };
+        let head = usize::try_from(elapsed.as_secs())
+            .unwrap()
+>>>>>>> chore/pedantic-b
             .min(self.segments.len() - WINDOW);
         let mut text = format!(
             "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:{head}\n"

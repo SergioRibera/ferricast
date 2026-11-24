@@ -13,7 +13,7 @@ use crate::{BoxedSource, Packet, TrackSelection, VideoStream, micros};
 
 const VISUAL_ENTRY_HEADER: usize = 78;
 /// `SampleEntry` (8 bytes) plus the version 0 `AudioSampleEntry`
-/// fields (20 bytes). QuickTime version 1 and 2 entries append 16 and
+/// fields (20 bytes). `QuickTime` version 1 and 2 entries append 16 and
 /// 36 more bytes before their child boxes.
 const AUDIO_ENTRY_HEADER: usize = 28;
 // Upper bound on the samples taken from one track: about 19 hours at 30 fps.
@@ -259,7 +259,8 @@ impl AudioTrack {
         i64::try_from(t)
             .unwrap_or(i64::MAX)
             .saturating_add(self.shift)
-            .max(0) as u64
+            .max(0)
+            .cast_unsigned()
     }
 
     /// Moves to the first sample still playing at `timestamp_us`.
@@ -429,7 +430,7 @@ impl Fragments {
                     "moof box of {body_len} bytes exceeds the {MAX_MOOF} byte limit"
                 )));
             }
-            let mut body = vec![0; body_len as usize];
+            let mut body = zeroed(body_len)?;
             source.seek(SeekFrom::Start(offset + header_len))?;
             source.read_exact(&mut body)?;
             let runs = fragment::parse_moof(&body, offset, &self.trex, |id| self.continue_dts(id));
@@ -694,7 +695,7 @@ impl Mp4Demuxer {
         if len > MAX_INDEX_BOX {
             return Ok(None);
         }
-        let mut body = vec![0; len as usize];
+        let mut body = zeroed(len)?;
         self.source.seek(SeekFrom::Start(offset + header_len))?;
         self.source.read_exact(&mut body)?;
         Ok(Some(body))
@@ -843,6 +844,7 @@ impl Mp4Demuxer {
 
     /// The body of the `mfra` box located through the `mfro` box that
     /// closes the file.
+    #[expect(clippy::similar_names, reason = "`mfra` and `mfro` are the box names")]
     fn read_mfra(&mut self, file_len: u64) -> Result<Option<Vec<u8>>> {
         if file_len < 16 {
             return Ok(None);
@@ -857,7 +859,7 @@ impl Mp4Demuxer {
         if !(16..=MAX_INDEX_BOX).contains(&size) || size > file_len {
             return Ok(None);
         }
-        let mut mfra = vec![0; size as usize];
+        let mut mfra = zeroed(size)?;
         self.source.seek(SeekFrom::Start(file_len - size))?;
         self.source.read_exact(&mut mfra)?;
         if mfra.get(4..8) != Some(&b"mfra"[..]) {
@@ -1029,7 +1031,11 @@ impl Mp4Demuxer {
     fn primary_ticks(&self, timestamp_us: u64) -> u64 {
         let ticks = |us: u64, timescale: u32, origin: i64| {
             let t = u128::from(us) * u128::from(timescale) / 1_000_000;
-            (t as i64).saturating_add(origin).max(0) as u64
+            i64::try_from(t)
+                .unwrap_or(i64::MAX)
+                .saturating_add(origin)
+                .max(0)
+                .cast_unsigned()
         };
         match (&self.video, &self.audio) {
             (Some(v), _) => ticks(timestamp_us, v.timescale, v.origin),
@@ -1087,7 +1093,7 @@ impl Mp4Demuxer {
         let mut candidate = at.saturating_sub(1);
         loop {
             let moof = self.primary_fragment(candidate);
-            self.restart_at(moof)?;
+            self.restart_at(moof);
             self.fill()?;
             if self.has_keyframe_by(timestamp_us) || candidate == 0 {
                 let landed = self.position_tracks(timestamp_us);
@@ -1147,7 +1153,7 @@ impl Mp4Demuxer {
         let Some(earlier) = earlier else {
             return Ok(landed);
         };
-        self.restart_at(Some(earlier))?;
+        self.restart_at(Some(earlier));
         self.load_through(landed)?;
         Ok(self.position_tracks(timestamp_us))
     }
@@ -1174,7 +1180,7 @@ impl Mp4Demuxer {
 
     /// Drops every queued sample and continues reading at the `moof` at
     /// `moof` (the first one when `None`).
-    fn restart_at(&mut self, moof: Option<u64>) -> Result<()> {
+    fn restart_at(&mut self, moof: Option<u64>) {
         if let Some(fragments) = self.fragments.as_mut() {
             fragments.next_box = moof.unwrap_or(0);
             fragments.ended = false;
@@ -1189,7 +1195,6 @@ impl Mp4Demuxer {
             audio.next = 0;
             audio.first = 0;
         }
-        Ok(())
     }
 
     /// Whether the loaded video has a keyframe at or before
@@ -1276,7 +1281,7 @@ fn read_moov(source: &mut BoxedSource, len: u64) -> Result<(Vec<u8>, u64)> {
                     "moov box of {body_len} bytes exceeds the {MAX_MOOV} byte limit"
                 )));
             }
-            let mut body = vec![0; body_len as usize];
+            let mut body = zeroed(body_len)?;
             source.seek(SeekFrom::Start(offset + header_len))?;
             source.read_exact(&mut body)?;
             return Ok((body, offset + size));
@@ -1362,6 +1367,7 @@ fn parse_moov(moov: &[u8], selection: TrackSelection) -> Result<Tracks> {
     }
 }
 
+#[expect(clippy::similar_names, reason = "`trak` is the box name")]
 fn parse_track(trak: &[u8]) -> Option<Parsed> {
     let mdia = child(trak, b"mdia")?;
     let handler = child(mdia, b"hdlr")?.get(8..12)?;
@@ -1408,18 +1414,15 @@ fn parse_tkhd_id(tkhd: &[u8]) -> Option<u32> {
 /// Returns the media timescale and duration; an all-ones duration means
 /// "unknown" (ISO/IEC 14496-12 §8.4.2.3) and comes back as `None`.
 fn parse_mdhd(mdhd: &[u8]) -> Option<(u32, Option<u64>)> {
-    match *mdhd.first()? {
-        1 => {
-            let duration = be64(mdhd, 24)?;
-            Some((be32(mdhd, 20)?, (duration != u64::MAX).then_some(duration)))
-        }
-        _ => {
-            let duration = be32(mdhd, 16)?;
-            Some((
-                be32(mdhd, 12)?,
-                (duration != u32::MAX).then_some(u64::from(duration)),
-            ))
-        }
+    if *mdhd.first()? == 1 {
+        let duration = be64(mdhd, 24)?;
+        Some((be32(mdhd, 20)?, (duration != u64::MAX).then_some(duration)))
+    } else {
+        let duration = be32(mdhd, 16)?;
+        Some((
+            be32(mdhd, 12)?,
+            (duration != u32::MAX).then_some(u64::from(duration)),
+        ))
     }
 }
 
@@ -1545,7 +1548,7 @@ fn descriptor(data: &[u8]) -> Option<(u8, &[u8])> {
     Some((tag, rest.get(..len)?))
 }
 
-/// A `colr` box: `nclx` (ISO/IEC 23001-8) or QuickTime `nclc`, both
+/// A `colr` box: `nclx` (ISO/IEC 23001-8) or `QuickTime` `nclc`, both
 /// carrying 16-bit H.273 primaries, transfer and matrix codes; only
 /// `nclx` has a range flag (`nclc` is always limited).
 fn parse_colr(colr: &[u8]) -> Option<ColourDescription> {
@@ -1616,14 +1619,15 @@ fn parse_elst(elst: &[u8]) -> Option<i64> {
         .take(count)
         .find_map(|entry| {
             let media_time = if version == 1 {
-                be64(entry, 8)? as i64
+                be64(entry, 8)?.cast_signed()
             } else {
-                i64::from(be32(entry, 4)? as i32)
+                i64::from(be32(entry, 4)?.cast_signed())
             };
             (media_time >= 0).then_some(media_time)
         })
 }
 
+#[expect(clippy::similar_names, reason = "`stts` and `stsc` are the box names")]
 fn parse_tables(stbl: &[u8]) -> Option<Tables> {
     // Entry counts are capped like the sample count: a table never needs more
     // entries than there can be samples, and the cap bounds every walk below.
@@ -1658,7 +1662,7 @@ fn parse_tables(stbl: &[u8]) -> Option<Tables> {
             .map(|(body, count)| pairs(body, count))
             .unwrap_or_default()
             .into_iter()
-            .map(|(count, offset)| (count, offset as i32))
+            .map(|(count, offset)| (count, offset.cast_signed()))
             .collect(),
         stsc: chunk_runs(stsc, stsc_count),
         sizes,
@@ -1756,10 +1760,10 @@ fn build_samples(tables: &Tables) -> Result<Vec<Sample>> {
                 dts,
                 duration,
                 cts_offset: cts_offsets.next().unwrap_or(0),
-                sync: tables
-                    .sync
-                    .as_ref()
-                    .is_none_or(|sync| sync.binary_search(&(samples.len() as u32 + 1)).is_ok()),
+                sync: tables.sync.as_ref().is_none_or(|sync| {
+                    u32::try_from(samples.len() + 1)
+                        .is_ok_and(|number| sync.binary_search(&number).is_ok())
+                }),
             });
             offset = offset.saturating_add(u64::from(size));
             dts = dts.saturating_add(u64::from(duration));
@@ -1788,6 +1792,10 @@ fn expand<T: Copy>(runs: &[(u32, T)]) -> impl Iterator<Item = T> + '_ {
         .flat_map(|&(count, value)| std::iter::repeat_n(value, count as usize))
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "box kinds are written as byte-string literals"
+)]
 fn child<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
     Boxes(data)
         .find(|(found, _)| found == kind)
@@ -1796,6 +1804,14 @@ fn child<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
 
 fn be16(data: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_be_bytes(data.get(at..at + 2)?.try_into().ok()?))
+}
+
+/// A zeroed buffer of `len` bytes for a box body (callers bound `len`).
+fn zeroed(len: u64) -> Result<Vec<u8>> {
+    let len = usize::try_from(len).map_err(|_| {
+        FerricastError::Demux(format!("a box body of {len} bytes does not fit in memory"))
+    })?;
+    Ok(vec![0; len])
 }
 
 fn be32(data: &[u8], at: usize) -> Option<u32> {
@@ -1807,6 +1823,11 @@ fn be64(data: &[u8], at: usize) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::trivially_copy_pass_by_ref,
+    reason = "fixtures are a few hundred bytes; box kinds are byte-string literals"
+)]
 mod tests {
     use super::*;
     use ferricast_core::{ColourRange, MatrixCoefficients};

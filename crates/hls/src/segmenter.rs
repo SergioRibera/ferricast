@@ -8,7 +8,7 @@
 //!
 //! The capture-pull loop is paced to `config.target_fps`: if the
 //! upstream `ScreenCapture` doesn't deliver a fresh frame inside one
-//! frame period (PipeWire on idle desktops routinely pauses for
+//! frame period (`PipeWire` on idle desktops routinely pauses for
 //! hundreds of ms), we re-encode the most recent one with its
 //! timestamp bumped forward. Without this padding the playlist would
 //! stop advancing whenever nothing on screen was changing — players
@@ -38,6 +38,20 @@ use ferricast_muxer::mpeg_ts::{MpegTs, in_band_parameter_sets};
 use crate::HlsConfig;
 use crate::ring::SegmentRing;
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "µs and kbps from Duration and float math; the casts saturate and the values stay far below the limits"
+)]
+#[expect(
+    clippy::similar_names,
+    reason = "`encoder` and `encoded` name the encoder and its output"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one capture, encode and segment loop"
+)]
 pub async fn run<S, E>(
     mut capture: S,
     mut encoder: E,
@@ -59,7 +73,7 @@ where
     }
 
     let target = Duration::from_secs_f32(config.segment_target_secs);
-    let frame_period = Duration::from_secs_f64(1.0 / (config.target_fps.max(1) as f64));
+    let frame_period = Duration::from_secs_f64(1.0 / f64::from(config.target_fps.max(1)));
     let frame_period_us = frame_period.as_micros() as u64;
 
     // Adaptive PTS rate. Start at the configured frame period, then
@@ -118,26 +132,24 @@ where
         // frames here until the encoder produces one. On cold start
         // request a keyframe up front so we don't waste an entire
         // GOP waiting for the encoder's natural interval to fire.
-        let first = match pending.take() {
-            Some(f) => f,
-            None => {
-                encoder.request_keyframe();
-                loop {
-                    let frame = next_paced_frame(
-                        &mut capture,
-                        &mut last_frame,
-                        &mut last_frame_at,
-                        frame_period,
-                        frame_period_us,
-                    )
-                    .await?;
-                    match encoder.encode(frame) {
-                        Ok(e) if e.is_keyframe => break e,
-                        Ok(_) => continue, // pre-IDR frame, drop
-                        Err(err) => {
-                            warn!(error = %err, "encoder.encode failed, dropping frame");
-                            continue;
-                        }
+        let first = if let Some(f) = pending.take() {
+            f
+        } else {
+            encoder.request_keyframe();
+            loop {
+                let frame = next_paced_frame(
+                    &mut capture,
+                    &mut last_frame,
+                    &mut last_frame_at,
+                    frame_period,
+                    frame_period_us,
+                )
+                .await?;
+                match encoder.encode(frame) {
+                    Ok(e) if e.is_keyframe => break e,
+                    Ok(_) => {} // pre-IDR frame, drop
+                    Err(err) => {
+                        warn!(error = %err, "encoder.encode failed, dropping frame");
                     }
                 }
             }
@@ -293,16 +305,13 @@ where
             // the playlist keeps advancing. Otherwise fall through
             // to an unbounded await — this only happens before the
             // very first real frame.
-            match last_frame.as_mut() {
-                Some(stored) => {
-                    bump_timestamp_us(stored, frame_period_us);
-                    (stored.clone(), "dup")
-                }
-                None => {
-                    let f = capture.next_frame().await?;
-                    *last_frame = Some(f.clone());
-                    (f, "real")
-                }
+            if let Some(stored) = last_frame.as_mut() {
+                bump_timestamp_us(stored, frame_period_us);
+                (stored.clone(), "dup")
+            } else {
+                let f = capture.next_frame().await?;
+                *last_frame = Some(f.clone());
+                (f, "real")
             }
         }
     };
@@ -321,6 +330,10 @@ fn bump_timestamp_us(frame: &mut CapturedFrame, delta_us: u64) {
 /// of `kind="dup"` means the encoder/PW pipeline can't keep up with
 /// `target_fps`, while a cluster of `kind="real"` with low `dt_ms`
 /// means PW is delivering bursts.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "frame gaps in milliseconds are far below u64::MAX"
+)]
 fn record_frame_dt(last: &mut Option<Instant>, kind: &'static str) {
     let now = Instant::now();
     if let Some(prev) = *last {
@@ -344,6 +357,13 @@ fn record_frame_dt(last: &mut Option<Instant>, kind: &'static str) {
 /// each segment, refined after each segment using observed wall span
 /// ÷ frames pushed. Without this the player drifts away from the
 /// live edge and segments expire underneath it.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "µs, rates and kbps from Duration and float math; the casts saturate and the values stay far below the limits"
+)]
+#[expect(clippy::too_many_lines, reason = "one frame, audio and segment loop")]
 pub async fn run_from_frames(
     mut frames: mpsc::Receiver<EncodedFrame>,
     mut audio_frames: Option<mpsc::Receiver<AudioFrame>>,
@@ -447,7 +467,7 @@ pub async fn run_from_frames(
                             let pts = timeline.video_pts(f.timestamp_us);
                             break (f, pts);
                         }
-                        Some(_) => continue,
+                        Some(_) => {}
                         None => return Ok(()),
                     },
                     a = recv_audio(&mut audio_frames), if audio_frames.is_some() => {
@@ -750,10 +770,10 @@ async fn recv_audio(chan: &mut Option<mpsc::Receiver<AudioFrame>>) -> Option<Aud
 /// so audio PTS uses the same formula as video:
 ///   `pts_us = wall_ts.saturating_sub(video_wall_anchor)`
 ///
-/// Audio whose wall ts is older than the video anchor (PipeWire audio
+/// Audio whose wall ts is older than the video anchor (`PipeWire` audio
 /// started capturing before the first video keyframe arrived — common
 /// on Wayland where xdg-screencopy negotiation takes ~1 s longer than
-/// PipeWire audio graph setup) saturates to PTS=0 and gets dropped by
+/// `PipeWire` audio graph setup) saturates to PTS=0 and gets dropped by
 /// the muxer's silent-AAC watermark, which is exactly what we want:
 /// the receiver timeline starts at the first video frame, anything
 /// captured before that is uninteresting.
@@ -774,6 +794,10 @@ async fn recv_audio(chan: &mut Option<mpsc::Receiver<AudioFrame>>) -> Option<Aud
 /// offset (see [`Timeline`]); audio captured on the other side of the
 /// step than the video timeline currently is gets dropped instead of
 /// landing a whole step away from the video.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the audio offset in µs is far below u64::MAX"
+)]
 fn push_audio_frame(
     muxer: &mut MpegTs,
     audio: &AudioFrame,
@@ -785,8 +809,7 @@ fn push_audio_frame(
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_micros() as u64);
     let staleness_us = now.saturating_sub(audio.timestamp_us);
     if staleness_us > MAX_AUDIO_STALENESS_US {
         debug!(
@@ -840,6 +863,11 @@ struct SegmentCut {
 }
 
 impl SegmentCut {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a segment target of a few seconds in µs; the float-to-int cast saturates"
+    )]
     fn new(segment_target_secs: f32, frame_period_us: u64) -> Self {
         let target_us = if segment_target_secs.is_finite() && segment_target_secs > 0.0 {
             // Saturating float→int cast; the target is a few seconds.
@@ -952,6 +980,11 @@ mod pipeline_tests {
 }
 
 /// Microseconds on the PTS timeline → seconds for playlist durations.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "segment and part durations are seconds, well inside f32"
+)]
 fn micros_to_secs(us: u64) -> f32 {
     // Precision loss is irrelevant: playlists print milliseconds.
     (us as f64 / 1_000_000.0) as f32

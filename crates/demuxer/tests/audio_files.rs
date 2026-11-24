@@ -2,6 +2,10 @@
 //! with ffmpeg (`FERRICAST_FFMPEG`, else `PATH`); skipped without it.
 
 #![cfg(feature = "audio-files")]
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "durations and sample counts are compared approximately"
+)]
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};

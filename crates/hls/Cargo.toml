@@ -67,3 +67,6 @@ tempfile = "3"
 # Encrypts ffmpeg's fMP4 output in tests: ffmpeg cannot write
 # AES-128 fragmented MP4 HLS itself.
 aes = "0.8"
+
+[lints]
+workspace = true

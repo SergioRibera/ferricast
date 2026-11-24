@@ -1,4 +1,4 @@
-//! Raw ADTS AAC files (`.aac`), optionally behind an ID3v2 tag.
+//! Raw ADTS AAC files (`.aac`), optionally behind an `ID3v2` tag.
 //!
 //! The frames are handed out as they are: the AAC decoder reads ADTS.
 //! There is no index, so seeking walks the frame headers (seven bytes
@@ -33,7 +33,7 @@ pub(crate) fn is_adts(head: &[u8]) -> bool {
     matches!(head, [0xFF, second, ..] if second & 0xF6 == 0xF0)
 }
 
-/// Length of the ID3v2 tag `head` starts with, if any.
+/// Length of the `ID3v2` tag `head` starts with, if any.
 pub(crate) fn id3v2_len(head: &[u8; 10]) -> Option<u64> {
     if &head[..3] != b"ID3" || head[6..].iter().any(|b| b & 0x80 != 0) {
         return None;
@@ -55,8 +55,8 @@ struct Header {
 }
 
 impl Header {
-    fn parse(data: &[u8; HEADER_LEN]) -> Option<Self> {
-        if !is_adts(data) {
+    fn parse(data: [u8; HEADER_LEN]) -> Option<Self> {
+        if !is_adts(&data) {
             return None;
         }
         let rate = *RATES.get(usize::from((data[2] >> 2) & 0xF))?;
@@ -77,7 +77,7 @@ impl Header {
 
 pub struct AdtsDemuxer {
     source: BoxedSource,
-    /// First frame (after any ID3v2 tag).
+    /// First frame (after any `ID3v2` tag).
     start: u64,
     len: u64,
     stream: AudioStream,
@@ -113,7 +113,7 @@ impl AdtsDemuxer {
         let duration_us = (probed_bytes > 0).then(|| {
             let bytes = u128::from(len - start);
             let samples = bytes * u128::from(probed_samples) / u128::from(probed_bytes);
-            (samples * 1_000_000 / u128::from(first.sample_rate)) as u64
+            u64::try_from(samples * 1_000_000 / u128::from(first.sample_rate)).unwrap_or(u64::MAX)
         });
         Ok(Self {
             source,
@@ -153,7 +153,8 @@ impl AdtsDemuxer {
         }
         // Not a frame: look for the next sync word followed by a valid
         // header.
-        let window = (self.len.saturating_sub(self.offset)).min(RESYNC_WINDOW as u64) as usize;
+        let window = usize::try_from(self.len.saturating_sub(self.offset))
+            .map_or(RESYNC_WINDOW, |left| left.min(RESYNC_WINDOW));
         if window < HEADER_LEN {
             return Ok(None);
         }
@@ -164,7 +165,7 @@ impl AdtsDemuxer {
             let Some(head) = buf[at..].first_chunk::<HEADER_LEN>() else {
                 break;
             };
-            if let Some(header) = Header::parse(head) {
+            if let Some(header) = Header::parse(*head) {
                 self.offset += at as u64;
                 return Ok(Some(header));
             }
@@ -243,7 +244,7 @@ fn read_header(source: &mut BoxedSource, offset: u64, len: u64) -> Result<Option
     let mut head = [0; HEADER_LEN];
     source.seek(SeekFrom::Start(offset))?;
     source.read_exact(&mut head)?;
-    Ok(Header::parse(&head))
+    Ok(Header::parse(head))
 }
 
 #[cfg(test)]
@@ -251,6 +252,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "header fields masked to their bit widths"
+    )]
     fn headers_describe_their_frame() {
         // LC, 44.1 kHz (index 4), stereo, 371 bytes, one raw block.
         let len = 371usize;
@@ -263,7 +268,7 @@ mod tests {
             (((len & 7) as u8) << 5) | 0x1F,
             0xFC,
         ];
-        let header = Header::parse(&head).unwrap();
+        let header = Header::parse(head).unwrap();
         assert_eq!(header.sample_rate, 44_100);
         assert_eq!(header.channels, 2);
         assert_eq!(header.frame_len, 371);

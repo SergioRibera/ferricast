@@ -1,4 +1,4 @@
-//! Audio-only files read through symphonia: MP3 (ID3v2 tags, Xing/VBR
+//! Audio-only files read through symphonia: MP3 (`ID3v2` tags, Xing/VBR
 //! headers), FLAC, Ogg (Vorbis and Opus) and WAV (16/24-bit integer and
 //! 32-bit float PCM).
 //!
@@ -116,7 +116,7 @@ impl AudioFileDemuxer {
         let track_id = track.id;
         let channels = params
             .channels
-            .map(|c| c.count())
+            .map(symphonia::core::audio::Channels::count)
             .and_then(|c| u16::try_from(c).ok())
             .filter(|&c| c > 0)
             .ok_or_else(|| FerricastError::Demux("audio track without a channel count".into()))?;
@@ -239,7 +239,7 @@ impl AudioFileDemuxer {
         let timestamp_us = timestamp_us.saturating_sub(SEEK_PREROLL_US);
         let time = Time::new(
             timestamp_us / 1_000_000,
-            (timestamp_us % 1_000_000) as f64 / 1e6,
+            f64::from(u32::try_from(timestamp_us % 1_000_000).unwrap_or(0)) / 1e6,
         );
         let seeked = self
             .format
@@ -266,7 +266,18 @@ fn micros(time_base: TimeBase, ts: u64) -> u64 {
     let time = time_base.calc_time(ts);
     time.seconds
         .saturating_mul(1_000_000)
-        .saturating_add((time.frac * 1e6) as u64)
+        .saturating_add(frac_micros(time.frac))
+}
+
+/// A fraction of a second in whole microseconds.
+fn frac_micros(frac: f64) -> u64 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "symphonia keeps the fraction in 0..1; the float-to-int cast saturates"
+    )]
+    let micros = (frac * 1e6) as u64;
+    micros
 }
 
 /// The stored format behind a symphonia decoder's short name. Only the

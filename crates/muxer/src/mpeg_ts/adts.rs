@@ -72,6 +72,10 @@ impl AdtsFormat {
     }
 
     /// One complete ADTS frame of digital silence in this format.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the frame length fields are masked to their bit widths"
+    )]
     pub(super) fn silent_frame(self) -> Vec<u8> {
         let raw = silent_raw_data_block(self.channels);
         let len = ADTS_HEADER_LEN + raw.len();
@@ -136,7 +140,7 @@ fn put_ics_info(bits: &mut BitWriter) {
 }
 
 /// `individual_channel_stream` with no spectral content; `with_ics_info`
-/// is false inside a CPE that shares its window through common_window.
+/// is false inside a CPE that shares its window through `common_window`.
 fn put_silent_ics(bits: &mut BitWriter, with_ics_info: bool) {
     bits.put(SILENT_GLOBAL_GAIN, 8);
     if with_ics_info {

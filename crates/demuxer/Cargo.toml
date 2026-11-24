@@ -30,3 +30,6 @@ symphonia = { version = "0.5", optional = true, default-features = false, featur
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
+
+[lints]
+workspace = true
