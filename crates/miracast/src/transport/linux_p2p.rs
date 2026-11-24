@@ -810,15 +810,24 @@ mod pin_tests {
     }
 }
 
-/// Put the radio into continuous Listen mode. A sink does NOT need
-/// Find (which alternates scan + listen and takes the radio off the
-/// listen channel during each scan burst, making the device blink
-/// in/out of the peer's picker). Listen keeps us parked on the
-/// Listen channel responding to probes. The `0` timeout maps to
-/// `p2p_long_listen=1` internally, which supplicant re-arms on its
-/// own — but `Connect` clears it, so we must re-issue on every
-/// terminal signal.
+/// Put the radio into continuous Listen mode AND re-upload the WFD
+/// Information Element. supplicant clears `p2p_long_listen` on every
+/// `Connect` call and — according to multiple field reports — can
+/// drop the cached WFD IE together with it, so without a Peer we're
+/// visible as a plain P2P device but not as a Miracast sink. Both
+/// have to be re-asserted or Android/Windows filter us out of their
+/// Miracast picker even though probe responses keep arriving.
 async fn arm_find(p2p: &Proxy<'_>) -> Result<(), TransportError> {
+    // Re-upload WFDIEs so we stay visible to Miracast scanners.
+    if let Ok(conn) = Connection::system().await {
+        if let Ok(root) = Proxy::new(&conn, SUPPLICANT_BUS, SUPPLICANT_ROOT_PATH, ROOT_IFACE).await
+        {
+            let ie = WfdIe::new(crate::ie::DeviceInformation::primary_sink()).to_subelements();
+            let _ = root
+                .set_property("WFDIEs", Value::from(ie.to_vec()))
+                .await;
+        }
+    }
     match p2p.call_method("Listen", &(0i32,)).await {
         Ok(_) => Ok(()),
         Err(e) => {
