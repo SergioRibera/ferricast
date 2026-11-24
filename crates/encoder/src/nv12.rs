@@ -4,7 +4,7 @@
 
 use ferricast_core::{
     BackendId, CodecError, CodecResult, ColourDescription, ColourRange, MatrixCoefficients,
-    PixelFormat,
+    PixelFormat, RawFrame,
 };
 use yuv::{BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvRange, YuvStandardMatrix};
 
@@ -33,6 +33,25 @@ impl Nv12Layout {
     )]
     pub(crate) fn packed(width: u32, height: u32) -> Self {
         let stride = width.div_ceil(2) as usize * 2;
+        Self {
+            width,
+            height,
+            stride,
+            chroma_offset: stride * height as usize,
+        }
+    }
+
+    /// Tightly packed P010 (16-bit samples): rows of `ceil(width / 2) × 4`
+    /// bytes, for [`write_p010`].
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "conditional: only the 10-bit platform encoders take P010"
+        )
+    )]
+    pub(crate) fn packed_p010(width: u32, height: u32) -> Self {
+        let stride = width.div_ceil(2) as usize * 4;
         Self {
             width,
             height,
@@ -209,10 +228,113 @@ pub(crate) fn write(
             }
             Ok(())
         }
-        PixelFormat::P010 => Err(fail(
-            "10-bit P010 input into an 8-bit NV12 buffer; configure BitDepth::Ten".into(),
-        )),
+        // An 8-bit encoder keeps the top eight bits of 10-bit input.
+        PixelFormat::P010 => {
+            let (data, stride) = src
+                .narrowed()
+                .ok_or_else(|| fail("P010 frame could not be narrowed".into()))?;
+            let narrowed = RawFrame {
+                width: src.width(),
+                height: src.height(),
+                stride: u32::try_from(stride).map_err(|_| fail("stride exceeds u32".into()))?,
+                format: PixelFormat::Nv12,
+                data: data.into(),
+                timestamp_us: 0,
+                colour: None,
+                hdr: None,
+            };
+            let view = FrameView::new(&narrowed, src.width(), src.height())
+                .map_err(|error| fail(error.to_string()))?;
+            write(&view, colour, layout, dst, backend)
+        }
     }
+}
+
+/// Writes `src` into `dst` as P010 laid out as `layout`, for 10-bit
+/// encoders: `layout` is read as for NV12 but with 16-bit samples, so
+/// `stride` and `chroma_offset` are in bytes and a luma row holds
+/// `2 × width` of them ([`Nv12Layout::packed_p010`] packs tightly).
+/// P010 input is copied as is; 8-bit input (RGB converted with `colour`,
+/// NV12, I420) is widened, each sample moved to the high byte.
+///
+/// # Errors
+/// As [`write`]: [`CodecError::UnsupportedConfig`] for a matrix
+/// [`conversion`] lacks; [`CodecError::Backend`] (naming `backend`) when
+/// `dst` is shorter than the layout or `src` does not match it.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "conditional: only the 10-bit platform encoders take P010"
+    )
+)]
+pub(crate) fn write_p010(
+    src: &FrameView<'_>,
+    colour: ColourDescription,
+    layout: Nv12Layout,
+    dst: &mut [u8],
+    backend: BackendId,
+) -> CodecResult<()> {
+    let fail =
+        |reason: String| CodecError::backend(backend, ferricast_core::Operation::Encode, reason);
+    if src.width() != layout.width || src.height() != layout.height {
+        return Err(fail(format!(
+            "frame {}x{} does not match the {}x{} input buffer",
+            src.width(),
+            src.height(),
+            layout.width,
+            layout.height
+        )));
+    }
+    let row = layout.width.div_ceil(2) as usize * 4;
+    if layout.stride < row
+        || dst.len() < layout.len()
+        || layout.chroma_offset < layout.stride * layout.height as usize
+    {
+        return Err(fail(format!(
+            "P010 input buffer of {} bytes does not fit {layout:?} ({row}-byte rows)",
+            dst.len()
+        )));
+    }
+    let (luma, chroma) = dst.split_at_mut(layout.chroma_offset);
+    if src.format() == PixelFormat::P010 {
+        copy_plane(
+            luma,
+            layout.stride,
+            src.data(),
+            src.stride(),
+            layout.width as usize * 2,
+            layout.height as usize,
+        );
+        copy_plane(
+            chroma,
+            layout.stride,
+            &src.data()[src.chroma_offset()..],
+            src.chroma_stride(),
+            row,
+            src.chroma_rows(),
+        );
+        return Ok(());
+    }
+    let packed = Nv12Layout::packed(layout.width, layout.height);
+    let mut nv12 = vec![0; packed.len()];
+    write(src, colour, packed, &mut nv12, backend)?;
+    let (nv12_luma, nv12_chroma) = nv12.split_at(packed.chroma_offset);
+    let widen = |dst: &mut [u8], dst_stride: usize, src: &[u8], bytes: usize| {
+        for (out, line) in dst.chunks_mut(dst_stride).zip(src.chunks(packed.stride)) {
+            for (word, &sample) in out[..bytes * 2]
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(&line[..bytes])
+            {
+                *word = [0, sample];
+            }
+        }
+    };
+    widen(luma, layout.stride, nv12_luma, layout.width as usize);
+    widen(chroma, layout.stride, nv12_chroma, row / 2);
+    Ok(())
 }
 
 /// Copies `rows` rows of `row_bytes` bytes between two strides.
@@ -236,7 +358,6 @@ fn copy_plane(
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use ferricast_core::RawFrame;
 
     use super::*;
 
@@ -337,6 +458,86 @@ mod tests {
                 narrow,
                 &mut out,
                 BackendId::MediaCodec
+            )
+            .is_err()
+        );
+    }
+
+    /// A 2x2 P010 frame: luma words 0x1234, 0xFF00, 0x0040, 0x8000 and
+    /// one chroma pair 0x4000 / 0xC000.
+    fn p010() -> RawFrame {
+        let words: [u16; 6] = [0x1234, 0xFF00, 0x0040, 0x8000, 0x4000, 0xC000];
+        raw(
+            PixelFormat::P010,
+            words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            4,
+        )
+    }
+
+    #[test]
+    fn p010_into_an_eight_bit_buffer_keeps_the_high_bytes() {
+        let frame = p010();
+        let view = FrameView::new(&frame, 2, 2).unwrap();
+        let layout = Nv12Layout::packed(2, 2);
+        let mut out = vec![0; layout.len()];
+        write(
+            &view,
+            ColourDescription::BT709_LIMITED,
+            layout,
+            &mut out,
+            BackendId::MediaCodec,
+        )
+        .unwrap();
+        assert_eq!(out, [0x12, 0xFF, 0x00, 0x80, 0x40, 0xC0]);
+    }
+
+    #[test]
+    fn p010_is_copied_and_eight_bit_input_widened_for_ten_bit_buffers() {
+        let frame = p010();
+        let view = FrameView::new(&frame, 2, 2).unwrap();
+        let layout = Nv12Layout {
+            stride: 6,
+            chroma_offset: 14,
+            ..Nv12Layout::packed_p010(2, 2)
+        };
+        let mut out = vec![0xAA; layout.len()];
+        write_p010(
+            &view,
+            ColourDescription::BT709_LIMITED,
+            layout,
+            &mut out,
+            BackendId::MediaFoundation,
+        )
+        .unwrap();
+        assert_eq!(&out[..4], &frame.data[..4]);
+        assert_eq!(&out[6..10], &frame.data[4..8]);
+        assert_eq!(&out[14..18], &frame.data[8..12]);
+
+        let nv12 = raw(PixelFormat::Nv12, vec![1, 2, 3, 4, 5, 6], 2);
+        let view = FrameView::new(&nv12, 2, 2).unwrap();
+        let layout = Nv12Layout::packed_p010(2, 2);
+        let mut out = vec![0; layout.len()];
+        write_p010(
+            &view,
+            ColourDescription::BT709_LIMITED,
+            layout,
+            &mut out,
+            BackendId::MediaFoundation,
+        )
+        .unwrap();
+        assert_eq!(out, [0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6]);
+
+        let narrow = Nv12Layout {
+            stride: 3,
+            ..layout
+        };
+        assert!(
+            write_p010(
+                &view,
+                ColourDescription::BT709_LIMITED,
+                narrow,
+                &mut out,
+                BackendId::MediaFoundation
             )
             .is_err()
         );

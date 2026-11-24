@@ -102,6 +102,8 @@ impl X264Encoder {
         let raw = self
             .scaler
             .fit(raw, FrameSize::new(session.width, session.height))?;
+        // This build is 8-bit: 10-bit input keeps its top eight bits.
+        let raw = crate::frame_view::eight_bit(raw, session.width, session.height)?;
         let view = FrameView::new(&raw, session.width, session.height)?;
         let planar = self
             .planar
@@ -639,7 +641,7 @@ impl I420Scratch {
                 Ok(())
             }
             PixelFormat::P010 => Err(FerricastError::Encoder(
-                "x264: 10-bit P010 input is not supported by this 8-bit build".into(),
+                "x264: P010 input must be narrowed to NV12 first".into(),
             )),
         }
     }

@@ -259,6 +259,41 @@ pub fn sei_nal(hdr: HdrMetadata, syntax: NalSyntax) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// `access_unit` (Annex B) with the Annex B NAL unit `sei` placed right
+/// before its first slice, after any access unit delimiter and parameter
+/// sets, where H.264 / H.265 require prefix SEI messages. An access unit
+/// without a slice gets `sei` at the end.
+#[must_use]
+pub fn insert_before_slices(access_unit: &[u8], sei: &[u8], syntax: NalSyntax) -> Vec<u8> {
+    let is_slice = |header: u8| match syntax {
+        NalSyntax::H264 => (1..=5).contains(&(header & 0x1f)),
+        NalSyntax::H265 => (header >> 1) & 0x3f < 32,
+    };
+    let mut at = access_unit.len();
+    let mut index = 0;
+    while index + 3 < access_unit.len() {
+        if access_unit[index..index + 3] == [0, 0, 1] {
+            if is_slice(access_unit[index + 3]) {
+                // Include the leading zero of a 4-byte start code.
+                at = if index > 0 && access_unit[index - 1] == 0 {
+                    index - 1
+                } else {
+                    index
+                };
+                break;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(access_unit.len() + sei.len());
+    out.extend_from_slice(&access_unit[..at]);
+    out.extend_from_slice(sei);
+    out.extend_from_slice(&access_unit[at..]);
+    out
+}
+
 /// The latest HDR metadata of a stream. Feed it every access unit;
 /// a half once seen stays until the stream sends a new one.
 #[derive(Debug, Clone, Default)]
@@ -335,6 +370,29 @@ mod tests {
         let nal = sei_nal(light_only, NalSyntax::H265).unwrap();
         assert_eq!(from_annex_b(&nal, NalSyntax::H265), light_only);
         assert!(sei_nal(HdrMetadata::default(), NalSyntax::H265).is_none());
+    }
+
+    #[test]
+    fn sei_goes_after_the_parameter_sets_and_before_the_first_slice() {
+        let sei = sei_nal(HDR, NalSyntax::H264).unwrap();
+        let au = [
+            0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 0, 0, 0, 1, 0x65, 3,
+        ];
+        let out = insert_before_slices(&au, &sei, NalSyntax::H264);
+        assert_eq!(&out[..17], &au[..17]);
+        assert_eq!(&out[17..17 + sei.len()], &sei[..]);
+        assert_eq!(&out[17 + sei.len()..], &au[17..]);
+        assert_eq!(from_annex_b(&out, NalSyntax::H264), HDR);
+        let no_slice = [0, 0, 1, 0x67, 1];
+        assert_eq!(
+            insert_before_slices(&no_slice, &sei, NalSyntax::H264)[5..],
+            sei[..]
+        );
+        // H.265: VPS 0x40, then IDR_W_RADL 0x26.
+        let hevc = [0, 0, 1, 0x40, 1, 0, 0, 1, 0x26, 1];
+        let sei = sei_nal(HDR, NalSyntax::H265).unwrap();
+        let out = insert_before_slices(&hevc, &sei, NalSyntax::H265);
+        assert_eq!(&out[5..5 + sei.len()], &sei[..]);
     }
 
     #[test]

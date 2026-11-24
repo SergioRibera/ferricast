@@ -99,10 +99,7 @@ pub fn sps_bit_depth(nal: &[u8]) -> Option<(u8, u8)> {
 /// The bit depths of the last SPS in an Annex B buffer, if it has one.
 #[must_use]
 pub fn annex_b_bit_depth(buf: &[u8]) -> Option<(u8, u8)> {
-    split_annex_b(buf)
-        .into_iter()
-        .rev()
-        .find_map(sps_bit_depth)
+    split_annex_b(buf).into_iter().rev().find_map(sps_bit_depth)
 }
 
 #[cfg(test)]
