@@ -72,7 +72,7 @@ use adts::AdtsFormat;
 /// External-audio mode (real PipeWire-captured AAC pushed via
 /// [`MpegTs::add_audio_frame`]) leaves the audio PID alive only as
 /// long as the upstream actually delivers frames. When the system
-/// audio source goes idle (paused media, suspended sink) PipeWire
+/// audio source goes idle (paused media, suspended sink) `PipeWire`
 /// stops emitting buffers — the encoder produces nothing, the
 /// segmenter pushes nothing, and the PID's elementary stream goes
 /// silent in the literal "no packets at all" sense. The chromecast
@@ -198,6 +198,7 @@ impl MpegTs {
     /// HLS streams with `LOAD_FAILED`. Newer receivers (Ultra,
     /// Google TV) accept video-only and we can save ~6 KB/s by
     /// leaving this off.
+    #[must_use]
     pub fn with_silent_audio(mut self, inject: bool) -> Self {
         self.inject_silent_audio = inject;
         self
@@ -209,6 +210,7 @@ impl MpegTs {
     /// [`Self::add_audio_frame`]. Used by the chromecast HLS
     /// pipeline when the user opted into real-audio capture
     /// (`StreamConfig::audio = Some(_)`).
+    #[must_use]
     pub fn with_external_audio(mut self, enable: bool) -> Self {
         self.has_external_audio = enable;
         self
@@ -229,6 +231,10 @@ impl MpegTs {
     /// that some receivers fail to splice. This only fires when
     /// the upstream lagged the lag-threshold; in normal flow real
     /// audio's PTS always stays ahead of the watermark.
+    ///
+    /// # Errors
+    /// [`FerricastError::Encoder`] when the muxer was not built with
+    /// external audio.
     pub fn add_audio_frame(&mut self, payload: &[u8], pts_90k: u64) -> Result<(), FerricastError> {
         if !self.has_external_audio {
             return Err(FerricastError::Encoder(
@@ -306,6 +312,7 @@ impl MpegTs {
     /// True when the muxer is currently advertising an audio PID.
     /// Used by the HLS segmenter to decide whether silent-AAC
     /// injection should be suppressed.
+    #[must_use]
     pub fn audio_advertised(&self) -> bool {
         self.inject_silent_audio || self.has_external_audio
     }
@@ -492,7 +499,7 @@ fn build_pat_section() -> Vec<u8> {
     // CRC(4) = 13 bytes.
     let mut s = Vec::with_capacity(17);
     s.push(0x00); // table_id = PAT
-    s.extend_from_slice(&(0xB000u16 | 13).to_be_bytes()); // ssi=1, '0', reserved=11, section_length=13
+    s.extend_from_slice(&(0xB000u16 | 0x000D).to_be_bytes()); // ssi=1, '0', reserved=11, section_length=13
     s.extend_from_slice(&1u16.to_be_bytes()); // transport_stream_id
     s.push(0xC1); // reserved=11, version=0, current_next=1
     s.push(0x00); // section_number
@@ -509,8 +516,8 @@ fn build_pmt_section(codec: VideoCodec, with_audio: bool) -> Vec<u8> {
     // last_sec_num(1) + PCR_PID(2) + program_info_len(2) +
     // stream_loop + CRC(4).
     // stream_loop is 5 bytes per stream (type + EPID + ES_info_len).
-    let stream_count = if with_audio { 2 } else { 1 };
-    let section_length: u16 = (13 + 5 * stream_count) as u16;
+    let stream_count: u16 = if with_audio { 2 } else { 1 };
+    let section_length: u16 = 13 + 5 * stream_count;
     let mut s = Vec::with_capacity(4 + section_length as usize);
     s.push(0x02); // table_id = PMT
     s.extend_from_slice(&(0xB000u16 | section_length).to_be_bytes());
@@ -541,7 +548,7 @@ fn build_pmt_section(codec: VideoCodec, with_audio: bool) -> Vec<u8> {
 fn crc32_mpeg2(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
-        crc ^= (b as u32) << 24;
+        crc ^= u32::from(b) << 24;
         for _ in 0..8 {
             crc = if crc & 0x8000_0000 != 0 {
                 (crc << 1) ^ 0x04C1_1DB7
@@ -615,6 +622,10 @@ fn build_audio_pes(payload: &[u8], pts_90k: u64) -> Result<Vec<u8>, FerricastErr
 /// Encode a 33-bit timestamp into 5 bytes per ISO/IEC 13818-1
 /// figure 2-19. `prefix4` is the 4-bit tag (`0010` for PTS-only,
 /// `0011` for PTS-with-DTS, `0001` for DTS).
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "every field is masked to its bit width before or after the cast"
+)]
 fn encode_ts(prefix4: u8, ts: u64) -> [u8; 5] {
     let p = ts & 0x1_FFFF_FFFF;
     [
@@ -630,10 +641,10 @@ fn encode_ts(prefix4: u8, ts: u64) -> [u8; 5] {
 // Access unit construction
 // ---------------------------------------------------------------------
 
-/// H.264 AUD: nal_unit_type 9, primary_pic_type 7 (any slice type).
+/// H.264 AUD: `nal_unit_type` 9, `primary_pic_type` 7 (any slice type).
 const AUD_NAL_H264: [u8; 6] = [0x00, 0x00, 0x00, 0x01, 0x09, 0xF0];
-/// HEVC AUD: nal_unit_type 35, layer 0, temporal_id_plus1 1,
-/// pic_type 2 (any slice type) plus the stop bit.
+/// HEVC AUD: `nal_unit_type` 35, layer 0, `temporal_id_plus1` 1,
+/// `pic_type` 2 (any slice type) plus the stop bit.
 const AUD_NAL_HEVC: [u8; 7] = [0x00, 0x00, 0x00, 0x01, 0x46, 0x01, 0x50];
 
 /// Video codecs the muxer can carry.
@@ -801,6 +812,10 @@ fn write_psi_packet(out: &mut Vec<u8>, pid: u16, cc: &mut u8, section: &[u8]) {
 /// * **Last packet**: stuffing-only adaptation field if the
 ///   remaining payload doesn't fill 184 bytes; otherwise full
 ///   payload like a middle packet.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "adaptation field lengths are below the 184-byte payload space"
+)]
 fn write_pes_to_ts(
     out: &mut Vec<u8>,
     pid: u16,
@@ -841,10 +856,9 @@ fn write_pes_to_ts(
         let first_af_body = if first {
             if pcr_90k.is_some() {
                 7 // flags(1) + PCR(6)
-            } else if keyframe {
-                1 // flags(1)
             } else {
-                0
+                // flags(1) for a keyframe's random access indicator.
+                usize::from(keyframe)
             }
         } else {
             0
@@ -931,6 +945,10 @@ fn write_pes_to_ts(
 
 /// PCR encoded as 33-bit base + 6 reserved bits + 9-bit extension.
 /// Extension is always 0; `pcr_90k` is the base directly.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "every byte is masked to 8 bits before the cast"
+)]
 fn encode_pcr(pcr_90k: u64) -> [u8; 6] {
     let base = pcr_90k & 0x1_FFFF_FFFF;
     [
@@ -985,11 +1003,11 @@ mod tests {
             assert_eq!(bytes[2] & 0x01, 0x01);
             assert_eq!(bytes[4] & 0x01, 0x01);
             // Decode back.
-            let decoded = ((bytes[0] as u64 & 0x0E) << 29)
-                | ((bytes[1] as u64) << 22)
-                | ((bytes[2] as u64 & 0xFE) << 14)
-                | ((bytes[3] as u64) << 7)
-                | ((bytes[4] as u64 & 0xFE) >> 1);
+            let decoded = ((u64::from(bytes[0]) & 0x0E) << 29)
+                | (u64::from(bytes[1]) << 22)
+                | ((u64::from(bytes[2]) & 0xFE) << 14)
+                | (u64::from(bytes[3]) << 7)
+                | ((u64::from(bytes[4]) & 0xFE) >> 1);
             assert_eq!(decoded, t & 0x1_FFFF_FFFF);
         }
     }

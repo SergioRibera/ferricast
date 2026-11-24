@@ -17,6 +17,9 @@ pub mod mpeg_ts;
 pub trait Muxer {
     /// Provide the codec parameter sets (e.g. H.264 SPS+PPS in Annex B
     /// form) that must precede each random-access point.
+    ///
+    /// # Errors
+    /// [`FerricastError::Encoder`] when `parameter_sets` is empty.
     fn config(&mut self, parameter_sets: Vec<u8>) -> Result<(), FerricastError>;
 
     /// Append one encoded frame.
@@ -24,6 +27,10 @@ pub trait Muxer {
     /// `pts_90k` and `dts_90k` are MPEG-2 system clock ticks (90 kHz).
     /// For codecs without frame reordering (H.264 Baseline, used here)
     /// `dts_90k == pts_90k`.
+    ///
+    /// # Errors
+    /// [`FerricastError::Encoder`] when the frame's codec is not the one
+    /// the muxer carries.
     fn add_frame(
         &mut self,
         frame: &EncodedFrame,
