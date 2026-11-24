@@ -29,7 +29,7 @@ use ferricast_core::{
     DecodedAudio, FerricastError, Operation, Result,
 };
 
-use super::{Shape, adts};
+use crate::adts::{self, Shape};
 
 /// Most channels output: 7.1, the widest AAC channel configuration.
 const MAX_CHANNELS: usize = 8;

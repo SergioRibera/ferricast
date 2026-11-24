@@ -13,6 +13,7 @@
 //! With the `istmo` feature, [`plugin`] serves the same machinery as
 //! the istmo plugin `ferricast.codec`.
 
+pub mod aac;
 pub mod audio;
 pub mod bitstream;
 pub mod facade;

@@ -17,7 +17,7 @@
 //! Linux audio sink (PipeWire, ALSA, PulseAudio) accepts without
 //! further conversion.
 
-mod adts;
+use crate::adts::{self, Shape};
 #[cfg(feature = "fdk-aac-decode")]
 mod eld;
 #[cfg(feature = "fdk-aac-decode")]
@@ -42,13 +42,6 @@ use symphonia::core::{
 use symphonia::default::codecs::AacDecoder as SymphoniaCodec;
 
 const MICROS_PER_SECOND: u64 = 1_000_000;
-
-/// Sample rate and channel count one decoder instance is built for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Shape {
-    sample_rate: u32,
-    channels: u16,
-}
 
 impl Shape {
     /// The configured shape, or `None` when the stream metadata left it
@@ -293,8 +286,8 @@ pub(crate) fn interleave_s16(buf: AudioBufferRef<'_>) -> Vec<i16> {
 mod tests {
     use bytes::Bytes;
 
-    use super::adts::tests::frame;
     use super::*;
+    use crate::adts::tests::frame;
 
     /// A silent mono `raw_data_block()`: one SCE with max_sfb = 0, then END.
     const SILENT_MONO: [u8; 4] = [0x00, 0xC8, 0x00, 0x07];

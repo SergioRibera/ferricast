@@ -21,6 +21,16 @@
 
 #[cfg(feature = "aac")]
 pub mod aac;
+#[cfg_attr(
+    not(any(
+        feature = "aac",
+        all(target_os = "android", feature = "mediacodec"),
+        all(target_os = "windows", feature = "media-foundation"),
+        all(any(target_os = "macos", target_os = "ios"), feature = "audiotoolbox")
+    )),
+    allow(dead_code, reason = "used by the AAC decoders only")
+)]
+mod adts;
 #[cfg(feature = "alac-decode")]
 mod alac;
 #[cfg(feature = "av1-decode")]

@@ -9,7 +9,13 @@ use std::fmt;
 
 use ferricast_core::frame::AacChannelConfig;
 
-use super::Shape;
+/// Sample rate and channel count of an AAC stream (one decoder
+/// instance is built per shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Shape {
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: u16,
+}
 
 const HEADER_LEN: usize = 7;
 const CRC_LEN: usize = 2;
@@ -20,7 +26,7 @@ const SAMPLE_RATES: [u32; 13] = [
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum AdtsError {
+pub(crate) enum AdtsError {
     Truncated {
         offset: usize,
         needed: usize,
@@ -81,18 +87,18 @@ impl std::error::Error for AdtsError {}
 /// One AAC access unit ready for the decoder. `shape` is `None` for
 /// unframed (raw) input, where the configured shape applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Unit<'a> {
-    pub shape: Option<Shape>,
-    pub payload: &'a [u8],
+pub(crate) struct Unit<'a> {
+    pub(crate) shape: Option<Shape>,
+    pub(crate) payload: &'a [u8],
 }
 
-pub(super) fn has_sync(data: &[u8]) -> bool {
+pub(crate) fn has_sync(data: &[u8]) -> bool {
     matches!(data, [0xFF, second, ..] if second & 0xF0 == 0xF0)
 }
 
 /// Splits `data` into access units: every ADTS frame when the payload
 /// starts with a sync word, otherwise the whole payload as one raw unit.
-pub(super) fn units(data: &[u8]) -> Units<'_> {
+pub(crate) fn units(data: &[u8]) -> Units<'_> {
     Units {
         data,
         offset: 0,
@@ -101,7 +107,7 @@ pub(super) fn units(data: &[u8]) -> Units<'_> {
     }
 }
 
-pub(super) struct Units<'a> {
+pub(crate) struct Units<'a> {
     data: &'a [u8],
     offset: usize,
     framed: bool,
@@ -194,16 +200,11 @@ fn parse_frame(data: &[u8], offset: usize) -> Result<(Unit<'_>, usize), AdtsErro
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Builds an ADTS frame around `payload` (AAC-LC, no CRC unless asked).
-    pub(in crate::aac) fn frame(
-        rate_index: u8,
-        channels: u8,
-        crc: bool,
-        payload: &[u8],
-    ) -> Vec<u8> {
+    pub(crate) fn frame(rate_index: u8, channels: u8, crc: bool, payload: &[u8]) -> Vec<u8> {
         let header_len = if crc { 9 } else { 7 };
         let frame_len = header_len + payload.len();
         let mut out = vec![

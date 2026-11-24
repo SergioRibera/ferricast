@@ -35,6 +35,44 @@ pub fn split_annex_b(buf: &[u8]) -> Vec<&[u8]> {
     out
 }
 
+/// The NAL units of an Annex B buffer rewritten with a 4-byte big-endian
+/// length in front of each (AVCC / HVCC framing, what VideoToolbox and
+/// MP4 carry).
+#[must_use]
+pub fn annex_b_to_length_prefixed(buf: &[u8]) -> Vec<u8> {
+    let units = split_annex_b(buf);
+    let mut out = Vec::with_capacity(buf.len() + units.len());
+    for unit in units {
+        let len = u32::try_from(unit.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(unit);
+    }
+    out
+}
+
+/// Length-prefixed NAL units (`length_size` bytes each, big-endian:
+/// 1, 2 or 4) rewritten as Annex B with 4-byte start codes; `None` when
+/// a length runs past the end of `buf` or `length_size` is invalid.
+#[must_use]
+pub fn length_prefixed_to_annex_b(buf: &[u8], length_size: usize) -> Option<Vec<u8>> {
+    if !matches!(length_size, 1 | 2 | 4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(buf.len() + buf.len() / 64 + 8);
+    let mut rest = buf;
+    while !rest.is_empty() {
+        let (len, tail) = rest.split_at_checked(length_size)?;
+        let len = len
+            .iter()
+            .fold(0usize, |acc, &byte| (acc << 8) | usize::from(byte));
+        let (unit, tail) = tail.split_at_checked(len)?;
+        out.extend_from_slice(&START_CODE);
+        out.extend_from_slice(unit);
+        rest = tail;
+    }
+    Some(out)
+}
+
 /// Which NAL unit types carry the parameter sets a decoder needs before
 /// it can decode a slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +199,19 @@ mod tests {
                 0, 0, 0, 1, 0x40, 1, 0, 0, 0, 1, 0x42, 2, 0, 0, 0, 1, 0x44, 3
             ]
         );
+    }
+
+    #[test]
+    fn length_prefixed_and_annex_b_framings_convert_both_ways() {
+        let annex_b = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x65, 3];
+        let avcc = annex_b_to_length_prefixed(&annex_b);
+        assert_eq!(avcc, [0, 0, 0, 3, 0x67, 1, 2, 0, 0, 0, 2, 0x65, 3]);
+        assert_eq!(
+            length_prefixed_to_annex_b(&avcc, 4).unwrap(),
+            [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x65, 3]
+        );
+        assert!(length_prefixed_to_annex_b(&[0, 0, 0, 9, 1], 4).is_none());
+        assert!(length_prefixed_to_annex_b(&avcc, 3).is_none());
     }
 
     #[test]

@@ -13,6 +13,14 @@ mod frame_view;
 mod gop;
 pub mod h264;
 pub mod h265;
+#[cfg_attr(
+    not(any(
+        all(target_os = "android", feature = "mediacodec"),
+        all(target_os = "windows", feature = "media-foundation")
+    )),
+    allow(dead_code, reason = "used by the NV12-input platform encoders only")
+)]
+mod nv12;
 #[cfg(feature = "nvenc")]
 pub mod nvenc;
 pub mod opus;
