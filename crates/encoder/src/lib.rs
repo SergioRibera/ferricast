@@ -4,7 +4,13 @@
 //! [`ferricast_core::BackendSelection`]; see [`ferricast_codec`].
 
 pub mod aac;
-#[cfg(any(feature = "fdk-aac", feature = "opus-rs"))]
+#[cfg(any(
+    feature = "fdk-aac",
+    feature = "opus-rs",
+    all(target_os = "android", feature = "mediacodec"),
+    all(any(target_os = "macos", target_os = "ios"), feature = "audiotoolbox"),
+    all(target_os = "windows", feature = "media-foundation")
+))]
 mod audio_clock;
 #[cfg(any(feature = "vaapi", feature = "nvenc"))]
 mod config_ext;
