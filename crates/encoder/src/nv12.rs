@@ -22,7 +22,8 @@ pub(crate) struct Nv12Layout {
 }
 
 impl Nv12Layout {
-    /// Tightly packed NV12.
+    /// Tightly packed NV12 (rows rounded up to an even width, the
+    /// interleaved chroma row of an odd-width picture is one byte longer).
     #[cfg_attr(
         not(test),
         allow(
@@ -31,7 +32,7 @@ impl Nv12Layout {
         )
     )]
     pub(crate) fn packed(width: u32, height: u32) -> Self {
-        let stride = width as usize;
+        let stride = width.div_ceil(2) as usize * 2;
         Self {
             width,
             height,
@@ -115,9 +116,15 @@ pub(crate) fn write(
             dst.len()
         )));
     }
-    let (luma, chroma) = dst.split_at_mut(layout.chroma_offset);
     let width = layout.width as usize;
     let chroma_width = layout.width.div_ceil(2) as usize * 2;
+    if layout.stride < chroma_width {
+        return Err(fail(format!(
+            "NV12 stride {} is shorter than one {chroma_width}-byte chroma row",
+            layout.stride
+        )));
+    }
+    let (luma, chroma) = dst.split_at_mut(layout.chroma_offset);
     match src.format() {
         PixelFormat::Bgra | PixelFormat::Rgba => {
             let (range, matrix) = conversion(colour, backend)?;
@@ -287,6 +294,48 @@ mod tests {
         .unwrap();
         assert_eq!(&out[..6], &[1, 2, 0, 0, 3, 4]);
         assert_eq!(&out[16..18], &[5, 6]);
+    }
+
+    #[test]
+    fn odd_widths_are_converted_or_refused_never_panic() {
+        let frame = RawFrame {
+            width: 3,
+            ..raw(PixelFormat::Nv12, vec![9; 3 * 2 + 4], 3)
+        };
+        assert!(
+            FrameView::new(&frame, 3, 2).is_err(),
+            "NV12 rows of an odd width need a padded stride"
+        );
+        let padded = RawFrame {
+            width: 3,
+            ..raw(PixelFormat::Nv12, vec![9; 4 * 2 + 4], 4)
+        };
+        let view = FrameView::new(&padded, 3, 2).unwrap();
+        let layout = Nv12Layout::packed(3, 2);
+        let mut out = vec![0; layout.len()];
+        write(
+            &view,
+            ColourDescription::BT709_LIMITED,
+            layout,
+            &mut out,
+            BackendId::MediaCodec,
+        )
+        .unwrap();
+        let narrow = Nv12Layout {
+            stride: 3,
+            chroma_offset: 6,
+            ..layout
+        };
+        assert!(
+            write(
+                &view,
+                ColourDescription::BT709_LIMITED,
+                narrow,
+                &mut out,
+                BackendId::MediaCodec
+            )
+            .is_err()
+        );
     }
 
     #[test]

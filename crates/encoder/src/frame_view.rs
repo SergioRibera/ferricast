@@ -162,9 +162,10 @@ impl<'a> FrameView<'a> {
     fn min_stride(&self) -> usize {
         match self.format {
             // I420 chroma rows are `stride / 2` wide and must still hold
-            // `ceil(width / 2)` samples.
-            PixelFormat::I420 => self.width.div_ceil(2) as usize * 2,
-            PixelFormat::Bgra | PixelFormat::Rgba | PixelFormat::Nv12 => self.row_bytes(),
+            // `ceil(width / 2)` samples; NV12 chroma rows interleave
+            // `ceil(width / 2)` pairs, one byte more than an odd width.
+            PixelFormat::I420 | PixelFormat::Nv12 => self.width.div_ceil(2) as usize * 2,
+            PixelFormat::Bgra | PixelFormat::Rgba => self.row_bytes(),
         }
     }
 

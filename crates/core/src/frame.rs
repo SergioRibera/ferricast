@@ -165,13 +165,20 @@ pub enum FrameError {
     Readback { reason: String },
 }
 
+/// One compressed video access unit.
 #[derive(Debug, Clone)]
 pub struct EncodedFrame {
     pub codec: crate::Codec,
+    /// Annex B for H.264 / H.265, with the parameter sets in front of
+    /// every keyframe when an encoder produced it.
     pub data: Bytes,
+    /// Capture (presentation) time of the picture, wall-clock microseconds.
     pub timestamp_us: u64,
     pub is_keyframe: bool,
     pub duration_us: Option<u64>,
+    /// Presentation and decode order of the picture in frame-index
+    /// units (0, 1, 2, ... in capture order), as an encoder emits them;
+    /// equal when the stream has no B-frames.
     pub pts_dts: (u64, u64),
 }
 
