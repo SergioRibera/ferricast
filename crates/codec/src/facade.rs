@@ -8,9 +8,10 @@
 //! }
 //! ```
 //!
-//! Each facade gets `new()`, `registry()` (the backends of this build
-//! for its job), `backends()` (their capability report) and `backend()`
-//! (the one running now).
+//! Each facade gets `new()`, `with_cache(cache)` (its own
+//! [`crate::SelectionCache`]), `registry()` (the backends of this build for
+//! its job), `backends()` (their capability report), `backend()` (the one
+//! running now) and `subscribe(capacity)` (its [`crate::SessionEvent`]s).
 
 #[doc(hidden)]
 pub use ferricast_core as __core;
@@ -42,6 +43,22 @@ macro_rules! video_encoder_facade {
             #[must_use]
             pub fn new() -> Self {
                 Self::default()
+            }
+
+            /// One that remembers automatic selection's winner in `cache`
+            /// instead of the process-wide one (see [`$crate::cache`]).
+            #[must_use]
+            pub fn with_cache(
+                cache: ::std::sync::Arc<dyn $crate::SelectionCache>,
+            ) -> Self {
+                let Self(inner) = Self::default();
+                Self(inner.with_cache(cache))
+            }
+
+            /// Subscribes to this session's events (see [`$crate::SessionEvent`]).
+            #[must_use]
+            pub fn subscribe(&self, capacity: usize) -> $crate::EventReceiver {
+                self.0.subscribe(capacity)
             }
 
             /// The backends of this build for this job, in automatic order.
@@ -141,6 +158,22 @@ macro_rules! video_decoder_facade {
                 Self::default()
             }
 
+            /// One that remembers automatic selection's winner in `cache`
+            /// instead of the process-wide one (see [`$crate::cache`]).
+            #[must_use]
+            pub fn with_cache(
+                cache: ::std::sync::Arc<dyn $crate::SelectionCache>,
+            ) -> Self {
+                let Self(inner) = Self::default();
+                Self(inner.with_cache(cache))
+            }
+
+            /// Subscribes to this session's events (see [`$crate::SessionEvent`]).
+            #[must_use]
+            pub fn subscribe(&self, capacity: usize) -> $crate::EventReceiver {
+                self.0.subscribe(capacity)
+            }
+
             /// The backends of this build for this job, in automatic order.
             #[must_use]
             pub fn registry() -> $crate::VideoDecoderRegistry {
@@ -222,6 +255,22 @@ macro_rules! audio_encoder_facade {
             #[must_use]
             pub fn new() -> Self {
                 Self::default()
+            }
+
+            /// One that remembers automatic selection's winner in `cache`
+            /// instead of the process-wide one (see [`$crate::cache`]).
+            #[must_use]
+            pub fn with_cache(
+                cache: ::std::sync::Arc<dyn $crate::SelectionCache>,
+            ) -> Self {
+                let Self(inner) = Self::default();
+                Self(inner.with_cache(cache))
+            }
+
+            /// Subscribes to this session's events (see [`$crate::SessionEvent`]).
+            #[must_use]
+            pub fn subscribe(&self, capacity: usize) -> $crate::EventReceiver {
+                self.0.subscribe(capacity)
             }
 
             /// The backends of this build for this job, in automatic order.
@@ -309,6 +358,22 @@ macro_rules! audio_decoder_facade {
             #[must_use]
             pub fn new() -> Self {
                 Self::default()
+            }
+
+            /// One that remembers automatic selection's winner in `cache`
+            /// instead of the process-wide one (see [`$crate::cache`]).
+            #[must_use]
+            pub fn with_cache(
+                cache: ::std::sync::Arc<dyn $crate::SelectionCache>,
+            ) -> Self {
+                let Self(inner) = Self::default();
+                Self(inner.with_cache(cache))
+            }
+
+            /// Subscribes to this session's events (see [`$crate::SessionEvent`]).
+            #[must_use]
+            pub fn subscribe(&self, capacity: usize) -> $crate::EventReceiver {
+                self.0.subscribe(capacity)
             }
 
             /// The backends of this build for this job, in automatic order.

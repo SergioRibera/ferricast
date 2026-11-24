@@ -1,11 +1,15 @@
 //! A video encoder that picks its backend.
 
+use std::sync::Arc;
+
 use ferricast_core::{
     Acceleration, BackendId, CapturedFrame, CodecError, CodecResult, CodecTarget, EncodedFrame,
     EncoderConfig, Operation, RuntimeFallback,
 };
 use tracing::warn;
 
+use crate::cache::SelectionCache;
+use crate::events::{EventReceiver, SessionEvent, SessionEvents};
 use crate::registry::{Plan, Registry};
 use crate::session::VideoEncoderSession;
 
@@ -32,6 +36,7 @@ struct Active {
 pub struct SelectingVideoEncoder {
     registry: VideoEncoderRegistry,
     active: Option<Active>,
+    events: SessionEvents,
 }
 
 impl std::fmt::Debug for SelectingVideoEncoder {
@@ -50,7 +55,16 @@ impl SelectingVideoEncoder {
         Self {
             registry,
             active: None,
+            events: SessionEvents::default(),
         }
+    }
+
+    /// Remembers automatic selection's winner in `cache` instead of the
+    /// process-wide one (see [`crate::cache`]).
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<dyn SelectionCache>) -> Self {
+        self.registry.set_cache(cache);
+        self
     }
 
     /// The job this encoder does.
@@ -73,6 +87,19 @@ impl SelectingVideoEncoder {
             .map(|active| (active.backend, active.acceleration))
     }
 
+    /// The session's event hub.
+    #[must_use]
+    pub fn events(&self) -> &SessionEvents {
+        &self.events
+    }
+
+    /// Subscribes to the session's events; see
+    /// [`SessionEvents::subscribe_at`].
+    #[must_use]
+    pub fn subscribe(&self, capacity: usize) -> EventReceiver {
+        self.events.subscribe_at(capacity, self.backend())
+    }
+
     /// Selects (or re-selects) the backend, or reconfigures the open one.
     ///
     /// # Errors
@@ -80,6 +107,11 @@ impl SelectingVideoEncoder {
     /// [`Registry::open`]); the open backend's `configure` error when no
     /// fallback applies.
     pub fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+        let result = self.reconfigure(config);
+        self.events.report(result)
+    }
+
+    fn reconfigure(&mut self, config: &EncoderConfig) -> CodecResult<()> {
         let Some(active) = &mut self.active else {
             return self.select(config);
         };
@@ -104,7 +136,13 @@ impl SelectingVideoEncoder {
         let opened = self
             .registry
             .open(&active.plan, active.position + 1, config)
-            .map_err(|_| error)?;
+            .map_err(|_| error.clone())?;
+        self.events.emit(&SessionEvent::Switched {
+            from: active.backend,
+            to: opened.backend,
+            acceleration: opened.acceleration,
+            reason: error,
+        });
         active.session = opened.session;
         active.backend = opened.backend;
         active.acceleration = opened.acceleration;
@@ -116,6 +154,10 @@ impl SelectingVideoEncoder {
     fn select(&mut self, config: &EncoderConfig) -> CodecResult<()> {
         let plan = self.registry.plan(&config.backend)?;
         let opened = self.registry.open(&plan, 0, config)?;
+        self.events.emit(&SessionEvent::Opened {
+            backend: opened.backend,
+            acceleration: opened.acceleration,
+        });
         self.active = Some(Active {
             session: opened.session,
             backend: opened.backend,
@@ -137,34 +179,54 @@ impl SelectingVideoEncoder {
     /// # Errors
     /// [`CodecError::NotConfigured`] before `configure`, or the backend's.
     pub fn encode(&mut self, frame: CapturedFrame) -> CodecResult<EncodedFrame> {
-        self.active(Operation::Encode)?.session.encode(frame)
+        let result = self
+            .active(Operation::Encode)
+            .and_then(|active| active.session.encode(frame));
+        self.events.report(result)
     }
 
     /// # Errors
     /// The backend's; an encoder never configured flushes nothing.
-    pub fn flush(self) -> CodecResult<Vec<EncodedFrame>> {
-        self.active
-            .map_or_else(|| Ok(Vec::new()), |active| active.session.flush())
+    pub fn flush(mut self) -> CodecResult<Vec<EncodedFrame>> {
+        let result = self
+            .active
+            .take()
+            .map_or_else(|| Ok(Vec::new()), |active| active.session.flush());
+        self.events.report(result)
     }
 
     /// # Errors
     /// [`CodecError::NotConfigured`] before `configure`, or the backend's.
     pub fn headers(&mut self) -> CodecResult<Vec<u8>> {
-        self.active(Operation::Headers)?.session.headers()
+        let result = self
+            .active(Operation::Headers)
+            .and_then(|active| active.session.headers());
+        self.events.report(result)
     }
 
     /// Asks for a keyframe next; a no-op before `configure`.
     pub fn request_keyframe(&mut self) {
         if let Some(active) = &mut self.active {
             active.session.request_keyframe();
+            self.events.emit(&SessionEvent::KeyframeRequested);
         }
     }
 
     /// # Errors
     /// [`CodecError::NotConfigured`] before `configure`, or the backend's.
     pub fn set_bitrate_kbps(&mut self, kbps: u32) -> CodecResult<()> {
-        self.active(Operation::SetBitrate)?
-            .session
-            .set_bitrate_kbps(kbps)
+        let result = self
+            .active(Operation::SetBitrate)
+            .and_then(|active| active.session.set_bitrate_kbps(kbps));
+        if result.is_ok() {
+            self.events.emit(&SessionEvent::BitrateChanged { kbps });
+        }
+        self.events.report(result)
+    }
+}
+
+impl Drop for SelectingVideoEncoder {
+    fn drop(&mut self) {
+        self.events.emit(&SessionEvent::Closed);
     }
 }

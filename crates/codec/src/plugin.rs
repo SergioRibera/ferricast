@@ -31,12 +31,14 @@ use ferricast_core::{
     CodecTarget, DecoderConfig, Direction, EncoderConfig,
 };
 use istmo_core::{IstmoError, NativeHandleId, Runtime};
-use istmo_macros::{message, owned, plugin};
+use istmo_macros::{message, owned, plugin, stream};
 
 use crate::audio::{
     AudioDecoderRegistry, AudioEncoderRegistry, SelectingAudioDecoder, SelectingAudioEncoder,
 };
 use crate::bitstream::NalSyntax;
+use crate::cache::SelectionCache;
+use crate::events::{self, EventReceiver, SessionEvent, SessionEvents};
 use crate::registry::BackendReport;
 use crate::video_decoder::{SelectingVideoDecoder, VideoDecoderRegistry};
 use crate::video_encoder::{SelectingVideoEncoder, VideoEncoderRegistry};
@@ -133,6 +135,14 @@ pub trait Codecs {
 
     /// Retargets a video encoder session's bitrate.
     async fn set_bitrate(&self, session: NativeHandleId, kbps: u32) -> Result<(), CodecError>;
+
+    /// What happens to `session`: first [`SessionEvent::Opened`] for the
+    /// backend open now, then every switch, request and failure, and
+    /// [`SessionEvent::Closed`] when the session ends (the stream then
+    /// completes). An unknown session yields one
+    /// [`SessionEvent::Failed`] with [`CodecError::NoSuchSession`].
+    #[stream]
+    fn events(&self, session: NativeHandleId) -> SessionEvent;
 }
 
 /// Reads the typed [`CodecError`] out of a failed plugin call.
@@ -170,17 +180,37 @@ pub struct Catalog {
     video_decoders: Vec<VideoDecodeJob>,
     audio_encoders: Vec<(AudioCodec, fn() -> AudioEncoderRegistry)>,
     audio_decoders: Vec<(AudioCodec, fn() -> AudioDecoderRegistry)>,
+    /// `None`: the process-wide cache ([`crate::cache::global`]).
+    cache: Option<Arc<dyn SelectionCache>>,
 }
 
 impl fmt::Debug for Catalog {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Catalog")
             .field("jobs", &self.jobs())
-            .finish()
+            .field("cache", &self.cache)
+            .finish_non_exhaustive()
     }
 }
 
 impl Catalog {
+    /// Sessions opened from this catalog remember automatic selection's
+    /// winners in `cache` instead of the process-wide one (see
+    /// [`crate::cache`]).
+    #[must_use]
+    pub fn with_selection_cache(mut self, cache: Arc<dyn SelectionCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// `registry` with this catalog's cache, if it has one.
+    fn cached<C, S: ?Sized>(&self, registry: crate::Registry<C, S>) -> crate::Registry<C, S> {
+        match &self.cache {
+            Some(cache) => registry.with_cache(Arc::clone(cache)),
+            None => registry,
+        }
+    }
+
     /// Adds a video encode job.
     #[must_use]
     pub fn video_encoder(mut self, codec: Codec, registry: fn() -> VideoEncoderRegistry) -> Self {
@@ -286,7 +316,7 @@ impl Catalog {
                     .iter()
                     .find(|(codec, _)| *codec == config.codec)
                     .ok_or_else(|| Self::not_in_catalog(target))?;
-                let mut encoder = SelectingVideoEncoder::new(registry());
+                let mut encoder = SelectingVideoEncoder::new(self.cached(registry()));
                 encoder.configure(&config)?;
                 Ok(Session::VideoEncoder(Arc::new(Mutex::new(encoder))))
             }
@@ -296,7 +326,7 @@ impl Catalog {
                     .iter()
                     .find(|(codec, ..)| *codec == config.codec)
                     .ok_or_else(|| Self::not_in_catalog(target))?;
-                let mut decoder = SelectingVideoDecoder::new(registry(), *syntax);
+                let mut decoder = SelectingVideoDecoder::new(self.cached(registry()), *syntax);
                 decoder.configure(&config)?;
                 Ok(Session::VideoDecoder(Arc::new(Mutex::new(decoder))))
             }
@@ -306,7 +336,7 @@ impl Catalog {
                     .iter()
                     .find(|(codec, _)| *codec == config.codec)
                     .ok_or_else(|| Self::not_in_catalog(target))?;
-                let mut encoder = SelectingAudioEncoder::new(registry());
+                let mut encoder = SelectingAudioEncoder::new(self.cached(registry()));
                 encoder.configure(&config)?;
                 Ok(Session::AudioEncoder(Arc::new(Mutex::new(encoder))))
             }
@@ -316,7 +346,7 @@ impl Catalog {
                     .iter()
                     .find(|(codec, _)| *codec == config.codec)
                     .ok_or_else(|| Self::not_in_catalog(target))?;
-                let mut decoder = SelectingAudioDecoder::new(registry());
+                let mut decoder = SelectingAudioDecoder::new(self.cached(registry()));
                 decoder.configure(&config)?;
                 Ok(Session::AudioDecoder(Arc::new(Mutex::new(decoder))))
             }
@@ -327,6 +357,7 @@ impl Catalog {
 /// A shared codec session; lock it for each call.
 pub type Shared<T> = Arc<Mutex<T>>;
 
+#[derive(Clone)]
 enum Session {
     VideoEncoder(Shared<SelectingVideoEncoder>),
     VideoDecoder(Shared<SelectingVideoDecoder>),
@@ -360,6 +391,28 @@ impl Session {
             target,
             backend,
             acceleration,
+        }
+    }
+
+    /// The session's event hub and the backend open now.
+    fn events(&self) -> (SessionEvents, Option<(BackendId, Acceleration)>) {
+        match self {
+            Self::VideoEncoder(s) => {
+                let s = lock(s);
+                (s.events().clone(), s.backend())
+            }
+            Self::VideoDecoder(s) => {
+                let s = lock(s);
+                (s.events().clone(), s.backend())
+            }
+            Self::AudioEncoder(s) => {
+                let s = lock(s);
+                (s.events().clone(), s.backend())
+            }
+            Self::AudioDecoder(s) => {
+                let s = lock(s);
+                (s.events().clone(), s.backend())
+            }
         }
     }
 }
@@ -533,6 +586,32 @@ impl CodecService {
             _ => None,
         })
     }
+
+    /// The hub and current backend of `session`, read without holding
+    /// the session table while the codec is locked.
+    fn session_events(
+        &self,
+        session: NativeHandleId,
+    ) -> Result<(SessionEvents, Option<(BackendId, Acceleration)>), CodecError> {
+        let found = lock(&self.0.sessions).get(&session).cloned();
+        found
+            .map(|found| found.events())
+            .ok_or_else(|| no_session(session, "codec"))
+    }
+
+    /// Subscribes to `session`'s events with a queue of `capacity`; see
+    /// [`Codecs::events`] for what arrives.
+    ///
+    /// # Errors
+    /// [`CodecError::NoSuchSession`] when `session` is not open.
+    pub fn events(
+        &self,
+        session: NativeHandleId,
+        capacity: usize,
+    ) -> Result<EventReceiver, CodecError> {
+        let (hub, current) = self.session_events(session)?;
+        Ok(hub.subscribe_at(capacity, current))
+    }
 }
 
 impl Codecs for CodecService {
@@ -570,6 +649,23 @@ impl Codecs for CodecService {
 
     async fn set_bitrate(&self, session: NativeHandleId, kbps: u32) -> Result<(), CodecError> {
         lock(&*self.video_encoder(session)?).set_bitrate_kbps(kbps)
+    }
+
+    fn events(&self, session: NativeHandleId) -> flume::Receiver<SessionEvent> {
+        let (sender, receiver) = flume::bounded(events::DEFAULT_CAPACITY);
+        match self.session_events(session) {
+            Ok((hub, current)) => {
+                let opened = current.map(|(backend, acceleration)| SessionEvent::Opened {
+                    backend,
+                    acceleration,
+                });
+                hub.attach(Box::new(sender), opened);
+            }
+            // A fresh queue has room for one event; the stream then
+            // completes as the sender drops.
+            Err(error) => drop(sender.try_send(SessionEvent::Failed { error })),
+        }
+        receiver
     }
 }
 
@@ -635,12 +731,68 @@ mod tests {
             .missing(BackendId::Nvenc, "ferricast-encoder/nvenc")
     }
 
+    /// A hardware decoder that opens and then rejects every packet.
+    #[derive(Default)]
+    struct Rejecting;
+
+    impl ferricast_core::VideoDecoder for Rejecting {
+        const CODEC: Codec = Codec::H264;
+        fn configure(&mut self, _: &DecoderConfig) -> CodecResult<()> {
+            Ok(())
+        }
+        fn decode(&mut self, _: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+            Err(CodecError::backend(
+                BackendId::Nvdec,
+                ferricast_core::Operation::Decode,
+                "CUVID_ERROR_NOT_SUPPORTED",
+            ))
+        }
+        fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Turns every packet into a picture stamped with its timestamp.
+    #[derive(Default)]
+    struct Pictures;
+
+    impl ferricast_core::VideoDecoder for Pictures {
+        const CODEC: Codec = Codec::H264;
+        fn configure(&mut self, _: &DecoderConfig) -> CodecResult<()> {
+            Ok(())
+        }
+        fn decode(&mut self, packet: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+            Ok(Some(frame(packet.timestamp_us)))
+        }
+        fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn decoders() -> VideoDecoderRegistry {
+        VideoDecoderRegistry::new(CodecTarget::decode(Codec::H264))
+            .candidate(Candidate::new(
+                BackendId::Nvdec,
+                Acceleration::Hardware,
+                crate::open_video_decoder::<Rejecting>,
+            ))
+            .candidate(Candidate::new(
+                BackendId::OpenH264,
+                Acceleration::Software,
+                crate::open_video_decoder::<Pictures>,
+            ))
+    }
+
     fn service() -> (CodecService, CodecsClient) {
         let RuntimeInit { runtime, outbound } = Runtime::mock();
         // Nothing reads the outbound frames of an in-process test.
         std::thread::spawn(move || while outbound.recv().is_ok() {});
         let service = CodecService::with_runtime(
-            Catalog::default().video_encoder(Codec::H264, registry),
+            Catalog::default()
+                .video_encoder(Codec::H264, registry)
+                .video_decoder(Codec::H264, decoders, Some(NalSyntax::H264))
+                // Tests must not see each other's winners.
+                .with_selection_cache(Arc::new(crate::cache::NoCache)),
             &runtime,
         );
         runtime.register_host(CodecsHost::new(service.clone()));
@@ -665,7 +817,7 @@ mod tests {
     fn capabilities_list_compiled_and_missing_backends() {
         let (_, client) = service();
         let jobs = pollster::block_on(client.capabilities()).unwrap();
-        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0].target, CodecTarget::encode(Codec::H264));
         assert_eq!(jobs[0].backends[0].availability, Availability::Unprobed);
         assert!(matches!(
@@ -729,5 +881,112 @@ mod tests {
             .into_codec_error()
             .unwrap();
         assert!(matches!(missing_job, CodecError::NoBackendCompiled { .. }));
+    }
+
+    fn decoder_config() -> DecoderConfig {
+        DecoderConfig {
+            codec: Codec::H264,
+            width: 1280,
+            height: 720,
+            pixel_format: PixelFormat::Nv12,
+            low_latency: true,
+            colour: None,
+            hdr: None,
+            memory: ferricast_core::FrameMemory::Cpu,
+            backend: BackendSelection::default(),
+        }
+    }
+
+    fn next(
+        stream: &istmo_core::TypedStream<SessionEvent>,
+    ) -> istmo_core::StreamItem<SessionEvent, ()> {
+        stream.recv().unwrap()
+    }
+
+    #[test]
+    fn an_istmo_client_watches_a_hand_over_and_the_close() {
+        let (service, client) = service();
+        let session =
+            pollster::block_on(client.open_owned(OpenRequest::VideoDecoder(decoder_config())))
+                .unwrap();
+        assert_eq!(session.resolution.backend, BackendId::Nvdec);
+        let id = session.session.id();
+        let events = client.events(id).unwrap();
+        assert_eq!(
+            next(&events),
+            istmo_core::StreamItem::Event(SessionEvent::Opened {
+                backend: BackendId::Nvdec,
+                acceleration: Acceleration::Hardware,
+            })
+        );
+
+        let decoder = service.video_decoder(id).unwrap();
+        let picture = lock(&decoder)
+            .decode(EncodedFrame {
+                codec: Codec::H264,
+                data: bytes::Bytes::from_static(&[0, 0, 1, 0x65, 1]),
+                timestamp_us: 9,
+                is_keyframe: true,
+                duration_us: None,
+                pts_dts: (0, 0),
+            })
+            .unwrap();
+        assert_eq!(picture.map(|p| p.timestamp_us()), Some(9));
+        assert_eq!(
+            next(&events),
+            istmo_core::StreamItem::Event(SessionEvent::Switched {
+                from: BackendId::Nvdec,
+                to: BackendId::OpenH264,
+                acceleration: Acceleration::Software,
+                reason: CodecError::backend(
+                    BackendId::Nvdec,
+                    ferricast_core::Operation::Decode,
+                    "CUVID_ERROR_NOT_SUPPORTED",
+                ),
+            })
+        );
+
+        drop(decoder);
+        drop(session);
+        assert_eq!(
+            next(&events),
+            istmo_core::StreamItem::Event(SessionEvent::Closed)
+        );
+        assert_eq!(next(&events), istmo_core::StreamItem::Completed);
+    }
+
+    #[test]
+    fn encoder_requests_reach_rust_subscribers_and_unknown_sessions_fail_typed() {
+        let (service, client) = service();
+        let session = pollster::block_on(
+            client.open_owned(OpenRequest::VideoEncoder(EncoderConfig::default())),
+        )
+        .unwrap();
+        let id = session.session.id();
+        let events = service.events(id, 8).unwrap();
+        pollster::block_on(client.request_keyframe(id)).unwrap();
+        pollster::block_on(client.set_bitrate(id, 2500)).unwrap();
+        let seen: Vec<_> = events.drain().collect();
+        assert_eq!(
+            seen,
+            [
+                SessionEvent::Opened {
+                    backend: BackendId::X264,
+                    acceleration: Acceleration::Software,
+                },
+                SessionEvent::KeyframeRequested,
+                SessionEvent::BitrateChanged { kbps: 2500 },
+            ]
+        );
+
+        drop(session);
+        let unknown = client.events(id).unwrap();
+        assert!(matches!(
+            next(&unknown),
+            istmo_core::StreamItem::Event(SessionEvent::Failed {
+                error: CodecError::NoSuchSession { .. }
+            })
+        ));
+        assert_eq!(next(&unknown), istmo_core::StreamItem::Completed);
     }
 }

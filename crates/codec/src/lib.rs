@@ -16,6 +16,8 @@
 pub mod aac;
 pub mod audio;
 pub mod bitstream;
+pub mod cache;
+pub mod events;
 pub mod facade;
 pub mod registry;
 pub mod session;
@@ -36,6 +38,10 @@ pub mod mf;
 pub use audio::{
     AudioDecoderRegistry, AudioEncoderRegistry, SelectingAudioDecoder, SelectingAudioEncoder,
 };
+pub use cache::{
+    FileCache, MemoryCache, NoCache, SelectionCache, SelectionInput, SelectionKey, SizeClass,
+};
+pub use events::{EventReceiver, SessionEvent, SessionEvents};
 pub use registry::{
     Availability, BackendReport, Candidate, Missing, OpenFn, Plan, ProbeFn, Registry,
 };

@@ -11,7 +11,12 @@ default = []
 # capability reports, backend resolution and session control callable
 # from any istmo client (Rust, Kotlin, Swift). Frames never cross the
 # istmo wire; a session handle opens a direct Rust data path.
-istmo = ["dep:istmo-core", "dep:istmo-macros", "ferricast-core/wire"]
+istmo = [
+    "dep:istmo-core",
+    "dep:istmo-macros",
+    "dep:flume",
+    "ferricast-core/wire",
+]
 # The Media Foundation plumbing (`mf`) the Windows encoders and decoders
 # share. Windows-only dependency; inert elsewhere.
 media-foundation = ["dep:windows"]
@@ -24,6 +29,8 @@ tracing.workspace = true
 # Pre-release: an exact pin, since `0.1` would not match `0.1.1-alpha.6`.
 istmo-core = { version = "=0.1.1-alpha.6", optional = true }
 istmo-macros = { version = "=0.1.1-alpha.6", optional = true }
+# The channel istmo hosted streams read from (the version istmo-core uses).
+flume = { version = "0.11", default-features = false, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [
