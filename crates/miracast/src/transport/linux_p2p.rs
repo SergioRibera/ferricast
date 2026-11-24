@@ -490,9 +490,12 @@ impl LinuxP2pClient {
                         // Watchdog: if neither GroupStarted nor any
                         // failure signal arrives within 15 s, the peer
                         // bailed silently. Log + reset state so the
-                        // next attempt starts clean.
+                        // next attempt starts clean. Guarded against
+                        // panics so a stray zbus error can't tear down
+                        // the whole GUI process.
                         let watchdog_peer = peer.clone();
-                        let watchdog_proxy = p2p_owned.clone();
+                        let watchdog_conn = conn.clone();
+                        let watchdog_iface = interface_path.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                             tracing::warn!(
@@ -500,7 +503,21 @@ impl LinuxP2pClient {
                                 "sink: 15s after Connect — no GroupStarted/Failure signal. \
                                  Peer probably timed out. Issuing P2PDevice.Cancel() to reset."
                             );
-                            let _ = watchdog_proxy.call_method("Cancel", &()).await;
+                            match Proxy::new(
+                                &watchdog_conn,
+                                SUPPLICANT_BUS,
+                                watchdog_iface,
+                                P2P_IFACE,
+                            )
+                            .await
+                            {
+                                Ok(p) => {
+                                    if let Err(e) = p.call_method("Cancel", &()).await {
+                                        tracing::debug!(error = %e, "watchdog: Cancel ignored");
+                                    }
+                                }
+                                Err(e) => tracing::debug!(error = %e, "watchdog: proxy"),
+                            }
                         });
                     }
                     msg = started.next() => {
