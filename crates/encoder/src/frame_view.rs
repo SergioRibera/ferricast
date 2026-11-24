@@ -13,6 +13,8 @@
 //! * **I420** — U plane starts at `stride × height`, V right after it;
 //!   both chroma planes use `stride / 2`.
 
+#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+use ferricast_core::{BackendId, BitDepth, CodecError, CodecResult, EncoderConfig};
 use ferricast_core::{FerricastError, PixelFormat, RawFrame, Result};
 
 /// A [`RawFrame`] whose dimensions match the encoder configuration
@@ -163,6 +165,41 @@ impl<'a> FrameView<'a> {
         scratch
     }
 
+    /// For a P010 frame, the picture as tightly packed NV12 holding the
+    /// top eight bits of every sample (rows `ceil(width / 2) * 2` bytes
+    /// apart), for encoders that only take 8-bit input; `None` for any
+    /// other format.
+    pub(crate) fn narrowed(&self) -> Option<(Vec<u8>, usize)> {
+        if self.format != PixelFormat::P010 {
+            return None;
+        }
+        let pairs = self.width.div_ceil(2) as usize;
+        let stride = pairs * 2;
+        let rows = self.height as usize;
+        let mut out = vec![0; stride * (rows + self.chroma_rows())];
+        let (luma, chroma) = out.split_at_mut(stride * rows);
+        // P010 words are little-endian: the high byte is the second one.
+        let narrow = |dst: &mut [u8], src: &[u8]| {
+            for (byte, word) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
+                *byte = word[1];
+            }
+        };
+        for (dst, src) in luma
+            .chunks_exact_mut(stride)
+            .zip(self.data.chunks(self.stride))
+        {
+            narrow(&mut dst[..self.width as usize], src);
+        }
+        let chroma_src = &self.data[self.chroma_offset()..];
+        for (dst, src) in chroma
+            .chunks_exact_mut(stride)
+            .zip(chroma_src.chunks(self.stride))
+        {
+            narrow(dst, src);
+        }
+        Some((out, stride))
+    }
+
     fn min_stride(&self) -> usize {
         match self.format {
             // I420 chroma rows are `stride / 2` wide and must still hold
@@ -202,6 +239,54 @@ impl<'a> FrameView<'a> {
             }
         }
     }
+}
+
+/// `raw` as 8-bit samples for an encoder that only takes 8-bit input:
+/// P010 becomes tightly packed NV12 holding the top eight bits of every
+/// sample; every other format is returned as it is.
+///
+/// # Errors
+///
+/// As [`FrameView::new`], for a P010 frame whose geometry does not
+/// match `width × height` or its buffer.
+#[allow(
+    dead_code,
+    reason = "conditional: only the x264 and platform encoders take P010 down to 8 bits"
+)]
+pub(crate) fn eight_bit(raw: RawFrame, width: u32, height: u32) -> Result<RawFrame> {
+    let Some((data, stride)) = FrameView::new(&raw, width, height)?.narrowed() else {
+        return Ok(raw);
+    };
+    Ok(RawFrame {
+        stride: u32::try_from(stride)
+            .map_err(|_| FerricastError::Encoder("NV12 stride exceeds u32".into()))?,
+        format: PixelFormat::Nv12,
+        data: data.into(),
+        ..raw
+    })
+}
+
+/// Refuses what an 8-bit backend without HDR signalling cannot encode:
+/// a 10-bit stream, or static HDR metadata it would silently drop.
+///
+/// # Errors
+///
+/// [`CodecError::UnsupportedConfig`] naming `backend` and what it lacks.
+#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+pub(crate) fn eight_bit_sdr_only(config: &EncoderConfig, backend: BackendId) -> CodecResult<()> {
+    if config.bit_depth != BitDepth::Eight {
+        return Err(CodecError::UnsupportedConfig {
+            backend,
+            what: format!("{}-bit {}", config.bit_depth.bits(), config.codec),
+        });
+    }
+    if config.hdr.is_some_and(|hdr| !hdr.is_empty()) {
+        return Err(CodecError::UnsupportedConfig {
+            backend,
+            what: "static HDR metadata (mastering display / content light level)".into(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -295,6 +380,43 @@ mod tests {
         assert_eq!(v.chroma_stride(), 8);
         let short = raw(PixelFormat::Nv12, 4, 2, 8, 19);
         assert!(FrameView::new(&short, 4, 2).is_err());
+    }
+
+    #[test]
+    fn p010_layout_is_nv12_with_two_byte_samples() {
+        // 3x2, stride 8: luma rows of 6 bytes, chroma at 16 holding two
+        // 4-byte pairs (8 bytes): 16 + 8.
+        let f = raw(PixelFormat::P010, 3, 2, 8, 24);
+        let v = FrameView::new(&f, 3, 2).unwrap();
+        assert_eq!(
+            (v.row_bytes(), v.chroma_offset(), v.chroma_stride()),
+            (6, 16, 8)
+        );
+        assert!(FrameView::new(&raw(PixelFormat::P010, 3, 2, 8, 23), 3, 2).is_err());
+        assert!(FrameView::new(&raw(PixelFormat::P010, 3, 2, 6, 18), 3, 2).is_err());
+    }
+
+    #[test]
+    fn p010_is_narrowed_to_the_high_bytes_and_other_formats_are_kept() {
+        let words: [u16; 6] = [0x1234, 0xFF00, 0x0040, 0x8000, 0x4000, 0xC000];
+        let f = RawFrame {
+            data: Bytes::from(
+                words
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+            timestamp_us: 7,
+            ..raw(PixelFormat::P010, 2, 2, 4, 12)
+        };
+        let narrowed = eight_bit(f, 2, 2).unwrap();
+        assert_eq!(
+            (narrowed.format, narrowed.stride, narrowed.timestamp_us),
+            (PixelFormat::Nv12, 2, 7)
+        );
+        assert_eq!(&narrowed.data[..], &[0x12, 0xFF, 0x00, 0x80, 0x40, 0xC0]);
+        let nv12 = raw(PixelFormat::Nv12, 4, 2, 8, 20);
+        assert_eq!(eight_bit(nv12, 4, 2).unwrap().stride, 8);
     }
 
     #[test]

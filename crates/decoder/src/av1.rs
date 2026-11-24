@@ -2,10 +2,11 @@ use std::collections::VecDeque;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
+use ferricast_core::ContentLightLevel;
 use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
     CapturedFrame, ChromaLocation, Codec, ColourDescription, ColourRange, DecoderConfig,
-    EncodedFrame, FerricastError, Result, VideoDecoder,
+    EncodedFrame, FerricastError, HdrMetadata, MasteringDisplay, Result, VideoDecoder,
 };
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
@@ -15,7 +16,7 @@ use rav1d::src::lib::{
     dav1d_open, dav1d_picture_unref, dav1d_send_data,
 };
 
-use crate::nv12::{self, OutputFormat, Planar};
+use crate::nv12::{self, OutputFormat, Planar, WidePicture, WidePlane, WideSamples};
 
 const I420: u32 = 1;
 const MAX_FRAME_PIXELS: u32 = 8192 * 8192;
@@ -25,6 +26,8 @@ pub struct Rav1dDecoder {
     context: Option<Dav1dContext>,
     ready: VecDeque<CapturedFrame>,
     format: OutputFormat,
+    /// The container's HDR metadata, for pictures whose stream sends none.
+    container_hdr: Option<HdrMetadata>,
 }
 
 // SAFETY: the context is an Arc-backed rav1d decoder that is only ever used through
@@ -41,6 +44,7 @@ impl Rav1dDecoder {
         }
         self.close();
         self.format = OutputFormat(config.pixel_format);
+        self.container_hdr = config.hdr;
         let mut settings = MaybeUninit::<Dav1dSettings>::uninit();
         // SAFETY: `settings` is valid for writes and dav1d_default_settings initialises all of it.
         let mut settings = unsafe {
@@ -158,7 +162,7 @@ impl Rav1dDecoder {
                     got.0
                 )));
             }
-            let frame = nv12_frame(&picture, self.format);
+            let frame = nv12_frame(&picture, self.format, self.container_hdr);
             // SAFETY: `picture` was filled by dav1d_get_picture and is unreferenced exactly once.
             unsafe { dav1d_picture_unref(Some(NonNull::from(&mut picture))) };
             self.ready.push_back(frame?);
@@ -183,7 +187,11 @@ impl Drop for Rav1dDecoder {
     }
 }
 
-fn nv12_frame(picture: &Dav1dPicture, format: OutputFormat) -> Result<CapturedFrame> {
+fn nv12_frame(
+    picture: &Dav1dPicture,
+    format: OutputFormat,
+    container_hdr: Option<HdrMetadata>,
+) -> Result<CapturedFrame> {
     let short = || FerricastError::Decode("rav1d returned short planes".into());
     if picture.p.layout != I420 {
         return Err(FerricastError::Decode(format!(
@@ -195,8 +203,7 @@ fn nv12_frame(picture: &Dav1dPicture, format: OutputFormat) -> Result<CapturedFr
         usize::try_from(picture.p.w).map_err(|_| short())?,
         usize::try_from(picture.p.h).map_err(|_| short())?,
     );
-    let (chroma_width, chroma_height) = (width.div_ceil(2), height.div_ceil(2));
-    let bytes = if picture.p.bpc > 8 { 2 } else { 1 };
+    let chroma_height = height.div_ceil(2);
     let plane = |index: usize, rows: usize| {
         let stride = usize::try_from(picture.stride[usize::from(index > 0)]).ok()?;
         let base = picture.data[index]?;
@@ -209,37 +216,6 @@ fn nv12_frame(picture: &Dav1dPicture, format: OutputFormat) -> Result<CapturedFr
     let (y, y_stride) = plane(0, height).ok_or_else(short)?;
     let (u, uv_stride) = plane(1, chroma_height).ok_or_else(short)?;
     let (v, _) = plane(2, chroma_height).ok_or_else(short)?;
-    let (data, stride) = if bytes == 1 {
-        nv12::from_i420(&Planar {
-            width,
-            height,
-            y,
-            y_stride,
-            u,
-            v,
-            uv_stride,
-        })
-    } else {
-        let depth = u32::try_from(picture.p.bpc).map_err(|_| short())?;
-        let (y, u, v) = (
-            nv12::narrow_le_bytes(y, y_stride, width, height, depth),
-            nv12::narrow_le_bytes(u, uv_stride, chroma_width, chroma_height, depth),
-            nv12::narrow_le_bytes(v, uv_stride, chroma_width, chroma_height, depth),
-        );
-        match (y, u, v) {
-            (Some(y), Some(u), Some(v)) => nv12::from_i420(&Planar {
-                width,
-                height,
-                y: &y,
-                y_stride: width,
-                u: &u,
-                v: &v,
-                uv_stride: chroma_width,
-            }),
-            _ => None,
-        }
-    }
-    .ok_or_else(short)?;
     let colour = match picture.seq_hdr {
         Some(header) => {
             // SAFETY: a picture returned by dav1d_get_picture holds a reference on its sequence
@@ -249,16 +225,78 @@ fn nv12_frame(picture: &Dav1dPicture, format: OutputFormat) -> Result<CapturedFr
         }
         None => ColourDescription::unspecified(ColourRange::Limited),
     };
-    nv12::deliver(
-        data,
-        stride,
-        (width, height),
-        picture.m.timestamp as u64,
-        format.0,
-        colour,
-    )
-    .map(CapturedFrame::Cpu)
-    .ok_or_else(short)
+    let timestamp_us = u64::try_from(picture.m.timestamp).unwrap_or(0);
+    let raw = if picture.p.bpc > 8 {
+        let wide = |samples| WidePlane {
+            samples: WideSamples::LeBytes(samples),
+            stride: uv_stride,
+        };
+        WidePicture {
+            width,
+            height,
+            depth: u32::try_from(picture.p.bpc).map_err(|_| short())?,
+            y: WidePlane {
+                samples: WideSamples::LeBytes(y),
+                stride: y_stride,
+            },
+            u: wide(u),
+            v: wide(v),
+        }
+        .deliver(timestamp_us, format.0, colour)
+    } else {
+        let (data, stride) = nv12::from_i420(&Planar {
+            width,
+            height,
+            y,
+            y_stride,
+            u,
+            v,
+            uv_stride,
+        })
+        .ok_or_else(short)?;
+        nv12::deliver(
+            data,
+            stride,
+            (width, height),
+            timestamp_us,
+            format.0,
+            colour,
+        )
+    };
+    let mut raw = raw.ok_or_else(short)?;
+    raw.hdr = picture_hdr(picture).or(container_hdr);
+    Ok(CapturedFrame::Cpu(raw))
+}
+
+/// The HDR metadata dav1d attached to `picture` (from the stream's
+/// metadata OBUs, carried forward by dav1d to every later picture).
+fn picture_hdr(picture: &Dav1dPicture) -> Option<HdrMetadata> {
+    // SAFETY: a picture returned by dav1d_get_picture holds references on its
+    // metadata, released only when the caller unreferences the picture,
+    // after this function returns.
+    let (display, light) = unsafe {
+        (
+            picture.mastering_display.map(|meta| meta.as_ref()),
+            picture.content_light.map(|meta| meta.as_ref()),
+        )
+    };
+    let hdr = HdrMetadata {
+        mastering_display: display.map(|display| {
+            let [r, g, b] = display.primaries;
+            let point = |[x, y]: [u16; 2]| (x, y);
+            MasteringDisplay::from_av1(
+                [point(r), point(g), point(b)],
+                point(display.white_point),
+                display.max_luminance,
+                display.min_luminance,
+            )
+        }),
+        content_light: light.map(|light| ContentLightLevel {
+            max_cll: light.max_content_light_level,
+            max_fall: light.max_frame_average_light_level,
+        }),
+    };
+    (!hdr.is_empty()).then_some(hdr)
 }
 
 /// The colour description of an AV1 sequence header. AV1 codes

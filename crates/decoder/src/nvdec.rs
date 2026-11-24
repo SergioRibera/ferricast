@@ -27,8 +27,7 @@ use std::marker::PhantomData;
 use bytes::Bytes;
 use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
-    CapturedFrame, Codec, ColourDescription, ColourRange, DecoderConfig, EncodedFrame,
-    FerricastError, Result, VideoDecoder,
+    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
 };
 use shiguredo_nvcodec::{
     Decoder as NvDecoder, DecoderCodec, DecoderConfig as NvDecCfg, SurfaceFormat,
@@ -36,7 +35,10 @@ use shiguredo_nvcodec::{
 use tracing::{debug, info};
 
 use self::sealed::Headers as _;
-use crate::nv12::{self, OutputFormat};
+use ferricast_codec::bitstream::hdr::HdrTracker;
+use ferricast_codec::bitstream::{NalSyntax, hevc};
+
+use crate::nv12::{self, Container, OutputFormat};
 use timestamps::{Picture, Timestamps};
 
 /// Sealed marker pinning a [`NvdecDecoder`] to one bitstream codec.
@@ -48,6 +50,8 @@ pub trait NvdecCodec: sealed::Sealed + Send + 'static {
     /// shiguredo codec selector used by `query_caps` + `Decoder::new`.
     const NV_CODEC: DecoderCodec;
     const NAME: &'static str;
+    /// How the codec's NAL units are typed, for reading its SEI messages.
+    const SYNTAX: NalSyntax;
 }
 
 mod sealed {
@@ -73,6 +77,7 @@ impl NvdecCodec for H264 {
     const FERRICAST_CODEC: Codec = Codec::H264;
     const NV_CODEC: DecoderCodec = DecoderCodec::H264;
     const NAME: &'static str = "H.264";
+    const SYNTAX: NalSyntax = NalSyntax::H264;
 }
 
 /// HEVC marker.
@@ -87,6 +92,7 @@ impl NvdecCodec for Hevc {
     const FERRICAST_CODEC: Codec = Codec::H265;
     const NV_CODEC: DecoderCodec = DecoderCodec::Hevc;
     const NAME: &'static str = "HEVC";
+    const SYNTAX: NalSyntax = NalSyntax::H265;
 }
 
 impl sealed::Headers for h264::Headers {
@@ -118,6 +124,9 @@ pub struct NvdecDecoder<C: NvdecCodec> {
     headers: C::Headers,
     timestamps: Timestamps,
     format: OutputFormat,
+    /// The binding exposes neither the VUI colour nor SEI messages.
+    container: Container,
+    hdr: HdrTracker,
     _codec: PhantomData<C>,
 }
 
@@ -129,6 +138,8 @@ impl<C: NvdecCodec> Default for NvdecDecoder<C> {
             headers: C::Headers::default(),
             timestamps: Timestamps::default(),
             format: OutputFormat::default(),
+            container: Container::default(),
+            hdr: HdrTracker::default(),
             _codec: PhantomData,
         }
     }
@@ -151,18 +162,18 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
             let mut data = Vec::with_capacity(y_stride * height * 3 / 2);
             data.extend_from_slice(nv_frame.y_plane());
             data.extend_from_slice(nv_frame.uv_plane());
-            // The binding does not surface the VUI colour description.
-            let frame = nv12::deliver(
+            let mut frame = nv12::deliver(
                 Bytes::from(data),
                 y_stride,
                 (width, height),
                 self.timestamps.claim(),
                 self.format.0,
-                ColourDescription::unspecified(ColourRange::Limited),
+                self.container.colour(),
             )
             .ok_or_else(|| {
                 FerricastError::Decode(format!("NVDEC ({}) returned short planes", C::NAME))
             })?;
+            frame.hdr = self.hdr.current_or(self.container.hdr);
             self.ready.push_back(CapturedFrame::Cpu(frame));
         }
         Ok(())
@@ -234,6 +245,8 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
         self.ready.clear();
         self.format = OutputFormat(config.pixel_format);
         self.headers = C::Headers::default();
+        self.container = Container::of(config);
+        self.hdr = HdrTracker::default();
         self.timestamps = Timestamps::default();
         Ok(())
     }
@@ -246,6 +259,7 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
         // Read before NVDEC sees the packet so its parameter sets are
         // known whatever happens to the decode.
         let pictures = self.headers.shown(&frame.data);
+        self.hdr.observe_annex_b(&frame.data, C::SYNTAX);
         // NVDEC's parser owns picture-boundary detection; one packet may
         // release 0, 1 or N pictures depending on the GOP structure.
         decoder
@@ -284,6 +298,20 @@ impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
     }
 
     fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
+        // The binding only has 8-bit NV12 surfaces: a 10-bit stream goes
+        // to a backend that keeps its samples (the selection hands over).
+        if C::FERRICAST_CODEC == Codec::H265
+            && let Some((luma, chroma)) = hevc::annex_b_bit_depth(&frame.data)
+            && luma.max(chroma) > 8
+        {
+            return Err(CodecError::UnsupportedStream {
+                backend: BackendId::Nvdec,
+                reason: format!(
+                    "{}-bit HEVC: the NVDEC binding only produces 8-bit NV12",
+                    luma.max(chroma)
+                ),
+            });
+        }
         self.try_decode(frame).map_err(CodecError::from_backend(
             BackendId::Nvdec,
             Operation::Decode,

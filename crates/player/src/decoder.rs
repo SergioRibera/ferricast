@@ -1,8 +1,10 @@
 use ferricast_core::{
     Acceleration, AccelerationPolicy, AutoSelect, BackendId, BackendSelection, CapturedFrame,
-    Codec, CodecResult, DecoderConfig, EncodedFrame, PixelFormat, RuntimeFallback, VideoDecoder,
+    Codec, CodecResult, DecoderConfig, EncodedFrame, FrameMemory, PixelFormat, RuntimeFallback,
+    VideoDecoder,
 };
 use ferricast_decoder::{Av1Decoder, H264Decoder, H265Decoder, Vp8Decoder, Vp9Decoder};
+use ferricast_demuxer::VideoStream;
 
 pub(crate) enum Decoder {
     H264(H264Decoder),
@@ -18,12 +20,8 @@ impl Decoder {
     /// codec's `FERRICAST_<CODEC>_DECODE_BACKEND` asks for it; with
     /// `software_only` (the player's fallback after a hardware decoder
     /// failed) the environment is ignored too.
-    pub(crate) fn open(
-        codec: Codec,
-        width: u32,
-        height: u32,
-        software_only: bool,
-    ) -> CodecResult<Self> {
+    pub(crate) fn open(stream: &VideoStream, software_only: bool) -> CodecResult<Self> {
+        let codec = stream.codec;
         let backend = if software_only {
             BackendSelection::Ordered {
                 backends: vec![software_backend(codec)],
@@ -35,14 +33,16 @@ impl Decoder {
                 .into()
         };
         let config = DecoderConfig {
-            hdr: None,
-            memory: ferricast_core::FrameMemory::Cpu,
+            hdr: stream.hdr,
+            memory: FrameMemory::Cpu,
             codec,
-            width,
-            height,
-            pixel_format: PixelFormat::Nv12,
+            width: stream.width,
+            height: stream.height,
+            // 10-bit streams keep their samples (and HDR signalling) as P010;
+            // 8-bit ones are handed out as NV12.
+            pixel_format: PixelFormat::P010,
             low_latency: false,
-            colour: None,
+            colour: stream.colour,
             backend,
         };
         let decoder = match codec {
@@ -53,7 +53,7 @@ impl Decoder {
             Codec::Av1 => configured(&config).map(Self::Av1),
         }?;
         if let Some((backend, acceleration)) = decoder.backend() {
-            tracing::info!(%codec, width, height, %backend, %acceleration, "decoder opened");
+            tracing::info!(%codec, width = stream.width, height = stream.height, hdr = stream.hdr.is_some(), %backend, %acceleration, "decoder opened");
         }
         Ok(decoder)
     }

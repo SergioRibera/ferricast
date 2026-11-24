@@ -271,8 +271,10 @@ impl StereoDownmix {
 #[async_trait::async_trait]
 impl FrameSink for WindowSink {
     fn video_format(&self) -> PixelFormat {
-        // The window converts YCbCr on the GPU.
-        PixelFormat::Nv12
+        // The window converts YCbCr on the GPU. P010 is the preference for
+        // 10-bit streams (they keep their depth and HDR signalling); 8-bit
+        // ones still arrive as NV12.
+        PixelFormat::P010
     }
 
     async fn push_video(&mut self, frame: CapturedFrame) -> Result<()> {

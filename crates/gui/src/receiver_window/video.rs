@@ -1,6 +1,7 @@
 //! Decoded video frames and how a receiver window draws them.
 //!
-//! The decoders hand the window NV12 with its colour description.
+//! The decoders hand the window NV12 (P010 for 10-bit streams) with its
+//! colour description.
 //! On a GPU renderer (Vulkan or OpenGL, whichever Freya picked) the
 //! two planes are uploaded as textures straight from the decoded
 //! buffer and Skia converts YCbCr to RGB and scales to the window in
@@ -9,12 +10,17 @@
 //! into a reused buffer instead.
 
 use bytes::Bytes;
-use ferricast::{ColourRange, FerricastError, PixelFormat, RawFrame, Result, YuvColour, YuvMatrix};
+use ferricast::{
+    ColourDescription, ColourPrimaries, ColourRange, FerricastError, PixelFormat, RawFrame, Result,
+    TransferCharacteristics, YuvColour, YuvMatrix,
+};
 use skia_safe::gpu::{self, Mipmapped, RecordingContext};
+use skia_safe::image::RequiredProperties;
 use skia_safe::yuva_info::{PlaneConfig, Subsampling};
 use skia_safe::{
-    AlphaType, Canvas, ColorType, Data, FilterMode, ISize, Image, ImageInfo, MipmapMode, Paint,
-    Rect, SamplingOptions, YUVAInfo, YUVAPixmapInfo, YUVAPixmaps, YUVColorSpace, images,
+    AlphaType, Canvas, ColorSpace, ColorType, Data, FilterMode, ISize, Image, ImageInfo,
+    MipmapMode, Paint, Rect, SamplingOptions, YUVAInfo, YUVAPixmapInfo, YUVAPixmaps, YUVColorSpace,
+    images,
 };
 
 /// How a frame's bytes are laid out.
@@ -23,6 +29,10 @@ pub enum Layout {
     /// `stride`-pitched luma rows, then interleaved CbCr rows at half
     /// resolution.
     Nv12(YuvColour),
+    /// As NV12 with 16-bit little-endian samples holding 10 bits in their
+    /// high bits; the full description, since 10-bit pictures are the
+    /// ones that carry wide-gamut / PQ / HLG signalling.
+    P010(ColourDescription),
     /// Packed BGRA8888 rows, `stride` bytes apart.
     Bgra,
 }
@@ -52,8 +62,12 @@ impl TryFrom<RawFrame> for VideoFrame {
                 || YuvColour::guess(raw.height as usize),
                 |colour| colour.yuv(raw.height as usize),
             )),
+            PixelFormat::P010 => Layout::P010(
+                raw.colour
+                    .unwrap_or(ColourDescription::unspecified(ColourRange::Limited)),
+            ),
             PixelFormat::Bgra => Layout::Bgra,
-            PixelFormat::Rgba | PixelFormat::I420 | PixelFormat::P010 => {
+            PixelFormat::Rgba | PixelFormat::I420 => {
                 return Err(FerricastError::Decode(format!(
                     "receiver window: cannot show {:?} frames",
                     raw.format
@@ -79,23 +93,36 @@ impl VideoFrame {
         )
     }
 
-    /// Uploads the frame to the GPU as a YCbCr image Skia converts to
-    /// RGB when drawing.
-    fn nv12_texture(&self, colour: YuvColour, context: &mut RecordingContext) -> Option<Image> {
+    /// Uploads an NV12 or P010 frame to the GPU as a YCbCr image Skia
+    /// converts to RGB when drawing. A P010 frame signalling a wide gamut
+    /// or an HDR transfer (PQ, HLG) is tagged with that colour space and
+    /// converted to sRGB on the GPU, so it shows with its colours instead
+    /// of washed out; HDR is tone-mapped down to SDR by Skia's colour
+    /// management, not shown as HDR.
+    fn yuv_texture(&self, context: &mut RecordingContext) -> Option<Image> {
+        let (space, planes, image_space) = match self.layout {
+            Layout::Nv12(colour) => (
+                yuv_colour_space(colour, false),
+                [ColorType::Gray8, ColorType::R8G8UNorm],
+                None,
+            ),
+            Layout::P010(colour) => (
+                yuv_colour_space(colour.yuv(self.height as usize), true),
+                [ColorType::A16UNorm, ColorType::R16G16UNorm],
+                managed_colour_space(colour),
+            ),
+            Layout::Bgra => return None,
+        };
         let info = YUVAInfo::new(
             self.dimensions(),
             PlaneConfig::Y_UV,
             Subsampling::S420,
-            yuv_colour_space(colour),
+            space,
             None,
             None,
         )?;
         let stride = self.stride as usize;
-        let pixmap_info = YUVAPixmapInfo::new(
-            &info,
-            &[ColorType::Gray8, ColorType::R8G8UNorm],
-            Some(&[stride, stride]),
-        )?;
+        let pixmap_info = YUVAPixmapInfo::new(&info, &planes, Some(&[stride, stride]))?;
         if pixmap_info.compute_total_bytes(None) > self.data.len() {
             return None;
         }
@@ -109,16 +136,39 @@ impl VideoFrame {
         let pixmaps = unsafe {
             YUVAPixmaps::from_external_memory(&pixmap_info, self.data.as_ptr().cast_mut().cast())
         }?;
-        gpu::images::texture_from_yuva_pixmaps(context, &pixmaps, Mipmapped::No, false, None)
+        let image = gpu::images::texture_from_yuva_pixmaps(
+            context,
+            &pixmaps,
+            Mipmapped::No,
+            false,
+            image_space.clone(),
+        )?;
+        if image_space.is_none() {
+            return Some(image);
+        }
+        image.make_color_space(
+            Some(context.as_recorder()),
+            ColorSpace::new_srgb(),
+            RequiredProperties::default(),
+        )
     }
 
-    /// A CPU image of the frame, converting NV12 into `scratch`.
+    /// A CPU image of the frame, converting NV12 into `scratch` (P010
+    /// keeps its top eight bits first; the software renderer applies no
+    /// colour management).
     fn raster(&self, scratch: &mut Vec<u8>) -> Option<Image> {
+        let size = (self.width as usize, self.height as usize);
         let (bytes, row_bytes): (&[u8], usize) = match self.layout {
             Layout::Bgra => (&self.data, self.stride as usize),
             Layout::Nv12(colour) => {
-                let size = (self.width as usize, self.height as usize);
                 colour.nv12_to_bgra_into(&self.data, self.stride as usize, size, scratch)?;
+                (scratch, self.width as usize * 4)
+            }
+            Layout::P010(colour) => {
+                let (nv12, stride) = narrow_p010(&self.data, self.stride as usize, size)?;
+                colour
+                    .yuv(size.1)
+                    .nv12_to_bgra_into(&nv12, stride, size, scratch)?;
                 (scratch, self.width as usize * 4)
             }
         };
@@ -132,15 +182,67 @@ impl VideoFrame {
     }
 }
 
-fn yuv_colour_space(colour: YuvColour) -> YUVColorSpace {
-    match (colour.matrix, colour.range) {
-        (YuvMatrix::Bt601, ColourRange::Limited) => YUVColorSpace::Rec601_Limited,
-        (YuvMatrix::Bt601, ColourRange::Full) => YUVColorSpace::JPEG_Full,
-        (YuvMatrix::Bt709, ColourRange::Limited) => YUVColorSpace::Rec709_Limited,
-        (YuvMatrix::Bt709, ColourRange::Full) => YUVColorSpace::Rec709_Full,
-        (YuvMatrix::Bt2020, ColourRange::Limited) => YUVColorSpace::BT2020_8bit_Limited,
-        (YuvMatrix::Bt2020, ColourRange::Full) => YUVColorSpace::BT2020_8bit_Full,
+/// Skia's YCbCr conversion for `colour`. P010 samples sit in the high
+/// bits of 16-bit words, so Skia reads them normalised like 10-bit
+/// values; BT.601 and BT.709 have no 10-bit variants, and their 8-bit
+/// range offsets differ from the 10-bit ones by under 0.1 %.
+fn yuv_colour_space(colour: YuvColour, ten_bit: bool) -> YUVColorSpace {
+    match (colour.matrix, colour.range, ten_bit) {
+        (YuvMatrix::Bt601, ColourRange::Limited, _) => YUVColorSpace::Rec601_Limited,
+        (YuvMatrix::Bt601, ColourRange::Full, _) => YUVColorSpace::JPEG_Full,
+        (YuvMatrix::Bt709, ColourRange::Limited, _) => YUVColorSpace::Rec709_Limited,
+        (YuvMatrix::Bt709, ColourRange::Full, _) => YUVColorSpace::Rec709_Full,
+        (YuvMatrix::Bt2020, ColourRange::Limited, false) => YUVColorSpace::BT2020_8bit_Limited,
+        (YuvMatrix::Bt2020, ColourRange::Full, false) => YUVColorSpace::BT2020_8bit_Full,
+        (YuvMatrix::Bt2020, ColourRange::Limited, true) => YUVColorSpace::BT2020_10bit_Limited,
+        (YuvMatrix::Bt2020, ColourRange::Full, true) => YUVColorSpace::BT2020_10bit_Full,
     }
+}
+
+/// The colour space a P010 picture's RGB lives in, when it is one the
+/// window must convert to sRGB: wide-gamut (BT.2020) primaries or an HDR
+/// transfer. `None` (drawn as is) for SDR BT.709-class pictures and for
+/// codes Skia has no CICP mapping for.
+fn managed_colour_space(colour: ColourDescription) -> Option<ColorSpace> {
+    use skia_safe::named_primaries::CicpId as Primaries;
+    use skia_safe::named_transfer_fn::CicpId as Transfer;
+    let hdr_transfer = match colour.transfer {
+        TransferCharacteristics::Pq => Some(Transfer::PQ),
+        TransferCharacteristics::Hlg => Some(Transfer::HLG),
+        _ => None,
+    };
+    let wide = colour.primaries == ColourPrimaries::Bt2020;
+    if hdr_transfer.is_none() && !wide {
+        return None;
+    }
+    let transfer = hdr_transfer.unwrap_or(Transfer::Rec709);
+    let primaries = if wide {
+        Primaries::Rec2020
+    } else {
+        Primaries::Rec709
+    };
+    ColorSpace::new_cicp(primaries, transfer)
+}
+
+/// The top eight bits of a P010 picture as tightly packed NV12 (rows of
+/// `ceil(width / 2) * 2` bytes); `None` when `data` is short.
+fn narrow_p010(
+    data: &[u8],
+    stride: usize,
+    (width, height): (usize, usize),
+) -> Option<(Vec<u8>, usize)> {
+    let out_stride = width.div_ceil(2) * 2;
+    let rows = height + height.div_ceil(2);
+    let mut out = vec![0; out_stride * rows];
+    for (row, line) in out.chunks_exact_mut(out_stride).enumerate() {
+        let bytes = if row < height { width } else { out_stride };
+        let source = data.get(row * stride..)?.get(..bytes * 2)?;
+        // Little-endian words: the high byte is the second one.
+        for (byte, word) in line[..bytes].iter_mut().zip(source.as_chunks::<2>().0) {
+            *byte = word[1];
+        }
+    }
+    Some((out, out_stride))
 }
 
 /// The newest frame the window has been handed, numbered so the
@@ -182,7 +284,7 @@ impl VideoRenderer {
         let image = match cached {
             Some((_, image)) => Some(image),
             None => match (frame.layout, context.as_mut()) {
-                (Layout::Nv12(colour), Some(context)) => frame.nv12_texture(colour, context),
+                (Layout::Nv12(_) | Layout::P010(_), Some(context)) => frame.yuv_texture(context),
                 _ => frame.raster(&mut self.scratch),
             },
         };
@@ -284,6 +386,44 @@ mod tests {
         let image = frame.raster(&mut scratch).unwrap();
         assert_eq!((image.width(), image.height()), (2, 2));
         assert_eq!(scratch, [255; 16]);
+    }
+
+    /// [`nv12`] as P010: every sample in the high byte.
+    fn p010(colour: Option<ColourDescription>) -> RawFrame {
+        let eight = nv12(colour);
+        RawFrame {
+            stride: 4,
+            format: PixelFormat::P010,
+            data: eight.data.iter().flat_map(|&sample| [0, sample]).collect(),
+            ..eight
+        }
+    }
+
+    #[test]
+    fn p010_frames_keep_their_full_description() {
+        let pq = ColourDescription {
+            transfer: ferricast::TransferCharacteristics::Pq,
+            ..ColourDescription::BT709_LIMITED
+        };
+        let frame = VideoFrame::try_from(p010(Some(pq))).unwrap();
+        assert_eq!(frame.layout, Layout::P010(pq));
+        let unsignalled = VideoFrame::try_from(p010(None)).unwrap();
+        assert_eq!(
+            unsignalled.layout,
+            Layout::P010(ColourDescription::unspecified(ColourRange::Limited))
+        );
+        assert!(managed_colour_space(pq).is_some(), "PQ is colour managed");
+        assert!(managed_colour_space(ColourDescription::BT709_LIMITED).is_none());
+    }
+
+    #[test]
+    fn the_software_path_draws_p010_from_its_top_eight_bits() {
+        let frame = VideoFrame::try_from(p010(None)).unwrap();
+        let mut scratch = Vec::new();
+        let image = frame.raster(&mut scratch).unwrap();
+        assert_eq!((image.width(), image.height()), (2, 2));
+        assert_eq!(scratch, [255; 16]);
+        assert!(narrow_p010(&[0; 11], 4, (2, 2)).is_none(), "short data");
     }
 
     #[test]

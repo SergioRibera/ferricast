@@ -512,6 +512,7 @@ impl VideoEncoder for VaapiH265Encoder {
     const CODEC: Codec = Codec::H265;
 
     fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+        crate::frame_view::eight_bit_sdr_only(config, BackendId::Vaapi)?;
         self.try_configure(config).map_err(CodecError::from_backend(
             BackendId::Vaapi,
             Operation::Configure,

@@ -11,8 +11,9 @@ use ash::vk::{self, Handle};
 use bytes::Bytes;
 use ferricast::decoder::H264Decoder;
 use ferricast::{
-    Codec, ColourRange, DecoderConfig, EncodedFrame, PixelFormat, RawFrame, VideoDecoder,
-    YuvColour, YuvMatrix,
+    Codec, ColourDescription, ColourPrimaries, ColourRange, DecoderConfig, EncodedFrame,
+    MatrixCoefficients, PixelFormat, RawFrame, TransferCharacteristics, VideoDecoder, YuvColour,
+    YuvMatrix,
 };
 use skia_safe::gpu::{self, Budgeted, DirectContext, vk as skvk};
 use skia_safe::{AlphaType, ColorType, ImageInfo, Surface};
@@ -216,6 +217,117 @@ fn the_gpu_converts_nv12_like_the_cpu_for_every_colour_space() {
             }
         }
     }
+}
+
+/// `nv12` widened to P010: every sample moved to the high byte.
+fn widen(nv12: &[u8]) -> Vec<u8> {
+    nv12.iter().flat_map(|&sample| [0, sample]).collect()
+}
+
+/// Draws `frame` into a fresh `width` × `height` surface and reads it back.
+fn draw_and_read(gpu: &mut Gpu, frame: VideoFrame) -> Vec<u8> {
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    let mut surface = gpu.surface(width as i32, height as i32);
+    let mut slot = FrameSlot::default();
+    slot.replace(frame);
+    let mut renderer = VideoRenderer::default();
+    renderer.draw(surface.canvas(), &slot, width as f32, height as f32);
+    assert!(
+        renderer.image.as_ref().unwrap().1.is_texture_backed(),
+        "uploaded, not a raster image"
+    );
+    gpu.context.flush_submit_and_sync_cpu().unwrap();
+    let info = ImageInfo::new(
+        (width as i32, height as i32),
+        ColorType::BGRA8888,
+        AlphaType::Premul,
+        None,
+    );
+    let mut pixels = vec![0; width * height * 4];
+    assert!(surface.read_pixels(&info, &mut pixels, width * 4, (0, 0)));
+    pixels
+}
+
+#[test]
+fn the_gpu_draws_sdr_p010_like_its_top_eight_bits() {
+    let Some(mut gpu) = gpu() else { return };
+    let (width, height) = (64, 16);
+    let data = bars(
+        width,
+        height,
+        &[
+            (235, 128, 128),
+            (16, 128, 128),
+            (173, 42, 26),
+            (63, 102, 240),
+        ],
+    );
+    let matrices = [
+        MatrixCoefficients::Smpte170M,
+        MatrixCoefficients::Bt709,
+        MatrixCoefficients::Bt2020Ncl,
+    ];
+    for matrix in matrices {
+        let colour = ColourDescription {
+            matrix,
+            ..ColourDescription::BT709_LIMITED
+        };
+        let frame = VideoFrame {
+            width: width as u32,
+            height: height as u32,
+            stride: width as u32 * 2,
+            layout: Layout::P010(colour),
+            data: Bytes::from(widen(&data)),
+            pts_us: 0,
+        };
+        let gpu_pixels = draw_and_read(&mut gpu, frame);
+        let cpu_pixels = colour
+            .yuv(height)
+            .nv12_to_bgra(&data, width, width, height)
+            .unwrap();
+        let row = height / 2 * width * 4;
+        for bar in 0..4 {
+            let at = row + (bar * width / 4 + width / 8) * 4;
+            let (g, c) = (&gpu_pixels[at..at + 4], &cpu_pixels[at..at + 4]);
+            assert!(
+                g.iter().zip(c).all(|(g, c)| g.abs_diff(*c) <= 4),
+                "{matrix:?} bar {bar}: gpu {g:?} cpu {c:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn pq_p010_is_converted_to_srgb_rather_than_drawn_as_sdr() {
+    let Some(mut gpu) = gpu() else { return };
+    let (width, height) = (16, 4);
+    // A BT.2020 limited-range mid grey, chroma neutral.
+    let data = widen(&bars(width, height, &[(128, 128, 128)]));
+    let frame = |colour: ColourDescription| VideoFrame {
+        width: width as u32,
+        height: height as u32,
+        stride: width as u32 * 2,
+        layout: Layout::P010(colour),
+        data: Bytes::from(data.clone()),
+        pts_us: 0,
+    };
+    let sdr = ColourDescription {
+        matrix: MatrixCoefficients::Bt2020Ncl,
+        ..ColourDescription::BT709_LIMITED
+    };
+    let pq = ColourDescription {
+        primaries: ColourPrimaries::Bt2020,
+        transfer: TransferCharacteristics::Pq,
+        ..sdr
+    };
+    let as_sdr = draw_and_read(&mut gpu, frame(sdr));
+    let as_pq = draw_and_read(&mut gpu, frame(pq));
+    let centre = (height / 2 * width + width / 2) * 4;
+    assert_ne!(
+        &as_sdr[centre..centre + 3],
+        &as_pq[centre..centre + 3],
+        "the PQ transfer must change how the samples are shown"
+    );
 }
 
 #[test]

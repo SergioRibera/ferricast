@@ -5,8 +5,8 @@ use std::ptr::{addr_of_mut, from_mut, null_mut};
 
 use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
-    CapturedFrame, Codec, ColourDescription, ColourRange, DecoderConfig, EncodedFrame,
-    FerricastError, PixelFormat, Result, VideoDecoder,
+    CapturedFrame, Codec, ColourDescription, DecoderConfig, EncodedFrame, FerricastError,
+    PixelFormat, RawFrame, Result, VideoDecoder,
 };
 use h264_reader::nal::sps::SeqParameterSet;
 use h264_reader::rbsp::{BitReader, decode_nal};
@@ -18,7 +18,10 @@ use openh264_sys2::{
     DECODER_OPTION, DECODER_OPTION_NUM_OF_FRAMES_REMAINING_IN_BUFFER, SBufferInfo,
 };
 
-use crate::nv12::{self, OutputFormat, Planar};
+use ferricast_codec::bitstream::NalSyntax;
+use ferricast_codec::bitstream::hdr::HdrTracker;
+
+use crate::nv12::{self, Container, OutputFormat, Planar};
 
 /// `profile_idc` of Baseline and Constrained Baseline, which have no B
 /// slices and so never reorder pictures.
@@ -30,6 +33,10 @@ pub struct OpenH264Decoder {
     format: OutputFormat,
     low_latency: bool,
     release: Release,
+    /// What openh264 does not expose: the container colour, and HDR
+    /// metadata from the SEI messages.
+    container: Container,
+    hdr: HdrTracker,
 }
 
 /// When openh264 hands a decoded picture over.
@@ -99,6 +106,8 @@ impl OpenH264Decoder {
         self.session = Some(Session::open()?);
         self.format = OutputFormat(config.pixel_format);
         self.low_latency = config.low_latency;
+        self.container = Container::of(config);
+        self.hdr = HdrTracker::default();
         // Low latency releases pictures at once until an SPS says the
         // stream may reorder.
         self.release = if config.low_latency {
@@ -117,29 +126,35 @@ impl OpenH264Decoder {
             tracing::debug!(?release, "openh264 picture release follows the new SPS");
             self.release = release;
         }
-        let format = self.format.0;
+        self.hdr.observe_annex_b(&frame.data, NalSyntax::H264);
+        let (format, colour) = (self.format.0, self.container.colour());
+        let hdr = self.hdr.current_or(self.container.hdr);
         let release = self.release;
         let session = self.session.as_mut().ok_or_else(|| {
             FerricastError::Decode("OpenH264Decoder::decode before configure()".into())
         })?;
         let decoded = session.decode(&frame.data, frame.timestamp_us)?;
-        if decoded.is_ready() {
-            return decoded.picture(format);
-        }
-        if release == Release::Immediately && session.buffered()? > 0 {
-            return session.release_one()?.picture(format);
-        }
-        Ok(None)
+        let picture = if decoded.is_ready() {
+            decoded.picture(format, colour)?
+        } else if release == Release::Immediately && session.buffered()? > 0 {
+            session.release_one()?.picture(format, colour)?
+        } else {
+            None
+        };
+        Ok(picture.map(|raw| CapturedFrame::Cpu(RawFrame { hdr, ..raw })))
     }
 
     fn try_flush(&mut self) -> Result<Vec<CapturedFrame>> {
-        let format = self.format.0;
+        let (format, colour) = (self.format.0, self.container.colour());
+        let hdr = self.hdr.current_or(self.container.hdr);
         let Some(session) = self.session.as_mut() else {
             return Ok(Vec::new());
         };
         let mut frames = Vec::new();
         for _ in 0..session.buffered()? {
-            frames.extend(session.release_one()?.picture(format)?);
+            if let Some(raw) = session.release_one()?.picture(format, colour)? {
+                frames.push(CapturedFrame::Cpu(RawFrame { hdr, ..raw }));
+            }
         }
         Ok(frames)
     }
@@ -290,8 +305,8 @@ impl Picture<'_> {
     }
 
     /// The released picture in `format`, stamped with the timestamp of the
-    /// packet it was decoded from.
-    fn picture(&self, format: PixelFormat) -> Result<Option<CapturedFrame>> {
+    /// packet it was decoded from and described as `colour`.
+    fn picture(&self, format: PixelFormat, colour: ColourDescription) -> Result<Option<RawFrame>> {
         let output = self.output;
         let [y, u, v] = output.planes;
         // openh264 may report a picture yet hand out no planes; decoding
@@ -327,16 +342,15 @@ impl Picture<'_> {
             uv_stride,
         })
         .ok_or_else(short)?;
-        // openh264 does not expose the VUI colour description.
         nv12::deliver(
             data,
             stride,
             (width, height),
             output.info.uiOutYuvTimeStamp,
             format,
-            ColourDescription::unspecified(ColourRange::Limited),
+            colour,
         )
-        .map(|raw| Some(CapturedFrame::Cpu(raw)))
+        .map(Some)
         .ok_or_else(short)
     }
 }

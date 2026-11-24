@@ -25,7 +25,9 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use ferricast_core::{AudioFrame, Codec, ColourDescription, EncodedFrame, FerricastError, Result};
+use ferricast_core::{
+    AudioFrame, Codec, ColourDescription, EncodedFrame, FerricastError, HdrMetadata, Result,
+};
 
 pub use adts::AdtsDemuxer;
 pub use audio::AudioStream;
@@ -52,6 +54,8 @@ pub struct VideoStream {
     pub height: u32,
     /// The colour signalling the container carries for the track.
     pub colour: Option<ColourDescription>,
+    /// The static HDR metadata the container carries for the track.
+    pub hdr: Option<HdrMetadata>,
     pub duration_us: Option<u64>,
     /// Timestamp of the first frame meant to be shown. Frames before it are
     /// pre-roll (samples ahead of an MP4 edit list's start): they must be

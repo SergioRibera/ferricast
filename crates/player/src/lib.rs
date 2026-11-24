@@ -145,10 +145,5 @@ impl Player {
 }
 
 fn open_decoder(stream: &VideoStream, software_only: bool) -> Result<Decoder> {
-    Ok(Decoder::open(
-        stream.codec,
-        stream.width,
-        stream.height,
-        software_only,
-    )?)
+    Ok(Decoder::open(stream, software_only)?)
 }

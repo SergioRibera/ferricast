@@ -22,10 +22,12 @@ use std::mem::MaybeUninit;
 use std::ptr::{self, NonNull};
 
 use bytes::Bytes;
+use ferricast_codec::bitstream::NalSyntax;
+use ferricast_codec::bitstream::hdr::{insert_before_slices, sei_nal};
 use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
 use ferricast_core::{
-    CapturedFrame, Codec, EncodedFrame, EncoderConfig, FerricastError, H264Profile, PixelFormat,
-    Result, VideoEncoder,
+    BitDepth, CapturedFrame, Codec, ColourRange, EncodedFrame, EncoderConfig, FerricastError,
+    H264Profile, PixelFormat, Result, VideoEncoder,
 };
 use tracing::warn;
 use x264_sys as sys;
@@ -61,6 +63,27 @@ pub struct X264Encoder {
     pending_keyframe: bool,
     /// Fits frames whose size differs from the session into it.
     scaler: FrameScaler,
+    /// The matrix and range RGB input is converted with, from
+    /// `EncoderConfig::colour`.
+    conversion: Conversion,
+    /// SEI NAL unit carrying `EncoderConfig::hdr`, put in every keyframe.
+    hdr_sei: Option<Vec<u8>>,
+}
+
+/// How RGB input becomes YCbCr.
+#[derive(Debug, Clone, Copy)]
+struct Conversion {
+    range: yuv::YuvRange,
+    matrix: yuv::YuvStandardMatrix,
+}
+
+impl Default for Conversion {
+    fn default() -> Self {
+        Self {
+            range: yuv::YuvRange::Limited,
+            matrix: yuv::YuvStandardMatrix::Bt709,
+        }
+    }
 }
 
 impl X264Encoder {
@@ -102,11 +125,13 @@ impl X264Encoder {
         let raw = self
             .scaler
             .fit(raw, FrameSize::new(session.width, session.height))?;
+        // This build is 8-bit: 10-bit input keeps its top eight bits.
+        let raw = crate::frame_view::eight_bit(raw, session.width, session.height)?;
         let view = FrameView::new(&raw, session.width, session.height)?;
         let planar = self
             .planar
             .get_or_insert_with(|| I420Scratch::new(view.width(), view.height()));
-        planar.fill_from(&view)?;
+        planar.fill_from(&view, self.conversion)?;
 
         let pts = self.frame_count;
         let mut picture = planar.picture(pts, self.pending_keyframe);
@@ -172,6 +197,18 @@ impl VideoEncoder for X264Encoder {
     const CODEC: Codec = Codec::H264;
 
     fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+        if config.bit_depth != BitDepth::Eight {
+            return Err(CodecError::UnsupportedConfig {
+                backend: BackendId::X264,
+                what: format!(
+                    "{}-bit H.264 (this libx264 build is 8-bit)",
+                    config.bit_depth.bits()
+                ),
+            });
+        }
+        let (range, matrix) = crate::nv12::conversion(config.colour, BackendId::X264)?;
+        self.conversion = Conversion { range, matrix };
+        self.hdr_sei = config.hdr.and_then(|hdr| sei_nal(hdr, NalSyntax::H264));
         self.try_configure(config).map_err(CodecError::from_backend(
             BackendId::X264,
             Operation::Configure,
@@ -220,9 +257,15 @@ impl X264Encoder {
             );
             fallback_us
         });
+        let data = match &self.hdr_sei {
+            Some(sei) if out.keyframe => {
+                Bytes::from(insert_before_slices(&out.data, sei, NalSyntax::H264))
+            }
+            _ => out.data,
+        };
         EncodedFrame {
             codec: Codec::H264,
-            data: out.data,
+            data,
             timestamp_us,
             is_keyframe: out.keyframe,
             duration_us: Some(1_000_000 / u64::from(self.fps.max(1))),
@@ -330,13 +373,16 @@ impl Session {
         // self-contained; Annex B start codes for MPEG-TS.
         params.b_repeat_headers = 1;
         params.b_annexb = 1;
-        // The RGB → YUV conversion is BT.709 limited range; say so in
-        // the VUI instead of letting decoders guess (H.273 code 1 =
-        // BT.709 for primaries, transfer and matrix).
-        params.vui.b_fullrange = 0;
-        params.vui.i_colorprim = 1;
-        params.vui.i_transfer = 1;
-        params.vui.i_colmatrix = 1;
+        // Signal the colour the RGB conversion produces (or the producer
+        // of YUV input promised) instead of letting decoders guess.
+        let colour = config.colour;
+        params.vui.b_fullrange = c_int::from(colour.range == ColourRange::Full);
+        params.vui.i_colorprim = c_int::from(colour.primaries.code());
+        params.vui.i_transfer = c_int::from(colour.transfer.code());
+        params.vui.i_colmatrix = c_int::from(colour.matrix.code());
+        if let Some(location) = colour.chroma_location {
+            params.vui.i_chroma_loc = c_int::from(location.code());
+        }
         // Presets default to CRF, which ignores `i_bitrate` entirely.
         // ABR with a VBV capped at the target makes the bitrate a real
         // ceiling (≈ CBR) so a weak receiver link isn't flooded.
@@ -568,7 +614,7 @@ impl I420Scratch {
 
     /// Convert / copy `src` into the scratch planes, walking `src` with
     /// its own stride (see [`FrameView`] for the planar layouts).
-    fn fill_from(&mut self, src: &FrameView<'_>) -> Result<()> {
+    fn fill_from(&mut self, src: &FrameView<'_>, conversion: Conversion) -> Result<()> {
         let dst = &mut self.0;
         let stride = u32::try_from(src.stride())
             .map_err(|_| FerricastError::Encoder("x264: stride exceeds u32".into()))?;
@@ -577,8 +623,8 @@ impl I420Scratch {
                 dst,
                 src.data(),
                 stride,
-                yuv::YuvRange::Limited,
-                yuv::YuvStandardMatrix::Bt709,
+                conversion.range,
+                conversion.matrix,
                 yuv::YuvConversionMode::Balanced,
             )
             .map_err(|e| FerricastError::Encoding(format!("x264: BGRA → I420: {e}"))),
@@ -586,8 +632,8 @@ impl I420Scratch {
                 dst,
                 src.data(),
                 stride,
-                yuv::YuvRange::Limited,
-                yuv::YuvStandardMatrix::Bt709,
+                conversion.range,
+                conversion.matrix,
                 yuv::YuvConversionMode::Balanced,
             )
             .map_err(|e| FerricastError::Encoding(format!("x264: RGBA → I420: {e}"))),
@@ -639,7 +685,7 @@ impl I420Scratch {
                 Ok(())
             }
             PixelFormat::P010 => Err(FerricastError::Encoder(
-                "x264: 10-bit P010 input is not supported by this 8-bit build".into(),
+                "x264: P010 input must be narrowed to NV12 first".into(),
             )),
         }
     }
@@ -732,6 +778,56 @@ mod tests {
         assert_eq!(out.timestamp_us, 7);
         let (sps, pps) = count_param_sets(&out.data);
         assert!(sps >= 1 && pps >= 1, "SPS={sps} PPS={pps}");
+    }
+
+    /// HDR metadata goes into keyframes as SEI; a 10-bit stream and a
+    /// matrix the conversion lacks are refused up front.
+    #[test]
+    fn hdr_metadata_rides_keyframes_and_ten_bit_is_refused() {
+        let hdr = ferricast_core::HdrMetadata {
+            mastering_display: None,
+            content_light: Some(ferricast_core::ContentLightLevel {
+                max_cll: 1000,
+                max_fall: 400,
+            }),
+        };
+        let mut enc = X264Encoder::default();
+        enc.configure(&EncoderConfig {
+            hdr: Some(hdr),
+            ..small_cfg()
+        })
+        .expect("configure");
+        let key = enc.encode(bgra_frame(320, 240, 1280, 0)).expect("encode");
+        assert!(key.is_keyframe);
+        assert_eq!(
+            ferricast_codec::bitstream::hdr::from_annex_b(&key.data, NalSyntax::H264),
+            hdr
+        );
+        let next = enc.encode(bgra_frame(320, 240, 1280, 1)).expect("encode");
+        assert!(!next.is_keyframe);
+        assert!(
+            ferricast_codec::bitstream::hdr::from_annex_b(&next.data, NalSyntax::H264).is_empty()
+        );
+
+        let ten_bit = EncoderConfig {
+            bit_depth: BitDepth::Ten,
+            ..small_cfg()
+        };
+        assert!(matches!(
+            X264Encoder::default().configure(&ten_bit),
+            Err(CodecError::UnsupportedConfig { .. })
+        ));
+        let ictcp = EncoderConfig {
+            colour: ferricast_core::ColourDescription {
+                matrix: ferricast_core::MatrixCoefficients::ICtCp,
+                ..ferricast_core::ColourDescription::BT709_LIMITED
+            },
+            ..small_cfg()
+        };
+        assert!(matches!(
+            X264Encoder::default().configure(&ictcp),
+            Err(CodecError::UnsupportedConfig { .. })
+        ));
     }
 
     /// Each output carries its own input's timestamp and PTS == DTS.

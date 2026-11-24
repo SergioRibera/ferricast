@@ -3,7 +3,8 @@ mod fragment;
 use std::io::SeekFrom;
 
 use ferricast_core::{
-    AudioFrame, ChromaLocation, Codec, ColourDescription, EncodedFrame, FerricastError, Result,
+    AudioFrame, ChromaLocation, Codec, ColourDescription, ContentLightLevel, EncodedFrame,
+    FerricastError, HdrMetadata, MasteringDisplay, Result,
 };
 
 use crate::audio::{AacConfig, AudioFormat, AudioStream, OPUS_RATE, opus_channels};
@@ -116,6 +117,7 @@ struct VideoEntry {
     height: u32,
     framing: Framing,
     colour: Option<ColourDescription>,
+    hdr: Option<HdrMetadata>,
 }
 
 struct AudioEntry {
@@ -487,6 +489,7 @@ impl Mp4Demuxer {
                         width: entry.width,
                         height: entry.height,
                         colour: entry.colour,
+                        hdr: entry.hdr,
                         duration_us: Some(micros(
                             i64::try_from(track.duration).unwrap_or(i64::MAX),
                             track.timescale,
@@ -1439,12 +1442,14 @@ fn parse_entry(kind: [u8; 4], entry: &[u8]) -> Option<VideoEntry> {
     let colour = child(children, b"colr")
         .and_then(parse_colr)
         .or_else(|| child(children, b"vpcC").and_then(parse_vpcc));
+    let hdr = parse_hdr(children);
     Some(VideoEntry {
         codec,
         width: u32::from(be16(entry, 24)?),
         height: u32::from(be16(entry, 26)?),
         framing,
         colour,
+        hdr,
     })
 }
 
@@ -1553,6 +1558,37 @@ fn parse_colr(colr: &[u8]) -> Option<ColourDescription> {
     };
     Some(ColourDescription::from_codes(
         primaries, transfer, matrix, full_range,
+    ))
+}
+
+/// The static HDR metadata of a visual sample entry: `mdcv` / `clli`
+/// (ISO/IEC 23001-8 boxes with the H.265 SEI payload layout) or the VP
+/// codec binding's `SmDm` / `CoLL` full boxes (`SmDm` uses AV1's fixed
+/// point units, primaries in R, G, B order). `None` when the entry has none.
+fn parse_hdr(children: &[u8]) -> Option<HdrMetadata> {
+    let mastering_display = child(children, b"mdcv")
+        .and_then(MasteringDisplay::from_sei)
+        .or_else(|| child(children, b"SmDm").and_then(|smdm| parse_smdm(smdm.get(4..)?)));
+    let content_light = child(children, b"clli")
+        .and_then(ContentLightLevel::from_sei)
+        .or_else(|| {
+            child(children, b"CoLL").and_then(|coll| ContentLightLevel::from_sei(coll.get(4..)?))
+        });
+    let hdr = HdrMetadata {
+        mastering_display,
+        content_light,
+    };
+    (!hdr.is_empty()).then_some(hdr)
+}
+
+/// An `SmDm` body (after the full-box header).
+fn parse_smdm(body: &[u8]) -> Option<MasteringDisplay> {
+    let point = |at: usize| Some((be16(body, at)?, be16(body, at + 2)?));
+    Some(MasteringDisplay::from_av1(
+        [point(0)?, point(4)?, point(8)?],
+        point(12)?,
+        be32(body, 16)?,
+        be32(body, 20)?,
     ))
 }
 
@@ -2148,6 +2184,59 @@ mod tests {
         data.extend_from_slice(&100u32.to_be_bytes());
         data.extend_from_slice(b"moov");
         assert_eq!(Boxes(&data).count(), 1);
+    }
+
+    #[test]
+    fn sample_entry_hdr_boxes_are_read_in_both_layouts() {
+        let display = ferricast_core::MasteringDisplay {
+            red: ferricast_core::Chromaticity {
+                x: 35_400,
+                y: 14_600,
+            },
+            green: ferricast_core::Chromaticity {
+                x: 8_500,
+                y: 39_850,
+            },
+            blue: ferricast_core::Chromaticity { x: 6_550, y: 2_300 },
+            white_point: ferricast_core::Chromaticity {
+                x: 15_635,
+                y: 16_450,
+            },
+            max_luminance: 10_000_000,
+            min_luminance: 50,
+        };
+        let light = ContentLightLevel {
+            max_cll: 1000,
+            max_fall: 400,
+        };
+        let mut children = boxed(b"mdcv", &display.to_sei());
+        children.extend(boxed(b"clli", &light.to_sei()));
+        let hdr = parse_hdr(&children).unwrap();
+        assert_eq!(hdr.mastering_display, Some(display));
+        assert_eq!(hdr.content_light, Some(light));
+
+        // VP codec binding: full boxes, AV1 fixed-point units, R first.
+        let mut smdm = vec![0; 4];
+        for (x, y) in [
+            (46_399_u16, 19_136_u16),
+            (11_141, 52_233),
+            (8_585, 3_015),
+            (20_493, 21_561),
+        ] {
+            smdm.extend(x.to_be_bytes());
+            smdm.extend(y.to_be_bytes());
+        }
+        smdm.extend((1000_u32 << 8).to_be_bytes());
+        smdm.extend(82_u32.to_be_bytes());
+        let mut coll = vec![0; 4];
+        coll.extend(light.to_sei());
+        let mut children = boxed(b"SmDm", &smdm);
+        children.extend(boxed(b"CoLL", &coll));
+        let hdr = parse_hdr(&children).unwrap();
+        assert_eq!(hdr.mastering_display.unwrap().red, display.red);
+        assert_eq!(hdr.content_light, Some(light));
+
+        assert_eq!(parse_hdr(&boxed(b"colr", b"nclx")), None);
     }
 
     #[test]
