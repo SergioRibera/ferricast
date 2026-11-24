@@ -1,42 +1,45 @@
-//! H.264 / H.265 decode through VideoToolbox.
+//! H.264 / H.265 / VP9 / AV1 decode through VideoToolbox.
 //!
-//! Packets arrive as Annex B. Their parameter sets build the
-//! `CMVideoFormatDescription` the session decodes against (rebuilt, and
-//! the session recreated when it cannot take the new one, whenever they
-//! change); the remaining NAL units are rewritten length-prefixed into a
-//! `CMSampleBuffer` stamped with the packet timestamp. Pictures come back
-//! through a callback carrying that timestamp; outside low-latency mode
-//! temporal processing is on, so VideoToolbox emits them in display
-//! order. Each picture is copied out of its `CVPixelBuffer` (NV12, video
-//! range) and handed out in the configured pixel format.
+//! [`stream`] turns packets into samples and the format description they
+//! decode against; the session is recreated when it cannot take a new
+//! description, or when the bit depth changes (8-bit streams decode to
+//! NV12, deeper ones to P010). Samples are stamped with the packet
+//! timestamp; pictures come back through a callback carrying it. Outside
+//! low-latency mode temporal processing is on, so VideoToolbox emits
+//! them in display order.
+//!
+//! With [`FrameMemory::Native`] each picture is handed out as the
+//! IOSurface-backed `CVPixelBuffer` VideoToolbox decoded into
+//! ([`ferricast_codec::apple::PixelBuffer`]), with no copy; otherwise it
+//! is copied out in the configured pixel format.
+//!
+//! VP9 uses Apple's supplemental decoder, registered on demand (macOS
+//! 11+); AV1 needs a hardware decoder (Apple M3 / A17 Pro and later).
+
+mod stream;
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
-use ferricast_codec::bitstream::split_annex_b;
+use ferricast_codec::apple::PixelBuffer;
 use ferricast_codec::{Candidate, VideoDecoderRegistry};
 use ferricast_core::{
-    Acceleration, BackendId, CapturedFrame, Codec, CodecError, CodecKind, CodecResult, CodecTarget,
-    ColourDescription, ColourRange, DecoderConfig, EncodedFrame, Operation, VideoDecoder,
+    Acceleration, BackendId, CapturedFrame, Codec, CodecError, CodecKind, CodecResult,
+    ColourDescription, DecoderConfig, EncodedFrame, FrameMemory, HdrMetadata, NativeFrame,
+    NativeSurface, Operation, PixelFormat, RawFrame, VideoDecoder,
 };
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_core_media::{
     CMBlockBuffer, CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime, CMTimeFlags,
-    CMVideoCodecType, CMVideoFormatDescriptionCreateFromH264ParameterSets,
-    CMVideoFormatDescriptionCreateFromHEVCParameterSets, kCMTimeInvalid, kCMVideoCodecType_H264,
-    kCMVideoCodecType_HEVC,
+    CMVideoCodecType, kCMTimeInvalid,
 };
 use objc2_core_video::{
-    CVColorPrimariesGetIntegerCodePointForString, CVImageBuffer,
-    CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight,
-    CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-    CVPixelBufferUnlockBaseAddress, CVTransferFunctionGetIntegerCodePointForString,
-    CVYCbCrMatrixGetIntegerCodePointForString, kCVImageBufferColorPrimariesKey,
-    kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrixKey,
+    CVImageBuffer, kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey,
     kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
 };
 use objc2_video_toolbox::{
     VTDecodeFrameFlags, VTDecodeInfoFlags, VTDecompressionOutputCallbackRecord,
@@ -45,8 +48,9 @@ use objc2_video_toolbox::{
     kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
     kVTVideoDecoderUnsupportedDataFormatErr,
 };
-use tracing::{debug, warn};
+use tracing::warn;
 
+use self::stream::{Stream, codec_type};
 use super::os_status;
 use crate::nv12::{self, OutputFormat};
 
@@ -54,32 +58,91 @@ const BACKEND: BackendId = BackendId::VideoToolbox;
 /// Timestamps cross VideoToolbox as microseconds.
 const MICROS: i32 = 1_000_000;
 
-/// Adds the VideoToolbox H.264 / H.265 decoders.
+/// What a candidate opens.
+type Opened = Box<dyn ferricast_codec::VideoDecoderSession>;
+
+/// Adds the VideoToolbox decoders of the registry's codec.
 pub(crate) fn video(registry: VideoDecoderRegistry) -> VideoDecoderRegistry {
-    if !matches!(
-        registry.target().codec,
-        CodecKind::Video(Codec::H264 | Codec::H265)
-    ) {
+    let CodecKind::Video(codec) = registry.target().codec else {
         return registry;
+    };
+    match codec {
+        Codec::H264 | Codec::H265 => {
+            let registry = registry.candidate(Candidate::new(
+                BACKEND,
+                Acceleration::Hardware,
+                open_hardware,
+            ));
+            // Apple's software H.264 / HEVC decoders back the hardware
+            // ones on macOS; iOS decodes in the media engine.
+            #[cfg(target_os = "macos")]
+            let registry = registry.candidate(Candidate::new(
+                BACKEND,
+                Acceleration::Software,
+                open_software,
+            ));
+            registry
+        }
+        // Apple's VP9 decoder is a supplemental one, registered on
+        // request; the call exists on macOS only.
+        #[cfg(target_os = "macos")]
+        Codec::Vp9 => registry
+            .candidate(
+                Candidate::new(BACKEND, Acceleration::Hardware, open_hardware)
+                    .with_probe(|| hardware_supported(Codec::Vp9)),
+            )
+            .candidate(Candidate::new(
+                BACKEND,
+                Acceleration::Software,
+                open_software,
+            )),
+        Codec::Av1 => registry.candidate(
+            Candidate::new(BACKEND, Acceleration::Hardware, open_hardware)
+                .with_probe(|| hardware_supported(Codec::Av1)),
+        ),
+        _ => registry,
     }
-    let registry = registry.candidate(Candidate::new(
-        BACKEND,
-        Acceleration::Hardware,
-        |config: &DecoderConfig| {
-            VtDecoder::open(config, Acceleration::Hardware).map(|decoder| Box::new(decoder) as _)
-        },
-    ));
-    // Apple's software H.264 / HEVC decoders back the hardware ones on
-    // macOS; iOS decodes in the media engine.
-    #[cfg(target_os = "macos")]
-    let registry = registry.candidate(Candidate::new(
-        BACKEND,
-        Acceleration::Software,
-        |config: &DecoderConfig| {
-            VtDecoder::open(config, Acceleration::Software).map(|decoder| Box::new(decoder) as _)
-        },
-    ));
-    registry
+}
+
+fn open_hardware(config: &DecoderConfig) -> CodecResult<Opened> {
+    VtDecoder::open(config, Acceleration::Hardware).map(|decoder| Box::new(decoder) as _)
+}
+
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "conditional: the software decoders exist on macOS only"
+    )
+)]
+fn open_software(config: &DecoderConfig) -> CodecResult<Opened> {
+    VtDecoder::open(config, Acceleration::Software).map(|decoder| Box::new(decoder) as _)
+}
+
+/// Registers Apple's supplemental decoder of `codec_type` when the system
+/// has one that is not registered by default (VP9); a no-op elsewhere.
+#[cfg(target_os = "macos")]
+fn register_supplemental(codec_type: CMVideoCodecType) {
+    // SAFETY: a plain registration call, idempotent.
+    unsafe { objc2_video_toolbox::VTRegisterSupplementalVideoDecoderIfAvailable(codec_type) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn register_supplemental(_codec_type: CMVideoCodecType) {}
+
+/// Whether this device decodes `codec` in hardware.
+fn hardware_supported(codec: Codec) -> CodecResult<()> {
+    let codec_type = codec_type(codec)?;
+    register_supplemental(codec_type);
+    // SAFETY: a plain capability query.
+    if unsafe { VTIsHardwareDecodeSupported(codec_type) } {
+        Ok(())
+    } else {
+        Err(CodecError::BackendUnavailable {
+            backend: BACKEND,
+            reason: format!("this device has no hardware {codec} decoder"),
+        })
+    }
 }
 
 fn fail(operation: Operation, what: impl std::fmt::Display) -> CodecError {
@@ -106,17 +169,6 @@ fn decode_error(status: i32, what: &str) -> CodecError {
     }
 }
 
-fn codec_type(codec: Codec) -> CodecResult<CMVideoCodecType> {
-    match codec {
-        Codec::H264 => Ok(kCMVideoCodecType_H264),
-        Codec::H265 => Ok(kCMVideoCodecType_HEVC),
-        other => Err(CodecError::BackendCannotHandle {
-            backend: BACKEND,
-            target: CodecTarget::decode(other),
-        }),
-    }
-}
-
 fn cm_time(value: i64) -> CMTime {
     CMTime {
         value,
@@ -126,112 +178,18 @@ fn cm_time(value: i64) -> CMTime {
     }
 }
 
-/// Where a NAL unit goes: a parameter-set slot, dropped, or decoded.
-enum Nal {
-    ParameterSet(usize),
-    Skip,
-    Slice,
-}
-
-fn classify(codec: Codec, nal: &[u8]) -> Nal {
-    let Some(&header) = nal.first() else {
-        return Nal::Skip;
-    };
-    match codec {
-        Codec::H265 => match (header >> 1) & 0x3f {
-            32 => Nal::ParameterSet(0),
-            33 => Nal::ParameterSet(1),
-            34 => Nal::ParameterSet(2),
-            // Access unit delimiter, end of sequence / bitstream.
-            35..=37 => Nal::Skip,
-            _ => Nal::Slice,
-        },
-        _ => match header & 0x1f {
-            7 => Nal::ParameterSet(0),
-            8 => Nal::ParameterSet(1),
-            9..=11 => Nal::Skip,
-            _ => Nal::Slice,
-        },
-    }
-}
-
-/// A picture the callback copied out, still NV12.
-struct Picture {
-    data: Vec<u8>,
-    width: usize,
-    height: usize,
-    timestamp_us: u64,
-    colour: Option<ColourDescription>,
-}
-
 enum Output {
-    Picture(Picture),
-    Failed(i32),
+    Picture {
+        buffer: PixelBuffer,
+        timestamp_us: u64,
+    },
+    Failed(CodecError),
 }
 
 type Outbox = Mutex<Vec<Output>>;
 
 fn lock(outbox: &Outbox) -> MutexGuard<'_, Vec<Output>> {
     outbox.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// The colour attachments of a decoded picture, when it has them.
-fn attached_colour(image: &CVImageBuffer) -> Option<ColourDescription> {
-    // SAFETY: CoreVideo exports these keys for the life of the process.
-    let keys = unsafe {
-        [
-            kCVImageBufferColorPrimariesKey,
-            kCVImageBufferTransferFunctionKey,
-            kCVImageBufferYCbCrMatrixKey,
-        ]
-    };
-    let read = |key: &CFString| {
-        // SAFETY: `image` is live; the attachment mode out pointer may be null.
-        let value = unsafe { image.attachment(key, ptr::null_mut()) }?;
-        value.downcast::<CFString>().ok()
-    };
-    let [primaries, transfer, matrix] = keys.map(read);
-    if primaries.is_none() && transfer.is_none() && matrix.is_none() {
-        return None;
-    }
-    let code = |value: i32| u8::try_from(value).unwrap_or(2);
-    // VideoToolbox hands out video-range NV12 (requested below).
-    Some(ColourDescription::from_codes(
-        code(CVColorPrimariesGetIntegerCodePointForString(
-            primaries.as_deref(),
-        )),
-        code(CVTransferFunctionGetIntegerCodePointForString(
-            transfer.as_deref(),
-        )),
-        code(CVYCbCrMatrixGetIntegerCodePointForString(matrix.as_deref())),
-        false,
-    ))
-}
-
-/// Copies a locked NV12 picture into a tightly packed buffer.
-fn copy_nv12(image: &CVImageBuffer) -> Option<(Vec<u8>, usize, usize)> {
-    let width = CVPixelBufferGetWidth(image);
-    let height = CVPixelBufferGetHeight(image);
-    let mut out = Vec::with_capacity(width * height * 3 / 2);
-    for (plane, rows) in [(0, height), (1, height.div_ceil(2))] {
-        let base = CVPixelBufferGetBaseAddressOfPlane(image, plane).cast::<u8>();
-        let pitch = CVPixelBufferGetBytesPerRowOfPlane(image, plane);
-        let row_bytes = if plane == 0 {
-            width
-        } else {
-            width.div_ceil(2) * 2
-        };
-        if base.is_null() || pitch < row_bytes {
-            return None;
-        }
-        for row in 0..rows {
-            // SAFETY: the buffer is locked; plane `plane` holds `rows` rows
-            // of `pitch >= row_bytes` bytes.
-            let line = unsafe { std::slice::from_raw_parts(base.add(row * pitch), row_bytes) };
-            out.extend_from_slice(line);
-        }
-    }
-    Some((out, width, height))
 }
 
 unsafe extern "C-unwind" fn on_decoded(
@@ -247,40 +205,35 @@ unsafe extern "C-unwind" fn on_decoded(
     // outlives the session (`Session::drop` invalidates first).
     let outbox = unsafe { &*refcon.cast::<Outbox>() };
     if status != 0 {
-        lock(outbox).push(Output::Failed(status));
+        lock(outbox).push(Output::Failed(decode_error(status, "decoding a frame")));
         return;
     }
     // A null image is a frame the decoder dropped on purpose.
     let Some(image) = NonNull::new(image) else {
         return;
     };
-    // SAFETY: VideoToolbox passes a live image buffer for this call.
-    let image = unsafe { image.as_ref() };
-    // SAFETY: the buffer is live and unlocked; read-only lock.
-    if unsafe { CVPixelBufferLockBaseAddress(image, CVPixelBufferLockFlags::ReadOnly) } != 0 {
-        lock(outbox).push(Output::Failed(kVTVideoDecoderBadDataErr));
-        return;
-    }
-    let copied = copy_nv12(image);
-    // SAFETY: locked just above with the same flags.
-    unsafe { CVPixelBufferUnlockBaseAddress(image, CVPixelBufferLockFlags::ReadOnly) };
-    let output = match copied {
-        Some((data, width, height)) => Output::Picture(Picture {
-            data,
-            width,
-            height,
+    // SAFETY: VideoToolbox passes a live image buffer for this call; the
+    // retain keeps it alive past the callback.
+    let image = unsafe { CFRetained::retain(image) };
+    let output = match PixelBuffer::new(image) {
+        Ok(buffer) => Output::Picture {
+            buffer,
             timestamp_us: u64::try_from(pts.value).unwrap_or(0),
-            colour: attached_colour(image),
-        }),
-        None => Output::Failed(kVTVideoDecoderBadDataErr),
+        },
+        Err(unsupported) => Output::Failed(fail(
+            Operation::Decode,
+            format!("the decoder produced a picture this crate cannot read: {unsupported}"),
+        )),
     };
     lock(outbox).push(output);
 }
 
-/// One decompression session and the format description it decodes.
+/// One decompression session.
 struct Session {
     session: CFRetained<VTDecompressionSession>,
-    description: CFRetained<CMFormatDescription>,
+    /// The generation of the stream format the session decodes.
+    generation: u64,
+    depth: u8,
     /// The callback's reference value; boxed so its address outlives the
     /// session (freed after `invalidate`).
     outbox: Box<Outbox>,
@@ -288,7 +241,7 @@ struct Session {
 
 // SAFETY: a VideoToolbox session may be driven from any thread as long as
 // calls do not overlap; it is only reached through `&mut VtDecoder`, and
-// the callback only touches the `Mutex` outbox.
+// the callback only touches the `Mutex` outbox, whose pictures are `Send`.
 unsafe impl Send for Session {}
 
 impl Drop for Session {
@@ -299,72 +252,22 @@ impl Drop for Session {
     }
 }
 
-/// A format description from Annex-B-free parameter sets.
-fn format_description(
-    codec: Codec,
-    sets: &[Vec<u8>],
-) -> CodecResult<CFRetained<CMFormatDescription>> {
-    let mut pointers: Vec<NonNull<u8>> = sets
-        .iter()
-        .map(|set| {
-            NonNull::new(set.as_ptr().cast_mut())
-                .ok_or_else(|| fail(Operation::Decode, "an empty parameter set"))
-        })
-        .collect::<CodecResult<_>>()?;
-    let mut sizes: Vec<usize> = sets.iter().map(Vec::len).collect();
-    let mut raw: *const CMFormatDescription = ptr::null();
-    let pointers_ptr = NonNull::new(pointers.as_mut_ptr())
-        .ok_or_else(|| fail(Operation::Decode, "no parameter sets"))?;
-    let sizes_ptr = NonNull::new(sizes.as_mut_ptr())
-        .ok_or_else(|| fail(Operation::Decode, "no parameter sets"))?;
-    // SAFETY: `pointers` / `sizes` describe `sets.len()` live parameter
-    // sets; the out pointer is a valid local. 4-byte NAL lengths match
-    // what `decode` writes.
-    let status = unsafe {
-        match codec {
-            Codec::H265 => CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-                None,
-                sets.len(),
-                pointers_ptr,
-                sizes_ptr,
-                4,
-                None,
-                NonNull::from(&mut raw),
-            ),
-            _ => CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                None,
-                sets.len(),
-                pointers_ptr,
-                sizes_ptr,
-                4,
-                NonNull::from(&mut raw),
-            ),
-        }
-    };
-    if status != 0 {
-        return Err(CodecError::UnsupportedStream {
-            backend: BACKEND,
-            reason: format!("its parameter sets are not accepted: {}", os_status(status)),
-        });
-    }
-    let raw = NonNull::new(raw.cast_mut())
-        .ok_or_else(|| fail(Operation::Decode, "no format description was created"))?;
-    // SAFETY: the create call handed over a +1 reference.
-    Ok(unsafe { CFRetained::from_raw(raw) })
-}
-
 impl Session {
     fn open(
-        description: CFRetained<CMFormatDescription>,
+        description: &CMFormatDescription,
+        depth: u8,
+        generation: u64,
         acceleration: Acceleration,
     ) -> CodecResult<Self> {
         // SAFETY: VideoToolbox / CoreVideo export these keys for the life
         // of the process.
-        let (require, enable, format_key) = unsafe {
+        let (require, enable, format_key, surface_key, metal_key) = unsafe {
             (
                 kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
                 kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder,
                 kCVPixelBufferPixelFormatTypeKey,
+                kCVPixelBufferIOSurfacePropertiesKey,
+                kCVPixelBufferMetalCompatibilityKey,
             )
         };
         let specification = match acceleration {
@@ -377,11 +280,23 @@ impl Session {
                 &[CFBoolean::new(false).as_ref()],
             ),
         };
-        let pixel_format = CFNumber::new_i32(
-            i32::try_from(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange).unwrap_or(i32::MAX),
+        let os_type = if depth > 8 {
+            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        } else {
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        };
+        let pixel_format = CFNumber::new_i32(i32::try_from(os_type).unwrap_or(i32::MAX));
+        // IOSurface-backed, Metal-compatible buffers: what a native frame
+        // hands to an encoder or a renderer without a copy.
+        let empty = CFDictionary::<CFString, CFType>::empty();
+        let attributes = CFDictionary::<CFString, CFType>::from_slices(
+            &[format_key, surface_key, metal_key],
+            &[
+                pixel_format.as_ref(),
+                (*empty).as_ref(),
+                CFBoolean::new(true).as_ref(),
+            ],
         );
-        let attributes =
-            CFDictionary::<CFString, CFType>::from_slices(&[format_key], &[pixel_format.as_ref()]);
         let outbox: Box<Outbox> = Box::new(Mutex::new(Vec::new()));
         let record = VTDecompressionOutputCallbackRecord {
             decompressionOutputCallback: Some(on_decoded),
@@ -393,7 +308,7 @@ impl Session {
         let status = unsafe {
             VTDecompressionSession::create(
                 None,
-                &description,
+                description,
                 Some(specification.as_ref()),
                 Some(attributes.as_ref()),
                 &raw const record,
@@ -413,47 +328,40 @@ impl Session {
         let session = unsafe { CFRetained::from_raw(session) };
         Ok(Self {
             session,
-            description,
+            generation,
+            depth,
             outbox,
         })
     }
 }
 
-/// A VideoToolbox H.264 / H.265 decoder.
+/// A VideoToolbox decoder.
 pub(crate) struct VtDecoder {
     acceleration: Acceleration,
-    codec: Codec,
+    stream: Stream,
     format: OutputFormat,
+    memory: FrameMemory,
     low_latency: bool,
     container_colour: Option<ColourDescription>,
-    /// The latest parameter sets, by slot (SPS, PPS; VPS, SPS, PPS).
-    sets: Vec<Option<Vec<u8>>>,
-    /// The parameter sets the open session's description was built from.
-    session_sets: Vec<Vec<u8>>,
+    container_hdr: Option<HdrMetadata>,
     session: Option<Session>,
     ready: VecDeque<CapturedFrame>,
 }
 
 impl VtDecoder {
     fn open(config: &DecoderConfig, acceleration: Acceleration) -> CodecResult<Self> {
-        let codec_type = codec_type(config.codec)?;
-        // SAFETY: a plain capability query.
-        if acceleration == Acceleration::Hardware
-            && !unsafe { VTIsHardwareDecodeSupported(codec_type) }
-        {
-            return Err(CodecError::BackendUnavailable {
-                backend: BACKEND,
-                reason: format!("this device has no hardware {} decoder", config.codec),
-            });
+        register_supplemental(codec_type(config.codec)?);
+        if acceleration == Acceleration::Hardware {
+            hardware_supported(config.codec)?;
         }
         let mut decoder = Self {
             acceleration,
-            codec: config.codec,
+            stream: Stream::new(config.codec)?,
             format: OutputFormat::default(),
+            memory: config.memory,
             low_latency: config.low_latency,
             container_colour: config.colour,
-            sets: Vec::new(),
-            session_sets: Vec::new(),
+            container_hdr: config.hdr,
             session: None,
             ready: VecDeque::new(),
         };
@@ -461,29 +369,40 @@ impl VtDecoder {
         Ok(decoder)
     }
 
-    /// Makes sure a session decodes the current parameter sets; `false`
-    /// while some are still missing.
-    fn ensure_session(&mut self) -> CodecResult<bool> {
-        let Some(sets) = self.sets.iter().cloned().collect::<Option<Vec<_>>>() else {
-            return Ok(false);
-        };
-        if self.session.is_some() && self.session_sets == sets {
-            return Ok(true);
-        }
-        let description = format_description(self.codec, &sets)?;
+    /// Makes sure a session decodes the stream's current format.
+    fn ensure_session(&mut self) -> CodecResult<()> {
+        let format = self
+            .stream
+            .format()
+            .ok_or_else(|| fail(Operation::Decode, "no format description"))?;
         if let Some(session) = &mut self.session {
-            // SAFETY: both objects are live.
-            if unsafe { session.session.can_accept_format_description(&description) } {
-                session.description = description;
-                self.session_sets = sets;
-                return Ok(true);
+            if session.generation == format.generation {
+                return Ok(());
             }
+            // SAFETY: both objects are live.
+            let accepts = unsafe {
+                session
+                    .session
+                    .can_accept_format_description(&format.description)
+            };
+            if session.depth == format.depth && accepts {
+                session.generation = format.generation;
+                return Ok(());
+            }
+        }
+        let (depth, generation) = (format.depth, format.generation);
+        let description = format.description.clone();
+        if self.session.is_some() {
             self.drain(Operation::Decode)?;
             self.session = None;
         }
-        self.session = Some(Session::open(description, self.acceleration)?);
-        self.session_sets = sets;
-        Ok(true)
+        self.session = Some(Session::open(
+            &description,
+            depth,
+            generation,
+            self.acceleration,
+        )?);
+        Ok(())
     }
 
     /// Hands out what the callback delivered.
@@ -494,29 +413,81 @@ impl VtDecoder {
         let outputs = std::mem::take(&mut *lock(&session.outbox));
         for output in outputs {
             match output {
-                Output::Picture(picture) => {
-                    let colour = picture
-                        .colour
-                        .or(self.container_colour)
-                        .unwrap_or(ColourDescription::unspecified(ColourRange::Limited))
-                        // The session converts to video-range NV12 whatever the
-                        // stream used.
-                        .with_range(ColourRange::Limited);
-                    let frame = nv12::deliver(
-                        Bytes::from(picture.data),
-                        picture.width,
-                        (picture.width, picture.height),
-                        picture.timestamp_us,
-                        self.format.0,
-                        colour,
-                    )
-                    .ok_or_else(|| fail(Operation::Decode, "converting a picture failed"))?;
-                    self.ready.push_back(CapturedFrame::Cpu(frame));
+                Output::Picture {
+                    buffer,
+                    timestamp_us,
+                } => {
+                    let frame = self.picture(buffer, timestamp_us)?;
+                    self.ready.push_back(frame);
                 }
-                Output::Failed(status) => return Err(decode_error(status, "decoding a frame")),
+                Output::Failed(error) => return Err(error),
             }
         }
         Ok(())
+    }
+
+    /// One decoded picture in the configured frame memory and format.
+    fn picture(&self, buffer: PixelBuffer, timestamp_us: u64) -> CodecResult<CapturedFrame> {
+        let range = buffer.format().range;
+        let colour = buffer
+            .colour()
+            .or(self.container_colour)
+            .unwrap_or(ColourDescription::unspecified(range))
+            // The session outputs video range whatever the stream used.
+            .with_range(range);
+        let hdr = buffer.hdr().or(self.container_hdr);
+        if self.memory == FrameMemory::Native {
+            return Ok(CapturedFrame::Native(NativeFrame {
+                width: buffer.width(),
+                height: buffer.height(),
+                timestamp_us,
+                colour: Some(colour),
+                hdr,
+                surface: Arc::new(buffer),
+            }));
+        }
+        let (width, height) = (buffer.width() as usize, buffer.height() as usize);
+        let pixels = buffer
+            .readback()
+            .map_err(|error| fail(Operation::Decode, error))?;
+        let stride = pixels.stride as usize;
+        let converted = match (buffer.format().format, self.format.0) {
+            // Planar requests get the picture's own layout.
+            (PixelFormat::P010, PixelFormat::P010 | PixelFormat::Nv12 | PixelFormat::I420) => {
+                Some(RawFrame {
+                    width: buffer.width(),
+                    height: buffer.height(),
+                    stride: pixels.stride,
+                    format: PixelFormat::P010,
+                    data: pixels.data,
+                    timestamp_us,
+                    colour: Some(colour),
+                    hdr,
+                })
+            }
+            (PixelFormat::P010, requested @ (PixelFormat::Bgra | PixelFormat::Rgba)) => {
+                nv12::deliver(
+                    Bytes::from(p010_to_nv12(&pixels.data)),
+                    stride / 2,
+                    (width, height),
+                    timestamp_us,
+                    requested,
+                    colour,
+                )
+            }
+            (_, requested) => nv12::deliver(
+                pixels.data,
+                stride,
+                (width, height),
+                timestamp_us,
+                requested,
+                colour,
+            ),
+        };
+        let mut frame =
+            converted.ok_or_else(|| fail(Operation::Decode, "converting a picture failed"))?;
+        frame.hdr = hdr;
+        Ok(CapturedFrame::Cpu(frame))
     }
 
     /// Waits for every frame the session still holds.
@@ -541,93 +512,91 @@ impl VtDecoder {
         }
         self.collect()
     }
+}
 
-    /// One sample buffer holding `nals` length-prefixed.
-    fn sample(&self, nals: &[&[u8]], timestamp_us: u64) -> CodecResult<CFRetained<CMSampleBuffer>> {
-        let session = self
-            .session
-            .as_ref()
-            .ok_or_else(|| fail(Operation::Decode, "no session"))?;
-        let mut avcc = Vec::with_capacity(nals.iter().map(|nal| nal.len() + 4).sum());
-        for nal in nals {
-            let len = u32::try_from(nal.len())
-                .map_err(|_| fail(Operation::Decode, "NAL unit too long"))?;
-            avcc.extend_from_slice(&len.to_be_bytes());
-            avcc.extend_from_slice(nal);
-        }
-        let mut block: *mut CMBlockBuffer = ptr::null_mut();
-        // SAFETY: a null memory block with the default allocator makes
-        // CoreMedia allocate `avcc.len()` bytes; the out pointer is valid.
-        let status = unsafe {
-            CMBlockBuffer::create_with_memory_block(
-                None,
-                ptr::null_mut(),
-                avcc.len(),
-                None,
-                ptr::null(),
-                0,
-                avcc.len(),
-                0,
-                NonNull::from(&mut block),
-            )
-        };
-        if status != 0 {
-            return Err(fail(
-                Operation::Decode,
-                format!("CMBlockBufferCreateWithMemoryBlock: {}", os_status(status)),
-            ));
-        }
-        let block =
-            NonNull::new(block).ok_or_else(|| fail(Operation::Decode, "no block buffer"))?;
-        // SAFETY: the create call handed over a +1 reference.
-        let block = unsafe { CFRetained::from_raw(block) };
-        let source = NonNull::new(avcc.as_mut_ptr().cast::<c_void>())
-            .ok_or_else(|| fail(Operation::Decode, "an empty access unit"))?;
-        // SAFETY: `block` was allocated with exactly `avcc.len()` bytes.
-        let status = unsafe { CMBlockBuffer::replace_data_bytes(source, &block, 0, avcc.len()) };
-        if status != 0 {
-            return Err(fail(
-                Operation::Decode,
-                format!("CMBlockBufferReplaceDataBytes: {}", os_status(status)),
-            ));
-        }
-        let pts = i64::try_from(timestamp_us)
-            .map_err(|_| fail(Operation::Decode, "timestamp exceeds i64"))?;
-        // SAFETY: reading an exported constant.
-        let invalid = unsafe { kCMTimeInvalid };
-        let timing = CMSampleTimingInfo {
-            duration: invalid,
-            presentationTimeStamp: cm_time(pts),
-            decodeTimeStamp: invalid,
-        };
-        let size = avcc.len();
-        let mut sample: *mut CMSampleBuffer = ptr::null_mut();
-        // SAFETY: the block and description are live; `timing` and `size`
-        // describe the one sample; the out pointer is valid.
-        let status = unsafe {
-            CMSampleBuffer::create_ready(
-                None,
-                Some(&block),
-                Some(&session.description),
-                1,
-                1,
-                &raw const timing,
-                1,
-                &raw const size,
-                NonNull::from(&mut sample),
-            )
-        };
-        if status != 0 {
-            return Err(fail(
-                Operation::Decode,
-                format!("CMSampleBufferCreateReady: {}", os_status(status)),
-            ));
-        }
-        let sample =
-            NonNull::new(sample).ok_or_else(|| fail(Operation::Decode, "no sample buffer"))?;
-        // SAFETY: the create call handed over a +1 reference.
-        Ok(unsafe { CFRetained::from_raw(sample) })
+/// One sample buffer holding `data` against `description`.
+fn sample_buffer(
+    data: &[u8],
+    description: &CMFormatDescription,
+    timestamp_us: u64,
+) -> CodecResult<CFRetained<CMSampleBuffer>> {
+    let mut block: *mut CMBlockBuffer = ptr::null_mut();
+    // SAFETY: a null memory block with the default allocator makes
+    // CoreMedia allocate `data.len()` bytes; the out pointer is valid.
+    let status = unsafe {
+        CMBlockBuffer::create_with_memory_block(
+            None,
+            ptr::null_mut(),
+            data.len(),
+            None,
+            ptr::null(),
+            0,
+            data.len(),
+            0,
+            NonNull::from(&mut block),
+        )
+    };
+    if status != 0 {
+        return Err(fail(
+            Operation::Decode,
+            format!("CMBlockBufferCreateWithMemoryBlock: {}", os_status(status)),
+        ));
     }
+    let block = NonNull::new(block).ok_or_else(|| fail(Operation::Decode, "no block buffer"))?;
+    // SAFETY: the create call handed over a +1 reference.
+    let block = unsafe { CFRetained::from_raw(block) };
+    let source = NonNull::new(data.as_ptr().cast_mut().cast::<c_void>())
+        .ok_or_else(|| fail(Operation::Decode, "an empty sample"))?;
+    // SAFETY: `block` was allocated with exactly `data.len()` bytes; the
+    // source is only read.
+    let status = unsafe { CMBlockBuffer::replace_data_bytes(source, &block, 0, data.len()) };
+    if status != 0 {
+        return Err(fail(
+            Operation::Decode,
+            format!("CMBlockBufferReplaceDataBytes: {}", os_status(status)),
+        ));
+    }
+    let pts = i64::try_from(timestamp_us)
+        .map_err(|_| fail(Operation::Decode, "timestamp exceeds i64"))?;
+    // SAFETY: reading an exported constant.
+    let invalid = unsafe { kCMTimeInvalid };
+    let timing = CMSampleTimingInfo {
+        duration: invalid,
+        presentationTimeStamp: cm_time(pts),
+        decodeTimeStamp: invalid,
+    };
+    let size = data.len();
+    let mut sample: *mut CMSampleBuffer = ptr::null_mut();
+    // SAFETY: the block and description are live; `timing` and `size`
+    // describe the one sample; the out pointer is valid.
+    let status = unsafe {
+        CMSampleBuffer::create_ready(
+            None,
+            Some(&block),
+            Some(description),
+            1,
+            1,
+            &raw const timing,
+            1,
+            &raw const size,
+            NonNull::from(&mut sample),
+        )
+    };
+    if status != 0 {
+        return Err(fail(
+            Operation::Decode,
+            format!("CMSampleBufferCreateReady: {}", os_status(status)),
+        ));
+    }
+    let sample = NonNull::new(sample).ok_or_else(|| fail(Operation::Decode, "no sample buffer"))?;
+    // SAFETY: the create call handed over a +1 reference.
+    Ok(unsafe { CFRetained::from_raw(sample) })
+}
+
+/// P010 (little-endian 16-bit samples, value in the high 10 bits) as NV12
+/// of the same layout at half the stride: the high byte of each sample.
+fn p010_to_nv12(p010: &[u8]) -> Vec<u8> {
+    p010.chunks_exact(2).map(|sample| sample[1]).collect()
 }
 
 impl VideoDecoder for VtDecoder {
@@ -635,43 +604,32 @@ impl VideoDecoder for VtDecoder {
 
     fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()> {
         codec_type(config.codec)?;
-        // The same codec keeps its parameter sets and session: a
-        // reconfigure mid-stream must not drop slices until the next
-        // in-band SPS / PPS.
-        let slots = if config.codec == Codec::H265 { 3 } else { 2 };
-        if config.codec != self.codec || self.sets.len() != slots {
+        // The same codec keeps its stream state and session: a reconfigure
+        // mid-stream must not drop pictures until the next in-band
+        // configuration.
+        if config.codec != self.stream.codec() {
             self.session = None;
-            self.session_sets.clear();
-            self.codec = config.codec;
-            self.sets = vec![None; slots];
+            self.stream = Stream::new(config.codec)?;
         }
         self.format = OutputFormat(config.pixel_format);
+        self.memory = config.memory;
         self.low_latency = config.low_latency;
         self.container_colour = config.colour;
+        self.container_hdr = config.hdr;
         Ok(())
     }
 
     fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
-        let mut slices = Vec::new();
-        for nal in split_annex_b(&frame.data) {
-            match classify(self.codec, nal) {
-                Nal::ParameterSet(slot) => {
-                    if let Some(entry) = self.sets.get_mut(slot) {
-                        *entry = Some(nal.to_vec());
-                    }
-                }
-                Nal::Skip => {}
-                Nal::Slice => slices.push(nal),
-            }
-        }
-        if slices.is_empty() {
+        let Some(data) = self.stream.sample(&frame.data, self.container_colour)? else {
             return Ok(self.ready.pop_front());
-        }
-        if !self.ensure_session()? {
-            debug!(codec = %self.codec, "VideoToolbox: slice before the parameter sets; skipped");
-            return Ok(self.ready.pop_front());
-        }
-        let sample = self.sample(&slices, frame.timestamp_us)?;
+        };
+        self.ensure_session()?;
+        let description = &self
+            .stream
+            .format()
+            .ok_or_else(|| fail(Operation::Decode, "no format description"))?
+            .description;
+        let sample = sample_buffer(&data, description, frame.timestamp_us)?;
         let flags = if self.low_latency {
             VTDecodeFrameFlags(0)
         } else {
@@ -713,26 +671,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nal_units_are_sorted_into_parameter_sets_and_slices() {
-        assert!(matches!(
-            classify(Codec::H264, &[0x67]),
-            Nal::ParameterSet(0)
-        ));
-        assert!(matches!(
-            classify(Codec::H264, &[0x68]),
-            Nal::ParameterSet(1)
-        ));
-        assert!(matches!(classify(Codec::H264, &[0x09]), Nal::Skip));
-        assert!(matches!(classify(Codec::H264, &[0x65]), Nal::Slice));
-        assert!(matches!(
-            classify(Codec::H265, &[0x40]),
-            Nal::ParameterSet(0)
-        ));
-        assert!(matches!(
-            classify(Codec::H265, &[0x44]),
-            Nal::ParameterSet(2)
-        ));
-        assert!(matches!(classify(Codec::H265, &[0x46]), Nal::Skip));
-        assert!(matches!(classify(Codec::H265, &[0x26]), Nal::Slice));
+    fn p010_keeps_the_high_byte_of_each_sample() {
+        assert_eq!(p010_to_nv12(&[0x40, 0xEB, 0xC0, 0x10]), [0xEB, 0x10]);
     }
 }
