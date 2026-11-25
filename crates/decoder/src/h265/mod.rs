@@ -57,7 +57,8 @@ fn registry() -> VideoDecoderRegistry {
                 Ok(Box::new(decoder) as Box<dyn ferricast_codec::VideoDecoderSession>)
             },
         )
-        .opt_in(),
+        .opt_in()
+        .on_gpu(ferricast_core::GpuAffinity::Any),
     );
     #[cfg(not(feature = "vaapi-hevc-decode"))]
     let registry = registry.missing(BackendId::Vaapi, "ferricast-decoder/vaapi-hevc-decode");

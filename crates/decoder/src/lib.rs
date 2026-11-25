@@ -55,6 +55,8 @@ mod pcm;
 mod platform;
 #[cfg(any(feature = "openh264-decode", feature = "hevc-decode"))]
 mod signalling;
+#[cfg(any(feature = "vaapi-decode", feature = "vaapi-hevc-decode"))]
+mod vaapi;
 #[cfg(feature = "vp8-decode")]
 mod vp8;
 #[cfg(feature = "vp9-decode")]

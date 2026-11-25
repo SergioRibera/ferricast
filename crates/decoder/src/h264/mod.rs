@@ -59,16 +59,19 @@ fn registry() -> VideoDecoderRegistry {
     let registry = VideoDecoderRegistry::new(CodecTarget::decode(Codec::H264));
     let registry = crate::facades::nvdec(registry, Codec::H264);
     #[cfg(feature = "vaapi-decode")]
-    let registry = registry.candidate(Candidate::new(
-        BackendId::Vaapi,
-        Acceleration::Hardware,
-        |config: &DecoderConfig| {
-            let mut decoder = VaapiH264Decoder::probe_with(config)
-                .map_err(CodecError::from_backend(BackendId::Vaapi, Operation::Open))?;
-            ferricast_core::VideoDecoder::configure(&mut decoder, config)?;
-            Ok(Box::new(decoder))
-        },
-    ));
+    let registry = registry.candidate(
+        Candidate::new(
+            BackendId::Vaapi,
+            Acceleration::Hardware,
+            |config: &DecoderConfig| {
+                let mut decoder = VaapiH264Decoder::probe_with(config)
+                    .map_err(CodecError::from_backend(BackendId::Vaapi, Operation::Open))?;
+                ferricast_core::VideoDecoder::configure(&mut decoder, config)?;
+                Ok(Box::new(decoder) as Box<dyn ferricast_codec::VideoDecoderSession>)
+            },
+        )
+        .on_gpu(ferricast_core::GpuAffinity::Any),
+    );
     #[cfg(not(feature = "vaapi-decode"))]
     let registry = registry.missing(BackendId::Vaapi, "ferricast-decoder/vaapi-decode");
     let registry = crate::platform::video(registry);

@@ -120,12 +120,13 @@ impl VaapiH264Decoder {
                 config.codec
             )));
         }
+        let node = crate::vaapi::render_node(config)?;
         let (probe_tx, probe_rx) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Cmd>(2);
         let (reply_tx, reply_rx) = mpsc::sync_channel::<Reply>(2);
         thread::Builder::new()
             .name("ferricast-vaapi-h264".into())
-            .spawn(move || run_worker(probe_tx, cmd_rx, reply_tx))
+            .spawn(move || run_worker(probe_tx, cmd_rx, reply_tx, node.as_deref()))
             .map_err(|e| {
                 FerricastError::Decode(format!("VA-API: failed to spawn worker thread: {e}"))
             })?;
@@ -241,11 +242,13 @@ fn run_worker(
     probe_tx: SyncSender<std::result::Result<(), String>>,
     cmd_rx: Receiver<Cmd>,
     reply_tx: SyncSender<Reply>,
+    node: Option<&str>,
 ) {
-    let Some(display) = Display::open() else {
-        let _ = probe_tx.send(Err(
-            "VA-API: no display (no /dev/dri/renderD* available)".into()
-        ));
+    let Some(display) = crate::vaapi::open_display(node) else {
+        let _ = probe_tx.send(Err(match node {
+            Some(node) => format!("VA-API: cannot open {node}"),
+            None => "VA-API: no display (no /dev/dri/renderD* available)".into(),
+        }));
         return;
     };
     let profiles = [

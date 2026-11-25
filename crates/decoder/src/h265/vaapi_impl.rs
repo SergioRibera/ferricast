@@ -29,7 +29,6 @@
 //! handoff — are real so the wiring can be extended in place rather
 //! than rebuilt.
 
-use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
@@ -43,13 +42,7 @@ use ferricast_core::{
     CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, H265Profile, Result,
     VideoDecoder,
 };
-use tracing::{debug, info, warn};
-
-const RENDER_NODES: &[&str] = &[
-    "/dev/dri/renderD128",
-    "/dev/dri/renderD129",
-    "/dev/dri/renderD130",
-];
+use tracing::{debug, info};
 
 const VA_FOURCC_NV12: u32 = 0x3231_564E;
 const VA_RT_FORMAT_YUV420: u32 = 0x01;
@@ -235,7 +228,8 @@ fn worker_main(
     reply_tx: mpsc::Sender<Reply>,
     initial_config: DecoderConfig,
 ) -> Result<()> {
-    let display = open_render_node()
+    let node = crate::vaapi::render_node(&initial_config)?;
+    let display = crate::vaapi::open_display(node.as_deref())
         .ok_or_else(|| FerricastError::Decode("VA-API HEVC: no usable DRM render node".into()))?;
     let vendor = display.query_vendor_string().unwrap_or_default();
     debug!(%vendor, "VA-API display opened for HEVC decode");
@@ -348,23 +342,6 @@ fn configure_session(state: &mut WorkerState, cfg: &DecoderConfig) -> Result<()>
     state.surfaces = surfaces;
     debug!(width, height, "VA-API HEVC decode session ready");
     Ok(())
-}
-
-fn open_render_node() -> Option<Rc<Display>> {
-    for node in RENDER_NODES {
-        let path = Path::new(node);
-        if !path.exists() {
-            continue;
-        }
-        match Display::open_drm_display(path) {
-            Ok(d) => {
-                debug!(node = node, "opened VA-API DRM display");
-                return Some(d);
-            }
-            Err(e) => warn!(node = node, error = %e, "render node open failed"),
-        }
-    }
-    Display::open()
 }
 
 fn profile_has_vld(display: &Display, profile: VAProfile::Type) -> bool {
