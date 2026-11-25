@@ -135,6 +135,20 @@ pub trait VideoEncoder: Send {
     /// internal interval.
     fn request_keyframe(&mut self) {}
 
+    /// Rebuilds the encoding session for `config` even when `config` is the
+    /// one in effect: what a pipeline calls after encode failures, so a
+    /// session in a bad state (a lost GPU, a stuck hardware encoder) is
+    /// replaced rather than kept. The next picture is a keyframe.
+    ///
+    /// Default: [`VideoEncoder::configure`], for backends whose configure
+    /// always starts over.
+    ///
+    /// # Errors
+    /// As [`VideoEncoder::configure`].
+    fn reset(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+        self.configure(config)
+    }
+
     /// Live-update the encoder's target average bitrate in kbps,
     /// without tearing down the encoding session.
     ///

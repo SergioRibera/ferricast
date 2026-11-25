@@ -166,6 +166,14 @@ pub enum CodecError {
         operation: Operation,
         reason: String,
     },
+
+    /// The backend runs here but cannot take a session right now (a GPU at
+    /// its session limit, a driver that failed to start this time, a GPU
+    /// lost and not back yet). Selection moves on, and a later selection
+    /// tries the backend again. (Last, so the wire encoding of the other
+    /// variants is unchanged.)
+    #[error("the {backend} backend cannot take a session right now: {reason}")]
+    BackendBusy { backend: BackendId, reason: String },
 }
 
 impl CodecError {
@@ -199,6 +207,7 @@ impl CodecError {
             Self::BackendNotCompiled { backend, .. }
             | Self::BackendCannotHandle { backend, .. }
             | Self::BackendUnavailable { backend, .. }
+            | Self::BackendBusy { backend, .. }
             | Self::UnsupportedConfig { backend, .. }
             | Self::UnsupportedStream { backend, .. }
             | Self::UnsupportedInput { backend, .. }
