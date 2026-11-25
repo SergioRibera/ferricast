@@ -19,7 +19,7 @@ use std::sync::Arc;
 use super::caps::DecoderCaps;
 use super::crop::CropScanner;
 use super::format::{DecodeStatus, Fields, FrameInfo, Layout, PixelFormat, Rect, SequenceInfo};
-use super::frame::{DeviceFrame, DeviceSlot, HostFrame, HostSlot};
+use super::frame::{DeviceFrame, DeviceSlot, HostFrame, HostMemory, HostSlot, PinnedBuffer};
 use super::pool::Pool;
 use super::sei::SeiStore;
 use super::{Codec, CuvidCheck as _, DecoderConfig, ulong};
@@ -81,6 +81,10 @@ pub(super) struct State {
     pub(super) crop: CropScanner,
     /// SEI of each decode surface, from the SEI callback until display.
     sei: Vec<SeiStore>,
+    /// Which decode surfaces hold a picture NVDEC actually decoded.
+    references: References,
+    /// A VP8 key frame has been passed to the parser (see [`super::vp8`]).
+    pub(super) vp8_keyed: bool,
     pub(super) output: Output,
     /// The first error a callback hit during the current parse.
     pub(super) error: Option<Error>,
@@ -115,6 +119,8 @@ impl State {
             crop: CropScanner::default(),
             sequence: None,
             sei: Vec::new(),
+            references: References::default(),
+            vp8_keyed: false,
             output,
             error: None,
         })
@@ -151,13 +157,23 @@ impl State {
             decoder.fits(&sequence, needed)
                 && (self.cuvid.reconfigure_decoder.is_some() || decoder.same_size(&sequence))
         });
-        let surfaces = match self.decoder.as_mut() {
-            Some(decoder) if reusable => {
-                if !decoder.same_size(&sequence) {
-                    decoder.reconfigure(&sequence)?;
+        let kept = match self.decoder.as_mut() {
+            Some(decoder) if reusable && !decoder.same_size(&sequence) => {
+                match decoder.reconfigure(&sequence) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        // The decoder may be left half-configured, and
+                        // retrying fails the same way: replace it.
+                        tracing::debug!(%error, "recreating the NVDEC decoder");
+                        false
+                    }
                 }
-                decoder.surfaces
             }
+            Some(_) => reusable,
+            None => false,
+        };
+        let surfaces = match self.decoder.as_ref() {
+            Some(decoder) if kept => decoder.surfaces,
             _ => {
                 // Free the old decoder's surfaces before allocating new ones.
                 self.decoder = None;
@@ -171,6 +187,8 @@ impl State {
                 )?;
                 let surfaces = decoder.surfaces;
                 self.decoder = Some(decoder);
+                // No surface of the new decoder holds a picture yet.
+                self.references.reset();
                 surfaces
             }
         };
@@ -178,6 +196,7 @@ impl State {
         if self.sei.len() < slots {
             self.sei.resize_with(slots, SeiStore::default);
         }
+        self.references.grow(slots);
         tracing::debug!(?sequence, surfaces, "NVDEC sequence");
         self.sequence = Some(sequence);
         c_int::try_from(surfaces).map_err(|_| Error::SizeOverflow {
@@ -190,13 +209,32 @@ impl State {
         // SAFETY: the parser passes a valid picture for the callback's
         // duration.
         let index = unsafe { (*params).CurrPicIdx };
-        decoder.check_index(index)?;
+        let current = decoder.check_index(index)?;
+        // The surface later pictures reference: for AV1 with film grain,
+        // `decodePicIdx` holds the picture without the grain.
+        let mut reference = current;
+        if self.config.codec == Codec::Av1 {
+            // SAFETY: the parser fills the AV1 member for AV1 streams; every
+            // field is plain data, valid for the callback's duration.
+            let av1 = unsafe { &(*params).CodecSpecific.av1 };
+            reference = decoder.check_index(av1.decodePicIdx).unwrap_or(current);
+            if let Err(error) = self.references.check_av1(av1) {
+                self.references.refuse(current, reference);
+                return Err(error);
+            }
+        }
         let _current = self.context.guard()?;
         // SAFETY: a live decoder, its context current, and the parser's
-        // picture parameters for a surface index inside the decoder's range.
-        unsafe { (self.cuvid.decode_picture)(decoder.raw.as_ptr(), params) }
-            .check_cuvid("cuvidDecodePicture")?;
-        Ok(1)
+        // picture parameters for a surface index inside the decoder's range
+        // (and, for AV1, references NVDEC decoded).
+        let status = unsafe { (self.cuvid.decode_picture)(decoder.raw.as_ptr(), params) }
+            .check_cuvid("cuvidDecodePicture");
+        if status.is_ok() {
+            self.references.decoded(current, reference);
+        } else {
+            self.references.refuse(current, reference);
+        }
+        status.map(|()| 1)
     }
 
     fn on_display(&mut self, info: &sys::CUVIDPARSERDISPINFO) -> Result<c_int> {
@@ -205,6 +243,7 @@ impl State {
             decoder,
             sequence,
             sei,
+            references,
             output,
             stream,
             context,
@@ -214,6 +253,11 @@ impl State {
             return Err(no_sequence());
         };
         let index = decoder.check_index(info.picture_index)?;
+        if references.is_refused(index) {
+            // Never decoded (its references were missing): nothing to show.
+            tracing::debug!(index, "dropping a picture NVDEC did not decode");
+            return Ok(1);
+        }
         let _current = context.guard()?;
         let mut params = sys::CUVIDPROCPARAMS {
             progressive_frame: info.progressive_frame,
@@ -224,23 +268,7 @@ impl State {
         };
         let mapped = decoder.map(info.picture_index, &mut params)?;
         let area = sequence.display_area;
-        let frame = FrameInfo {
-            timestamp: info.timestamp,
-            width: area.width(),
-            height: area.height(),
-            format: sequence.format,
-            bit_depth: sequence.bit_depth,
-            colour: sequence.colour,
-            display_area: area,
-            coded_width: sequence.coded_width,
-            coded_height: sequence.coded_height,
-            fields: Fields {
-                progressive: info.progressive_frame != 0,
-                top_field_first: info.top_field_first != 0,
-                repeat_first_field: info.repeat_first_field,
-            },
-            status: decoder.status(info.picture_index),
-        };
+        let frame = frame_info(info, sequence, decoder.status(info.picture_index));
         let source = Source {
             ptr: mapped.ptr,
             pitch: mapped.pitch,
@@ -249,18 +277,37 @@ impl State {
             format: sequence.format,
         };
         let picture_sei = sei.get_mut(index);
+        let settle = |error| settle(stream, error);
         match output {
             Output::Host { pool, queue } => {
                 let layout = Layout::packed(frame.format, frame.width, frame.height);
+                let bytes = layout.total_bytes();
                 let mut slot = pool.take(|| Ok(HostSlot::default()))?;
-                slot.data.resize(layout.total_bytes(), 0);
-                let destination = Destination::Host(&mut slot.data);
-                source.copy(cuda, stream, &layout, destination)?;
-                // Pageable host memory: the copy has finished when the call
-                // returns, but only a sync orders it with this function's
-                // return on every driver.
-                stream.synchronize()?;
-                mapped.unmap()?;
+                slot.prepare(context, bytes)?;
+                let pinned = slot.data.is_pinned();
+                let destination = Destination::Host(
+                    slot.data
+                        .as_mut_slice()
+                        .get_mut(..bytes)
+                        .unwrap_or_default(),
+                );
+                source
+                    .copy(cuda, stream, &layout, destination)
+                    .and_then(|()| match (&slot.ready, pinned) {
+                        // Page-locked: the copy runs on while parsing goes
+                        // on; `next_frame` waits for this event.
+                        (Some(ready), true) => ready.record(stream),
+                        // Pageable memory: the copy has finished when the
+                        // call returns, but only a sync orders it with this
+                        // function's return on every driver.
+                        _ => stream.synchronize(),
+                    })
+                    .map_err(settle)?;
+                slot.copy_pending = pinned;
+                if let Err(error) = mapped.unmap() {
+                    slot.copy_pending = false;
+                    return Err(settle(error));
+                }
                 take_sei(&mut slot.sei, picture_sei);
                 queue.push_back(HostFrame {
                     info: frame,
@@ -279,12 +326,14 @@ impl State {
                     slot.release_pending = false;
                 }
                 let destination = Destination::Device(slot.buffer.device_ptr());
-                source.copy(cuda, stream, &layout, destination)?;
-                slot.ready.record(stream)?;
+                source
+                    .copy(cuda, stream, &layout, destination)
+                    .and_then(|()| slot.ready.record(stream))
+                    .map_err(settle)?;
                 // The copy is queued on `stream`, where any later map of this
                 // output surface also runs, so the surface is released
                 // without waiting for the copy.
-                mapped.unmap()?;
+                mapped.unmap().map_err(settle)?;
                 take_sei(&mut slot.sei, picture_sei);
                 queue.push_back(DeviceFrame {
                     info: frame,
@@ -343,6 +392,170 @@ impl State {
         } else {
             0
         }
+    }
+}
+
+/// `frame_type` values of an AV1 frame header.
+const AV1_KEY_FRAME: u32 = 0;
+const AV1_INTER_FRAME: u32 = 1;
+const AV1_SWITCH_FRAME: u32 = 3;
+/// `ref_frame[i].index` of a reference slot the parser has no picture for.
+const AV1_NO_PICTURE: u8 = 0xff;
+
+/// Which decode surfaces hold a picture NVDEC decoded, for the AV1
+/// reference check.
+///
+/// NVIDIA's AV1 parser hands inter frames to `cuvidDecodePicture` whose
+/// references were never decoded (after packet loss: the key frame or a
+/// reference frame missing), and NVDEC faults on those (SIGSEGV, driver
+/// 595) instead of failing. Refusing only references the parser marks as
+/// absent (`0xff`) is not enough: it also points them at surfaces no
+/// picture was decoded into since the last key frame. So the decoder
+/// remembers which surfaces NVDEC decoded since the last shown key frame
+/// and refuses inter frames that reference any other.
+#[derive(Debug, Default)]
+struct References {
+    decoded: Vec<bool>,
+    /// The picture last parsed into this surface was not decoded: it is
+    /// not displayed.
+    refused: Vec<bool>,
+}
+
+impl References {
+    /// Forgets every surface (a new decoder).
+    fn reset(&mut self) {
+        self.decoded.fill(false);
+        self.refused.fill(false);
+    }
+
+    fn grow(&mut self, surfaces: usize) {
+        if self.decoded.len() < surfaces {
+            self.decoded.resize(surfaces, false);
+            self.refused.resize(surfaces, false);
+        }
+    }
+
+    /// Whether `params` can be decoded: a key frame, an intra-only frame,
+    /// or an inter frame whose seven references NVDEC decoded.
+    fn check_av1(&mut self, params: &sys::CUVIDAV1PICPARAMS) -> Result<()> {
+        let frame_type = params.frame_type();
+        if frame_type == AV1_KEY_FRAME && params.show_frame() != 0 {
+            // A shown key frame refreshes every reference slot.
+            self.decoded.fill(false);
+        }
+        if !matches!(frame_type, AV1_INTER_FRAME | AV1_SWITCH_FRAME) {
+            return Ok(());
+        }
+        let missing = params.ref_frame.iter().position(|reference| {
+            reference.index == AV1_NO_PICTURE
+                || !self
+                    .decoded
+                    .get(usize::from(reference.index))
+                    .copied()
+                    .unwrap_or(false)
+        });
+        match missing {
+            None => Ok(()),
+            Some(slot) => Err(Error::MissingReference {
+                reason: format!(
+                    "AV1 inter frame: reference {slot} (surface {}) was never decoded",
+                    params.ref_frame[slot].index
+                ),
+            }),
+        }
+    }
+
+    /// NVDEC decoded a picture into `current` (and its unfiltered version,
+    /// the one later pictures reference, into `reference`).
+    fn decoded(&mut self, current: usize, reference: usize) {
+        self.mark(current, reference, true);
+    }
+
+    /// The picture parsed into `current` was not decoded: whatever the
+    /// surfaces held before is no reference for later pictures, and the
+    /// picture is not displayed.
+    fn refuse(&mut self, current: usize, reference: usize) {
+        self.mark(current, reference, false);
+    }
+
+    fn mark(&mut self, current: usize, reference: usize, decoded: bool) {
+        for index in [current, reference] {
+            if let (Some(slot), Some(refused)) =
+                (self.decoded.get_mut(index), self.refused.get_mut(index))
+            {
+                (*slot, *refused) = (decoded, !decoded);
+            }
+        }
+    }
+
+    fn is_refused(&self, index: usize) -> bool {
+        self.refused.get(index).copied().unwrap_or(false)
+    }
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        // Host frames still queued may have their copy running into
+        // page-locked memory that is about to be freed.
+        if let Err(error) = self.stream.synchronize() {
+            tracing::debug!(%error, "synchronising the NVDEC stream on drop");
+        }
+    }
+}
+
+impl HostSlot {
+    /// Makes the slot hold at least `bytes`: page-locked memory when the
+    /// driver gives it, else pageable.
+    fn prepare(&mut self, context: &Arc<Context>, bytes: usize) -> Result<()> {
+        let fits = match &self.data {
+            HostMemory::Pinned(buffer) => buffer.len() >= bytes,
+            HostMemory::Pageable(data) => data.len() >= bytes,
+            HostMemory::Empty => false,
+        };
+        if !fits {
+            self.data = PinnedBuffer::new(context, bytes)
+                .map_or_else(|| HostMemory::Pageable(vec![0; bytes]), HostMemory::Pinned);
+        }
+        if self.data.is_pinned() && self.ready.is_none() {
+            self.ready = Some(Event::new(context)?);
+        }
+        Ok(())
+    }
+}
+
+/// Once a copy is queued, an error must not hand its destination back (to
+/// the pool, or to be freed) while the copy may still run: waits for
+/// `stream`, then returns `error`.
+fn settle(stream: &Stream, error: Error) -> Error {
+    if let Err(sync) = stream.synchronize() {
+        tracing::debug!(%sync, "synchronising after a failed NVDEC copy");
+    }
+    error
+}
+
+/// What a displayed picture is, from the parser.s report and the sequence.
+fn frame_info(
+    info: &sys::CUVIDPARSERDISPINFO,
+    sequence: &SequenceInfo,
+    status: DecodeStatus,
+) -> FrameInfo {
+    let area = sequence.display_area;
+    FrameInfo {
+        timestamp: info.timestamp,
+        width: area.width(),
+        height: area.height(),
+        format: sequence.format,
+        bit_depth: sequence.bit_depth,
+        colour: sequence.colour,
+        display_area: area,
+        coded_width: sequence.coded_width,
+        coded_height: sequence.coded_height,
+        fields: Fields {
+            progressive: info.progressive_frame != 0,
+            top_field_first: info.top_field_first != 0,
+            repeat_first_field: info.repeat_first_field,
+        },
+        status,
     }
 }
 
@@ -426,7 +639,7 @@ struct Source {
 }
 
 enum Destination<'a> {
-    Host(&'a mut Vec<u8>),
+    Host(&'a mut [u8]),
     Device(cu::CUdeviceptr),
 }
 

@@ -2,19 +2,157 @@
 //! buffer to the decoder's pool on drop.
 
 use std::fmt;
+use std::ptr::{self, NonNull};
 use std::sync::Arc;
 
 use super::format::{FrameInfo, Layout};
 use super::pool::Pooled;
 use super::sei::{SeiMessages, SeiStore};
-use crate::cuda::{DeviceBuffer, Event, HostImageMut, Point, Region, Stream};
-use crate::error::Result;
+use crate::cuda::{Context, DeviceBuffer, Event, HostImageMut, Point, Region, Stream};
+use crate::error::{CheckStatus as _, Result};
+use crate::loader::{CudaLibrary, Required};
+use crate::sys;
 
-/// A host buffer and the SEI of the picture in it.
+/// A host buffer, the event its copy completes, and the SEI of the
+/// picture in it.
 #[derive(Debug, Default)]
 pub(super) struct HostSlot {
-    pub(super) data: Vec<u8>,
+    pub(super) data: HostMemory,
+    /// Recorded on the decoder's stream after an asynchronous copy into
+    /// page-locked `data`; `None` when the copy was synchronous.
+    pub(super) ready: Option<Event>,
+    /// The copy into `data` may still be running: wait for `ready`.
+    pub(super) copy_pending: bool,
     pub(super) sei: SeiStore,
+}
+
+impl HostSlot {
+    /// Waits for the copy into the slot, if one is pending.
+    pub(super) fn wait(&mut self) -> Result<()> {
+        if self.copy_pending {
+            if let Some(ready) = &self.ready {
+                ready.synchronize()?;
+            }
+            self.copy_pending = false;
+        }
+        Ok(())
+    }
+}
+
+/// Where a host frame's planes live.
+#[derive(Debug, Default)]
+pub(super) enum HostMemory {
+    /// Nothing yet.
+    #[default]
+    Empty,
+    /// Page-locked (`cuMemHostAlloc`): copies into it run asynchronously.
+    Pinned(PinnedBuffer),
+    /// Ordinary memory, when page-locked memory is not available.
+    Pageable(Vec<u8>),
+}
+
+impl HostMemory {
+    pub(super) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Empty => &[],
+            Self::Pinned(buffer) => buffer.as_slice(),
+            Self::Pageable(data) => data,
+        }
+    }
+
+    pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Empty => &mut [],
+            Self::Pinned(buffer) => buffer.as_mut_slice(),
+            Self::Pageable(data) => data,
+        }
+    }
+
+    pub(super) fn is_pinned(&self) -> bool {
+        matches!(self, Self::Pinned(_))
+    }
+}
+
+/// Page-locked host memory (`cuMemHostAlloc`), freed on drop. Zeroed when
+/// allocated, so it is always initialised.
+pub(super) struct PinnedBuffer {
+    ptr: NonNull<u8>,
+    len: usize,
+    free: Required<sys::cuda::tcuMemFreeHost>,
+    context: Arc<Context>,
+}
+
+// SAFETY: plain host memory owned by this value; the driver keeps no
+// thread affinity for it.
+unsafe impl Send for PinnedBuffer {}
+// SAFETY: shared access only reads it.
+unsafe impl Sync for PinnedBuffer {}
+
+impl PinnedBuffer {
+    /// `len` zeroed bytes, or `None` when the driver has no
+    /// `cuMemHostAlloc` or refuses (page-locked memory is limited).
+    pub(super) fn new(context: &Arc<Context>, len: usize) -> Option<Self> {
+        let cuda = CudaLibrary::get().ok()?;
+        let (alloc, free) = (cuda.mem_host_alloc?, cuda.mem_free_host?);
+        let _current = context.guard().ok()?;
+        let mut raw = ptr::null_mut();
+        // SAFETY: a valid out-pointer, the context current, no flags.
+        let status = unsafe { alloc(&raw mut raw, len.max(1), 0) };
+        if status != sys::cuda::CUresult::CUDA_SUCCESS {
+            tracing::debug!(
+                ?status,
+                len,
+                "cuMemHostAlloc failed: copying through pageable memory"
+            );
+            return None;
+        }
+        let ptr = NonNull::new(raw.cast::<u8>())?;
+        // SAFETY: `len` bytes just allocated, exclusively ours.
+        unsafe { ptr.as_ptr().write_bytes(0, len) };
+        Some(Self {
+            ptr,
+            len,
+            free,
+            context: Arc::clone(context),
+        })
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `len` initialised bytes owned by this buffer.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: as in `as_slice`, exclusively borrowed.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for PinnedBuffer {
+    fn drop(&mut self) {
+        let freed = self.context.guard().and_then(|_current| {
+            // SAFETY: allocated by `cuMemHostAlloc` in `new`, not used again;
+            // its context current. No copy into it is pending: a slot with
+            // one is waited for before it is handed out, and the decoder's
+            // stream is synchronised before it goes away.
+            unsafe { (self.free)(self.ptr.as_ptr().cast()) }.check("cuMemFreeHost")
+        });
+        if let Err(error) = freed {
+            tracing::warn!(%error, "freeing page-locked host memory");
+        }
+    }
+}
+
+impl fmt::Debug for PinnedBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PinnedBuffer")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A device buffer, the events ordering its uses, and the SEI of the
@@ -68,6 +206,7 @@ impl HostFrame {
     pub fn data(&self) -> &[u8] {
         self.slot
             .data
+            .as_slice()
             .get(..self.layout.total_bytes())
             .unwrap_or_default()
     }
@@ -78,6 +217,7 @@ impl HostFrame {
         let plane = self.layout.planes().get(index)?;
         self.slot
             .data
+            .as_slice()
             .get(plane.offset..plane.offset.checked_add(plane.len())?)
     }
 

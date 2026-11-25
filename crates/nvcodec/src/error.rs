@@ -283,6 +283,15 @@ pub enum Error {
         /// What does not match.
         reason: String,
     },
+    /// A picture refers to a reference picture the decoder does not have
+    /// (lost with an earlier packet, or sent before the first key frame),
+    /// so it was not passed to NVDEC, which faults on those instead of
+    /// failing. Decoding resumes at the next key frame.
+    #[error("missing reference: {reason}")]
+    MissingReference {
+        /// Which picture and which reference.
+        reason: String,
+    },
 }
 
 /// A DRM fourcc as its four characters, for messages.

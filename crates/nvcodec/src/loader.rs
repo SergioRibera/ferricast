@@ -256,6 +256,10 @@ driver_library! {
             graphics_resource_get_mapped_egl_frame: sys::cuda::tcuGraphicsResourceGetMappedEglFrame = ["cuGraphicsResourceGetMappedEglFrame"],
             /// Windows only.
             graphics_d3d11_register_resource: sys::cuda::tcuGraphicsD3D11RegisterResource = ["cuGraphicsD3D11RegisterResource"],
+            /// Page-locked host memory for NVDEC host-mode copies; decoding falls
+            /// back to pageable memory without it.
+            mem_host_alloc: sys::cuda::tcuMemHostAlloc = ["cuMemHostAlloc"],
+            mem_free_host: sys::cuda::tcuMemFreeHost = ["cuMemFreeHost"],
         }
     }
 }

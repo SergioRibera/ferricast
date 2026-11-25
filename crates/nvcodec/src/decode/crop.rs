@@ -12,6 +12,7 @@
 
 use super::Codec;
 use super::format::Rect;
+use super::nal::{Bits, unescape};
 
 /// The cropping window of the newest SPS, in luma samples from each edge of
 /// the coded picture.
@@ -49,56 +50,49 @@ impl Crop {
     }
 }
 
-/// Finds SPS NAL units in Annex B packets and keeps the newest crop.
+/// Reads the SPS NAL units in front of a packet's first slice (handed over
+/// by [`super::nal::screen`]) and keeps the newest crop.
 #[derive(Debug, Default)]
 pub(super) struct CropScanner {
-    /// The SPS payload without emulation prevention bytes, reused.
+    /// A NAL unit's payload without emulation prevention bytes, reused.
     rbsp: Vec<u8>,
     pub(super) latest: Option<Crop>,
 }
 
 impl CropScanner {
-    /// Reads every SPS in front of the first slice of `data`.
-    pub(super) fn scan(&mut self, codec: Codec, data: &[u8]) {
-        let mut rest = data;
-        while let Some(start) = find_start_code(rest) {
-            rest = rest.get(start + 3..).unwrap_or_default();
-            let Some(&header) = rest.first() else {
+    /// Reads `unit` (a NAL unit from its header on) when it is an SPS:
+    /// any SPS for H.264, a base-layer one for HEVC.
+    pub(super) fn read(&mut self, codec: Codec, unit: &[u8]) {
+        let Some(&header) = unit.first() else {
+            return;
+        };
+        let payload = if codec == Codec::H264 {
+            if header & 0x1f != 7 {
                 return;
-            };
-            let end = find_start_code(rest).unwrap_or(rest.len());
-            let nal = rest.get(..end).unwrap_or_default();
-            if codec == Codec::H264 {
-                match header & 0x1f {
-                    1..=5 => return,
-                    7 => self.parse(codec, nal.get(1..).unwrap_or_default()),
-                    _ => {}
-                }
-            } else {
-                let kind = (header >> 1) & 0x3f;
-                let layer = nal.get(1).map_or(0, |second| {
-                    (u16::from(header & 1) << 5) | u16::from(second >> 3)
-                });
-                match kind {
-                    0..=31 => return,
-                    33 if layer == 0 => self.parse(codec, nal.get(2..).unwrap_or_default()),
-                    _ => {}
-                }
             }
-            rest = rest.get(end..).unwrap_or_default();
-        }
+            unit.get(1..)
+        } else {
+            let layer = unit.get(1).map_or(0, |second| {
+                (u16::from(header & 1) << 5) | u16::from(second >> 3)
+            });
+            if (header >> 1) & 0x3f != 33 || layer != 0 {
+                return;
+            }
+            unit.get(2..)
+        };
+        self.parse(codec, payload.unwrap_or_default());
+    }
+
+    /// The scratch buffer, for other RBSP readers of the same walk.
+    pub(super) fn rbsp_buffer(&mut self) -> &mut Vec<u8> {
+        &mut self.rbsp
     }
 
     fn parse(&mut self, codec: Codec, payload: &[u8]) {
-        self.rbsp.clear();
-        let mut zeros = 0;
-        for &byte in payload {
-            if zeros >= 2 && byte == 3 {
-                zeros = 0;
-                continue;
-            }
-            zeros = if byte == 0 { zeros + 1 } else { 0 };
-            self.rbsp.push(byte);
+        // A payload with forbidden bytes is no SPS the parser accepts: its
+        // crop would not apply anyway.
+        if !unescape(payload, &mut self.rbsp) {
+            return;
         }
         let mut bits = Bits::new(&self.rbsp);
         let crop = match codec {
@@ -108,61 +102,6 @@ impl CropScanner {
         if let Some(crop) = crop {
             self.latest = Some(crop);
         }
-    }
-}
-
-/// Offset of the next `00 00 01`.
-fn find_start_code(data: &[u8]) -> Option<usize> {
-    data.windows(3).position(|window| window == [0, 0, 1])
-}
-
-/// An MSB-first bit reader with Exp-Golomb codes.
-struct Bits<'a> {
-    data: &'a [u8],
-    position: usize,
-}
-
-impl<'a> Bits<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, position: 0 }
-    }
-
-    fn bit(&mut self) -> Option<u32> {
-        let byte = self.data.get(self.position / 8)?;
-        let bit = (byte >> (7 - self.position % 8)) & 1;
-        self.position += 1;
-        Some(u32::from(bit))
-    }
-
-    fn bits(&mut self, count: u32) -> Option<u32> {
-        (0..count).try_fold(0, |value, _| Some((value << 1) | self.bit()?))
-    }
-
-    fn skip(&mut self, count: usize) -> Option<()> {
-        self.position += count;
-        (self.position <= self.data.len() * 8).then_some(())
-    }
-
-    fn flag(&mut self) -> Option<bool> {
-        self.bit().map(|bit| bit == 1)
-    }
-
-    /// `ue(v)`, at most 32 bits of value.
-    fn ue(&mut self) -> Option<u32> {
-        let mut zeros = 0;
-        while self.bit()? == 0 {
-            zeros += 1;
-            if zeros > 31 {
-                return None;
-            }
-        }
-        let suffix = self.bits(zeros)?;
-        ((1_u64 << zeros) - 1 + u64::from(suffix)).try_into().ok()
-    }
-
-    /// `se(v)`; only skipped, so the value is not needed.
-    fn skip_se(&mut self) -> Option<()> {
-        self.ue().map(drop)
     }
 }
 
@@ -310,6 +249,7 @@ fn hevc_crop(bits: &mut Bits<'_>) -> Option<Crop> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::nal::screen;
 
     #[test]
     fn exp_golomb() {
@@ -325,10 +265,22 @@ mod tests {
     fn emulation_prevention_is_removed_and_slices_end_the_scan() {
         // A garbage SPS (not parseable) must leave the crop alone.
         let mut scanner = CropScanner::default();
-        scanner.scan(Codec::H264, &[0, 0, 0, 1, 0x67, 0x64, 0, 0, 3, 1]);
+        screen(
+            Codec::H264,
+            &[0, 0, 0, 1, 0x67, 0x64, 0, 0, 3, 1],
+            true,
+            &mut scanner,
+        )
+        .unwrap();
         assert_eq!(scanner.latest, None);
         assert_eq!(scanner.rbsp, [0x64, 0, 0, 1]);
-        scanner.scan(Codec::H264, &[0, 0, 1, 0x65, 0, 0, 1, 0x67, 0x42]);
+        screen(
+            Codec::H264,
+            &[0, 0, 1, 0x65, 0, 0, 1, 0x67, 0x42],
+            true,
+            &mut scanner,
+        )
+        .unwrap();
         assert_eq!(
             scanner.rbsp,
             [0x64, 0, 0, 1],
