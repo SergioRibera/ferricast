@@ -787,6 +787,15 @@ impl Source {
     }
 }
 
+/// A driver pointer handed to the session thread (`crate::lifecycle::run`),
+/// which runs the job while the sender waits.
+struct SessionThread<T>(*mut T);
+
+// SAFETY: the pointee is only touched by the job on the session thread, while
+// the sending thread waits for it (`lifecycle::run` returns after the job);
+// NVDEC decoder handles have no thread affinity.
+unsafe impl<T> Send for SessionThread<T> {}
+
 /// An NVDEC decoder (`cuvidCreateDecoder`), destroyed on drop.
 pub(super) struct HwDecoder {
     raw: NonNull<c_void>,
@@ -840,14 +849,20 @@ impl HwDecoder {
         };
         (info.display_area.right, info.display_area.bottom) = area_edges(width, height)?;
         let mut raw = ptr::null_mut();
-        {
+        let (out, info) = (SessionThread(&raw mut raw), SessionThread(&raw mut info));
+        // Created on the session thread, like NVENC sessions: the driver
+        // faults when sessions come and go concurrently with other work
+        // (`crate::lifecycle`).
+        crate::lifecycle::run(context, move || {
+            let (out, info) = (out, info);
             let _current = context.guard()?;
             // SAFETY: the context is current; `info` is fully initialised with
             // reserved fields zeroed, and `lock` is a live context lock of the
-            // same context that outlives the decoder.
-            unsafe { (cuvid.create_decoder)(&raw mut raw, &raw mut info) }
-                .check_cuvid("cuvidCreateDecoder")?;
-        }
+            // same context that outlives the decoder. Both pointers are to
+            // locals of `create`, which waits for this job.
+            unsafe { (cuvid.create_decoder)(out.0, info.0) }.check_cuvid("cuvidCreateDecoder")
+        })
+        .map_err(|error| context.note_error(&error).unwrap_or(error))?;
         let raw = NonNull::new(raw).ok_or_else(|| Error::UnexpectedValue {
             call: "cuvidCreateDecoder",
             what: "a decoder",
@@ -982,11 +997,16 @@ fn area_edges(width: u32, height: u32) -> Result<(i16, i16)> {
 
 impl Drop for HwDecoder {
     fn drop(&mut self) {
-        let destroyed = self.context.guard().and_then(|_current| {
-            // SAFETY: a live decoder with nothing mapped (`Mapped` borrows
-            // it), its context current; not used again.
-            unsafe { (self.cuvid.destroy_decoder)(self.raw.as_ptr()) }
-                .check_cuvid("cuvidDestroyDecoder")
+        let (cuvid, context) = (self.cuvid, &self.context);
+        let doomed = SessionThread(self.raw.as_ptr());
+        // Destroyed on the session thread, where it was created.
+        let destroyed = crate::lifecycle::run(context, move || {
+            let doomed = doomed;
+            context.guard().and_then(|_current| {
+                // SAFETY: a live decoder with nothing mapped (`Mapped`
+                // borrows it), its context current; not used again.
+                unsafe { (cuvid.destroy_decoder)(doomed.0) }.check_cuvid("cuvidDestroyDecoder")
+            })
         });
         if let Err(error) = destroyed {
             tracing::warn!(%error, "destroying an NVDEC decoder");

@@ -513,10 +513,13 @@ impl<M: OutputMode> Decoder<M> {
             // held here while it runs.
             unsafe { (cuvid.parse_video_data)(self.parser.raw, &raw mut packet) }
         };
-        if let Some(error) = self.state.get_mut().error.take() {
-            return Err(error);
-        }
-        parsed.check_cuvid("cuvidParseVideoData")
+        let result = match self.state.get_mut().error.take() {
+            Some(error) => Err(error),
+            None => parsed.check_cuvid("cuvidParseVideoData"),
+        };
+        // A sticky CUDA error marks the shared context lost, so the next
+        // decoder or encoder starts on a fresh one.
+        result.map_err(|error| self.context.note_error(&error).unwrap_or(error))
     }
 
     /// The current sequence's format, once a sequence header has been
