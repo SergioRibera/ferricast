@@ -1,6 +1,7 @@
 use crate::codec::{BackendSelection, CodecResult};
 use crate::colour::{ColourDescription, HdrMetadata};
 use crate::frame::{AudioCodec, AudioFrame, CapturedFrame, EncodedFrame};
+use crate::gpu::{GpuId, GpuPreference};
 use crate::{BitDepth, Codec, H264Profile, H265Profile, PixelFormat};
 
 #[derive(Debug, Clone)]
@@ -44,6 +45,12 @@ pub struct EncoderConfig {
     pub hdr: Option<HdrMetadata>,
     /// Which backend encodes; see [`BackendSelection`].
     pub backend: BackendSelection,
+    /// Which GPU the hardware backends run on; see [`GpuPreference`].
+    pub gpu: GpuPreference,
+    /// The GPU the frames come from (`GpuFrame::producer`), when known:
+    /// [`GpuPreference::Auto`] and [`GpuPreference::SameAsCapture`]
+    /// prefer a backend on it (no copy between GPUs).
+    pub source_gpu: Option<GpuId>,
 }
 
 impl EncoderConfig {
@@ -83,6 +90,8 @@ impl Default for EncoderConfig {
             bit_depth: BitDepth::Eight,
             hdr: None,
             backend: BackendSelection::default(),
+            gpu: GpuPreference::Auto,
+            source_gpu: None,
         }
     }
 }

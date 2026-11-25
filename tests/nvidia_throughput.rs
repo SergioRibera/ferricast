@@ -40,6 +40,7 @@ fn decode_fps<D: VideoDecoder + Default>(memory: FrameMemory, backend: BackendSe
     let mut decoder = D::default();
     decoder
         .configure(&DecoderConfig {
+            gpu: Default::default(),
             codec,
             width,
             height,

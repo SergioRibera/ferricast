@@ -33,6 +33,7 @@ impl Decoder {
                 .into()
         };
         let config = DecoderConfig {
+            gpu: ferricast_core::GpuPreference::Auto,
             hdr: stream.hdr,
             memory: FrameMemory::Cpu,
             codec,

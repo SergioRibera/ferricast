@@ -31,6 +31,7 @@ fn fnv(data: &[u8]) -> u64 {
 fn pictures<C: NvdecCodec>(name: &str, packets: &[EncodedFrame]) -> Option<Vec<u64>> {
     let mut decoder = NvdecDecoder::<C>::default();
     let config = DecoderConfig {
+        gpu: Default::default(),
         hdr: None,
         memory: FrameMemory::Cpu,
         codec: C::FERRICAST_CODEC,

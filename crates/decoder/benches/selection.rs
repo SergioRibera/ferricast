@@ -20,6 +20,7 @@ use ferricast_decoder::H264Decoder;
 
 fn config() -> DecoderConfig {
     DecoderConfig {
+        gpu: Default::default(),
         codec: Codec::H264,
         width: 1920,
         height: 1080,

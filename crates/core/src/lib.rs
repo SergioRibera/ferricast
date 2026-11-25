@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod encoder;
 pub mod error;
 pub mod frame;
+pub mod gpu;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod pairing;
@@ -64,6 +65,10 @@ pub use frame::{
 pub use frame::{
     DmaBufFd, DmaBufId, DmaBufImporter, DmaBufPlane, DrmDevice, FrameSync, GpuFrame, SyncWait,
     Syncobj, SyncobjDevice,
+};
+pub use gpu::{
+    DevNumber, GPU_ENV_VAR, Gpu, GpuAffinity, GpuError, GpuId, GpuKind, GpuPlacement,
+    GpuPreference, GpuVendor, Gpus, InvalidGpuText, PciAddress,
 };
 #[cfg(feature = "net")]
 pub use net::{

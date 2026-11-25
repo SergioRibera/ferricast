@@ -123,6 +123,7 @@ fn decode<D: VideoDecoder + Default>(
     let mut decoder = D::default();
     decoder
         .configure(&DecoderConfig {
+            gpu: Default::default(),
             codec: D::CODEC,
             width: WIDTH,
             height: HEIGHT,
@@ -348,6 +349,7 @@ fn nvdec_device_frames_encode_on_nvenc_without_readback() {
     let mut decoder = ferricast_decoder::H264Decoder::default();
     decoder
         .configure(&DecoderConfig {
+            gpu: Default::default(),
             codec: Codec::H264,
             width: WIDTH,
             height: HEIGHT,
@@ -983,6 +985,7 @@ fn nvdec_p010_pictures(name: &str) -> Option<(Vec<Vec<u8>>, Vec<CapturedFrame>)>
     let mut decoder = ferricast_decoder::H265Decoder::default();
     decoder
         .configure(&DecoderConfig {
+            gpu: Default::default(),
             codec: Codec::H265,
             width: WIDTH,
             height: HEIGHT,

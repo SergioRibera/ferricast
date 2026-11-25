@@ -12,6 +12,7 @@ use crate::codec::Codec;
 use crate::codec::{BackendSelection, CodecResult};
 use crate::colour::{ColourDescription, HdrMetadata};
 use crate::frame::{AudioCodec, AudioFrame, CapturedFrame, EncodedFrame, PixelFormat};
+use crate::gpu::GpuPreference;
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
@@ -37,6 +38,9 @@ pub struct DecoderConfig {
     pub memory: FrameMemory,
     /// Which backend decodes; see [`BackendSelection`].
     pub backend: BackendSelection,
+    /// Which GPU the hardware backends run on; see [`GpuPreference`]
+    /// (decoders have no frame producer: `Auto` prefers discrete GPUs).
+    pub gpu: GpuPreference,
 }
 
 /// Where a video decoder hands out its pictures.
