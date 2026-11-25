@@ -14,7 +14,7 @@
 use std::any::Any;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use bytes::Bytes;
 use ferricast_core::{
@@ -22,22 +22,91 @@ use ferricast_core::{
     SurfacePixels,
 };
 pub use ferricast_nvcodec as nvcodec;
-use ferricast_nvcodec::cuda::{Context, Device};
+use ferricast_nvcodec::cuda::{Context, Device, PinnedBuffer, PinnedCopy, Point, Region, Stream};
 use ferricast_nvcodec::decode::{self, DeviceFrame};
+use ferricast_nvcodec::loader::Backoff;
 
-/// The primary CUDA context of the GPU ferricast's NVIDIA backends use
-/// (device 0), retained for the life of the process. The first call loads
-/// the driver; its outcome, failure included, is kept.
+/// The CUDA context of the GPU ferricast's NVIDIA backends use (device 0),
+/// shared by every decoder and encoder open at the same time, so a decoded
+/// picture and the encoder that takes it live on the same context.
+///
+/// - It is the device's primary context, retained while someone holds the
+///   returned `Arc` and released when the last holder drops it (about
+///   100 MiB of VRAM, and on a hybrid laptop what keeps the discrete GPU
+///   awake).
+/// - A context found lost ([`Context::is_lost`]: a sticky error, an Xid, a
+///   resume) is not handed out again: the next call retains the primary
+///   context afresh or, while the lost one is still held, creates a context
+///   of its own.
+/// - A failure to start the driver or open the device is retried after a
+///   delay ([`Backoff`]); loading failures (no driver library) are kept for
+///   the process.
 ///
 /// # Errors
 ///
 /// What loading the driver or opening the device failed with
 /// ([`nvcodec::Error::LibraryMissing`] without an NVIDIA driver).
 pub fn context() -> Result<Arc<Context>, nvcodec::Error> {
-    static CONTEXT: OnceLock<Result<Arc<Context>, nvcodec::Error>> = OnceLock::new();
-    CONTEXT
-        .get_or_init(|| Device::get(0).and_then(Context::primary))
-        .clone()
+    SHARED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .context()
+}
+
+/// The context [`context`] hands out.
+static SHARED: Mutex<SharedContext> = Mutex::new(SharedContext {
+    current: Weak::new(),
+    backoff: Backoff::new(),
+});
+
+struct SharedContext {
+    current: Weak<Context>,
+    /// Spaces out attempts after a failed one.
+    backoff: Backoff,
+}
+
+impl SharedContext {
+    fn context(&mut self) -> Result<Arc<Context>, nvcodec::Error> {
+        let held = self.current.upgrade();
+        if let Some(context) = &held
+            && !context.is_lost()
+        {
+            return Ok(Arc::clone(context));
+        }
+        let lost_and_held = held.is_some();
+        drop(held);
+        let context = self.backoff.retry(|| {
+            let device = Device::get(0)?;
+            // The driver would hand a lost primary context that someone
+            // still holds out again: take a context of its own instead.
+            if lost_and_held {
+                Context::create(device)
+            } else {
+                Context::primary(device)
+            }
+        })?;
+        if lost_and_held {
+            tracing::warn!(
+                "the shared CUDA context is lost and still held: new NVIDIA sessions get a context of their own"
+            );
+        }
+        self.current = Arc::downgrade(&context);
+        Ok(context)
+    }
+}
+
+/// Forgets the shared context if `error` says it is lost, so the next
+/// [`context`] call opens a new one. [`codec_error`] does this for every
+/// error it maps; the encoders and decoders mark their own context too.
+fn note_lost(error: &nvcodec::Error) {
+    if !error.is_device_lost() {
+        return;
+    }
+    let shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(context) = shared.current.upgrade() {
+        // Marks it lost (the error already says so; nothing is queried).
+        let _ = context.note_error(error);
+    }
 }
 
 /// Host readbacks of [`CudaSurface`]s since the process started.
@@ -107,39 +176,42 @@ impl NativeSurface for CudaSurface {
 
     fn readback(&self) -> Result<SurfacePixels, FrameError> {
         READBACKS.fetch_add(1, Ordering::Relaxed);
-        let readback = |reason: String| FrameError::Readback { reason };
-        let mut packed = Vec::new();
-        let layout = self
-            .frame
-            .download(&mut packed)
-            .map_err(|error| readback(format!("CUDA download: {error}")))?;
-        let [luma, chroma] = layout.planes() else {
-            return Err(readback(format!(
+        let fail = |reason: String| FrameError::Readback { reason };
+        let cuda = |error: nvcodec::Error| fail(format!("CUDA download: {error}"));
+        let frame = &self.frame;
+        let [luma, chroma] = frame.layout().planes() else {
+            return Err(fail(format!(
                 "{} planes in an NV12 / P010 picture",
-                layout.planes().len()
+                frame.layout().planes().len()
             )));
         };
         // One stride for both planes: they only differ for odd widths,
         // where the chroma row carries one sample more than the luma row.
-        let stride = luma.pitch.max(chroma.pitch);
-        let data = if luma.pitch == chroma.pitch {
-            packed
-        } else {
-            let mut data = vec![0; stride * (luma.rows + chroma.rows)];
-            for (plane, start) in [(luma, 0), (chroma, luma.rows)] {
-                let source = packed.get(plane.offset..plane.offset + plane.len());
-                let source = source.ok_or_else(|| readback("a short download".into()))?;
-                for (row, line) in source.chunks_exact(plane.pitch).enumerate() {
-                    let at = (start + row) * stride;
-                    data[at..at + plane.width_bytes].copy_from_slice(&line[..plane.width_bytes]);
-                }
-            }
-            data
-        };
+        let stride = luma.width_bytes.max(chroma.width_bytes);
+        let len = stride * (luma.rows + chroma.rows);
+        let buffer = frame.buffer();
+        let mut staging = Staging::take(buffer.context(), len).map_err(cuda)?;
+        // Both planes are copied on the staging stream once the picture is
+        // in the buffer, straight into page-locked memory at `stride`; one
+        // wait for both.
+        let copies = [(luma, 0), (chroma, luma.rows)].map(|(plane, start)| PinnedCopy {
+            src: Region::new(plane.width_bytes, plane.rows).at(Point {
+                x_bytes: 0,
+                row: plane.offset.checked_div(plane.pitch).unwrap_or(0),
+            }),
+            offset: start * stride,
+            pitch: stride,
+        });
+        let Staging { pinned, stream } = &mut staging;
+        pinned
+            .download(buffer, &copies, stream, Some(frame.ready()))
+            .map_err(cuda)?;
         Ok(SurfacePixels {
-            stride: u32::try_from(stride)
-                .map_err(|_| readback("the picture is too wide".into()))?,
-            data: Bytes::from(data),
+            stride: u32::try_from(stride).map_err(|_| fail("the picture is too wide".into()))?,
+            data: Bytes::from_owner(Readback {
+                staging: Some(staging),
+                len,
+            }),
         })
     }
 
@@ -148,48 +220,121 @@ impl NativeSurface for CudaSurface {
     }
 }
 
+/// Page-locked memory and a stream for readbacks, pooled: a readback costs
+/// two queued copies and one wait, no allocation in steady state.
+struct Staging {
+    pinned: PinnedBuffer,
+    stream: Stream,
+}
+
+/// Idle staging buffers.
+static STAGING: Mutex<Vec<Staging>> = Mutex::new(Vec::new());
+
+impl Staging {
+    /// Readbacks lent out at once beyond which buffers are freed on return.
+    const POOLED: usize = 4;
+
+    /// A pooled staging buffer of at least `len` bytes on `context`, or a
+    /// new one.
+    fn take(context: &Arc<Context>, len: usize) -> Result<Self, nvcodec::Error> {
+        let pooled = {
+            let mut pool = STAGING.lock().unwrap_or_else(PoisonError::into_inner);
+            pool.iter()
+                .position(|staging| {
+                    Arc::ptr_eq(staging.pinned.context(), context)
+                        && staging.pinned.as_slice().len() >= len
+                })
+                .map(|index| pool.swap_remove(index))
+        };
+        match pooled {
+            Some(staging) => Ok(staging),
+            None => Ok(Self {
+                pinned: PinnedBuffer::new(context, len)?,
+                stream: Stream::new(context)?,
+            }),
+        }
+    }
+
+    fn give_back(self) {
+        let mut pool = STAGING.lock().unwrap_or_else(PoisonError::into_inner);
+        // Buffers of a context nobody else uses would keep it alive.
+        pool.retain(|staging| Arc::strong_count(staging.pinned.context()) > 2);
+        if pool.len() < Self::POOLED && !self.pinned.context().is_lost() {
+            pool.push(self);
+        }
+    }
+}
+
+/// A readback lent to `Bytes`: its staging buffer goes back to the pool
+/// when the last clone drops.
+struct Readback {
+    staging: Option<Staging>,
+    len: usize,
+}
+
+impl AsRef<[u8]> for Readback {
+    fn as_ref(&self) -> &[u8] {
+        self.staging
+            .as_ref()
+            .and_then(|staging| staging.pinned.as_slice().get(..self.len))
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for Readback {
+    fn drop(&mut self) {
+        if let Some(staging) = self.staging.take() {
+            staging.give_back();
+        }
+    }
+}
+
 /// A `ferricast-nvcodec` error from `backend` while doing `operation`, as
 /// a [`CodecError`]:
 ///
-/// - no driver, a driver too old, no device, an NVENC session limit
-///   reached, and any CUDA failure while probing or opening:
-///   [`CodecError::BackendUnavailable`], so selection moves on;
-/// - something the GPU or driver cannot do: [`CodecError::UnsupportedStream`]
+/// - no driver library, a driver too old, no such device, an unusable
+///   NVENC API version: [`CodecError::BackendUnavailable`] (for the
+///   process; selection moves on);
+/// - an NVENC session limit reached, a closed encoder, and any CUDA / NVDEC
+///   / NVENC failure while probing or opening: [`CodecError::BackendBusy`]
+///   (selection moves on now and tries again next time);
+/// - a lost device (sticky CUDA error): [`CodecError::UnsupportedStream`]
 ///   while decoding (the next decoder takes the stream over),
-///   [`CodecError::UnsupportedConfig`] otherwise;
+///   [`CodecError::BackendBusy`] otherwise (an encoder hands over); the
+///   shared context is forgotten so the next open gets a new one;
+/// - something the GPU or driver cannot do: [`CodecError::UnsupportedStream`]
+///   while decoding, [`CodecError::UnsupportedConfig`] otherwise;
 /// - everything else (a corrupt packet, a failed copy):
 ///   [`CodecError::Backend`].
 #[must_use]
 pub fn codec_error(backend: BackendId, operation: Operation, error: nvcodec::Error) -> CodecError {
     use nvcodec::Error as E;
-    let unavailable = |error: E| CodecError::BackendUnavailable {
-        backend,
-        reason: error.to_string(),
-    };
+    note_lost(&error);
+    let decoding = matches!(operation, Operation::Decode | Operation::Flush);
+    let reason = error.to_string();
+    if error.is_permanent() || matches!(error, E::NoEglDevice { .. }) {
+        return CodecError::BackendUnavailable { backend, reason };
+    }
+    if error.is_device_lost() {
+        return if decoding {
+            CodecError::UnsupportedStream { backend, reason }
+        } else {
+            CodecError::BackendBusy { backend, reason }
+        };
+    }
     match error {
-        E::LibraryMissing { .. }
-        | E::SymbolMissing { .. }
-        | E::DriverTooOld { .. }
-        | E::ApiNotSupportedByDriver { .. }
-        | E::InvalidApiOverride { .. }
-        | E::NvencFunctionMissing { .. }
-        | E::DeviceOutOfRange { .. }
-        | E::NvencSessionLimit { .. }
-        | E::NoEglDevice { .. } => unavailable(error),
+        E::NvencSessionLimit { .. } | E::EncoderClosed { .. } => {
+            CodecError::BackendBusy { backend, reason }
+        }
         E::Cuda { .. } | E::Cuvid { .. } | E::Nvenc { .. }
             if matches!(operation, Operation::Probe | Operation::Open) =>
         {
-            unavailable(error)
+            CodecError::BackendBusy { backend, reason }
         }
-        E::Unsupported { .. } if matches!(operation, Operation::Decode | Operation::Flush) => {
-            CodecError::UnsupportedStream {
-                backend,
-                reason: error.to_string(),
-            }
-        }
+        E::Unsupported { .. } if decoding => CodecError::UnsupportedStream { backend, reason },
         E::Unsupported { .. } | E::InvalidEncodeConfig { .. } => CodecError::UnsupportedConfig {
             backend,
-            what: error.to_string(),
+            what: reason,
         },
         other => CodecError::backend(backend, operation, other),
     }
@@ -247,5 +392,88 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn cuda(code: u32) -> nvcodec::Error {
+        nvcodec::Error::Cuda {
+            call: "cuMemcpy2DAsync_v2",
+            status: nvcodec::error::CudaStatus(nvcodec::sys::cuda::CUresult(code)),
+        }
+    }
+
+    #[test]
+    fn a_full_gpu_is_busy_not_unavailable() {
+        let limit = nvcodec::Error::NvencSessionLimit {
+            call: "nvEncOpenEncodeSessionEx",
+            status: nvcodec::error::NvencStatus(21),
+            detail: None,
+        };
+        assert!(matches!(
+            codec_error(BackendId::Nvenc, Operation::Probe, limit),
+            CodecError::BackendBusy { .. }
+        ));
+        assert!(matches!(
+            codec_error(BackendId::Nvenc, Operation::Open, cuda(2)),
+            CodecError::BackendBusy { .. }
+        ));
+    }
+
+    /// Tests that report a lost device (which marks the shared context lost)
+    /// run one at a time.
+    static SHARED_CONTEXT: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_lost_device_hands_the_stream_over() {
+        let _shared = SHARED_CONTEXT
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // CUDA_ERROR_ILLEGAL_ADDRESS (700) is sticky.
+        assert!(matches!(
+            codec_error(BackendId::Nvdec, Operation::Decode, cuda(700)),
+            CodecError::UnsupportedStream { .. }
+        ));
+        assert!(matches!(
+            codec_error(BackendId::Nvenc, Operation::Encode, cuda(999)),
+            CodecError::BackendBusy { .. }
+        ));
+        // CUDA_ERROR_INVALID_VALUE (1) is not.
+        assert!(matches!(
+            codec_error(BackendId::Nvenc, Operation::Encode, cuda(1)),
+            CodecError::Backend { .. }
+        ));
+    }
+
+    #[test]
+    fn a_lost_context_is_replaced_and_the_last_holder_releases_it() {
+        let _shared = SHARED_CONTEXT
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Ok(first) = context() else {
+            eprintln!("skipping: no usable NVIDIA driver");
+            return;
+        };
+        assert!(
+            Arc::ptr_eq(&first, &context().unwrap()),
+            "shared while held"
+        );
+        assert!(first.is_primary());
+        // A sticky error seen on it (as an encoder or decoder would report).
+        assert!(first.note_error(&cuda(700)).is_some());
+        assert!(first.is_lost());
+        let second = context().unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a lost context is not handed out"
+        );
+        assert!(
+            !second.is_primary(),
+            "the lost primary is still held: a context of its own"
+        );
+        assert!(!second.is_lost());
+        drop((first, second));
+        // Nobody holds one: the primary context is retained afresh.
+        let third = context().unwrap();
+        assert!(third.is_primary());
+        assert!(!third.is_lost());
     }
 }

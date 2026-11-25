@@ -6,7 +6,7 @@ use ferricast_core::{
     Acceleration, BackendId, CapturedFrame, CodecError, CodecResult, CodecTarget, EncodedFrame,
     EncoderConfig, Operation, RuntimeFallback,
 };
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::cache::SelectionCache;
 use crate::events::{EventReceiver, SessionEvent, SessionEvents};
@@ -15,6 +15,13 @@ use crate::session::VideoEncoderSession;
 
 /// The registry of one video encode job.
 pub type VideoEncoderRegistry = Registry<EncoderConfig, dyn VideoEncoderSession>;
+
+/// Whether a configuration identical to the open one rebuilds the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rebuild {
+    IfChanged,
+    Always,
+}
 
 struct Active {
     session: Box<dyn VideoEncoderSession>,
@@ -107,20 +114,45 @@ impl SelectingVideoEncoder {
     /// [`Registry::open`]); the open backend's `configure` error when no
     /// fallback applies.
     pub fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()> {
-        let result = self.reconfigure(config);
+        let result = self.reconfigure(config, Rebuild::IfChanged);
         self.events.report(result)
     }
 
-    fn reconfigure(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+    /// Rebuilds the open backend's session for `config` even when nothing
+    /// changed ([`ferricast_core::VideoEncoder::reset`]); selects one when
+    /// none is open. Falls back like [`SelectingVideoEncoder::configure`].
+    ///
+    /// # Errors
+    /// As [`SelectingVideoEncoder::configure`].
+    pub fn reset(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+        let result = self.reconfigure(config, Rebuild::Always);
+        self.events.report(result)
+    }
+
+    fn reconfigure(&mut self, config: &EncoderConfig, rebuild: Rebuild) -> CodecResult<()> {
         let Some(active) = &mut self.active else {
             return self.select(config);
         };
         if active.config.backend != config.backend {
             return self.select(config);
         }
-        let Err(error) = active.session.configure(config) else {
+        let applied = match rebuild {
+            Rebuild::IfChanged => active.session.configure(config),
+            Rebuild::Always => active.session.reset(config),
+        };
+        let Err(error) = applied else {
             active.config = config.clone();
             return Ok(());
+        };
+        self.hand_over(config, error)
+    }
+
+    /// Moves to the backend after the open one, for `config`, because the
+    /// open one failed with `error`; `error` when the selection allows no
+    /// fallback or none opens.
+    fn hand_over(&mut self, config: &EncoderConfig, error: CodecError) -> CodecResult<()> {
+        let Some(active) = &mut self.active else {
+            return Err(error);
         };
         if matches!(active.plan.runtime_fallback(), RuntimeFallback::Disabled)
             || !active.plan.has_after(active.position)
@@ -131,7 +163,7 @@ impl SelectingVideoEncoder {
             target_job = %self.registry.target(),
             backend = %active.backend,
             %error,
-            "encoder backend refused the new configuration; moving to the next backend"
+            "encoder backend failed; moving to the next backend"
         );
         let opened = self
             .registry
@@ -182,6 +214,15 @@ impl SelectingVideoEncoder {
         let result = self
             .active(Operation::Encode)
             .and_then(|active| active.session.encode(frame));
+        // A backend that went away mid-stream (a lost GPU) hands over now:
+        // this picture is lost, the next one goes to the next backend.
+        if let Err(error @ (CodecError::BackendBusy { .. } | CodecError::BackendUnavailable { .. })) =
+            &result
+            && let Some(config) = self.active.as_ref().map(|active| active.config.clone())
+            && let Err(failed) = self.hand_over(&config, error.clone())
+        {
+            debug!(%failed, "no encoder backend to hand over to");
+        }
         self.events.report(result)
     }
 

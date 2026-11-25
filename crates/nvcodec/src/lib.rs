@@ -49,6 +49,7 @@ pub mod error;
 #[cfg(target_os = "linux")]
 pub mod interop;
 pub mod kernels;
+pub mod lifecycle;
 pub mod loader;
 pub mod sys;
 pub mod version;

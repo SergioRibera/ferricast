@@ -19,11 +19,11 @@ use std::sync::Arc;
 use super::caps::DecoderCaps;
 use super::crop::CropScanner;
 use super::format::{DecodeStatus, Fields, FrameInfo, Layout, PixelFormat, Rect, SequenceInfo};
-use super::frame::{DeviceFrame, DeviceSlot, HostFrame, HostMemory, HostSlot, PinnedBuffer};
+use super::frame::{DeviceFrame, DeviceSlot, HostFrame, HostMemory, HostSlot};
 use super::pool::Pool;
 use super::sei::SeiStore;
 use super::{Codec, CuvidCheck as _, DecoderConfig, ulong};
-use crate::cuda::{Context, DeviceBuffer, Event, Stream};
+use crate::cuda::{Context, DeviceBuffer, Event, PinnedBuffer, Stream};
 use crate::error::{CheckStatus as _, Error, Result};
 use crate::loader::{CudaLibrary, CuvidLibrary};
 use crate::sys::cuda as cu;
@@ -583,13 +583,18 @@ impl HostSlot {
     /// driver gives it, else pageable.
     fn prepare(&mut self, context: &Arc<Context>, bytes: usize) -> Result<()> {
         let fits = match &self.data {
-            HostMemory::Pinned(buffer) => buffer.len() >= bytes,
+            HostMemory::Pinned(buffer) => buffer.as_slice().len() >= bytes,
             HostMemory::Pageable(data) => data.len() >= bytes,
             HostMemory::Empty => false,
         };
         if !fits {
-            self.data = PinnedBuffer::new(context, bytes)
-                .map_or_else(|| HostMemory::Pageable(vec![0; bytes]), HostMemory::Pinned);
+            self.data = match PinnedBuffer::new(context, bytes) {
+                Ok(buffer) => HostMemory::Pinned(buffer),
+                Err(error) => {
+                    tracing::debug!(%error, bytes, "no page-locked memory: copying through pageable memory");
+                    HostMemory::Pageable(vec![0; bytes])
+                }
+            };
         }
         if self.data.is_pinned() && self.ready.is_none() {
             self.ready = Some(Event::new(context)?);

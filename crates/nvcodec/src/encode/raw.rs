@@ -236,8 +236,15 @@ pub(crate) trait EncodeApi: NvencApi {
     /// `config` (validated, and checked against this version).
     fn initialize(session: &Session<Self>, config: &Config) -> Result<()>;
 
-    /// `nvEncReconfigureEncoder` to `config` (same codec, size and format).
-    fn reconfigure(session: &Session<Self>, config: &Config, force_idr: bool) -> Result<()>;
+    /// `nvEncReconfigureEncoder` to `config` (same codec and format; a size
+    /// up to `max`, the size the session was initialised with). `reset`
+    /// restarts the stream with an IDR (needed for a new size).
+    fn reconfigure(
+        session: &Session<Self>,
+        config: &Config,
+        max: (u32, u32),
+        reset: bool,
+    ) -> Result<()>;
 
     /// The parameter sets (`nvEncGetSequenceParams`) into `out`.
     fn sequence_params(session: &Session<Self>, out: &mut Vec<u8>) -> Result<()>;
@@ -374,7 +381,7 @@ fn returned(
     call: &'static str,
     what: &'static str,
 ) -> Result<NonNull<c_void>> {
-    NonNull::new(pointer).ok_or(Error::UnexpectedValue {
+    NonNull::new(pointer).ok_or_else(|| Error::UnexpectedValue {
         call,
         what,
         value: "null".into(),
@@ -767,7 +774,12 @@ macro_rules! encode_api {
                 check(session, status.0, "nvEncInitializeEncoder")
             }
 
-            fn reconfigure(session: &Session<Self>, config: &Config, force_idr: bool) -> Result<()> {
+            fn reconfigure(
+                session: &Session<Self>,
+                config: &Config,
+                max: (u32, u32),
+                reset: bool,
+            ) -> Result<()> {
                 let reconfigure = entry!(session, nvEncReconfigureEncoder);
                 let mut nv = Self::build_config(session, config)?;
                 let mut params = nvenc::$module::NV_ENC_RECONFIGURE_PARAMS {
@@ -775,8 +787,10 @@ macro_rules! encode_api {
                     reInitEncodeParams: Self::initialize_params(config, &mut nv)?,
                     ..Default::default()
                 };
-                params.set_resetEncoder(0);
-                params.set_forceIDR(u32::from(force_idr));
+                params.reInitEncodeParams.maxEncodeWidth = max.0;
+                params.reInitEncodeParams.maxEncodeHeight = max.1;
+                params.set_resetEncoder(u32::from(reset));
+                params.set_forceIDR(u32::from(reset));
                 // SAFETY: as in `initialize`.
                 let status = unsafe { reconfigure(session.as_ptr(), &raw mut params) };
                 check(session, status.0, "nvEncReconfigureEncoder")

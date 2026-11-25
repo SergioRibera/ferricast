@@ -511,25 +511,29 @@ libgbm 26 with the NVIDIA GBM backend, `/dev/dri/renderD128`.
 - Pipeline depth = 1 + `frames_in_flight` + B frames + lookahead: one
   bitstream buffer and one (lazily created, registered once) host slot per
   position. Inputs are mapped per picture and unmapped after the lock.
-- Host input: `cuMemcpy2DAsync` on the encoder stream, then an event wait
-  before the call returns (the caller's slice is free afterwards, even if
-  pinned by someone).
+- Host input: copied on the CPU into the slot's page-locked staging buffer,
+  then uploaded with one `cuMemcpy2DAsync` on the encoder stream (NVENC's
+  IO stream, so NVENC reads after it); the call does not wait for the GPU
+  and the caller's slice is free when it returns (see "NVENC and context
+  hardening").
 - Device input: cached by `Arc<DeviceBuffer>` address with a `Weak`; the
   `Weak` keeps the `Arc` allocation, so the address cannot be reused while
   the entry exists, and `strong_count() == 0` retires it (swept on each
   device encode). A pending picture holds a strong `Arc`, so a buffer is
-  never freed while NVENC reads it. Deviation from NVIDIA's "unregister
-  before free": a dropped buffer's registration is unregistered at the next
-  sweep, after `cuMemFree`; it is never mapped in between. A buffer still
-  pending is refused rather than mapped twice. The decode module should
-  hand out frames as `Arc<DeviceBuffer>` (or something lending one).
+  never freed while NVENC reads it. The entry also holds the buffer's
+  memory (`DeviceBuffer::keep_allocated`, which does not count as a holder
+  of the buffer), so a dropped buffer's memory is freed only after its
+  registration is undone, as NVIDIA asks. A buffer still pending is
+  refused rather than mapped twice.
 - A chroma plane not right after the luma rows (`DeviceFrame::chroma_row`)
   uses `chromaOffsetIn` (13.0); verified bit-identical to a contiguous
   frame on 13.0, refused on 11.1–12.2.
 - CUDA arrays (packed RGB only): cached by a caller key, compared with the
   array handle and size; `encode_array` is `unsafe` because a destroyed
   array whose handle is reused under the same key without
-  `invalidate_array` would hit a stale registration.
+  `invalidate_array` would hit a stale registration. `invalidate_array` /
+  `clear_input_caches` unregister before returning, flushing the pictures
+  still reading the memory first, so the caller may free it right after.
 - Evicted registrations are retired and unregistered only once every
   picture submitted before the eviction has been locked.
 - Readiness: `NV_ENC_ERR_NEED_MORE_INPUT` holds pictures (B frames). With
@@ -1049,3 +1053,170 @@ top of that).
   Work on a non-blocking stream right after them can see stale memory (the
   kernel tests first failed this way). Tests synchronise the context after
   uploading; use `upload_async` / `fill_async` on the consuming stream.
+
+## NVENC and context hardening
+
+### The NVENC churn crash is the driver's
+
+Symptom: SIGSEGV in a libnvcuvid worker thread (or inside
+`nvEncInitializeEncoder`), glibc heap-corruption abort in `cuArrayDestroy`
+under `nvEncDestroyEncoder`, when NVENC sessions are opened, used and
+destroyed repeatedly.
+
+- Crash site, every time (Rust and C): a libnvcuvid worker thread,
+  `libnvcuvid.so.595.71.05+0x19fc1` (`mov 0xfc438(%rsi),%edx`, a field 1 MB
+  into an object the worker was handed) called from `+0x1a0e2` /
+  `+0x9e41e` / `+0x9eb8d` (the worker loop). The thread that owns the
+  worker is, at that moment, inside `nvEncDestroyEncoder` (or initialising
+  the next session): the driver frees the object while its own worker still
+  uses it.
+- Pure C reproducer (`crates/nvcodec/scripts/nvenc_churn.c`; libcuda +
+  libnvidia-encode through `dlopen`, nv-codec-headers 13.0): our exact
+  sequence (primary context; open, caps, preset, initialise, stream, event,
+  `nvEncSetIOCudaStreams`, bitstream buffer; register a pitched device
+  buffer, upload, map, encode, lock, unmap; unregister, destroy bitstream,
+  destroy encoder, destroy stream / event, free) crashes at the same
+  address. It does so with one thread (one session at a time, ten pictures
+  each: crashed after 56 s), with every lifecycle call under a process
+  mutex, with every NVENC call under a reader/writer lock (pictures shared,
+  lifecycle exclusive), with all opens and destroys on one dedicated thread
+  that keeps the context current, with per-session or once-per-process
+  `NvEncodeAPICreateInstance`, with and without `nvEncSetIOCudaStreams`.
+  None of ferricast's calls is needed beyond "encode a few pictures, then
+  destroy the session".
+- Our own sequence had real bugs, fixed below, but none of them is the
+  cause: registrations of freed device buffers (now freed after
+  unregistering), the per-open function list (now once per process).
+- What lowers the rate: draining the session before destroying it (an
+  end-of-stream picture, then waiting for its IO stream). Paired 30 s
+  trials of the C reproducer, 4 threads, 10 pictures per session: no drain
+  crashed in 3 of 6 runs (~9 000 sessions), with the drain 0 of 6 (~8 800
+  sessions). A persistent idle session on the context also held 0 of 6.
+- The rate depends heavily on load (the GPU was shared with other test and
+  fuzz processes during all of this): the same configuration ran from
+  "crash within 1 s" to "clean for 2 minutes" between runs, so single runs
+  prove nothing; only interleaved repeated trials were used to compare.
+
+### What ferricast does about it
+
+- `lifecycle::run`: every session set-up and tear-down (open, caps,
+  initialise, bitstream buffers, IO stream; and the whole engine drop:
+  end of stream, unregister, destroy) runs on one thread,
+  `nvcodec-lifecycle`, which keeps the context of its last job current.
+  Serialised and on a thread whose context never pops to empty: neither
+  is sufficient alone (see above), but they remove the concurrency
+  variants of the race and cost nothing (a session open is ~20 ms).
+  `run` takes borrowing closures and blocks until they ran (a scoped-thread
+  style lifetime erasure, see its SAFETY comment); calls from the thread
+  itself run inline.
+- Drain before destroy: `Engine::drop` sends an end-of-stream picture
+  whenever a picture was ever submitted (not only when one is pending),
+  then synchronises the encoder's stream, then locks / unmaps what is
+  pending, unregisters and destroys.
+- Less churn: `Encoder::reconfigure` changes size (up to the opened one),
+  rate, GOP, bitrate and colour with `nvEncReconfigureEncoder` instead of a
+  new session; ferricast's `configure` uses it.
+- Measured through this crate (`cfg`-style stress: 4 threads, sessions of
+  10 pictures, ~50 sessions/s, interleaved 30 s trials): before these
+  changes 5 of 6 runs crashed; with the session thread and the drain, 4 of
+  7; with an extra "park the closed session, destroy it on the next close
+  or after 1 s" scheme on top, 3 of 3 (dropped again). So the mitigations
+  remove ferricast's own races but do not make the driver's go away; the
+  C reproducer at the same load crashed in 3 of 6 to 1 of 4 runs.
+- Rejected after measuring (no effect, or within noise): a process mutex
+  around open/initialise/destroy; a reader/writer lock (pictures vs
+  lifecycle); keeping the context current on every thread; per-session
+  `NvEncodeAPICreateInstance` vs once; no `nvEncSetIOCudaStreams`;
+  parking closed sessions. Keeping an idle session alive to the end also
+  hangs the process at exit (the driver's exit handler).
+- Residual risk: a session destroy can still crash the process on this
+  driver. Opens and destroys are rare in ferricast (stream start / stop,
+  a larger resolution); the stress tests open thousands per minute.
+
+### One API version per process
+
+The driver keeps the API version of the last `NvEncodeAPICreateInstance`
+for the whole process; a session opened through another version's list
+fails with `NV_ENC_ERR_INVALID_VERSION`. The function list is created once
+(`AnyApi::load`, `static PROCESS_API`) and handed out from then on;
+`FERRICAST_NVENC_API` is read once. Loading another version in the same
+process is refused with `Error::ApiVersionInUse`. Tests that exercise
+several versions run each in a child process
+(`every_version_loads_in_its_own_process`,
+`every_version_the_driver_accepts_opens_a_session`,
+`encode_matrix_every_api_version`).
+
+### Context lifecycle
+
+- `ferricast_codec::cuda::context()` keeps a `Weak`: the primary context is
+  retained while a decoder or encoder holds it and released with the last
+  one (`Context`'s drop, `cuDevicePrimaryCtxRelease`), so an idle ferricast
+  holds no VRAM and lets a hybrid laptop's discrete GPU sleep.
+- Lost contexts: `Error::is_device_lost` (sticky codes 46, 214, 700,
+  714–719, 999, and the new `Error::DeviceLost`); `Context::note_error`
+  marks the context lost, asking it (`cuStreamQuery` on its default stream,
+  which returns the sticky error without waiting) when an NVENC or NVDEC
+  failure does not say. `Encoder` notes every failure. A lost context is
+  not handed out again: `context()` retains the primary context afresh, or
+  creates a context of its own (`Context::create`) while the lost one is
+  still held.
+- `codec_error` marks the shared context lost on a device-lost error and
+  maps it to `UnsupportedStream` while decoding (hand-over) and the new
+  `CodecError::BackendBusy` otherwise; `SelectingVideoEncoder::encode`
+  hands over to the next backend on `BackendBusy` / `BackendUnavailable`.
+- Retries: `CudaLibrary::get` keeps a load failure (no library, missing
+  symbol) for the process but retries a failed `cuInit` after a delay
+  (`loader::Backoff`, 250 ms doubling to 30 s); `context()` does the same
+  for the device / context retain. Probe verdicts that are `BackendBusy`
+  (session limit, CUDA failure while probing) are not memoized
+  (`cache::probe_once`), so the next selection probes again;
+  `BackendUnavailable` (no driver, too old) still is.
+- Tested with a fake sticky error (`codec::cuda` tests): the lost context
+  is replaced while held, and the primary context comes back once released.
+
+### Encoder hardening
+
+- Reopen old-first: `Encoder::reopen` closes the session before opening the
+  new one (at the session limit a resolution change no longer falls to
+  software), and reopens the previous configuration if the new one fails;
+  if that fails too the encoder is `Closed` and every call returns
+  `Error::EncoderClosed` (mapped to `BackendBusy`).
+- `VideoEncoder::reset` (default: `configure`) rebuilds the session even
+  for an unchanged configuration; the stream pipeline's `recover_encoder`
+  calls it (`configure` with the same configuration was a no-op for NVENC
+  and VA-API).
+- `invalidate_array` / `clear_input_caches` flush the pictures still
+  reading the invalidated memory and unregister before returning, which is
+  what the `encode_array` / `encode_pitched` contract promises.
+- A failed `nvEncLockBitstream` keeps the picture pending (input mapped,
+  slot taken) instead of recycling a slot NVENC may still use.
+- Host upload failures: the stream is synchronised before returning
+  whenever a copy may have been queued.
+- `DeviceBuffer::upload` / `fill` synchronise the context before and
+  after: they run on the legacy stream, which the crate's non-blocking
+  streams do not order against (`blocking_upload_and_fill_are_ordered_with_streams`
+  fails without it).
+
+### Performance
+
+- Host input: page-locked staging per slot, CPU copy, asynchronous upload
+  on NVENC's IO stream, no wait for the GPU in `encode_host`.
+- No allocation per packet: `UnexpectedValue`'s message is built only on
+  failure; ferricast lends packets to `Bytes` through a pool
+  (`Bytes::from_owner`) that hands buffers back to `Encoder::recycle_buffer`.
+- `CudaSurface::readback`: pooled page-locked buffer and stream, both planes
+  copied asynchronously straight at the output stride, one wait, lent to
+  the `Bytes` without a copy (`PinnedBuffer::download`).
+- Measured (RTX 3060, driver 595.71.05, release builds of the commit
+  before and after, interleaved, GPU shared with other jobs):
+  `CudaSurface::readback` 1080p 0.395 → 0.172 ms, 2160p 1.45–1.51 →
+  0.644 ms, 3.1 MB / 12.4 MB allocated per frame → ~0.6 KB; ferricast's
+  NVENC encode from CPU NV12 1080p 472–474 → 485 fps, 2160p 132–133 →
+  135 fps, 41.6 KB → 0.16 KB allocated per frame; raw `encode_host` 2160p
+  131–132 → 134 fps (frames in flight 2: 153 both, encoder-bound).
+- Not done: `decode::DeviceFrame::download` (the decode module's) still
+  zero-fills a pageable `Vec` and copies plane by plane synchronously;
+  `CudaSurface::readback` no longer uses it. Producers cannot yet write
+  straight into an encoder's staging buffer (one CPU copy remains).
+  `interop`'s `clear` / `forget` synchronise the whole shared context,
+  stalling every session on it.

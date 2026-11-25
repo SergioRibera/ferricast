@@ -245,17 +245,26 @@ encoder's `nvenc` / `nvenc-hevc` and the decoder's `nvdec-decode` /
 
 Shared pieces (`ferricast_codec::cuda`):
 
-- `context()`: the primary CUDA context of device 0, retained for the
-  process; decoders and encoders share it, so a decoded picture and the
-  encoder taking it are on the same context.
+- `context()`: the primary CUDA context of device 0, shared by the
+  decoders and encoders open at the same time (a decoded picture and the
+  encoder taking it are on the same context) and released when the last
+  one closes. A context marked lost (sticky CUDA error, Xid, resume) is
+  replaced: the primary context is retained afresh, or, while the lost one
+  is still held, a context of its own is created. Driver start-up failures
+  are retried after a growing delay instead of being kept for the process.
 - `CudaSurface`: an NVDEC picture in a pooled pitched CUDA buffer, handed
   out as `CapturedFrame::Native` of the new `SurfaceKind::CudaDevice`
   (NV12, P010 for streams deeper than 8 bits). `readback` downloads it;
   `CudaSurface::readbacks()` counts those, process-wide.
-- `codec_error`: no driver / too old / no device / NVENC session limit,
-  and any CUDA failure while probing or opening, are
-  `BackendUnavailable` (selection moves on: NVENC → VA-API → x264);
-  what the GPU cannot do is `UnsupportedStream` while decoding (the next
+- `codec_error`: no driver / too old / no device are `BackendUnavailable`
+  (selection moves on: NVENC → VA-API → x264, and the probe verdict is
+  kept); an NVENC session limit, a closed encoder and any CUDA failure
+  while probing or opening are the new `BackendBusy` (selection moves on,
+  but the verdict is not memoized, so the next selection tries NVIDIA
+  again); a lost device is `UnsupportedStream` while decoding and
+  `BackendBusy` otherwise (an encoder hands over mid-stream), and the
+  shared context is marked lost; what the GPU cannot do is
+  `UnsupportedStream` while decoding (the next
   decoder takes the stream over, e.g. H.264 High 10, sizes under NVDEC's
   minimum, 4:2:2 / 4:4:4 output ferricast has no pixel format for) and
   `UnsupportedConfig` otherwise; the rest (corrupt packet, failed copy) is
@@ -338,6 +347,17 @@ Encoder (`ferricast_encoder::nvenc`, `NvencEncoder<C>`):
   of `nvenc`. A root `nvenc-hevc` feature was added.
 - The probe queries NVENC's capabilities once per process (one session)
   instead of opening a 1080p encoder.
+- `configure` with a new shape reconfigures the session in place
+  (`nvEncReconfigureEncoder`: a size up to the opened one, rate, GOP,
+  bitrate, colour) and otherwise closes the old session before opening
+  the new one (a GPU at its session limit takes it), reopening the old
+  configuration if the new one fails. `VideoEncoder::reset` (new, default
+  `configure`) always reopens; the stream pipeline's encoder recovery
+  calls it, so a failed NVENC session is replaced rather than kept.
+- A mid-stream `BackendBusy` / `BackendUnavailable` from `encode` (a lost
+  GPU) hands the selection over to the next backend.
+- Packets are lent to `EncodedFrame::data` from a pool (`Bytes::from_owner`)
+  and come back to NVENC when dropped: no allocation per packet.
 
 Measured (RTX 3060, driver 595.71.05, release build, 1080p60 testsrc2
 clips, through the facades with `Fixed(Nvdec)` / `Fixed(Nvenc)`;

@@ -15,6 +15,11 @@ pub trait VideoEncoderSession: Send {
     /// # Errors
     /// The backend's.
     fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()>;
+    /// See [`VideoEncoder::reset`].
+    ///
+    /// # Errors
+    /// The backend's.
+    fn reset(&mut self, config: &EncoderConfig) -> CodecResult<()>;
     /// See [`VideoEncoder::encode`].
     ///
     /// # Errors
@@ -42,6 +47,10 @@ pub trait VideoEncoderSession: Send {
 impl<E: VideoEncoder> VideoEncoderSession for E {
     fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()> {
         VideoEncoder::configure(self, config)
+    }
+
+    fn reset(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+        VideoEncoder::reset(self, config)
     }
 
     fn encode(&mut self, frame: CapturedFrame) -> CodecResult<EncodedFrame> {

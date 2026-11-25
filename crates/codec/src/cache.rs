@@ -419,7 +419,11 @@ pub(crate) fn probe_once(
     // Probed outside the lock: a slow driver query must not stall other
     // jobs' probes. Two racing first probes both run; either verdict is right.
     let verdict = probe();
-    lock(&PROBES).insert((backend, target), verdict.clone());
+    // A busy backend (a full GPU, a driver that failed to start this time)
+    // is not unavailable: the next selection probes it again.
+    if !matches!(verdict, Err(CodecError::BackendBusy { .. })) {
+        lock(&PROBES).insert((backend, target), verdict.clone());
+    }
     verdict
 }
 
@@ -538,5 +542,24 @@ mod tests {
         })
         .unwrap();
         assert_eq!(runs, 2);
+    }
+
+    #[test]
+    fn a_busy_backend_is_probed_again() {
+        // A job no backend does, so no other test shares the verdict.
+        let target = CodecTarget::decode(Codec::Av1);
+        let mut runs = 0;
+        for _ in 0..3 {
+            let verdict = probe_once(BackendId::Pcm, target, || {
+                runs += 1;
+                Err(CodecError::BackendBusy {
+                    backend: BackendId::Pcm,
+                    reason: "session limit".into(),
+                })
+            });
+            assert!(matches!(verdict, Err(CodecError::BackendBusy { .. })));
+            assert!(known_unavailable(BackendId::Pcm, target).is_none());
+        }
+        assert_eq!(runs, 3);
     }
 }

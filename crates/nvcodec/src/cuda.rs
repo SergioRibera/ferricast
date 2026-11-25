@@ -18,6 +18,7 @@ use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::{CheckStatus as _, CudaStatus, Error, Result};
 use crate::loader::CudaLibrary;
@@ -300,7 +301,9 @@ pub struct MemoryInfo {
     pub total: usize,
 }
 
-/// A device's primary context, retained for as long as this value lives.
+/// A CUDA context: a device's primary context, retained for as long as this
+/// value lives, or (only to replace a lost primary context that others still
+/// hold) a context of its own.
 ///
 /// The primary context is the one context per device that the CUDA runtime,
 /// other libraries and other parts of ferricast share, so retaining it never
@@ -310,15 +313,27 @@ pub struct Context {
     raw: NonNull<sys::CUctx_st>,
     device: Device,
     cuda: &'static CudaLibrary,
+    kind: ContextKind,
+    /// Set once a sticky error showed the context is unusable.
+    lost: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextKind {
+    /// Retained with `cuDevicePrimaryCtxRetain`, released on drop.
+    Primary,
+    /// Created with `cuCtxCreate`, destroyed on drop.
+    Owned,
 }
 
 // SAFETY: a `CUcontext` has no thread affinity: the driver API is
 // thread-safe and every use pushes the context on the calling thread
 // (`ContextGuard`), as NVIDIA documents for sharing a context between
-// threads. `Context` exposes no interior state besides the handle.
+// threads. `Context` exposes no interior state besides the handle and an
+// atomic flag.
 unsafe impl Send for Context {}
-// SAFETY: as for `Send`; a primary context may be current on several threads
-// at once, so concurrent `&Context` use is allowed by the driver.
+// SAFETY: as for `Send`; a context may be current on several threads at
+// once, so concurrent `&Context` use is allowed by the driver.
 unsafe impl Sync for Context {}
 
 impl Context {
@@ -340,13 +355,63 @@ impl Context {
                 value: "null".into(),
             });
         };
-        Ok(Arc::new(Self { raw, device, cuda }))
+        Ok(Arc::new(Self {
+            raw,
+            device,
+            cuda,
+            kind: ContextKind::Primary,
+            lost: AtomicBool::new(false),
+        }))
+    }
+
+    /// Creates a context of its own on `device`, destroyed on drop. Only for
+    /// replacing a lost primary context while something still holds it
+    /// (memory of one context cannot be used on another); otherwise use
+    /// [`Context::primary`].
+    ///
+    /// # Errors
+    ///
+    /// Loading errors and [`Error::Cuda`].
+    pub fn create(device: Device) -> Result<Arc<Self>> {
+        let cuda = CudaLibrary::get()?;
+        let mut raw = ptr::null_mut();
+        // SAFETY: valid out-pointer and device handle; flags 0 (automatic
+        // scheduling).
+        unsafe { (cuda.ctx_create)(&raw mut raw, 0, device.raw) }.check("cuCtxCreate_v2")?;
+        let Some(raw) = NonNull::new(raw) else {
+            return Err(Error::UnexpectedValue {
+                call: "cuCtxCreate_v2",
+                what: "a context",
+                value: "null".into(),
+            });
+        };
+        // `cuCtxCreate` makes the new context current; every use pushes it.
+        let mut popped = ptr::null_mut();
+        // SAFETY: the context was just pushed on this thread; valid
+        // out-pointer.
+        let popped_status = unsafe { (cuda.ctx_pop_current)(&raw mut popped) };
+        if let Err(error) = popped_status.check("cuCtxPopCurrent_v2") {
+            tracing::warn!(%error, "popping a new CUDA context");
+        }
+        Ok(Arc::new(Self {
+            raw,
+            device,
+            cuda,
+            kind: ContextKind::Owned,
+            lost: AtomicBool::new(false),
+        }))
     }
 
     /// The device.
     #[must_use]
     pub fn device(&self) -> Device {
         self.device
+    }
+
+    /// Whether this is the device's primary context.
+    #[must_use]
+    pub fn is_primary(&self) -> bool {
+        self.kind == ContextKind::Primary
     }
 
     /// The driver's handle, for APIs that take a `CUcontext` (NVENC, NVDEC).
@@ -360,6 +425,48 @@ impl Context {
     #[must_use]
     pub fn as_non_null(&self) -> NonNull<std::ffi::c_void> {
         self.raw.cast()
+    }
+
+    /// Whether a sticky error was seen on the context ([`Context::note_error`]):
+    /// nothing on it works any more, and new work belongs on a new context.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+
+    /// Records `error` if it says the context is unusable
+    /// ([`Error::is_device_lost`]). For an NVENC or NVDEC failure, which
+    /// does not say, the context is asked (`cuStreamQuery` on its default
+    /// stream, which returns a sticky error without waiting).
+    ///
+    /// Returns [`Error::DeviceLost`] when the context is (now) lost, so the
+    /// caller can hand the failure over as such.
+    pub fn note_error(&self, error: &Error) -> Option<Error> {
+        let lost = match error {
+            Error::DeviceLost { call, status } => Some((*call, *status)),
+            Error::Cuda { call, status } | Error::Cuvid { call, status } if status.is_sticky() => {
+                Some((*call, *status))
+            }
+            Error::Nvenc { .. } | Error::NvencSessionLimit { .. } | Error::Cuvid { .. } => {
+                self.sticky_status().map(|status| ("cuStreamQuery", status))
+            }
+            _ => None,
+        };
+        let (call, status) = lost?;
+        if !self.lost.swap(true, Ordering::AcqRel) {
+            tracing::warn!(%status, call, device = ?self.device, "the CUDA context is lost");
+        }
+        Some(Error::DeviceLost { call, status })
+    }
+
+    /// The sticky error the context is in, if any (`cuStreamQuery` on the
+    /// legacy default stream: no wait).
+    fn sticky_status(&self) -> Option<CudaStatus> {
+        let _current = self.guard().ok()?;
+        // SAFETY: the context is current; the null stream is its default
+        // stream.
+        let status = CudaStatus(unsafe { (self.cuda.stream_query)(ptr::null_mut()) });
+        status.is_sticky().then_some(status)
     }
 
     /// Makes the context current on this thread until the guard drops.
@@ -404,11 +511,20 @@ impl Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        // SAFETY: this value retained the primary context once.
-        let released = unsafe { (self.cuda.device_primary_ctx_release)(self.device.raw) }
-            .check("cuDevicePrimaryCtxRelease");
+        let released = match self.kind {
+            ContextKind::Primary => {
+                // SAFETY: this value retained the primary context once.
+                unsafe { (self.cuda.device_primary_ctx_release)(self.device.raw) }
+                    .check("cuDevicePrimaryCtxRelease")
+            }
+            ContextKind::Owned => {
+                // SAFETY: this value created the context and nothing uses it
+                // any more (every user holds the `Arc`).
+                unsafe { (self.cuda.ctx_destroy)(self.raw.as_ptr()) }.check("cuCtxDestroy_v2")
+            }
+        };
         if let Err(error) = released {
-            tracing::warn!(%error, "releasing the primary CUDA context");
+            tracing::warn!(%error, kind = ?self.kind, "releasing a CUDA context");
         }
     }
 }
@@ -418,6 +534,8 @@ impl fmt::Debug for Context {
         f.debug_struct("Context")
             .field("raw", &self.raw)
             .field("device", &self.device)
+            .field("kind", &self.kind)
+            .field("lost", &self.is_lost())
             .finish_non_exhaustive()
     }
 }
@@ -785,6 +903,57 @@ pub struct HostImage<'a> {
     pub pitch: usize,
 }
 
+impl HostImage<'_> {
+    /// Copies its first `rows` rows of `width_bytes` into `dst`, packed
+    /// (`width_bytes` apart).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::PitchTooSmall`] for a pitch under `width_bytes`,
+    /// [`Error::CopyOutOfBounds`] when either side is too short.
+    pub(crate) fn copy_rows_into(
+        &self,
+        dst: &mut [u8],
+        width_bytes: usize,
+        rows: usize,
+    ) -> Result<()> {
+        if rows == 0 || width_bytes == 0 {
+            return Ok(());
+        }
+        if self.pitch < width_bytes {
+            return Err(Error::PitchTooSmall {
+                pitch: self.pitch,
+                width_bytes,
+            });
+        }
+        let needed = self.pitch * (rows - 1) + width_bytes;
+        let out_of_bounds = |side, needed, available| Error::CopyOutOfBounds {
+            side,
+            unit: "bytes",
+            needed,
+            available,
+        };
+        if self.data.len() < needed {
+            return Err(out_of_bounds("source", needed, self.data.len()));
+        }
+        if dst.len() < width_bytes * rows {
+            return Err(out_of_bounds("destination", width_bytes * rows, dst.len()));
+        }
+        if self.pitch == width_bytes {
+            dst[..needed].copy_from_slice(&self.data[..needed]);
+        } else {
+            for (target, source) in dst
+                .chunks_exact_mut(width_bytes)
+                .zip(self.data.chunks(self.pitch))
+                .take(rows)
+            {
+                target.copy_from_slice(&source[..width_bytes]);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Host pixels written by a copy: rows `pitch` bytes apart, starting at the
 /// first byte of `data`.
 #[derive(Debug)]
@@ -814,7 +983,10 @@ impl<'a> ArrayView<'a> {
     ///
     /// `raw` must be a CUDA array of `context`, at least `width` × `height`
     /// elements, that stays allocated (and, for an interop array, mapped)
-    /// for all of `'a`.
+    /// for all of `'a`, and past it until the GPU work queued on it while
+    /// lent has completed. A consumer that keeps a registration of it
+    /// (NVENC's [`Encoder::encode_array`](crate::encode::Encoder::encode_array)
+    /// cache) extends that to the end of the registration.
     #[must_use]
     pub const unsafe fn from_raw(
         raw: sys::CUarray,
@@ -855,6 +1027,158 @@ impl<'a> ArrayView<'a> {
     }
 }
 
+/// Page-locked host memory (`cuMemHostAlloc`): the copy engine reads and
+/// writes it directly, so copies to and from it run asynchronously and at
+/// full bus speed (pageable memory is staged through a driver buffer and
+/// makes the copy synchronous). Freed on drop. Not zero-filled.
+pub struct PinnedBuffer {
+    ptr: NonNull<u8>,
+    len: usize,
+    context: Arc<Context>,
+}
+
+// SAFETY: the buffer owns its allocation exclusively; page-locked host memory
+// has no thread affinity, and `cuMemFreeHost` may run on any thread.
+unsafe impl Send for PinnedBuffer {}
+// SAFETY: shared access only reads the bytes.
+unsafe impl Sync for PinnedBuffer {}
+
+impl PinnedBuffer {
+    /// Allocates `len` bytes (at least one) of page-locked memory, usable
+    /// from every context (`CU_MEMHOSTALLOC_PORTABLE`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Cuda`] (`CUDA_ERROR_OUT_OF_MEMORY`).
+    pub fn new(context: &Arc<Context>, len: usize) -> Result<Self> {
+        /// `CU_MEMHOSTALLOC_PORTABLE`.
+        const PORTABLE: c_uint = 0x01;
+        let _current = context.guard()?;
+        let mut ptr = ptr::null_mut();
+        // SAFETY: the context is current; valid out-pointer.
+        unsafe { (context.cuda.mem_host_alloc)(&raw mut ptr, len.max(1), PORTABLE) }
+            .check("cuMemHostAlloc")?;
+        let Some(ptr) = NonNull::new(ptr.cast::<u8>()) else {
+            return Err(Error::UnexpectedValue {
+                call: "cuMemHostAlloc",
+                what: "a host pointer",
+                value: "null".into(),
+            });
+        };
+        Ok(Self {
+            ptr,
+            len,
+            context: Arc::clone(context),
+        })
+    }
+
+    /// The context it was allocated on.
+    #[must_use]
+    pub fn context(&self) -> &Arc<Context> {
+        &self.context
+    }
+
+    /// The bytes. Reading them while an asynchronous copy into them is
+    /// queued reads whatever the copy engine has written so far.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `len` bytes allocated by `cuMemHostAlloc` and owned by
+        // this value; bytes are always initialised for `u8` purposes
+        // (the allocation is plain host memory).
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// The bytes, writable.
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: as in `as_slice`, and `&mut self` makes the access
+        // exclusive on the host side.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// Copies regions of `src` into this buffer, queued on `stream` (after
+    /// `after` completes, when given) and waited for once: each lands at
+    /// [`PinnedCopy::offset`] with rows [`PinnedCopy::pitch`] apart.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CopyOutOfBounds`] / [`Error::PitchTooSmall`] for a region
+    /// outside either side, [`Error::Cuda`]. The copies queued before a
+    /// failure are waited for too.
+    pub fn download(
+        &mut self,
+        src: &DeviceBuffer,
+        copies: &[PinnedCopy],
+        stream: &Stream,
+        after: Option<&Event>,
+    ) -> Result<()> {
+        let queued = after
+            .map_or(Ok(()), |event| stream.wait(event))
+            .and_then(|()| {
+                copies.iter().try_for_each(|copy| {
+                    let data = self
+                        .as_mut_slice()
+                        .get_mut(copy.offset..)
+                        .unwrap_or_default();
+                    // SAFETY: this buffer is borrowed mutably until the stream
+                    // is synchronised below, so nothing reads, writes or frees
+                    // it while the copy engine writes it.
+                    unsafe {
+                        src.download_async(
+                            copy.src,
+                            HostImageMut {
+                                data,
+                                pitch: copy.pitch,
+                            },
+                            stream,
+                        )
+                    }
+                })
+            });
+        let waited = stream.synchronize();
+        queued.and(waited)
+    }
+}
+
+/// One copy of [`PinnedBuffer::download`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinnedCopy {
+    /// The region of the device buffer.
+    pub src: Region,
+    /// Where its first row lands in the pinned buffer.
+    pub offset: usize,
+    /// Bytes from one row to the next in the pinned buffer.
+    pub pitch: usize,
+}
+
+impl AsRef<[u8]> for PinnedBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl Drop for PinnedBuffer {
+    fn drop(&mut self) {
+        let cuda = self.context.cuda;
+        let freed = self.context.guard().and_then(|_current| {
+            // SAFETY: this value owns the allocation and it is not used
+            // again; every copy into it was waited for by its user.
+            unsafe { (cuda.mem_free_host)(self.ptr.as_ptr().cast()) }.check("cuMemFreeHost")
+        });
+        if let Err(error) = freed {
+            tracing::warn!(%error, "freeing page-locked host memory");
+        }
+    }
+}
+
+impl fmt::Debug for PinnedBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PinnedBuffer")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A pitched 2D allocation in device memory (`cuMemAllocPitch`): `rows` rows
 /// of `width_bytes`, each starting `pitch` bytes after the previous one, the
 /// pitch chosen by the driver for coalesced access. Freed on drop, with its
@@ -869,6 +1193,30 @@ pub struct DeviceBuffer {
     width_bytes: usize,
     rows: usize,
     context: Arc<Context>,
+    allocation: Arc<Allocation>,
+}
+
+/// The memory behind a [`DeviceBuffer`], freed when the last holder goes:
+/// the buffer, or someone that registered it with a driver and must
+/// unregister it before it is freed ([`DeviceBuffer::keep_allocated`]).
+pub(crate) struct Allocation {
+    ptr: sys::CUdeviceptr,
+    context: Arc<Context>,
+}
+
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        let cuda = self.context.cuda;
+        let freed = self.context.guard().and_then(|_current| {
+            // SAFETY: the last holder of the allocation is gone, its context
+            // is current. `cuMemFree` is not stream-ordered: it waits for
+            // queued work that uses the memory.
+            unsafe { (cuda.mem_free)(self.ptr) }.check("cuMemFree_v2")
+        });
+        if let Err(error) = freed {
+            tracing::warn!(%error, "freeing a CUDA device buffer");
+        }
+    }
 }
 
 // SAFETY: the buffer owns its allocation exclusively; a device pointer has no
@@ -911,6 +1259,10 @@ impl DeviceBuffer {
             width_bytes,
             rows,
             context: Arc::clone(context),
+            allocation: Arc::new(Allocation {
+                ptr,
+                context: Arc::clone(context),
+            }),
         })
     }
 
@@ -938,6 +1290,14 @@ impl DeviceBuffer {
         self.rows
     }
 
+    /// Keeps the memory allocated past the buffer's drop, until the
+    /// returned handle goes too: for a registration (NVENC) that must be
+    /// undone before the memory is freed. Does not count as a holder of the
+    /// buffer (`Arc::strong_count` of an `Arc<DeviceBuffer>` is unchanged).
+    pub(crate) fn keep_allocated(&self) -> Arc<Allocation> {
+        Arc::clone(&self.allocation)
+    }
+
     /// The whole buffer as a copy region.
     #[must_use]
     pub fn region(&self) -> Region {
@@ -950,15 +1310,26 @@ impl DeviceBuffer {
         &self.context
     }
 
-    /// Copies `src` into `dst` of this buffer, waiting for completion.
+    /// Copies `src` into `dst` of this buffer, ordered after all work
+    /// queued on the buffer's context (on any stream), and waits for the
+    /// copy to complete: work queued afterwards, on any stream, sees it.
+    ///
+    /// Synchronises the whole context twice (the copy runs on the legacy
+    /// default stream, which the crate's non-blocking streams do not order
+    /// against): for set-up and tests. Pipelines use
+    /// [`DeviceBuffer::upload_async`] on their own stream.
     ///
     /// # Errors
     ///
     /// [`Error::CopyOutOfBounds`] / [`Error::PitchTooSmall`] when either
-    /// side is too small, [`Error::Cuda`].
+    /// side is too small, [`Error::Cuda`] (including failures of earlier
+    /// work on the context).
     pub fn upload(&mut self, dst: Region, src: HostImage<'_>) -> Result<()> {
         let copy = self.upload_params(dst, src)?;
-        self.run(copy.as_ref(), None)
+        self.context.synchronize()?;
+        self.run(copy.as_ref(), None)?;
+        // A copy from pageable memory may return once the source is staged.
+        self.context.synchronize()
     }
 
     /// Queues the copy of `src` into `dst` of this buffer on `stream`.
@@ -1043,18 +1414,26 @@ impl DeviceBuffer {
         self.run(copy.as_ref(), Some(stream))
     }
 
-    /// Sets every byte of the buffer to `value`, waiting for completion.
+    /// Sets every byte of the buffer to `value`, ordered after all work
+    /// queued on the buffer's context (on any stream), and waits for it to
+    /// complete: work queued afterwards, on any stream, sees it.
+    ///
+    /// Synchronises the whole context twice (a memset of device memory runs
+    /// on the legacy default stream and returns before it completes): for
+    /// set-up and tests. Pipelines use [`DeviceBuffer::fill_async`].
     ///
     /// # Errors
     ///
-    /// [`Error::Cuda`].
+    /// [`Error::Cuda`] (including failures of earlier work on the context).
     pub fn fill(&mut self, value: u8) -> Result<()> {
         let cuda = self.context.cuda;
         let _current = self.context.guard()?;
+        self.context.synchronize()?;
         // SAFETY: the allocation spans `rows` rows of `pitch` bytes, of which
         // `width_bytes` are set; its context is current.
         unsafe { (cuda.memset_d2d8)(self.ptr, self.pitch, value, self.width_bytes, self.rows) }
-            .check("cuMemsetD2D8_v2")
+            .check("cuMemsetD2D8_v2")?;
+        self.context.synchronize()
     }
 
     /// Queues setting every byte of the buffer to `value` on `stream`.
@@ -1189,21 +1568,6 @@ enum Side {
     Destination,
 }
 
-impl Drop for DeviceBuffer {
-    fn drop(&mut self) {
-        let cuda = self.context.cuda;
-        let freed = self.context.guard().and_then(|_current| {
-            // SAFETY: this buffer owns the allocation, its context is
-            // current, and it is not used again. `cuMemFree` is not
-            // stream-ordered: it waits for queued work that uses the memory.
-            unsafe { (cuda.mem_free)(self.ptr) }.check("cuMemFree_v2")
-        });
-        if let Err(error) = freed {
-            tracing::warn!(%error, "freeing a CUDA device buffer");
-        }
-    }
-}
-
 impl fmt::Debug for DeviceBuffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeviceBuffer")
@@ -1235,7 +1599,10 @@ impl<'a> PitchedView<'a> {
     /// `ptr` must be device memory of `context` holding `rows` rows of
     /// `width_bytes` bytes, `pitch` bytes apart (`pitch >= width_bytes`),
     /// that stays allocated (and, for interop memory, mapped) for all of
-    /// `'a`.
+    /// `'a`, and past it until the GPU work queued on it while lent has
+    /// completed. A consumer that keeps a registration of it (NVENC's
+    /// [`Encoder::encode_pitched`](crate::encode::Encoder::encode_pitched)
+    /// cache) extends that to the end of the registration.
     #[must_use]
     pub const unsafe fn from_raw(
         ptr: sys::CUdeviceptr,

@@ -92,16 +92,20 @@ impl<A: NvencApi> Session<A> {
     /// [`Error::Nvenc`] if the driver refuses the session (no NVENC on this
     /// GPU, session limit reached, version mismatch).
     pub fn open(api: Api<A>, context: &Arc<Context>) -> Result<Self> {
-        let device = context.as_non_null();
-        let _current = context.guard()?;
-        // SAFETY: `device` is the context's handle and the session holds an
-        // `Arc` of the context, so it outlives the encoder; `api` holds the
-        // list for `A`.
-        let encoder = unsafe { A::open_encode_session(api.functions(), device, DeviceType::Cuda)? };
-        Ok(Self {
-            encoder,
-            api,
-            context: Arc::clone(context),
+        // Opened on the session thread (see `crate::lifecycle`).
+        crate::lifecycle::run(context, || {
+            let device = context.as_non_null();
+            let _current = context.guard()?;
+            // SAFETY: `device` is the context's handle and the session holds
+            // an `Arc` of the context, so it outlives the encoder; `api`
+            // holds the list for `A`.
+            let encoder =
+                unsafe { A::open_encode_session(api.functions(), device, DeviceType::Cuda)? };
+            Ok(Self {
+                encoder,
+                api,
+                context: Arc::clone(context),
+            })
         })
     }
 
@@ -132,12 +136,24 @@ impl<A: NvencApi> Session<A> {
     }
 }
 
+/// A session handle on its way to the session thread to be destroyed.
+struct Doomed(NonNull<c_void>);
+
+// SAFETY: an NVENC session has no thread affinity, and the handle is used by
+// one thread only (the session thread destroying it).
+unsafe impl Send for Doomed {}
+
 impl<A: NvencApi> Drop for Session<A> {
     fn drop(&mut self) {
-        let destroyed = self.context.guard().and_then(|_current| {
-            // SAFETY: the session is live, opened with this list, and not
-            // used again.
-            unsafe { A::destroy_encoder(self.api.functions(), self.encoder) }
+        let (api, doomed, context) = (self.api, Doomed(self.encoder), &self.context);
+        // Destroyed on the session thread (see `crate::lifecycle`).
+        let destroyed = crate::lifecycle::run(context, move || {
+            let doomed = doomed;
+            context.guard().and_then(|_current| {
+                // SAFETY: the session is live, opened with this list, and
+                // not used again.
+                unsafe { A::destroy_encoder(api.functions(), doomed.0) }
+            })
         });
         if let Err(error) = destroyed {
             tracing::warn!(%error, api = %A::VERSION, "destroying an NVENC session");
@@ -343,11 +359,52 @@ macro_rules! with_engine {
     };
 }
 
+/// Runs `$body` with `$engine` bound to the engine of an open encoder, or
+/// `$fallback` with `$closed` bound to what a closed one remembers.
+macro_rules! on_engine {
+    ($state:expr, $engine:ident => $body:expr, $closed:ident => $fallback:expr) => {
+        match $state {
+            State::Open(versioned) => with_engine!(versioned, $engine => $body),
+            State::Closed($closed) => $fallback,
+        }
+    };
+}
+
+/// Whether the encoder has a session.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "an open encoder is the normal state; boxing it would add an indirection to every call"
+)]
+enum State {
+    Open(Versioned),
+    /// A reopen failed twice ([`Encoder::reopen`]): no session until the
+    /// next successful reopen.
+    Closed(Box<Closed>),
+}
+
+/// What a closed encoder remembers of its last session.
+struct Closed {
+    config: Config,
+    caps: CodecCapabilities,
+    version: ApiVersion,
+    reason: String,
+}
+
+impl Closed {
+    fn error(&self) -> Error {
+        Error::EncoderClosed {
+            reason: self.reason.clone(),
+        }
+    }
+}
+
 /// An NVENC encoder. See the [module docs](self).
 ///
 /// `Send`, not `Sync`: one thread at a time drives it.
 pub struct Encoder {
-    versioned: Versioned,
+    state: State,
+    api: AnyApi,
+    context: Arc<Context>,
 }
 
 impl Encoder {
@@ -371,15 +428,122 @@ impl Encoder {
     ///
     /// As [`Encoder::open`].
     pub fn open_with(api: AnyApi, context: &Arc<Context>, config: &Config) -> Result<Self> {
-        let versioned = match api {
+        let versioned = Self::open_versioned(&api, context, config)
+            .map_err(|error| context.note_error(&error).unwrap_or(error))?;
+        Ok(Self {
+            state: State::Open(versioned),
+            api,
+            context: Arc::clone(context),
+        })
+    }
+
+    fn open_versioned(api: &AnyApi, context: &Arc<Context>, config: &Config) -> Result<Versioned> {
+        Ok(match *api {
             AnyApi::V11_1(api) => Versioned::V11_1(Engine::open(api, context, config)?),
             AnyApi::V12_0(api) => Versioned::V12_0(Engine::open(api, context, config)?),
             AnyApi::V12_1(api) => Versioned::V12_1(Engine::open(api, context, config)?),
             AnyApi::V12_2(api) => Versioned::V12_2(Engine::open(api, context, config)?),
             AnyApi::V13_0(api) => Versioned::V13_0(Engine::open(api, context, config)?),
             AnyApi::V13_1(api) => Versioned::V13_1(Engine::open(api, context, config)?),
+        })
+    }
+
+    /// Marks the context lost when `result` says the device is gone, so the
+    /// next user of the context can tell ([`Context::is_lost`]).
+    fn noted<T>(&self, result: Result<T>) -> Result<T> {
+        result.map_err(|error| self.context.note_error(&error).unwrap_or(error))
+    }
+
+    /// Closes the session and opens a new one for `config`, on the same
+    /// context and API version: the old session is closed first, so a GPU
+    /// at its session limit takes the new one. When `config` cannot be
+    /// opened, a session for the previous configuration is opened again.
+    /// Pending pictures are dropped (call [`Encoder::flush`] first to keep
+    /// their packets); packets not taken yet are lost.
+    ///
+    /// # Errors
+    ///
+    /// As [`Encoder::open`]. When the previous configuration cannot be
+    /// reopened either, the encoder stays closed: every call fails with
+    /// [`Error::EncoderClosed`] until a reopen succeeds.
+    pub fn reopen(&mut self, config: &Config) -> Result<()> {
+        let context = Arc::clone(&self.context);
+        self.reopen_on(&context, config)
+    }
+
+    /// As [`Encoder::reopen`], on `context`: the way back from a lost
+    /// context ([`Context::is_lost`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Encoder::reopen`].
+    pub fn reopen_on(&mut self, context: &Arc<Context>, config: &Config) -> Result<()> {
+        let previous = Closed {
+            config: self.config().clone(),
+            caps: self.capabilities().clone(),
+            version: self.api_version(),
+            reason: String::new(),
         };
-        Ok(Self { versioned })
+        // Closes the old session before the new one opens.
+        let old = std::mem::replace(
+            &mut self.state,
+            State::Closed(Box::new(Closed {
+                reason: "reopening".into(),
+                ..previous
+            })),
+        );
+        Self::close(&self.context, old);
+        self.context = Arc::clone(context);
+        let error = match Self::open_versioned(&self.api, &self.context, config) {
+            Ok(versioned) => {
+                self.state = State::Open(versioned);
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+        let error = self.context.note_error(&error).unwrap_or(error);
+        let State::Closed(previous) = &mut self.state else {
+            unreachable!("the state was set to closed above");
+        };
+        match Self::open_versioned(&self.api, &self.context, &previous.config) {
+            Ok(versioned) => self.state = State::Open(versioned),
+            Err(again) => {
+                tracing::warn!(%again, "reopening NVENC with the previous configuration");
+                previous.reason = format!("reopening failed: {error}; then: {again}");
+            }
+        }
+        Err(error)
+    }
+
+    /// Switches to `config`: in place when only the size (up to the size
+    /// the session was opened with), frame rate, GOP, rate control or
+    /// colour change ([`nvEncReconfigureEncoder`], pending pictures flushed
+    /// and their packets kept), otherwise through [`Encoder::reopen`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Encoder::reopen`]; driver errors of the in-place change.
+    pub fn reconfigure(&mut self, config: &Config) -> Result<()> {
+        let in_place = on_engine!(&mut self.state,
+            engine => engine.reconfigure(config),
+            closed => Err(closed.error()));
+        match in_place {
+            Ok(()) => Ok(()),
+            Err(Error::Unsupported { .. } | Error::EncoderClosed { .. }) => self.reopen(config),
+            Err(error) => self.noted(Err(error)),
+        }
+    }
+
+    /// Whether the encoder has a session (see [`Encoder::reopen`]).
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        matches!(self.state, State::Open(_))
+    }
+
+    /// The CUDA context the encoder runs on.
+    #[must_use]
+    pub fn context(&self) -> &Arc<Context> {
+        &self.context
     }
 
     /// The NVENC API version in use.
@@ -388,20 +552,20 @@ impl Encoder {
         fn version<A: EncodeApi>(_: &Engine<A>) -> ApiVersion {
             A::VERSION
         }
-        with_engine!(&self.versioned, engine => version(engine))
+        on_engine!(&self.state, engine => version(engine), closed => closed.version)
     }
 
     /// The configuration in effect (rate control updated by
     /// [`Encoder::set_rate_control`]).
     #[must_use]
     pub fn config(&self) -> &Config {
-        with_engine!(&self.versioned, engine => engine.config())
+        on_engine!(&self.state, engine => engine.config(), closed => &closed.config)
     }
 
     /// What the GPU can do for this encoder's codec.
     #[must_use]
     pub fn capabilities(&self) -> &CodecCapabilities {
-        with_engine!(&self.versioned, engine => engine.capabilities())
+        on_engine!(&self.state, engine => engine.capabilities(), closed => &closed.caps)
     }
 
     /// Encodes a picture from host memory: copied on the encoder's stream
@@ -415,13 +579,18 @@ impl Encoder {
     /// configuration's, [`Error::CopyOutOfBounds`] / [`Error::PitchTooSmall`]
     /// for planes too small for the picture, driver errors.
     pub fn encode_host(&mut self, frame: HostFrame<'_>, options: FrameOptions) -> Result<()> {
-        with_engine!(&mut self.versioned, engine => engine.encode_host(frame, options))
+        let result = on_engine!(&mut self.state,
+            engine => engine.encode_host(frame, options),
+            closed => Err(closed.error()));
+        self.noted(result)
     }
 
     /// Encodes a picture from a device buffer without copying it. The
     /// buffer's registration is cached and reused while it lives; the
     /// encoder keeps an `Arc` of it until the picture's packet is out, and
-    /// the buffer must not be written in that time.
+    /// the buffer must not be written in that time. Dropping the buffer
+    /// afterwards is fine: its memory is freed once the registration is
+    /// undone.
     ///
     /// # Errors
     ///
@@ -430,7 +599,10 @@ impl Encoder {
     /// [`Error::Unsupported`] for a chroma row offset the API version cannot
     /// express ([`ApiFeature::ChromaPlaneOffset`]); driver errors.
     pub fn encode_device(&mut self, frame: DeviceFrame<'_>, options: FrameOptions) -> Result<()> {
-        with_engine!(&mut self.versioned, engine => engine.encode_device(frame, options))
+        let result = on_engine!(&mut self.state,
+            engine => engine.encode_device(frame, options),
+            closed => Err(closed.error()));
+        self.noted(result)
     }
 
     /// Encodes a picture from a CUDA array (packed RGB formats only), such
@@ -447,8 +619,9 @@ impl Encoder {
     ///
     /// - The array behind `key` must stay allocated (and, for interop
     ///   arrays, mapped) until its registration is invalidated or the encoder
-    ///   is dropped: invalidate `key` before destroying or unmapping it. A
-    ///   new array that reuses an old handle under the same key without an
+    ///   is dropped: invalidate `key` before destroying or unmapping it
+    ///   ([`Encoder::invalidate_array`] returns once NVENC is done with it).
+    ///   A new array that reuses an old handle under the same key without an
     ///   invalidation in between would be read through the stale
     ///   registration.
     /// - The array must not be written until this picture's packet is out
@@ -460,9 +633,12 @@ impl Encoder {
         array: ArrayView<'_>,
         options: FrameOptions,
     ) -> Result<()> {
-        // SAFETY: the caller upholds the contract above, which is the
-        // engine's.
-        with_engine!(&mut self.versioned, engine => unsafe { engine.encode_array(key, array, options) })
+        let result = on_engine!(&mut self.state,
+            // SAFETY: the caller upholds the contract above, which is the
+            // engine's.
+            engine => unsafe { engine.encode_array(key, array, options) },
+            closed => Err(closed.error()));
+        self.noted(result)
     }
 
     /// Encodes a picture from pitched device memory someone else owns
@@ -486,24 +662,33 @@ impl Encoder {
         view: PitchedView<'_>,
         options: FrameOptions,
     ) -> Result<()> {
-        // SAFETY: the caller upholds the contract above, which is the
-        // engine's.
-        with_engine!(&mut self.versioned, engine => unsafe { engine.encode_pitched(key, view, options) })
+        let result = on_engine!(&mut self.state,
+            // SAFETY: the caller upholds the contract above, which is the
+            // engine's.
+            engine => unsafe { engine.encode_pitched(key, view, options) },
+            closed => Err(closed.error()));
+        self.noted(result)
     }
 
     /// The next packet, in submission order (decode order with B frames).
     pub fn next_packet(&mut self) -> Option<Packet> {
-        with_engine!(&mut self.versioned, engine => engine.next_packet())
+        on_engine!(&mut self.state, engine => engine.next_packet(), _closed => None)
     }
 
     /// Hands a packet's buffer back for reuse.
     pub fn recycle(&mut self, packet: Packet) {
-        with_engine!(&mut self.versioned, engine => engine.recycle(packet));
+        on_engine!(&mut self.state, engine => engine.recycle(packet.data), _closed => ());
+    }
+
+    /// Hands a buffer back for reuse as a packet's data: a
+    /// [`Packet::data`] the caller took out of its packet and is done with.
+    pub fn recycle_buffer(&mut self, buffer: Vec<u8>) {
+        on_engine!(&mut self.state, engine => engine.recycle(buffer), _closed => ());
     }
 
     /// Makes the next picture an IDR.
     pub fn request_idr(&mut self) {
-        with_engine!(&mut self.versioned, engine => engine.request_idr());
+        on_engine!(&mut self.state, engine => engine.request_idr(), _closed => ());
     }
 
     /// Changes the rate control without a new session (keeping `max ==
@@ -514,7 +699,10 @@ impl Encoder {
     /// [`Error::Unsupported`] when the GPU cannot change bitrate or mode on
     /// the fly, [`Error::InvalidEncodeConfig`], driver errors.
     pub fn set_rate_control(&mut self, rate_control: RateControl) -> Result<()> {
-        with_engine!(&mut self.versioned, engine => engine.set_rate_control(rate_control))
+        let result = on_engine!(&mut self.state,
+            engine => engine.set_rate_control(rate_control),
+            closed => Err(closed.error()));
+        self.noted(result)
     }
 
     /// The parameter sets (H.264 SPS + PPS, HEVC VPS + SPS + PPS in Annex B;
@@ -524,7 +712,10 @@ impl Encoder {
     ///
     /// Driver errors.
     pub fn sequence_params(&mut self) -> Result<Vec<u8>> {
-        with_engine!(&mut self.versioned, engine => engine.sequence_params())
+        let result = on_engine!(&mut self.state,
+            engine => engine.sequence_params(),
+            closed => Err(closed.error()));
+        self.noted(result)
     }
 
     /// Ends the stream: every picture still held (B frames, lookahead,
@@ -535,33 +726,62 @@ impl Encoder {
     ///
     /// Driver errors.
     pub fn flush(&mut self) -> Result<()> {
-        with_engine!(&mut self.versioned, engine => engine.flush())
+        let result = on_engine!(&mut self.state, engine => engine.flush(), _closed => Ok(()));
+        self.noted(result)
     }
 
     /// Drops the cached registration of `buffer`, e.g. before reusing its
     /// memory for another layout. Optional: registrations of dropped buffers
     /// go on their own.
     pub fn forget_device_buffer(&mut self, buffer: &Arc<DeviceBuffer>) {
-        with_engine!(&mut self.versioned, engine => engine.forget_device_buffer(buffer));
+        on_engine!(&mut self.state, engine => engine.forget_device_buffer(buffer), _closed => ());
     }
 
     /// Drops the cached registration of the array (or pitched memory, see
-    /// [`Encoder::encode_pitched`]) under `key`.
+    /// [`Encoder::encode_pitched`]) under `key`. When this returns NVENC no
+    /// longer reads it: a pending picture that does is encoded first (its
+    /// packet queued), so the memory may be freed or unmapped right after.
     pub fn invalidate_array(&mut self, key: u64) {
-        with_engine!(&mut self.versioned, engine => engine.invalidate_array(key));
+        on_engine!(&mut self.state, engine => engine.invalidate_array(key), _closed => ());
     }
 
     /// Drops every cached device-buffer and array registration (the host
-    /// input pool keeps its own).
+    /// input pool keeps its own), as [`Encoder::invalidate_array`] for each.
     pub fn clear_input_caches(&mut self) {
-        with_engine!(&mut self.versioned, engine => engine.clear_input_caches());
+        on_engine!(&mut self.state, engine => engine.clear_input_caches(), _closed => ());
     }
 
     /// How many input resources this encoder has registered with NVENC so
     /// far: constant in steady state.
     #[must_use]
     pub fn registrations(&self) -> u64 {
-        with_engine!(&self.versioned, engine => engine.registrations())
+        on_engine!(&self.state, engine => engine.registrations(), _closed => 0)
+    }
+}
+
+impl Encoder {
+    /// Drops `state`'s session on the session thread ([`crate::lifecycle`]),
+    /// where it was opened.
+    fn close(context: &Arc<Context>, state: State) {
+        if matches!(state, State::Open(_)) {
+            crate::lifecycle::run(context, move || drop(state));
+        }
+    }
+}
+
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        let State::Open(_) = &self.state else {
+            return;
+        };
+        let closed = State::Closed(Box::new(Closed {
+            config: self.config().clone(),
+            caps: self.capabilities().clone(),
+            version: self.api_version(),
+            reason: "dropped".into(),
+        }));
+        let state = std::mem::replace(&mut self.state, closed);
+        Self::close(&self.context, state);
     }
 }
 

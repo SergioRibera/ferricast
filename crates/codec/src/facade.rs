@@ -95,6 +95,13 @@ macro_rules! video_encoder_facade {
                 self.0.configure(config)
             }
 
+            fn reset(
+                &mut self,
+                config: &$crate::facade::__core::EncoderConfig,
+            ) -> $crate::facade::__core::CodecResult<()> {
+                self.0.reset(config)
+            }
+
             fn encode(
                 &mut self,
                 frame: $crate::facade::__core::CapturedFrame,

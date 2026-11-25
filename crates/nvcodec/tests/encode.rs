@@ -1505,16 +1505,17 @@ fn throughput_1080p() {
     }
 }
 
+/// Runs in a child process with `FERRICAST_NVENC_API` set; passes trivially
+/// otherwise. The process keeps the version it loaded first.
 #[test]
-fn every_version_loads_through_any_api() {
+fn child_loads_one_version() {
     let _gpu = gpu_lock();
-    if !isolated("every_version_loads_through_any_api") {
-        return;
-    }
-    let Some(driver_max) = driver_max() else {
+    let Some(value) = std::env::var_os(API_OVERRIDE_VAR) else {
         return;
     };
     let Some(context) = context() else { return };
+    let version = ApiVersion::negotiate().unwrap();
+    assert_eq!(version.to_string(), value.to_string_lossy());
     let config = Config::low_latency(
         Codec::Hevc,
         320,
@@ -1523,12 +1524,186 @@ fn every_version_loads_through_any_api() {
         rate(30),
         1_000_000,
     );
+    let encoder = Encoder::open_with(AnyApi::load(version).unwrap(), &context, &config).unwrap();
+    assert_eq!(encoder.api_version(), version);
+    assert_eq!(AnyApi::loaded().map(|api| api.version()), Some(version));
+    // Every other version is refused: the driver keeps one per process.
+    for other in ApiVersion::ALL
+        .into_iter()
+        .filter(|other| *other != version)
+    {
+        assert!(
+            matches!(
+                AnyApi::load(other),
+                Err(Error::ApiVersionInUse { in_use, requested }) if in_use == version && requested == other
+            ),
+            "{other} next to {version}"
+        );
+    }
+    eprintln!("API {version}: loaded alone");
+}
+
+#[test]
+fn every_version_loads_in_its_own_process() {
+    let _gpu = gpu_lock();
+    let Some(driver_max) = driver_max() else {
+        return;
+    };
+    if context().is_none() {
+        return;
+    }
     for version in ApiVersion::ALL
         .into_iter()
         .filter(|version| version.version() <= driver_max)
     {
-        let encoder =
-            Encoder::open_with(AnyApi::load(version).unwrap(), &context, &config).unwrap();
-        assert_eq!(encoder.api_version(), version);
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "child_loads_one_version",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(API_OVERRIDE_VAR, version.to_string())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("{}", stderr.trim());
+        assert!(
+            output.status.success(),
+            "{API_OVERRIDE_VAR}={version} failed"
+        );
+        assert!(
+            stderr.contains(&format!("API {version}: loaded alone")),
+            "the child did not run for {version}"
+        );
     }
+}
+
+/// Invalidating a key while pictures that read it are still held (frames in
+/// flight) encodes them first: when `invalidate_array` returns, NVENC no
+/// longer reads the memory, which may then be freed.
+#[test]
+fn invalidating_a_pending_input_drains_it() {
+    let _gpu = gpu_lock();
+    let Some(context) = context() else { return };
+    let format = InputFormat::Abgr;
+    let config = Config {
+        frames_in_flight: 2,
+        ..Config::low_latency(Codec::H264, WIDTH, HEIGHT, format, rate(30), 6_000_000)
+    };
+    let row = WIDTH as usize * 4;
+    let picture = vec![0x80; row * HEIGHT as usize];
+    let mut encoder = Encoder::open(&context, &config).unwrap();
+    for round in 0..3_u64 {
+        let mut buffer = DeviceBuffer::pitched(&context, row, HEIGHT as usize).unwrap();
+        buffer
+            .upload(
+                buffer.region(),
+                HostImage {
+                    data: &picture,
+                    pitch: row,
+                },
+            )
+            .unwrap();
+        for index in 0..2_u64 {
+            // SAFETY: the buffer is freed only after its key is invalidated,
+            // which drains the pictures reading it (what this test checks).
+            let view = unsafe {
+                PitchedView::from_raw(
+                    buffer.device_ptr(),
+                    buffer.pitch(),
+                    row,
+                    HEIGHT as usize,
+                    &context,
+                )
+            };
+            // SAFETY: as above.
+            unsafe {
+                encoder
+                    .encode_pitched(
+                        round,
+                        view,
+                        FrameOptions {
+                            timestamp: round * 2 + index,
+                            force_idr: false,
+                        },
+                    )
+                    .unwrap_or_else(|error| panic!("round {round}, picture {index}: {error}"));
+            }
+            // The same memory cannot be submitted again while it is
+            // pending: the first picture is flushed out before the second.
+            if index == 0 {
+                encoder.flush().unwrap();
+                while encoder.next_packet().is_some() {}
+            }
+        }
+        // The second picture is still held (two frames in flight).
+        assert!(
+            encoder.next_packet().is_none(),
+            "round {round}: a picture should be pending"
+        );
+        encoder.invalidate_array(round);
+        let drained = std::iter::from_fn(|| encoder.next_packet()).count();
+        assert_eq!(
+            drained, 1,
+            "round {round}: invalidating drained the pending picture"
+        );
+        drop(buffer);
+    }
+}
+
+/// A smaller picture is reconfigured in place (an IDR starts the new size);
+/// a larger one reopens the session; both encode right away.
+#[test]
+fn reconfigure_in_place_or_reopen() {
+    let _gpu = gpu_lock();
+    let Some(context) = context() else { return };
+    let config = |width, height| {
+        Config::low_latency(
+            Codec::H264,
+            width,
+            height,
+            InputFormat::Nv12,
+            rate(30),
+            2_000_000,
+        )
+    };
+    let encode = |encoder: &mut Encoder, width: u32, height: u32| {
+        let picture = vec![0x60; (width * height * 3 / 2) as usize];
+        encoder
+            .encode_host(
+                HostFrame::tight(&picture, InputFormat::Nv12, width, height),
+                FrameOptions::default(),
+            )
+            .unwrap();
+        encoder.next_packet().unwrap()
+    };
+    let mut encoder = Encoder::open(&context, &config(640, 360)).unwrap();
+    encode(&mut encoder, 640, 360);
+    encode(&mut encoder, 640, 360);
+    assert_eq!(encoder.registrations(), 1);
+
+    encoder.reconfigure(&config(320, 180)).unwrap();
+    assert_eq!(
+        (encoder.config().width, encoder.config().height),
+        (320, 180)
+    );
+    let packet = encode(&mut encoder, 320, 180);
+    assert!(packet.is_keyframe(), "a new size starts with an IDR");
+    // The old host slot (sized for 640x360) was dropped: registered anew.
+    assert_eq!(encoder.registrations(), 2, "in place: same session");
+
+    encoder.reconfigure(&config(1280, 720)).unwrap();
+    assert_eq!(
+        (encoder.config().width, encoder.config().height),
+        (1280, 720)
+    );
+    assert_eq!(
+        encoder.registrations(),
+        0,
+        "a larger size needs a new session"
+    );
+    assert!(encode(&mut encoder, 1280, 720).is_keyframe());
+    assert!(encoder.is_open());
 }
