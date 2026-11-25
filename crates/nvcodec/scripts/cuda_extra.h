@@ -25,4 +25,9 @@ typedef CUresult CUDAAPI tcuGraphicsEGLRegisterImage(CUgraphicsResource *pCudaRe
 typedef CUresult CUDAAPI tcuGraphicsResourceGetMappedEglFrame(CUeglFrame *eglFrame, CUgraphicsResource resource, unsigned int index, unsigned int mipLevel);
 typedef CUresult CUDAAPI tcuGraphicsResourceSetMapFlags_v2(CUgraphicsResource resource, unsigned int flags);
 
+/* GPU image kernels: JIT the committed PTX with an error log, and check an
+ * array's element format before reading it through a texture. */
+typedef CUresult CUDAAPI tcuModuleLoadDataEx(CUmodule *module, const void *image, unsigned int numOptions, CUjit_option *options, void **optionValues);
+typedef CUresult CUDAAPI tcuArrayGetDescriptor_v2(CUDA_ARRAY_DESCRIPTOR *pArrayDescriptor, CUarray hArray);
+
 #endif

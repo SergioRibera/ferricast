@@ -1455,3 +1455,395 @@ mod tests {
         send_sync::<DeviceBuffer>();
     }
 }
+
+/// The module / launch / texture entry points: every driver has them, but
+/// the loader resolves them as optional so that only their users fail
+/// without them.
+#[derive(Clone, Copy)]
+struct ModuleApi {
+    load_data_ex: crate::loader::Required<sys::tcuModuleLoadDataEx>,
+    unload: crate::loader::Required<sys::tcuModuleUnload>,
+    get_function: crate::loader::Required<sys::tcuModuleGetFunction>,
+    launch_kernel: crate::loader::Required<sys::tcuLaunchKernel>,
+    tex_object_create: crate::loader::Required<sys::tcuTexObjectCreate>,
+    tex_object_destroy: crate::loader::Required<sys::tcuTexObjectDestroy>,
+    array_get_descriptor: crate::loader::Required<sys::tcuArrayGetDescriptor_v2>,
+}
+
+impl ModuleApi {
+    fn get(cuda: &CudaLibrary) -> Result<Self> {
+        fn need<F>(entry: Option<F>, symbol: &'static str) -> Result<F> {
+            entry.ok_or_else(|| Error::SymbolMissing {
+                library: CudaLibrary::file_name(),
+                symbol,
+                reason: "not exported by this driver".into(),
+            })
+        }
+        Ok(Self {
+            load_data_ex: need(cuda.module_load_data_ex, "cuModuleLoadDataEx")?,
+            unload: need(cuda.module_unload, "cuModuleUnload")?,
+            get_function: need(cuda.module_get_function, "cuModuleGetFunction")?,
+            launch_kernel: need(cuda.launch_kernel, "cuLaunchKernel")?,
+            tex_object_create: need(cuda.tex_object_create, "cuTexObjectCreate")?,
+            tex_object_destroy: need(cuda.tex_object_destroy, "cuTexObjectDestroy")?,
+            array_get_descriptor: need(cuda.array_get_descriptor, "cuArrayGetDescriptor_v2")?,
+        })
+    }
+}
+
+/// A module of device code, JIT-compiled from PTX by the driver for the
+/// context's GPU, unloaded on drop.
+pub struct Module {
+    raw: NonNull<sys::CUmod_st>,
+    api: ModuleApi,
+    context: Arc<Context>,
+}
+
+// SAFETY: a `CUmodule` has no thread affinity; every call pushes the owning
+// context first.
+unsafe impl Send for Module {}
+// SAFETY: function lookups and launches on one module are thread-safe in the
+// driver API; `&Module` exposes nothing else.
+unsafe impl Sync for Module {}
+
+/// A kernel of a [`Module`]: a handle valid while the module is loaded,
+/// launched through [`Module::launch`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Function {
+    raw: sys::CUfunction,
+    module: sys::CUmodule,
+}
+
+// SAFETY: a function handle has no thread affinity; it is only used through
+// `Module::launch`, which pushes the module's context.
+unsafe impl Send for Function {}
+// SAFETY: as for `Send`; the handle is never mutated.
+unsafe impl Sync for Function {}
+
+/// Grid and block dimensions of a kernel launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Launch {
+    /// Blocks per grid (x, y, z).
+    pub grid: [u32; 3],
+    /// Threads per block (x, y, z).
+    pub block: [u32; 3],
+    /// Dynamic shared memory per block, in bytes.
+    pub shared_bytes: u32,
+}
+
+/// How much of the JIT compiler's error log is kept.
+const JIT_LOG_BYTES: usize = 4096;
+
+impl Module {
+    /// JIT-compiles `ptx` (a NUL-terminated PTX image) on `context`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::KernelLoad`] with the compiler's log when the driver
+    /// rejects the PTX (`CUDA_ERROR_UNSUPPORTED_PTX_VERSION` from a driver
+    /// older than its ISA), [`Error::SymbolMissing`].
+    pub fn load_ptx(context: &Arc<Context>, ptx: &CStr) -> Result<Self> {
+        let api = ModuleApi::get(context.cuda)?;
+        let _current = context.guard()?;
+        let mut log = vec![0_u8; JIT_LOG_BYTES];
+        let mut options = [
+            sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
+            sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+        ];
+        // The size option is a `void*`-sized slot holding an integer, as
+        // the driver API documents for scalar JIT options.
+        let mut values = [
+            log.as_mut_ptr().cast::<std::ffi::c_void>(),
+            ptr::without_provenance_mut(JIT_LOG_BYTES),
+        ];
+        let mut raw = ptr::null_mut();
+        // SAFETY: the context is current; `ptx` is NUL-terminated; the two
+        // options name a writable buffer of `JIT_LOG_BYTES` and its size,
+        // both alive for the call; valid out-pointer.
+        let status = unsafe {
+            (api.load_data_ex)(
+                &raw mut raw,
+                ptx.as_ptr().cast(),
+                2,
+                options.as_mut_ptr(),
+                values.as_mut_ptr(),
+            )
+        };
+        if status != sys::CUresult::CUDA_SUCCESS {
+            let end = log.iter().position(|&byte| byte == 0).unwrap_or(log.len());
+            return Err(Error::KernelLoad {
+                status: CudaStatus(status),
+                log: String::from_utf8_lossy(&log[..end]).trim().to_owned(),
+            });
+        }
+        let Some(raw) = NonNull::new(raw) else {
+            return Err(Error::UnexpectedValue {
+                call: "cuModuleLoadDataEx",
+                what: "a module",
+                value: "null".into(),
+            });
+        };
+        Ok(Self {
+            raw,
+            api,
+            context: Arc::clone(context),
+        })
+    }
+
+    /// The kernel named `name` (its `extern "C"` name).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Cuda`] (`CUDA_ERROR_NOT_FOUND` for an unknown name).
+    pub fn function(&self, name: &CStr) -> Result<Function> {
+        let _current = self.context.guard()?;
+        let mut raw = ptr::null_mut();
+        // SAFETY: live module, its context current; NUL-terminated name;
+        // valid out-pointer.
+        unsafe { (self.api.get_function)(&raw mut raw, self.raw.as_ptr(), name.as_ptr()) }
+            .check("cuModuleGetFunction")?;
+        Ok(Function {
+            raw,
+            module: self.raw.as_ptr(),
+        })
+    }
+
+    /// The owning context.
+    #[must_use]
+    pub fn context(&self) -> &Arc<Context> {
+        &self.context
+    }
+
+    /// Queues `function` on `stream`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidKernelInput`] for a function of another module or a
+    /// stream of another context, [`Error::Cuda`].
+    ///
+    /// # Safety
+    ///
+    /// `params` must hold one pointer per kernel parameter, each pointing to
+    /// a value of exactly the parameter's type and layout, alive for the
+    /// call (the driver copies them before returning). Every memory access
+    /// the kernel makes with these parameters must stay inside memory that
+    /// is allocated, and not freed or reused, until the kernel has run.
+    pub unsafe fn launch(
+        &self,
+        function: Function,
+        launch: Launch,
+        stream: &Stream,
+        params: &mut [*mut std::ffi::c_void],
+    ) -> Result<()> {
+        if function.module != self.raw.as_ptr() {
+            return Err(Error::InvalidKernelInput {
+                reason: "the function belongs to another module".into(),
+            });
+        }
+        if stream.context().raw() != self.context.raw() {
+            return Err(Error::InvalidKernelInput {
+                reason: "the stream belongs to another CUDA context".into(),
+            });
+        }
+        let [gx, gy, gz] = launch.grid;
+        let [bx, by, bz] = launch.block;
+        let _current = self.context.guard()?;
+        // SAFETY: live function of this module and live stream, the context
+        // current; the parameter contract is the caller's.
+        unsafe {
+            (self.api.launch_kernel)(
+                function.raw,
+                gx,
+                gy,
+                gz,
+                bx,
+                by,
+                bz,
+                launch.shared_bytes,
+                stream.raw(),
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        }
+        .check("cuLaunchKernel")
+    }
+}
+
+impl Drop for Module {
+    fn drop(&mut self) {
+        // Kernels already queued keep running: the driver defers freeing
+        // the module's code until they complete.
+        let unloaded = self.context.guard().and_then(|_current| {
+            // SAFETY: live module, its context current; not used again.
+            unsafe { (self.api.unload)(self.raw.as_ptr()) }.check("cuModuleUnload")
+        });
+        if let Err(error) = unloaded {
+            tracing::warn!(%error, "unloading a CUDA module");
+        }
+    }
+}
+
+impl fmt::Debug for Module {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Module")
+            .field("raw", &self.raw)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A texture object reading a CUDA array element by element: point
+/// filtering, clamped addressing, unnormalised coordinates, values as
+/// stored (no conversion to float). Destroyed on drop.
+///
+/// The texture does not keep the array alive. Reading through it after the
+/// array is freed or unmapped is a use after free; destroying it is not.
+pub struct TextureObject {
+    raw: sys::CUtexObject,
+    destroy: crate::loader::Required<sys::tcuTexObjectDestroy>,
+    context: Arc<Context>,
+}
+
+// SAFETY: a texture object is a plain handle without thread affinity; every
+// call pushes the owning context first.
+unsafe impl Send for TextureObject {}
+// SAFETY: `&TextureObject` only exposes the handle.
+unsafe impl Sync for TextureObject {}
+
+impl TextureObject {
+    /// A point-sampled texture over all of `array`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Cuda`], [`Error::SymbolMissing`].
+    pub fn point_sampled(array: ArrayView<'_>) -> Result<Self> {
+        let context = array.context();
+        let api = ModuleApi::get(context.cuda)?;
+        let resource = sys::CUDA_RESOURCE_DESC {
+            resType: sys::CUresourcetype::CU_RESOURCE_TYPE_ARRAY,
+            res: sys::CUDA_RESOURCE_DESC_st__bindgen_ty_1 {
+                array: sys::CUDA_RESOURCE_DESC_st__bindgen_ty_1__bindgen_ty_1 {
+                    hArray: array.raw(),
+                },
+            },
+            flags: 0,
+        };
+        let clamp = sys::CUaddress_mode::CU_TR_ADDRESS_MODE_CLAMP;
+        let texture = sys::CUDA_TEXTURE_DESC {
+            addressMode: [clamp; 3],
+            filterMode: sys::CUfilter_mode::CU_TR_FILTER_MODE_POINT,
+            // Integer element values; unnormalised coordinates (no
+            // CU_TRSF_NORMALIZED_COORDINATES).
+            flags: sys::CU_TRSF_READ_AS_INTEGER,
+            maxAnisotropy: 0,
+            mipmapFilterMode: sys::CUfilter_mode::CU_TR_FILTER_MODE_POINT,
+            mipmapLevelBias: 0.0,
+            minMipmapLevelClamp: 0.0,
+            maxMipmapLevelClamp: 0.0,
+            borderColor: [0.0; 4],
+            reserved: [0; 12],
+        };
+        let _current = context.guard()?;
+        let mut raw = 0;
+        // SAFETY: the context is current; the descriptors are fully
+        // initialised and live for the call; the array is live for `'a`
+        // (`ArrayView` contract); a null view descriptor means "the whole
+        // array"; valid out-pointer.
+        unsafe {
+            (api.tex_object_create)(
+                &raw mut raw,
+                &raw const resource,
+                &raw const texture,
+                ptr::null(),
+            )
+        }
+        .check("cuTexObjectCreate")?;
+        Ok(Self {
+            raw,
+            destroy: api.tex_object_destroy,
+            context: Arc::clone(context),
+        })
+    }
+
+    /// The handle kernels take (`cudaTextureObject_t`).
+    #[must_use]
+    pub fn raw(&self) -> sys::CUtexObject {
+        self.raw
+    }
+}
+
+impl Drop for TextureObject {
+    fn drop(&mut self) {
+        let destroyed = self.context.guard().and_then(|_current| {
+            // SAFETY: live texture object, its context current; not used
+            // again.
+            unsafe { (self.destroy)(self.raw) }.check("cuTexObjectDestroy")
+        });
+        if let Err(error) = destroyed {
+            tracing::warn!(%error, "destroying a CUDA texture object");
+        }
+    }
+}
+
+impl fmt::Debug for TextureObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TextureObject")
+            .field("raw", &self.raw)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The element layout of a CUDA array (`cuArrayGetDescriptor`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArrayDescriptor {
+    /// Width in elements.
+    pub width: usize,
+    /// Height in rows.
+    pub height: usize,
+    /// Channel format.
+    pub format: sys::CUarray_format,
+    /// Channels per element.
+    pub channels: u32,
+}
+
+impl ArrayView<'_> {
+    /// The array's size and element format, as the driver reports them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Cuda`], [`Error::SymbolMissing`].
+    pub fn descriptor(self) -> Result<ArrayDescriptor> {
+        let api = ModuleApi::get(self.context.cuda)?;
+        let _current = self.context.guard()?;
+        let mut descriptor = sys::CUDA_ARRAY_DESCRIPTOR {
+            Width: 0,
+            Height: 0,
+            Format: sys::CUarray_format(0),
+            NumChannels: 0,
+        };
+        // SAFETY: the array is live for `'a`, its context current; valid
+        // out-pointer.
+        unsafe { (api.array_get_descriptor)(&raw mut descriptor, self.raw) }
+            .check("cuArrayGetDescriptor_v2")?;
+        Ok(ArrayDescriptor {
+            width: descriptor.Width,
+            height: descriptor.Height,
+            format: descriptor.Format,
+            channels: descriptor.NumChannels,
+        })
+    }
+}
+
+impl DeviceBuffer {
+    /// The buffer lent as pitched memory, for APIs that take memory owned
+    /// elsewhere (image kernels).
+    #[must_use]
+    pub fn as_view(&self) -> PitchedView<'_> {
+        PitchedView {
+            ptr: self.ptr,
+            pitch: self.pitch,
+            width_bytes: self.width_bytes,
+            rows: self.rows,
+            context: &self.context,
+        }
+    }
+}

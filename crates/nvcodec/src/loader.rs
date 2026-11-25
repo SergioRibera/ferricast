@@ -256,6 +256,15 @@ driver_library! {
             graphics_resource_get_mapped_egl_frame: sys::cuda::tcuGraphicsResourceGetMappedEglFrame = ["cuGraphicsResourceGetMappedEglFrame"],
             /// Windows only.
             graphics_d3d11_register_resource: sys::cuda::tcuGraphicsD3D11RegisterResource = ["cuGraphicsD3D11RegisterResource"],
+            /// Module and launch API (every driver has it; optional so that
+            /// only the GPU image kernels fail without it).
+            module_load_data_ex: sys::cuda::tcuModuleLoadDataEx = ["cuModuleLoadDataEx"],
+            module_unload: sys::cuda::tcuModuleUnload = ["cuModuleUnload"],
+            module_get_function: sys::cuda::tcuModuleGetFunction = ["cuModuleGetFunction"],
+            launch_kernel: sys::cuda::tcuLaunchKernel = ["cuLaunchKernel"],
+            tex_object_create: sys::cuda::tcuTexObjectCreate = ["cuTexObjectCreate"],
+            tex_object_destroy: sys::cuda::tcuTexObjectDestroy = ["cuTexObjectDestroy"],
+            array_get_descriptor: sys::cuda::tcuArrayGetDescriptor_v2 = ["cuArrayGetDescriptor_v2"],
         }
     }
 }

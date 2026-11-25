@@ -1786,3 +1786,15 @@ pub type tcuGraphicsResourceGetMappedEglFrame = ::core::option::Option<
 pub type tcuGraphicsResourceSetMapFlags_v2 = ::core::option::Option<
     unsafe extern "C" fn(resource: CUgraphicsResource, flags: ::core::ffi::c_uint) -> CUresult,
 >;
+pub type tcuModuleLoadDataEx = ::core::option::Option<
+    unsafe extern "C" fn(
+        module: *mut CUmodule,
+        image: *const ::core::ffi::c_void,
+        numOptions: ::core::ffi::c_uint,
+        options: *mut CUjit_option,
+        optionValues: *mut *mut ::core::ffi::c_void,
+    ) -> CUresult,
+>;
+pub type tcuArrayGetDescriptor_v2 = ::core::option::Option<
+    unsafe extern "C" fn(pArrayDescriptor: *mut CUDA_ARRAY_DESCRIPTOR, hArray: CUarray) -> CUresult,
+>;
