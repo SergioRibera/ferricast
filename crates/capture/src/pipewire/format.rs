@@ -476,3 +476,49 @@ pub(super) fn param_meta_header_bytes() -> Vec<u8> {
     };
     serialize(obj)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params() -> EnumFormatParams {
+        EnumFormatParams {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+        }
+    }
+
+    #[test]
+    fn consumer_modifiers_are_offered_first() {
+        let formats = [
+            GpuFormat {
+                format: VideoFormat::BGRx,
+                modifiers: vec![1, 2, 0],
+                preferred: vec![2],
+            },
+            GpuFormat {
+                format: VideoFormat::RGBx,
+                modifiers: vec![1, 0],
+                preferred: vec![1, 0],
+            },
+        ];
+        let pods = initial_enum_format_list(&params(), &formats);
+        let expected = [
+            enum_format_with_modifier(VideoFormat::BGRx, &[2], &params()),
+            enum_format_with_modifier(VideoFormat::BGRx, &[1, 2, 0], &params()),
+            enum_format_with_modifier(VideoFormat::RGBx, &[1, 0], &params()),
+            enum_format_shm(&params()),
+        ];
+        assert_eq!(pods, expected);
+    }
+
+    #[test]
+    fn explicit_sync_buffers_param_differs_from_the_plain_one() {
+        let explicit = param_buffers_explicit_sync_bytes();
+        let plain = param_buffers_bytes();
+        assert!(Pod::from_bytes(&explicit).is_some());
+        assert_ne!(explicit, plain);
+        assert!(Pod::from_bytes(&param_meta_sync_timeline_bytes()).is_some());
+    }
+}

@@ -2146,6 +2146,39 @@ mod tests {
         }
     }
 
+    const TILED: u64 = 0x0300_0000_0060_6014;
+    const OTHER_TILED: u64 = 0x0300_0000_0060_6015;
+    const LINEAR: u64 = 0;
+    const INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+
+    #[test]
+    fn layout_prefers_what_every_side_takes() {
+        let compositor = vec![LINEAR, TILED, OTHER_TILED, INVALID];
+        let choice = LayoutChoice::new(Some(&compositor), &[TILED, OTHER_TILED, LINEAR], &[TILED]);
+        assert_eq!(choice.preferred, [TILED]);
+        assert_eq!(choice.readable, [TILED, OTHER_TILED, LINEAR]);
+        let attempts: Vec<&[u64]> = choice.attempts().collect();
+        assert_eq!(attempts, [&[TILED][..], &[TILED, OTHER_TILED, LINEAR][..]]);
+    }
+
+    #[test]
+    fn layout_without_importer_is_linear_only() {
+        let compositor = vec![TILED, LINEAR];
+        let choice = LayoutChoice::new(Some(&compositor), &[LINEAR], &[TILED]);
+        let attempts: Vec<&[u64]> = choice.attempts().collect();
+        assert_eq!(attempts, [&[LINEAR][..]]);
+        // A compositor that cannot import LINEAR leaves nothing to try.
+        let choice = LayoutChoice::new(Some(&vec![TILED]), &[LINEAR], &[]);
+        assert_eq!(choice.attempts().count(), 0);
+    }
+
+    #[test]
+    fn layout_without_feedback_never_picks_the_implicit_modifier() {
+        let choice = LayoutChoice::new(None, &[INVALID, TILED], &[]);
+        let attempts: Vec<&[u64]> = choice.attempts().collect();
+        assert_eq!(attempts, [&[TILED][..]]);
+    }
+
     #[test]
     fn identity_orientation_keeps_frame_untouched() {
         let frame = raw(1, 1, 8, vec![1, 2, 3, 4, 0, 0, 0, 0]);
