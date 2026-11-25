@@ -83,6 +83,7 @@ mod parser;
 mod pool;
 mod sei;
 mod vp8;
+mod vp9;
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -448,7 +449,10 @@ impl<M: OutputMode> Decoder<M> {
                 state.vp8_keyed |= frame.key_frame && state.sequence.is_some();
                 parsed
             }
-            Codec::Vp9 => self.parse(flags, packet.data, timestamp),
+            Codec::Vp9 => {
+                vp9::check_packet(packet.data)?;
+                self.parse(flags, packet.data, timestamp)
+            }
         }
     }
 
@@ -500,6 +504,7 @@ impl<M: OutputMode> Decoder<M> {
             },
             timestamp,
         };
+        self.state.get_mut().fed.parse(data.len());
         let parsed = {
             let _current = self.context.guard()?;
             // SAFETY: a live parser and a packet whose payload is borrowed

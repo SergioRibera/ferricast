@@ -85,6 +85,8 @@ pub(super) struct State {
     references: References,
     /// A VP8 key frame has been passed to the parser (see [`super::vp8`]).
     pub(super) vp8_keyed: bool,
+    /// What the parser was fed, to bound the pictures it hands over.
+    pub(super) fed: Fed,
     pub(super) output: Output,
     /// The first error a callback hit during the current parse.
     pub(super) error: Option<Error>,
@@ -121,6 +123,7 @@ impl State {
             sei: Vec::new(),
             references: References::default(),
             vp8_keyed: false,
+            fed: Fed::default(),
             output,
             error: None,
         })
@@ -213,6 +216,12 @@ impl State {
         // The surface later pictures reference: for AV1 with film grain,
         // `decodePicIdx` holds the picture without the grain.
         let mut reference = current;
+        let bound = self.fed.bound();
+        // SAFETY: as above.
+        if let Err(error) = check_bitstream(unsafe { &*params }, self.config.codec, bound) {
+            self.references.refuse(current, reference);
+            return Err(error);
+        }
         if self.config.codec == Codec::Av1 {
             // SAFETY: the parser fills the AV1 member for AV1 streams; every
             // field is plain data, valid for the callback's duration.
@@ -392,6 +401,72 @@ impl State {
         } else {
             0
         }
+    }
+}
+
+/// Bytes fed to the parser, to bound the bitstream of each picture it
+/// hands to `cuvidDecodePicture`.
+///
+/// NVIDIA's AV1 parser can report a picture's `nBitstreamDataLen` as a
+/// negative length wrapped to nearly 4 GiB (a damaged temporal unit after a
+/// lost one), and `cuvidDecodePicture` then copies that many bytes and
+/// faults (driver 595). No picture holds more than was ever fed, nor 2 GiB.
+#[derive(Debug, Default)]
+pub(super) struct Fed {
+    total: u64,
+}
+
+impl Fed {
+    /// A parse call of `bytes` begins.
+    pub(super) fn parse(&mut self, bytes: usize) {
+        self.total = self.total.saturating_add(bytes as u64);
+    }
+
+    /// The most bytes a picture's bitstream can hold.
+    fn bound(&self) -> u64 {
+        self.total.min(MAX_PICTURE_BYTES)
+    }
+}
+
+/// No picture's bitstream reaches 2 GiB; a length past it is a negative
+/// one wrapped.
+const MAX_PICTURE_BYTES: u64 = 1 << 31;
+/// Tiles of an AV1 frame at most (64 columns by 64 rows).
+const MAX_AV1_TILES: u32 = 4096;
+
+/// Checks the bitstream the parser hands over with a picture: its length
+/// against `bound`, and for AV1 every tile's start and end inside it.
+fn check_bitstream(params: &sys::CUVIDPICPARAMS, codec: Codec, bound: u64) -> Result<()> {
+    let invalid = |reason: String| Error::InvalidPacket {
+        reason: format!("{codec} picture: {reason}"),
+    };
+    let len = params.nBitstreamDataLen;
+    if u64::from(len) > bound {
+        return Err(invalid(format!(
+            "a bitstream of {len} bytes, more than the {bound} fed"
+        )));
+    }
+    if len > 0 && params.pBitstreamData.is_null() {
+        return Err(invalid("no bitstream".into()));
+    }
+    let tiles = params.nNumSlices;
+    if codec != Codec::Av1 || tiles == 0 || params.pSliceDataOffsets.is_null() {
+        return Ok(());
+    }
+    if tiles > MAX_AV1_TILES {
+        return Err(invalid(format!("{tiles} tiles")));
+    }
+    // SAFETY: for AV1 the parser passes a start and an end offset for each
+    // of the `nNumSlices` tiles, valid for the callback's duration.
+    let offsets =
+        unsafe { std::slice::from_raw_parts(params.pSliceDataOffsets, 2 * tiles as usize) };
+    let inside = offsets
+        .chunks_exact(2)
+        .all(|tile| tile[0] <= tile[1] && tile[1] <= len);
+    if inside {
+        Ok(())
+    } else {
+        Err(invalid(format!("tile offsets past its {len} bytes")))
     }
 }
 
