@@ -23,8 +23,16 @@ use std::time::Duration;
 
 use super::DrmDevice;
 
+/// The request type of `ioctl`: `c_int` in Bionic, `c_ulong` in glibc and
+/// musl. DRM request numbers use all 32 bits; Bionic takes them as the
+/// same bits in a signed int.
+#[cfg(target_os = "android")]
+type IoctlRequest = libc::c_int;
+#[cfg(not(target_os = "android"))]
+type IoctlRequest = libc::c_ulong;
+
 /// `DRM_IOWR(nr, size)`: `_IOWR('d', nr, size)`.
-const fn drm_iowr(nr: u8, size: usize) -> libc::c_ulong {
+const fn drm_iowr(nr: u8, size: usize) -> u32 {
     // Read + write direction (3) in the top two bits, then the size
     // (14 bits), the type ('d') and the number. Every DRM struct used
     // here is far below the 14-bit size limit.
@@ -33,7 +41,7 @@ const fn drm_iowr(nr: u8, size: usize) -> libc::c_ulong {
         reason = "ioctl sizes fit 14 bits by construction (const-evaluated)"
     )]
     let size = size as u32;
-    ((3u32 << 30) | (size << 16) | ((b'd' as u32) << 8) | nr as u32) as libc::c_ulong
+    (3u32 << 30) | (size << 16) | ((b'd' as u32) << 8) | nr as u32
 }
 
 #[repr(C)]
@@ -94,14 +102,14 @@ struct SyncobjTransfer {
     pad: u32,
 }
 
-const IOCTL_CREATE: libc::c_ulong = drm_iowr(0xBF, size_of::<SyncobjCreate>());
-const IOCTL_DESTROY: libc::c_ulong = drm_iowr(0xC0, size_of::<SyncobjDestroy>());
-const IOCTL_HANDLE_TO_FD: libc::c_ulong = drm_iowr(0xC1, size_of::<SyncobjHandle>());
-const IOCTL_FD_TO_HANDLE: libc::c_ulong = drm_iowr(0xC2, size_of::<SyncobjHandle>());
-const IOCTL_TIMELINE_WAIT: libc::c_ulong = drm_iowr(0xCA, size_of::<SyncobjTimelineWait>());
-const IOCTL_QUERY: libc::c_ulong = drm_iowr(0xCB, size_of::<SyncobjTimelineArray>());
-const IOCTL_TRANSFER: libc::c_ulong = drm_iowr(0xCC, size_of::<SyncobjTransfer>());
-const IOCTL_TIMELINE_SIGNAL: libc::c_ulong = drm_iowr(0xCD, size_of::<SyncobjTimelineArray>());
+const IOCTL_CREATE: u32 = drm_iowr(0xBF, size_of::<SyncobjCreate>());
+const IOCTL_DESTROY: u32 = drm_iowr(0xC0, size_of::<SyncobjDestroy>());
+const IOCTL_HANDLE_TO_FD: u32 = drm_iowr(0xC1, size_of::<SyncobjHandle>());
+const IOCTL_FD_TO_HANDLE: u32 = drm_iowr(0xC2, size_of::<SyncobjHandle>());
+const IOCTL_TIMELINE_WAIT: u32 = drm_iowr(0xCA, size_of::<SyncobjTimelineWait>());
+const IOCTL_QUERY: u32 = drm_iowr(0xCB, size_of::<SyncobjTimelineArray>());
+const IOCTL_TRANSFER: u32 = drm_iowr(0xCC, size_of::<SyncobjTransfer>());
+const IOCTL_TIMELINE_SIGNAL: u32 = drm_iowr(0xCD, size_of::<SyncobjTimelineArray>());
 
 const FD_TO_HANDLE_IMPORT_SYNC_FILE: u32 = 1;
 const HANDLE_TO_FD_EXPORT_SYNC_FILE: u32 = 1;
@@ -205,15 +213,20 @@ impl SyncobjDevice {
         })
     }
 
-    fn ioctl<T>(&self, request: libc::c_ulong, args: &mut T) -> std::io::Result<()> {
+    fn ioctl<T>(&self, request: u32, args: &mut T) -> std::io::Result<()> {
         loop {
             // SAFETY: `self.fd` is a live DRM node; `args` is the
             // `#[repr(C)]` struct `request` encodes (its size is part of
             // the request number), valid for reads and writes.
+            #[allow(
+                clippy::cast_lossless,
+                clippy::cast_possible_wrap,
+                reason = "the same 32 request bits in the libc's request type"
+            )]
             let rc = unsafe {
                 libc::ioctl(
                     self.fd.as_raw_fd(),
-                    request,
+                    request as IoctlRequest,
                     std::ptr::from_mut(args).cast::<libc::c_void>(),
                 )
             };
