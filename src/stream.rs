@@ -221,11 +221,18 @@ where
         let caps = &device.capabilities;
         // Apply the fps ceiling before start so the capture worker's
         // throttle anchors to the right rate from the first buffer.
+        // Capture prefers DMA-BUF layouts the GPU encoder takes without a
+        // copy. The first query brings up the GPU (EGL + CUDA), so it runs
+        // off the async workers; the answer is cached for the process.
+        let consumer_modifiers = tokio::task::spawn_blocking(ferricast_encoder::dmabuf_modifiers)
+            .await
+            .unwrap_or_default();
         let capture_config = CaptureConfig {
             fps: caps.max_fps.map_or(config.fps, |cap| config.fps.min(cap)),
             width: caps.max_width,
             height: caps.max_height,
             show_cursor: true,
+            consumer_modifiers,
         };
         start_capture_if_reachable(&device, &mut capture, source, capture_config).await?;
 

@@ -1131,6 +1131,7 @@ impl GpuPath {
             node: node.render_node(),
             unreadable_warned: false,
         };
+        debug!(bgra = ?path.bgra_modifiers, "wayland-direct: Vulkan readback modifiers");
         info!(
             bgra_modifiers = path.bgra_modifiers.len(),
             rgba_modifiers = path.rgba_modifiers.len(),
