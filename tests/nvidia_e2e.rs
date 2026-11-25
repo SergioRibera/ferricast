@@ -520,3 +520,102 @@ fn nvenc_encodes_ten_bit_hdr10_hevc() {
         );
     }
 }
+
+/// Reads a fixed picture back, standing in for the capture's Vulkan
+/// importer.
+struct Readback(Vec<u8>, Arc<AtomicUsize>);
+
+impl ferricast_core::DmaBufImporter for Readback {
+    fn readback(
+        &self,
+        _plane: &DmaBufPlane,
+        _width: u32,
+        _height: u32,
+        _format: PixelFormat,
+    ) -> ferricast_core::Result<bytes::Bytes> {
+        self.1.fetch_add(1, Ordering::SeqCst);
+        Ok(bytes::Bytes::from(self.0.clone()))
+    }
+}
+
+/// A frame the zero-copy path cannot import goes through the CPU readback;
+/// the next importable frame goes zero-copy again.
+#[test]
+fn a_zero_copy_failure_falls_back_for_that_frame_only() {
+    let name = "zero-copy fallback";
+    let Some(gpu) = dmabuf::Gpu::get() else {
+        return;
+    };
+    let Some(mut encoder) = encoder::<ferricast_encoder::h264::H264Encoder>(
+        name,
+        &nvenc(Codec::H264, PixelFormat::Bgra),
+    ) else {
+        return;
+    };
+    let pattern = bgra_pattern(WIDTH, HEIGHT, 0);
+    let readbacks = Arc::new(AtomicUsize::new(0));
+    // Not a DMA-BUF at all: EGL refuses to import it.
+    let memfd = memfd();
+    let not_importable = GpuFrame {
+        width: WIDTH,
+        height: HEIGHT,
+        stride: WIDTH * 4,
+        format: PixelFormat::Bgra,
+        timestamp_us: 0,
+        plane: DmaBufPlane {
+            fd: DmaBufFd::from(memfd),
+            offset: 0,
+            stride: WIDTH * 4,
+            modifier: 0,
+            size: WIDTH * 4 * HEIGHT,
+        },
+        importer: Some(Arc::new(Readback(pattern.clone(), Arc::clone(&readbacks)))),
+        lease: None,
+    };
+    encoder.encode(CapturedFrame::Gpu(not_importable)).unwrap();
+    assert_eq!(readbacks.load(Ordering::SeqCst), 1, "{name}: read back");
+
+    let importer = DmaBufImporter::new(&gpu.context, Some(gpu.node)).unwrap();
+    let bo = gpu
+        .allocate(
+            WIDTH,
+            HEIGHT,
+            DrmFormat::Argb8888,
+            dmabuf::Gpu::tiled_modifier(&importer),
+        )
+        .unwrap();
+    gpu.write(&bo, &pattern);
+    let importable = GpuFrame {
+        width: WIDTH,
+        height: HEIGHT,
+        stride: bo.stride,
+        format: PixelFormat::Bgra,
+        timestamp_us: 33_333,
+        plane: DmaBufPlane {
+            fd: DmaBufFd::dup(bo.fd.as_fd()).unwrap(),
+            offset: bo.offset,
+            stride: bo.stride,
+            modifier: bo.modifier.0,
+            size: bo.stride * HEIGHT,
+        },
+        importer: Some(Arc::new(Readback(pattern, Arc::clone(&readbacks)))),
+        lease: None,
+    };
+    encoder.encode(CapturedFrame::Gpu(importable)).unwrap();
+    assert_eq!(
+        readbacks.load(Ordering::SeqCst),
+        1,
+        "{name}: the importable frame was read back"
+    );
+}
+
+/// An anonymous memory file: a descriptor that is not a DMA-BUF.
+fn memfd() -> std::os::fd::OwnedFd {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: a NUL-terminated name; `memfd_create` returns a new descriptor
+    // or -1.
+    let fd = unsafe { libc::memfd_create(c"ferricast-not-a-dmabuf".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0, "memfd_create");
+    // SAFETY: `fd` was just created and nothing else owns it.
+    unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+}

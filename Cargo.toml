@@ -224,6 +224,7 @@ tokio = { workspace = true, features = ["test-util"] }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 ferricast-nvcodec.workspace = true
 libloading = "0.9"
+libc = "0.2"
 
 # Optimise hot-path crates in dev: x264/yuv/fdk-aac at opt=0 are
 # 5-10× slower and starve the audio pipeline.

@@ -41,7 +41,7 @@ use ferricast_core::{
     ColourDescription, ColourRange, EncodedFrame, EncoderConfig, H264Profile, HdrMetadata,
     MatrixCoefficients as Matrix, Operation, PixelFormat, RawFrame, VideoEncoder,
 };
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::config_ext::EncoderConfigExt;
 use crate::frame_view::{self, FrameView};
@@ -414,13 +414,14 @@ impl<C: NvencCodec> NvencEncoder<C> {
                 if let Input::Rgb(format) = self.input
                     && (gpu.width, gpu.height) == self.size()
                     && gpu.format == format
+                    // A failure is logged by the zero-copy path; this frame
+                    // is read back below.
+                    && self
+                        .zero_copy
+                        .encode(&mut self.encoder, &gpu, options)
+                        .is_ok()
                 {
-                    match self.zero_copy.encode(&mut self.encoder, &gpu, options) {
-                        Ok(()) => return Ok(Some(CapturedFrame::Gpu(gpu))),
-                        Err(error) => {
-                            debug!(%error, "NVENC: DMA-BUF zero-copy failed, reading this frame back");
-                        }
-                    }
+                    return Ok(Some(CapturedFrame::Gpu(gpu)));
                 }
                 let raw = CapturedFrame::Gpu(gpu).into_cpu().map_err(|error| {
                     CodecError::backend(BackendId::Nvenc, Operation::Encode, error)
@@ -661,7 +662,22 @@ mod zero_copy {
                 };
             }
             match self {
-                Self::Ready(zero_copy) => zero_copy.encode(encoder, frame, options),
+                Self::Ready(zero_copy) => {
+                    let result = zero_copy.encode(encoder, frame, options);
+                    if let Err(error) = &result {
+                        zero_copy.failures += 1;
+                        // Loud the first time, then once per minute at 60 fps:
+                        // a path that keeps failing costs a readback per frame.
+                        if zero_copy.failures % 3600 == 1 {
+                            tracing::warn!(
+                                %error,
+                                failures = zero_copy.failures,
+                                "NVENC: DMA-BUF zero-copy failed, reading the frame back"
+                            );
+                        }
+                    }
+                    result
+                }
                 Self::Untried | Self::Unavailable => Err(Error::Unavailable),
             }
         }
@@ -709,6 +725,8 @@ mod zero_copy {
         /// The description of the last frame: a change means the producer
         /// reallocated its pool.
         last: Option<Description>,
+        /// Frames that fell back to the CPU so far.
+        failures: u64,
     }
 
     impl ZeroCopy {
@@ -721,6 +739,7 @@ mod zero_copy {
                 buffers: HashMap::new(),
                 next_key: 0,
                 last: None,
+                failures: 0,
             })
         }
 
