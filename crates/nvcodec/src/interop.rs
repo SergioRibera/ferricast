@@ -77,7 +77,9 @@ pub use self::fence::FenceWait;
 pub use self::pool::{FramePool, PooledBuffer};
 
 use self::egl::{Egl, EglDisplay, EglImage, EglInt};
-use crate::cuda::{self, ArrayView, Context, DeviceBuffer, PitchedView, Point, Region, Stream};
+use crate::cuda::{
+    self, ArrayView, Context, DeviceBuffer, Event, PitchedView, Point, Region, Stream,
+};
 use crate::error::{CheckStatus as _, Error, Result};
 use crate::loader::{CudaLibrary, Required};
 use crate::sys::cuda as sys;
@@ -577,22 +579,104 @@ impl DmaBufImporter {
         })
     }
 
-    /// Unregisters `key`, waiting for queued CUDA work first; `false` when
-    /// it was not registered.
+    /// Unregisters `key`, waiting for all queued work of the context first
+    /// (every stream, every session sharing it); `false` when it was not
+    /// registered. [`DmaBufImporter::forget_all`] waits for less.
     pub fn forget(&mut self, key: BufferKey) -> bool {
         self.registrations.remove(&key).is_some()
     }
 
     /// Unregisters every buffer (the producer's pool changed), waiting for
-    /// queued CUDA work once.
+    /// all queued work of the context once. [`DmaBufImporter::clear_with`]
+    /// waits for less.
     pub fn clear(&mut self) {
+        self.clear_with(Quiesce::CONTEXT);
+    }
+
+    /// Unregisters every buffer once `quiesce` says the work reading them
+    /// is done.
+    pub fn clear_with(&mut self, quiesce: Quiesce<'_>) {
         if self.registrations.is_empty() {
             return;
         }
-        synchronize(&self.context);
+        quiesce.wait(&self.context);
         for (_, mut registration) in self.registrations.drain() {
             registration.synchronized = true;
             drop(registration);
+        }
+    }
+
+    /// Unregisters the buffers under `keys` with a single wait, as
+    /// `quiesce` says; returns how many were registered.
+    pub fn forget_all(
+        &mut self,
+        keys: impl IntoIterator<Item = BufferKey>,
+        quiesce: Quiesce<'_>,
+    ) -> usize {
+        let removed: Vec<Registration> = keys
+            .into_iter()
+            .filter_map(|key| self.registrations.remove(&key))
+            .collect();
+        if removed.is_empty() {
+            return 0;
+        }
+        quiesce.wait(&self.context);
+        let count = removed.len();
+        for mut registration in removed {
+            registration.synchronized = true;
+            drop(registration);
+        }
+        count
+    }
+}
+
+/// What the importer waits for before unregistering buffers: CUDA work
+/// still reading an unregistered EGL image is undefined behaviour.
+#[derive(Clone, Copy, Debug)]
+pub struct Quiesce<'a>(QuiesceKind<'a>);
+
+#[derive(Clone, Copy, Debug)]
+enum QuiesceKind<'a> {
+    Context,
+    Event(&'a Event),
+    Idle,
+}
+
+impl<'a> Quiesce<'a> {
+    /// All queued work of the context (`cuCtxSynchronize`). Always
+    /// correct, but it stalls every session sharing the context (the
+    /// process-wide primary context in ferricast).
+    pub const CONTEXT: Quiesce<'static> = Quiesce(QuiesceKind::Context);
+
+    /// The work before `event`: record it on the stream that last read the
+    /// buffers.
+    #[must_use]
+    pub fn after(event: &'a Event) -> Self {
+        Self(QuiesceKind::Event(event))
+    }
+
+    /// Nothing: the caller knows the work reading the buffers completed.
+    ///
+    /// # Safety
+    ///
+    /// No CUDA work that reads the buffers may be queued or running, e.g.
+    /// every NVENC picture encoded from them has been locked (with no frames
+    /// in flight, when each encode call returned).
+    #[must_use]
+    pub unsafe fn idle() -> Self {
+        Self(QuiesceKind::Idle)
+    }
+
+    fn wait(self, context: &Context) {
+        match self.0 {
+            QuiesceKind::Context => synchronize(context),
+            QuiesceKind::Event(event) => {
+                if let Err(error) = event.synchronize() {
+                    tracing::warn!(%error, "waiting for an event before unregistering DMA-BUFs");
+                    synchronize(context);
+                }
+            }
+            QuiesceKind::Idle => {}
         }
     }
 }

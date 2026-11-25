@@ -312,20 +312,27 @@ Encoder (`ferricast_encoder::nvenc`, `NvencEncoder<C>`):
   is encoded in place (`encode_device`, the decoder's pooled `Arc` cached
   by NVENC, its `ready` event waited on the encoder stream); the frame is
   held until the packet is out. Other sizes / formats are read back.
-- `CapturedFrame::Gpu` (Linux), packed RGB of the session's size: the
+- `CapturedFrame::Gpu` (Linux), packed RGB of the session's size (or one
+  pixel larger per axis, cropped: the session rounds odd sizes down): the
   DMA-BUF is imported through EGL (`interop::DmaBufImporter`, keyed by
   `DmaBufId`) and encoded from the CUDA array it aliases (tiled) or its
   pitched memory (LINEAR, through the new `Encoder::encode_pitched`; a
   first version copied into a staging buffer, which cannot be written
   while NVENC's cache holds it). The frame and its `BufferLease` are held
-  until NVENC is done. A change of the frames' description, or more than
-  16 distinct buffers, means the capture pool changed: NVENC's
-  registrations are invalidated first, then the importer's. Any failure
-  (no EGL device, another GPU, an unsupported modifier, a fence timeout,
-  an import error) sends that frame through the CPU readback; only the
-  importer's creation failing is remembered for the session. The first
-  fallback is logged as a warning. `FERRICAST_DRM_RENDER_NODE` (the
-  capture's variable) names the producer's GPU for the importer's check.
+  until NVENC is done. A change of the frames' description means the
+  capture pool changed: NVENC's registrations are invalidated first, then
+  the importer's; registrations unused for 600 frames, and the least
+  recently used past 16, are dropped the same way (without a
+  `cuCtxSynchronize`: NVENC has locked every picture). Any failure (no EGL
+  device, another GPU, an unsupported modifier, a fence timeout, an import
+  error) sends that frame through the CPU readback; the importer's creation
+  failing is remembered for the session and a buffer's import failing
+  until the pool changes. The first fallback is logged as a warning. The
+  frame names its GPU (`GpuFrame::producer`; `FERRICAST_DRM_RENDER_NODE`
+  for frames that do not) and whether it is complete (`GpuFrame::sync`):
+  `Ready` frames are not waited on, `Implicit` ones poll the DMA-BUF,
+  which the NVIDIA driver does not fence (see NVCODEC.md, "Capture
+  zero-copy").
 - `nvenc-zero-copy` is gone: the zero-copy path needs no build-time
   dependency (EGL is loaded at run time like the drivers), so it is part
   of `nvenc`. A root `nvenc-hevc` feature was added.
@@ -363,10 +370,11 @@ Known gaps:
   reach NVENC through a readback.
 - The zero-copy capture path takes packed RGB DMA-BUFs only (what
   PipeWire / wlr-screencopy produce here); NV12 DMA-BUFs are read back.
-- `GpuFrame` carries no DRM node, so without `FERRICAST_DRM_RENDER_NODE`
-  the importer cannot tell a buffer of another GPU before EGL refuses it
-  (that refusal falls back per frame, so it costs an import attempt per
-  new buffer).
+- Encoder selection does not yet prefer a backend on the capture's GPU
+  (`GpuFrame::producer`, `nvenc::imports_from`): on a hybrid laptop NVENC
+  is still picked over VA-API on the iGPU and reads the frames back.
+- Frames of another size than the session and rotated outputs are fitted
+  on the CPU until the CUDA scaler / rotator lands.
 - NVDEC native output is not narrowed on the GPU: a consumer asking for
   NV12 from a 10-bit stream gets P010 surfaces.
 - AV1 encode (Ada and newer) is not wired to a facade: there is no AV1

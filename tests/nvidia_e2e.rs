@@ -25,8 +25,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ferricast_core::{
     AccelerationPolicy, AutoSelect, BackendId, BackendSelection, BufferLease, CapturedFrame, Codec,
-    CodecError, ColourDescription, DecoderConfig, DmaBufFd, DmaBufPlane, EncodedFrame,
-    EncoderConfig, FrameMemory, GpuFrame, PixelFormat, RawFrame, VideoDecoder, VideoEncoder,
+    CodecError, ColourDescription, DecoderConfig, DmaBufFd, DmaBufPlane, DrmDevice, EncodedFrame,
+    EncoderConfig, FrameMemory, FrameSync, GpuFrame, PixelFormat, RawFrame, VideoDecoder,
+    VideoEncoder,
 };
 use ferricast_nvcodec::interop::{DmaBufImporter, DrmFormat, Modifier};
 
@@ -221,6 +222,9 @@ fn dma_buf_round_trip<E: VideoEncoder + Default, D: VideoDecoder + Default>(
             },
             importer: None,
             lease: Some(BufferLease::new(Returned(Arc::clone(&returned)))),
+            producer: Some(DrmDevice::from_dev(gpu.node.dev())),
+            // GLES finished writing (glFinish) before the frame is built.
+            sync: FrameSync::Ready,
         };
         let packet = encoder
             .encode(CapturedFrame::Gpu(frame))
@@ -571,6 +575,8 @@ fn a_zero_copy_failure_falls_back_for_that_frame_only() {
         },
         importer: Some(Arc::new(Readback(pattern.clone(), Arc::clone(&readbacks)))),
         lease: None,
+        producer: None,
+        sync: FrameSync::Implicit,
     };
     encoder.encode(CapturedFrame::Gpu(not_importable)).unwrap();
     assert_eq!(readbacks.load(Ordering::SeqCst), 1, "{name}: read back");
@@ -600,6 +606,8 @@ fn a_zero_copy_failure_falls_back_for_that_frame_only() {
         },
         importer: Some(Arc::new(Readback(pattern, Arc::clone(&readbacks)))),
         lease: None,
+        producer: Some(DrmDevice::from_dev(gpu.node.dev())),
+        sync: FrameSync::Ready,
     };
     encoder.encode(CapturedFrame::Gpu(importable)).unwrap();
     assert_eq!(
@@ -607,6 +615,82 @@ fn a_zero_copy_failure_falls_back_for_that_frame_only() {
         1,
         "{name}: the importable frame was read back"
     );
+}
+
+/// A frame one pixel larger than the session per axis (an odd source
+/// size the session rounded down to even) is encoded zero-copy from its
+/// top-left corner, and a buffer the importer refused once is read back
+/// again without another import attempt.
+#[test]
+fn odd_sized_frames_go_zero_copy_and_refused_buffers_stay_read_back() {
+    let name = "odd size";
+    let Some(gpu) = dmabuf::Gpu::get() else {
+        return;
+    };
+    let Some(mut encoder) = encoder::<ferricast_encoder::h264::H264Encoder>(
+        name,
+        &nvenc(Codec::H264, PixelFormat::Bgra),
+    ) else {
+        return;
+    };
+    let importer = DmaBufImporter::new(&gpu.context, Some(gpu.node)).unwrap();
+    let (width, height) = (WIDTH + 1, HEIGHT + 1);
+    let bo = gpu
+        .allocate(
+            width,
+            height,
+            DrmFormat::Argb8888,
+            dmabuf::Gpu::tiled_modifier(&importer),
+        )
+        .unwrap();
+    gpu.write(&bo, &bgra_pattern(width, height, 0));
+    let odd = GpuFrame {
+        width,
+        height,
+        stride: bo.stride,
+        format: PixelFormat::Bgra,
+        timestamp_us: 0,
+        plane: DmaBufPlane {
+            fd: DmaBufFd::dup(bo.fd.as_fd()).unwrap(),
+            offset: bo.offset,
+            stride: bo.stride,
+            modifier: bo.modifier.0,
+            size: bo.stride * height,
+        },
+        // No CPU importer: a readback would fail the encode.
+        importer: None,
+        lease: None,
+        producer: Some(DrmDevice::from_dev(gpu.node.dev())),
+        sync: FrameSync::Ready,
+    };
+    let packet = encoder.encode(CapturedFrame::Gpu(odd)).unwrap();
+    assert!(packet.is_keyframe, "{name}: encoded zero-copy");
+
+    let pattern = bgra_pattern(width, height, 1);
+    let readbacks = Arc::new(AtomicUsize::new(0));
+    let memfd = DmaBufFd::from(memfd());
+    for round in 1..=3 {
+        let refused = GpuFrame {
+            width,
+            height,
+            stride: width * 4,
+            format: PixelFormat::Bgra,
+            timestamp_us: round * 33_333,
+            plane: DmaBufPlane {
+                fd: memfd.clone(),
+                offset: 0,
+                stride: width * 4,
+                modifier: 0,
+                size: width * 4 * height,
+            },
+            importer: Some(Arc::new(Readback(pattern.clone(), Arc::clone(&readbacks)))),
+            lease: None,
+            producer: None,
+            sync: FrameSync::Implicit,
+        };
+        encoder.encode(CapturedFrame::Gpu(refused)).unwrap();
+    }
+    assert_eq!(readbacks.load(Ordering::SeqCst), 3, "{name}: read back");
 }
 
 /// An anonymous memory file: a descriptor that is not a DMA-BUF.

@@ -120,8 +120,8 @@ struct Gles {
     tex_sub_image: TexSubImage,
     finish: Finish,
     get_error: GetError,
-    _egl_library: Library,
-    _gles_library: Library,
+    egl_library: Library,
+    gl_library: Library,
 }
 
 impl Gles {
@@ -197,8 +197,8 @@ impl Gles {
             tex_sub_image: symbol(&gles, "glTexSubImage2D")?,
             finish: symbol(&gles, "glFinish")?,
             get_error: symbol(&gles, "glGetError")?,
-            _egl_library: egl,
-            _gles_library: gles,
+            egl_library: egl,
+            gl_library: gles,
         })
     }
 
@@ -292,6 +292,105 @@ impl Gles {
             (self.destroy_image)(self.display(), image);
         }
     }
+    /// See [`Gpu::render_pending`].
+    fn render_pending(&self, bo: &Bo, clears: u32) -> Result<OwnedFd, String> {
+        const EGL_SYNC_NATIVE_FENCE_ANDROID: u32 = 0x3144;
+        const GL_FRAMEBUFFER: u32 = 0x8D40;
+        const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+        const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
+        type QueryString = unsafe extern "C" fn(*mut c_void, i32) -> *const c_char;
+        type CreateSync = unsafe extern "C" fn(*mut c_void, u32, *const i32) -> *mut c_void;
+        type DupFence = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
+        type DestroySync = unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32;
+        type GenFramebuffers = unsafe extern "C" fn(i32, *mut u32);
+        type BindFramebuffer = unsafe extern "C" fn(u32, u32);
+        type FramebufferTexture = unsafe extern "C" fn(u32, u32, u32, u32, i32);
+        type ClearColor = unsafe extern "C" fn(f32, f32, f32, f32);
+        type Clear = unsafe extern "C" fn(u32);
+        type Flush = unsafe extern "C" fn();
+        let egl = &self.egl_library;
+        let gles = &self.gl_library;
+        let query_string: QueryString = symbol(egl, "eglQueryString")?;
+        // SAFETY: initialised display; static string or null.
+        let extensions = unsafe { query_string(self.display(), EGL_EXTENSIONS) };
+        // SAFETY: non-null NUL-terminated string.
+        if extensions.is_null()
+            || !unsafe { CStr::from_ptr(extensions) }
+                .to_string_lossy()
+                .contains("EGL_ANDROID_native_fence_sync")
+        {
+            return Err("the EGL display lacks EGL_ANDROID_native_fence_sync".into());
+        }
+        let get_proc: GetProcAddress = symbol(egl, "eglGetProcAddress")?;
+        let proc_address = |name: &CStr| {
+            // SAFETY: NUL-terminated name.
+            let pointer = unsafe { get_proc(name.as_ptr()) };
+            (!pointer.is_null())
+                .then_some(pointer)
+                .ok_or(format!("no {name:?}"))
+        };
+        // SAFETY (transmutes): the entry points named, with these prototypes.
+        let create_sync: CreateSync =
+            unsafe { std::mem::transmute(proc_address(c"eglCreateSyncKHR")?) };
+        let dup_fence: DupFence =
+            unsafe { std::mem::transmute(proc_address(c"eglDupNativeFenceFDANDROID")?) };
+        let destroy_sync: DestroySync =
+            unsafe { std::mem::transmute(proc_address(c"eglDestroySyncKHR")?) };
+        let gen_framebuffers: GenFramebuffers = symbol(gles, "glGenFramebuffers")?;
+        let bind_framebuffer: BindFramebuffer = symbol(gles, "glBindFramebuffer")?;
+        let framebuffer_texture: FramebufferTexture = symbol(gles, "glFramebufferTexture2D")?;
+        let clear_color: ClearColor = symbol(gles, "glClearColor")?;
+        let clear: Clear = symbol(gles, "glClear")?;
+        let flush: Flush = symbol(gles, "glFlush")?;
+        let context_attributes = [EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE];
+        let null = std::ptr::null_mut();
+        // SAFETY: test-only GLES calls on a context current on this thread,
+        // released before returning; the image outlives the queued work
+        // (the DMA-BUF is kept by `bo`, EGL keeps its own reference).
+        unsafe {
+            assert_eq!((self.bind_api)(EGL_OPENGL_ES_API), 1);
+            let context =
+                (self.create_context)(self.display(), null, null, context_attributes.as_ptr());
+            assert!(!context.is_null(), "eglCreateContext");
+            assert_eq!((self.make_current)(self.display(), null, null, context), 1);
+            let image = self.image(bo);
+            let mut texture = 0;
+            (self.gen_textures)(1, &raw mut texture);
+            (self.bind_texture)(GL_TEXTURE_2D, texture);
+            (self.image_target)(GL_TEXTURE_2D, image);
+            let mut framebuffer = 0;
+            gen_framebuffers(1, &raw mut framebuffer);
+            bind_framebuffer(GL_FRAMEBUFFER, framebuffer);
+            framebuffer_texture(
+                GL_FRAMEBUFFER,
+                GL_COLOR_ATTACHMENT0,
+                GL_TEXTURE_2D,
+                texture,
+                0,
+            );
+            for index in 0..clears {
+                clear_color(f32::from((index % 7) as u8) / 7.0, 0.5, 0.25, 1.0);
+                clear(GL_COLOR_BUFFER_BIT);
+            }
+            let attributes = [EGL_NONE];
+            let sync = create_sync(
+                self.display(),
+                EGL_SYNC_NATIVE_FENCE_ANDROID,
+                attributes.as_ptr(),
+            );
+            assert!(!sync.is_null(), "eglCreateSyncKHR(native fence)");
+            flush();
+            let fd = dup_fence(self.display(), sync);
+            destroy_sync(self.display(), sync);
+            assert_eq!((self.get_error)(), 0, "GL error queueing the clears");
+            (self.make_current)(self.display(), null, null, null);
+            (self.destroy_image)(self.display(), image);
+            if fd < 0 {
+                return Err("eglDupNativeFenceFDANDROID failed".into());
+            }
+            Ok(OwnedFd::from_raw_fd(fd))
+        }
+    }
 }
 
 /// The machine's NVIDIA GPU, its render node and the writers.
@@ -312,6 +411,14 @@ unsafe impl Sync for Gpu {}
 static GPU: OnceLock<Result<Gpu, String>> = OnceLock::new();
 
 impl Gpu {
+    /// Queues `clears` full-surface clears of a tiled `bo` with GLES,
+    /// flushes without waiting and returns the work's completion as a
+    /// `sync_file` (`EGL_ANDROID_native_fence_sync`). `Err` (the reason)
+    /// when the driver lacks native fences.
+    pub(super) fn render_pending(&self, bo: &Bo, clears: u32) -> Result<OwnedFd, String> {
+        self.gles.render_pending(bo, clears)
+    }
+
     /// The shared setup, or `None` (with the reason printed) when the
     /// machine cannot run these tests.
     pub(super) fn get() -> Option<&'static Self> {

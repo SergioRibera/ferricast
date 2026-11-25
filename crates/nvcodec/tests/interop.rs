@@ -420,6 +420,133 @@ fn per_frame_cost() {
     }
 }
 
+/// Whether `fd` (a `sync_file`) has signalled.
+fn signalled(fd: &OwnedFd) -> bool {
+    let mut poll_fd = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(fd),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd.
+    unsafe { libc::poll(&raw mut poll_fd, 1, 0) == 1 }
+}
+
+/// Pending GPU work on an NVIDIA-rendered buffer: the implicit wait
+/// (`FenceWait::Implicit`) returns at once although the work is still
+/// queued (the driver attaches no fence to the DMA-BUF), while waiting on
+/// the work's explicit fence through a DRM timeline syncobj — what the
+/// PipeWire capture does with `SPA_META_SyncTimeline` — blocks until it
+/// completed.
+#[test]
+fn implicit_wait_ignores_pending_nvidia_work_explicit_wait_does_not() {
+    use ferricast_core::{SyncWait, SyncobjDevice};
+
+    let Some(gpu) = Gpu::get() else { return };
+    let mut importer = DmaBufImporter::new(&gpu.context, Some(gpu.node)).unwrap();
+    let tiled = Gpu::tiled_modifier(&importer);
+    let bo = gpu
+        .allocate(3840, 2160, DrmFormat::Argb8888, tiled)
+        .unwrap();
+    let key = BufferKey(1);
+    importer.import(key, &dma_buf(&bo)).unwrap();
+    let clears = 3000;
+
+    // Implicit: returns while the clears are still running.
+    let work = match gpu.render_pending(&bo, clears) {
+        Ok(work) => work,
+        Err(reason) => {
+            eprintln!("skipping: {reason}");
+            return;
+        }
+    };
+    let start = Instant::now();
+    let _mapped = importer
+        .map(key, FenceWait::Implicit(Duration::from_secs(2)))
+        .unwrap();
+    let implicit = start.elapsed();
+    let pending_after_implicit = !signalled(&work);
+    let device = SyncobjDevice::open_render_node(None).unwrap();
+    let timeline = device.create().unwrap();
+    timeline
+        .import_sync_file(1, std::os::fd::AsFd::as_fd(&work))
+        .unwrap();
+    assert_eq!(
+        timeline.wait(1, Duration::from_secs(5)).unwrap(),
+        SyncWait::Signalled
+    );
+    eprintln!(
+        "implicit wait returned after {implicit:?}, work still pending: {pending_after_implicit}"
+    );
+    assert!(
+        pending_after_implicit,
+        "the work finished within the implicit wait ({implicit:?}): too little work to tell"
+    );
+
+    // Explicit: the timeline wait lasts until the work is done.
+    let work = gpu.render_pending(&bo, clears).unwrap();
+    let timeline = device.create().unwrap();
+    timeline
+        .import_sync_file(1, std::os::fd::AsFd::as_fd(&work))
+        .unwrap();
+    let start = Instant::now();
+    assert_eq!(
+        timeline.wait(1, Duration::from_secs(5)).unwrap(),
+        SyncWait::Signalled
+    );
+    let explicit = start.elapsed();
+    assert!(
+        signalled(&work),
+        "the timeline signalled before the work's fence"
+    );
+    // Then the frame is lent without another wait.
+    let _mapped = importer.map(key, FenceWait::AlreadySignalled).unwrap();
+    eprintln!("explicit timeline wait lasted {explicit:?} ({clears} clears of 3840x2160)");
+    assert!(
+        explicit > implicit * 10 && explicit > Duration::from_millis(5),
+        "explicit wait {explicit:?} vs implicit {implicit:?}"
+    );
+}
+
+/// Unregistering after an event recorded behind the last read, in one
+/// batch, then clearing the rest without a context-wide wait.
+#[test]
+fn forget_all_waits_for_an_event_and_clear_with_for_nothing() {
+    use ferricast_nvcodec::cuda::Event;
+    use ferricast_nvcodec::interop::Quiesce;
+
+    let Some(gpu) = Gpu::get() else { return };
+    let mut importer = DmaBufImporter::new(&gpu.context, Some(gpu.node)).unwrap();
+    let stream = Stream::new(&gpu.context).unwrap();
+    let tiled = Gpu::tiled_modifier(&importer);
+    let bos: Vec<_> = (0..3)
+        .map(|_| gpu.allocate(64, 32, DrmFormat::Argb8888, tiled).unwrap())
+        .collect();
+    for (index, bo) in bos.iter().enumerate() {
+        gpu.write(bo, &pattern(64, 32, index as u8));
+        importer
+            .import(BufferKey(index as u128), &dma_buf(bo))
+            .unwrap();
+    }
+    let pool = FramePool::new(importer.context(), 64 * 4, 32);
+    let copied = {
+        let frame = importer.map(BufferKey(0), FENCE).unwrap();
+        frame.copy_to_pool(&pool, &stream).unwrap()
+    };
+    let event = Event::new(&gpu.context).unwrap();
+    event.record(&stream).unwrap();
+    let forgotten = importer.forget_all(
+        [BufferKey(0), BufferKey(1), BufferKey(7)],
+        Quiesce::after(&event),
+    );
+    assert_eq!(forgotten, 2);
+    assert!(!importer.contains(BufferKey(0)) && importer.contains(BufferKey(2)));
+    stream.synchronize().unwrap();
+    drop(copied);
+    // SAFETY: the only work that read a buffer (the copy) is done.
+    importer.clear_with(unsafe { Quiesce::idle() });
+    assert!(importer.is_empty());
+}
+
 /// GBM, EGL and GLES, loaded at runtime like the crate loads its drivers.
 #[path = "support/dmabuf.rs"]
 mod support;

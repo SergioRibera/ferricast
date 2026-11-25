@@ -21,7 +21,9 @@
 //!   or pitched memory it aliases (tiled and LINEAR buffers). The
 //!   frame, and with it the capture buffer's lease, is held until NVENC has
 //!   finished reading it. Any failure on this path sends that frame through
-//!   the CPU readback instead; the next frame tries again.
+//!   the CPU readback instead; a buffer whose import failed is not tried
+//!   again until the capture pool changes. Frames of another GPU
+//!   (`GpuFrame::producer`) are read back without an import attempt.
 
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
@@ -248,6 +250,16 @@ fn hdr10(hdr: HdrMetadata) -> Hdr10 {
     }
 }
 
+/// Whether a `width`×`height` picture is encoded as the session's
+/// `size` by reading its top-left corner: the same size, or one pixel
+/// larger per axis (the session rounds odd sizes down to even, and NVENC
+/// takes inputs at least as large as the session).
+#[cfg(target_os = "linux")]
+fn crops_to(width: u32, height: u32, size: (u32, u32)) -> bool {
+    let fits = |have: u32, want: u32| have >= want && have - want <= 1;
+    fits(width, size.0) && fits(height, size.1)
+}
+
 /// What NVENC can do on this machine's GPU, queried once (it opens a
 /// session); a failed query is not kept, so a later probe retries.
 fn capabilities() -> CodecResult<Capabilities> {
@@ -410,9 +422,16 @@ impl<C: NvencCodec> NvencEncoder<C> {
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
             CapturedFrame::Gpu(gpu) => {
+                // A frame of another size (scaling, a rotated output, odd
+                // sizes) is read back and fitted on the CPU for now. The GPU
+                // path will map it as here and run the CUDA scaler on the
+                // mapped view before encoding:
+                // `kernels::Scaler::run(&mapped.view(), session size,
+                // rotation) -> pooled DeviceBuffer`, then `encode_device`
+                // (see design/NVCODEC.md, "Capture zero-copy").
                 #[cfg(target_os = "linux")]
                 if let Input::Rgb(format) = self.input
-                    && (gpu.width, gpu.height) == self.size()
+                    && crops_to(gpu.width, gpu.height, self.size())
                     && gpu.format == format
                     // A failure is logged by the zero-copy path; this frame
                     // is read back below.
@@ -598,26 +617,35 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
 
 /// DMA-BUF capture frames encoded without a CPU copy (Linux).
 #[cfg(target_os = "linux")]
-mod zero_copy {
-    use std::collections::HashMap;
+pub(crate) mod zero_copy {
+    use std::collections::{HashMap, HashSet};
     use std::os::fd::AsFd as _;
+    use std::sync::OnceLock;
     use std::time::Duration;
 
     use ferricast_codec::cuda::nvcodec::encode::{Encoder, FrameOptions};
     use ferricast_codec::cuda::nvcodec::interop::{
         BufferKey, DmaBuf, DmaBufImporter, DrmFormat, DrmNode, FenceWait, FrameView, Modifier,
+        Quiesce,
     };
     use ferricast_codec::cuda::{self, nvcodec};
-    use ferricast_core::{DmaBufId, GpuFrame, PixelFormat};
+    use ferricast_core::{DmaBufId, DmaBufModifiers, DrmDevice, FrameSync, GpuFrame, PixelFormat};
     use tracing::info;
 
-    /// How long the producer's write fence is waited for.
+    /// How long the producer's implicit write fence is waited for (only
+    /// for frames whose producer gives no stronger guarantee).
     const FENCE_TIMEOUT: Duration = Duration::from_millis(100);
-    /// More distinct buffers than any capture pool has: past this, the
-    /// producer is not reusing its buffers, so the caches start over.
+    /// Most capture buffers kept registered at once; past this the least
+    /// recently used one is dropped.
     const MAX_BUFFERS: usize = 16;
+    /// Frames after which a registration nobody used is dropped: the
+    /// producer discarded the buffer (a resize, a renegotiated pool), and
+    /// keeping it would pin the buffer's memory. Ten seconds at 60 fps;
+    /// a buffer that comes back is imported again (0.1–0.2 ms).
+    const STALE_AFTER_FRAMES: u64 = 600;
     /// The DRM node the capture renders on, when the user names it (the
-    /// same variable the capture's Vulkan importer reads).
+    /// same variable the capture's Vulkan importer reads), for frames that
+    /// carry no producer.
     const DRM_NODE_ENV: &str = "FERRICAST_DRM_RENDER_NODE";
 
     /// Why a frame could not go the zero-copy way.
@@ -625,6 +653,10 @@ mod zero_copy {
     pub(super) enum Error {
         #[error("DMA-BUF import into CUDA is unavailable here")]
         Unavailable,
+        #[error("the DMA-BUF lives on {producer:?}, not on the GPU NVENC imports into")]
+        OtherGpu { producer: DrmDevice },
+        #[error("this DMA-BUF was refused before; it is read back")]
+        Refused,
         #[error("cannot identify the DMA-BUF: {0}")]
         Identity(#[source] std::io::Error),
         #[error(transparent)]
@@ -653,7 +685,7 @@ mod zero_copy {
             options: FrameOptions,
         ) -> Result<(), Error> {
             if matches!(self, Self::Untried) {
-                *self = match ZeroCopy::new() {
+                *self = match ZeroCopy::new(frame.producer) {
                     Ok(zero_copy) => Self::Ready(Box::new(zero_copy)),
                     Err(error) => {
                         info!(%error, "NVENC: no DMA-BUF zero-copy, capture frames are read back");
@@ -715,40 +747,100 @@ mod zero_copy {
         /// pitched memory (LINEAR).
         key: u64,
         description: Description,
+        /// The frame counter when the buffer was last encoded.
+        last_used: u64,
     }
 
     /// The importer and what is registered with it and with NVENC.
     pub(super) struct ZeroCopy {
         importer: DmaBufImporter,
+        /// The GPU the importer was checked against, when known.
+        node: Option<DrmDevice>,
         buffers: HashMap<DmaBufId, Imported>,
+        /// Buffers whose import failed: read back without retrying until
+        /// the capture pool changes.
+        refused: HashSet<DmaBufId>,
         next_key: u64,
         /// The description of the last frame: a change means the producer
         /// reallocated its pool.
         last: Option<Description>,
+        /// Frames encoded (the clock of `Imported::last_used`).
+        frames: u64,
         /// Frames that fell back to the CPU so far.
         failures: u64,
     }
 
     impl ZeroCopy {
-        fn new() -> Result<Self, nvcodec::Error> {
+        fn new(producer: Option<DrmDevice>) -> Result<Self, nvcodec::Error> {
             let context = cuda::context()?;
-            let node =
-                std::env::var_os(DRM_NODE_ENV).and_then(|path| DrmNode::from_path(path).ok());
+            let node = producer.or_else(|| {
+                std::env::var_os(DRM_NODE_ENV).and_then(|path| DrmDevice::from_path(path).ok())
+            });
             Ok(Self {
-                importer: DmaBufImporter::new(&context, node)?,
+                importer: DmaBufImporter::new(&context, node.map(|n| DrmNode::from_dev(n.dev())))?,
+                node,
                 buffers: HashMap::new(),
+                refused: HashSet::new(),
                 next_key: 0,
                 last: None,
+                frames: 0,
                 failures: 0,
             })
         }
 
-        /// Forgets every buffer, NVENC's registrations first: an array must
-        /// stay registered with CUDA while NVENC's registration of it lives.
+        /// Forgets `ids`, NVENC's registrations first: an array must stay
+        /// registered with CUDA while NVENC's registration of it lives.
+        fn evict(&mut self, encoder: &mut Encoder, ids: &[DmaBufId]) {
+            let keys: Vec<BufferKey> = ids
+                .iter()
+                .filter_map(|id| {
+                    let imported = self.buffers.remove(id)?;
+                    encoder.invalidate_array(imported.key);
+                    Some(buffer_key(*id))
+                })
+                .collect();
+            // SAFETY: every picture NVENC encoded from these buffers has been
+            // locked: the session has no frames in flight and no B frames, so
+            // each `encode_array` / `encode_pitched` returned with its packet
+            // (`NvencEncoder::encode_frame` takes it right after), and no
+            // other CUDA work reads them.
+            let idle = unsafe { Quiesce::idle() };
+            self.importer.forget_all(keys, idle);
+        }
+
+        /// Forgets every buffer (the capture pool changed).
         fn clear(&mut self, encoder: &mut Encoder) {
             encoder.clear_input_caches();
-            self.importer.clear();
+            // SAFETY: as in `evict`.
+            self.importer.clear_with(unsafe { Quiesce::idle() });
             self.buffers.clear();
+            self.refused.clear();
+        }
+
+        /// Drops registrations unused for [`STALE_AFTER_FRAMES`] and, at
+        /// [`MAX_BUFFERS`], the least recently used one to make room.
+        fn retire(&mut self, encoder: &mut Encoder, incoming: DmaBufId) {
+            let mut stale: Vec<DmaBufId> = self
+                .buffers
+                .iter()
+                .filter(|(_, imported)| {
+                    self.frames.saturating_sub(imported.last_used) > STALE_AFTER_FRAMES
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            if self.buffers.len() - stale.len() >= MAX_BUFFERS
+                && !self.buffers.contains_key(&incoming)
+                && let Some((oldest, _)) = self
+                    .buffers
+                    .iter()
+                    .filter(|(id, _)| !stale.contains(id))
+                    .min_by_key(|(_, imported)| imported.last_used)
+            {
+                stale.push(*oldest);
+            }
+            if !stale.is_empty() {
+                self.evict(encoder, &stale);
+            }
         }
 
         fn encode(
@@ -757,40 +849,65 @@ mod zero_copy {
             frame: &GpuFrame,
             options: FrameOptions,
         ) -> Result<(), Error> {
+            if let (Some(node), Some(producer)) = (self.node, frame.producer)
+                && producer.render_node() != node.render_node()
+            {
+                return Err(Error::OtherGpu { producer });
+            }
             let description = Description::from(frame);
             let id = frame.plane.fd.buffer_id().map_err(Error::Identity)?;
-            let pool_changed = self.last.is_some_and(|last| last != description)
-                || (self.buffers.len() >= MAX_BUFFERS && !self.buffers.contains_key(&id));
-            if pool_changed {
+            if self.last.is_some_and(|last| last != description) {
                 self.clear(encoder);
             }
             self.last = Some(description);
-            let key = BufferKey::from((id.dev, id.ino));
+            if self.refused.contains(&id) {
+                return Err(Error::Refused);
+            }
+            self.frames += 1;
+            self.retire(encoder, id);
+            let key = buffer_key(id);
             let imported = match self.buffers.get(&id).copied() {
                 Some(imported) if imported.description == description => imported,
                 stale => {
-                    if let Some(stale) = stale {
-                        encoder.invalidate_array(stale.key);
-                        self.importer.forget(key);
+                    if stale.is_some() {
+                        self.evict(encoder, &[id]);
+                    }
+                    if let Err(error) = self.importer.import(key, &dma_buf(frame)) {
+                        self.refused.insert(id);
+                        return Err(error.into());
                     }
                     let imported = Imported {
                         key: self.next_key,
                         description,
+                        last_used: self.frames,
                     };
                     self.next_key += 1;
-                    self.importer.import(key, &dma_buf(frame))?;
-                    self.buffers.insert(id, imported);
                     imported
                 }
             };
-            let mapped = self.importer.map(key, FenceWait::Implicit(FENCE_TIMEOUT))?;
+            self.buffers.insert(
+                id,
+                Imported {
+                    last_used: self.frames,
+                    ..imported
+                },
+            );
+            let fence = match frame.sync {
+                // The capture waited for the producer (explicit acquire
+                // point, or a protocol that reports finished frames).
+                FrameSync::Ready => FenceWait::AlreadySignalled,
+                // Best effort: NVIDIA attaches no implicit fence.
+                FrameSync::Implicit => FenceWait::Implicit(FENCE_TIMEOUT),
+            };
+            let mapped = self.importer.map(key, fence)?;
             // SAFETY (both arms): the memory belongs to the importer's
             // registration under `key`, which stays alive until NVENC's
-            // registration of `imported.key` is invalidated (`clear` and the
-            // re-import above invalidate NVENC's first; `NvencEncoder` drops
-            // the encoder before the importer). The encoder's caller holds
-            // the frame, and with it the producer's lease, until the packet
-            // is out, so the buffer is not written while NVENC reads it.
+            // registration of `imported.key` is invalidated (`clear`,
+            // `evict` and the re-import above invalidate NVENC's first;
+            // `NvencEncoder` drops the encoder before the importer). The
+            // encoder's caller holds the frame, and with it the producer's
+            // lease, until the packet is out, so the buffer is not written
+            // while NVENC reads it.
             match mapped.view() {
                 FrameView::Array(array) => {
                     // SAFETY: see above.
@@ -803,6 +920,10 @@ mod zero_copy {
             }
             Ok(())
         }
+    }
+
+    fn buffer_key(id: DmaBufId) -> BufferKey {
+        BufferKey::from((id.dev, id.ino))
     }
 
     /// The frame's DMA-BUF as the importer takes it.
@@ -825,5 +946,75 @@ mod zero_copy {
             stride: frame.plane.stride,
             modifier: Modifier(frame.plane.modifier),
         }
+    }
+
+    /// What NVENC's DMA-BUF import takes on this machine, queried once per
+    /// process (it brings up EGL on the CUDA device's GPU).
+    #[derive(Debug, Clone)]
+    struct Importable {
+        modifiers: DmaBufModifiers,
+        node: Option<DrmDevice>,
+    }
+
+    fn importable() -> Option<Importable> {
+        // A machine without NVIDIA does not grow one: the answer is kept.
+        static IMPORTABLE: OnceLock<Option<Importable>> = OnceLock::new();
+        IMPORTABLE
+            .get_or_init(|| {
+                let context = cuda::context().ok()?;
+                let importer = DmaBufImporter::new(&context, None).ok()?;
+                let list = |format: DrmFormat| -> Vec<u64> {
+                    importer.modifiers(format).iter().map(|m| m.0).collect()
+                };
+                let node = context
+                    .device()
+                    .pci_bus_id()
+                    .ok()
+                    .and_then(|pci| DrmNode::render_node_of(pci).ok())
+                    .map(|node| DrmDevice::from_dev(node.dev()));
+                Some(Importable {
+                    modifiers: DmaBufModifiers::default()
+                        .with(PixelFormat::Bgra, list(DrmFormat::Argb8888))
+                        .with(PixelFormat::Rgba, list(DrmFormat::Abgr8888)),
+                    node,
+                })
+            })
+            .clone()
+    }
+
+    /// The DRM modifiers NVENC encodes from without a copy (what its EGL
+    /// import takes), for capture to prefer; empty without NVIDIA.
+    #[must_use]
+    pub fn dmabuf_modifiers() -> DmaBufModifiers {
+        importable().map(|i| i.modifiers).unwrap_or_default()
+    }
+
+    /// Whether DMA-BUFs of `producer` can be encoded without a copy: they
+    /// live on the GPU NVENC runs on. On a hybrid laptop whose compositor
+    /// renders on the integrated GPU this is `false`, and an encoder on
+    /// that GPU (VA-API) avoids the readback NVENC would need.
+    #[must_use]
+    pub fn imports_from(producer: DrmDevice) -> bool {
+        importable()
+            .and_then(|i| i.node)
+            .is_some_and(|node| node == producer.render_node())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use zero_copy::{dmabuf_modifiers, imports_from};
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::crops_to;
+
+    #[test]
+    fn crops_only_the_even_rounding() {
+        assert!(crops_to(1920, 1080, (1920, 1080)));
+        assert!(crops_to(1921, 1081, (1920, 1080)));
+        assert!(crops_to(1366, 769, (1366, 768)));
+        assert!(!crops_to(1922, 1080, (1920, 1080)));
+        assert!(!crops_to(1919, 1080, (1920, 1080)));
+        assert!(!crops_to(1080, 1920, (1920, 1080)));
     }
 }

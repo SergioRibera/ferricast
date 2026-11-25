@@ -116,9 +116,13 @@ the same GPU → `cuGraphicsEGLRegisterImage` → CUDA array → NVENC
 (`NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY`, or a device copy into a pooled
 buffer when direct registration is not possible). Registrations are
 cached per DMA-BUF identity (`DmaBufId`) and dropped when the pool
-changes. The producer's fence is waited on before NVENC reads. Only when
-the DMA-BUF lives on the CUDA device's GPU; otherwise the caller falls
-back to the CPU path.
+changes. NVENC reads only complete frames: the capture waits for the
+producer (explicit acquire point, or a protocol that reports finished
+frames) and says so (`FrameSync::Ready`); the implicit-fence poll is a
+best-effort fallback that the NVIDIA driver does not honour (see
+"Synchronisation" and "Capture zero-copy"). Only when the DMA-BUF lives
+on the CUDA device's GPU; otherwise the caller falls back to the CPU
+path.
 
 ## Safety rules
 
@@ -332,8 +336,13 @@ libgbm 26 with the NVIDIA GBM backend, `/dev/dri/renderD128`.
 - Displays are initialised once and never terminated (process-wide
   singletons; `EGL_KHR_display_reference` is not offered).
 - Each registration owns a dup of the DMA-BUF fd, the EGL image and the
-  CUDA resource; it waits for the context before unregistering (pool
-  changes only), so work queued on the array cannot outlive it. The
+  CUDA resource; it waits before unregistering, so work queued on the
+  array cannot outlive it. `forget` / `clear` wait for the whole context
+  (`cuCtxSynchronize`, which stalls every session on the process-wide
+  primary context); `forget_all` / `clear_with` take a `Quiesce`: an event
+  recorded behind the last read, or (unsafe) nothing when the caller knows
+  the work completed, which NVENC's zero-copy path does (its encode calls
+  return with the packet locked). The
   producer may free its buffer while it is registered.
 - Costs at 1920×1080: import (EGL image + register) 0.1–0.2 ms, once per
   pool buffer; `map` ≈ 0.5 µs; map + array→pitched device copy + stream
@@ -346,6 +355,15 @@ libgbm 26 with the NVIDIA GBM backend, `/dev/dri/renderD128`.
   `poll(POLLIN)` on the DMA-BUF (waits for its write fences; same as
   `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` + poll without the extra fd), bounded by
   a timeout. Explicit-sync callers pass `FenceWait::AlreadySignalled`.
+- **Measured: the poll does not wait for NVIDIA's own rendering.** With
+  3000 GLES clears of a 3840×2160 tiled buffer queued and flushed, the
+  poll returned after 14 µs with the work still pending; the work's
+  `EGL_ANDROID_native_fence_sync` fence, imported into a DRM timeline
+  syncobj, kept the wait for 310 ms (`tests/interop.rs`,
+  `implicit_wait_ignores_pending_nvidia_work_explicit_wait_does_not`).
+  The driver attaches no fence to the DMA-BUF's reservation object, so
+  `FenceWait::Implicit` is only meaningful for Mesa producers. On NVIDIA
+  correctness comes from the capture (see "Capture zero-copy").
 - CUDA → producer: CUDA attaches no fence to the DMA-BUF either. The
   consumer must keep the capture buffer's lease until the GPU work reading
   it (NVENC encode, the device copy's stream) has completed.
@@ -699,3 +717,133 @@ allocations, 1080p HEVC 59.8 → 14.7 µs, 2160p HEVC 295 → 72 µs.
   a helper process (or by dav1d) until that parser exists.
 - Anything the campaign did not reach: the driver remains unaudited; a
   helper process is the only complete answer.
+
+## Capture zero-copy
+
+What it took for real screen capture (not GBM test buffers) to reach
+NVENC without a CPU copy, measured on an RTX 3060, driver 595.71.05,
+niri 26.04, 1920×1080 outputs (one normal, two rotated 90° / 270°).
+
+### wlr-screencopy (wayland-direct)
+
+- **Allocation.** The pool used to allocate LINEAR only (an `mmap`
+  readback needed row-major bytes). NVIDIA's GBM refuses LINEAR with
+  `GBM_BO_USE_RENDERING`, so every allocation failed, the worker switched
+  to `wl_shm` for good and every frame was a CPU frame (479/479). Now the
+  modifier list is the compositor's `linux-dmabuf` feedback for the fourcc
+  ∩ the Vulkan importer's readable modifiers, tried first narrowed to what
+  the consumer imports without a copy (`CaptureConfig::consumer_modifiers`,
+  filled from `ferricast_encoder::dmabuf_modifiers()`, i.e. NVENC's EGL
+  modifiers), then the readable list; GBM picks the layout. Without the
+  Vulkan importer the list is LINEAR only and the `mmap` readback stays.
+  `INVALID` (implicit) is never chosen: both importers need the explicit
+  layout. On this machine: `0x0300000000606014` (block-linear), in NVENC's
+  list.
+- **CPU fallbacks read back through Vulkan**, never `mmap`: rotated /
+  y-inverted outputs (no GPU rotation yet) and layouts a CPU encoder needs.
+  An `mmap` of a tiled buffer reads scrambled tiles; one of an NVIDIA
+  LINEAR buffer stops showing the GPU's view after the first pages (see
+  "Observed hazard"). The Vulkan staging buffer is now `HOST_CACHED`
+  when the device offers it: uncached (write-combined) reads of a 1080p
+  frame took most of a frame period (rotated output: 31 → 58 fps).
+- **Producer.** Frames carry `GpuFrame::producer`, the render node the
+  bos were allocated on (the feedback's main device); NVENC's importer
+  checks it instead of `FERRICAST_DRM_RENDER_NODE` (still read for frames
+  without one).
+- **Damage.** Frames are requested with `copy_with_damage`; the
+  compositor answers when the output changed (niri renders the full
+  output into the buffer every time, `render_output` with buffer age 0,
+  so every pooled buffer is complete). The stream's `FramePacer` repeats
+  the last frame (same `GpuFrame`, same lease) while nothing changes, so
+  the cadence and keyframe interval the receivers need are unchanged.
+  `FERRICAST_WLR_FULL_COPY=1` requests every frame with `copy`.
+- **Synchronisation.** Frames leave with `FrameSync::Ready`. wlr-screencopy
+  `ready` means the copy is complete; niri sends it only after the render's
+  `SyncPoint` signalled (`submit_after_sync`, a calloop source on the
+  exported fence). Correctness on NVIDIA rests on that; the implicit poll
+  would not catch an early `ready`. niri 26.04 advertises neither
+  `ext_image_copy_capture_manager_v1` nor `wp_linux_drm_syncobj_manager_v1`
+  to this client (logged at start); ext-image-copy-capture has no explicit
+  sync either, and linux-drm-syncobj-v1 covers client surfaces, not capture.
+
+Live (`mycap`: wayland-direct → `H264Encoder`, NVENC, readbacks counted
+by wrapping the frame's importer; 10 s, 60 fps requested):
+
+| Output | Before | Now |
+|---|---|---|
+| DP-3, normal, every frame (`FULL_COPY`) | 479/479 CPU frames (`wl_shm`), 8 % of a core | 601/601 GPU frames, 0 readbacks, 0.4–1.0 % of a core, 60 fps |
+| DP-3, damage + pacing, idle screen | — | 1 capture, 512 repeats, 0.2 % of a core |
+| HDMI-A-1, 90°, every frame | 597 CPU frames (`wl_shm`), 61 % | 576 CPU frames (Vulkan readback + CPU rotate + scale), 50 %, 57.6 fps |
+| DP-2, 270°, every frame | — | 577 CPU frames, 45 %, 57.7 fps |
+| HDMI-A-1, damage + pacing | — | 7 captures, 394 repeats, 20 % |
+
+Picture checks: the Vulkan readback of a GPU frame equals `grim`'s
+screenshot of DP-3 bit for bit (PSNR ∞); NVENC's stream decoded by
+ffmpeg is 51–52 dB from the readback and from the screenshot; rotated
+outputs read back in the screen's orientation (53 dB / 35 dB against a
+later screenshot of moving content).
+
+### PipeWire
+
+- **Explicit sync.** The worker offers a `ParamBuffers` variant that
+  requires `SPA_META_SyncTimeline` (and the meta itself) before the plain
+  one; a producer that supports it (Mutter, KWin) adds the acquire and
+  release syncobjs to every buffer. The worker waits for the acquire point
+  (`DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` with `WAIT_FOR_SUBMIT`, 100 ms, on the
+  importer's render node; `ferricast_core::Syncobj`) before anything reads
+  the buffer and emits `FrameSync::Ready`; the release point is signalled
+  when the buffer is re-queued: for leased GPU frames when the lease drops,
+  i.e. after NVENC locked the picture. Without the meta frames are
+  `FrameSync::Implicit`. niri's own PipeWire producer has no SyncTimeline
+  (it waits for its render before queuing), so this path is unit-tested
+  (syncobj wait / signal / sync-file import, pod order) but has not met a
+  real explicit-sync producer.
+- **LINEAR DMA-BUFs** leave as `GpuFrame`s whenever the Vulkan importer
+  reads them (NVIDIA lists LINEAR among its 7 readable modifiers): NVENC
+  encodes them in place (`encode_pitched`), CPU encoders read back through
+  Vulkan. Only buffers the importer cannot read (implicit modifier, no
+  importer) are still `mmap`ped.
+- **Negotiation.** Per format, a pod with the modifiers the importer
+  reads *and* the consumer imports comes first, then one with every
+  readable modifier, then SHM.
+- **Producer.** The importer's render node (`VK_EXT_physical_device_drm`).
+
+### NVENC's zero-copy path
+
+- `FrameSync::Ready` maps with `FenceWait::AlreadySignalled`,
+  `Implicit` with the (best-effort) poll.
+- The importer is created against the first frame's producer; a frame of
+  another GPU is read back without an import attempt.
+- A buffer whose import failed is remembered (per `DmaBufId`) and read
+  back without retrying until the capture pool changes (a description
+  change clears every cache).
+- Registrations unused for 600 frames (the producer discarded the
+  buffer) are dropped, and at 16 the least recently used one, instead of
+  keeping freed buffers' VRAM until 16 accumulate. Evictions and pool
+  changes unregister with `Quiesce::idle()` (NVENC has locked every
+  picture), no `cuCtxSynchronize`.
+- A frame one pixel larger per axis than the session (the session rounds
+  odd sizes down to even) is encoded from its top-left corner: NVENC takes
+  larger inputs (`tests/nvidia_e2e.rs`,
+  `odd_sized_frames_go_zero_copy_and_refused_buffers_stay_read_back`).
+- **Hook for GPU scaling / rotation.** Other sizes and rotated outputs are
+  still fitted on the CPU (capture reads rotated outputs back; NVENC reads
+  back mismatched sizes). The expected GPU path, in
+  `NvencEncoder::submit`'s `Gpu` arm: import and map as today, then
+  `kernels::Scaler::run(&mapped.view(), session size, rotation) -> pooled
+  DeviceBuffer` and `encode_device`; rotation then has to travel on the
+  frame (a `GpuFrame` transform) instead of being undone by capture.
+- **Hybrid laptops.** `GpuFrame::producer` and
+  `ferricast_encoder::nvenc::imports_from(producer)` give encoder
+  selection what it needs to prefer a backend on the producer's GPU
+  (VA-API on the iGPU zero-copy over NVENC + readback). The selection
+  itself (registry order in the facades) does not use it yet.
+
+### Open
+
+- PipeWire explicit sync and LINEAR-as-GPU are unverified against a live
+  producer here (niri's portal needs an interactive pick).
+- Rotated outputs cost half a core until the CUDA scaler / rotator lands.
+- The acquire wait blocks the PipeWire loop thread (bounded by 100 ms); a
+  GPU-side wait would need a CUDA external semaphore, which CUDA cannot
+  import from a sync file.

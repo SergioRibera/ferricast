@@ -31,15 +31,27 @@
 //!
 //! ## Transport
 //!
-//! - **Preferred**: `linux_dmabuf` event. LINEAR gbm bos (universal)
-//!   from a small pool ([`pool`]), each wrapped once as a `wl_buffer`
-//!   via `zwp_linux_dmabuf_v1` and reused across frames. With the
-//!   shared Vulkan importer up, frames emit as `CapturedFrame::Gpu`
-//!   holding a lease on their bo, which keeps the compositor out of it
-//!   until every downstream clone is gone. Without the importer, or
-//!   when the output needs re-orienting (rotated / y-inverted — GPU
-//!   frames can't be), the bo is read back and emits as
-//!   `CapturedFrame::Cpu`.
+//! - **Preferred**: `linux_dmabuf` event. gbm bos from a small pool
+//!   ([`pool`]), each wrapped once as a `wl_buffer` via
+//!   `zwp_linux_dmabuf_v1` and reused across frames. Their layout is a
+//!   modifier the compositor imports (`linux-dmabuf` feedback), the
+//!   Vulkan importer reads back, and preferably the GPU encoder takes
+//!   without a copy (`CaptureConfig::consumer_modifiers`); on NVIDIA that
+//!   is a block-linear modifier, as its GBM refuses LINEAR render
+//!   targets. With the shared Vulkan importer up, frames emit as
+//!   `CapturedFrame::Gpu` holding a lease on their bo, which keeps the
+//!   compositor out of it until every downstream clone is gone, and
+//!   naming their GPU (`GpuFrame::producer`). When the output needs
+//!   re-orienting (rotated / y-inverted — GPU frames can't be yet) the
+//!   bo is read back through Vulkan and emits as `CapturedFrame::Cpu`;
+//!   without the importer the bos are LINEAR and read through `mmap`.
+//!   Frames are requested with `copy_with_damage`: an idle output costs
+//!   nothing, and the stream's pacer repeats the last frame.
+//! - **Synchronisation**: frames leave with `FrameSync::Ready`. The
+//!   protocol's `ready` event means the copy is complete; niri sends it
+//!   only after the render's sync point signalled. wlr-screencopy has no
+//!   explicit-sync extension, and `linux-drm-syncobj-v1` covers client
+//!   surfaces, not capture.
 //! - **Fallback**: `buffer` event (`wl_shm`). Allocates a memfd pool,
 //!   reads back. Emits `CapturedFrame::Cpu`. Used when the
 //!   compositor doesn't advertise `linux_dmabuf` for the frame
@@ -54,8 +66,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use ferricast_core::{
-    CaptureConfig, CaptureSource, CapturedFrame, DmaBufFd, DmaBufImporter, DmaBufPlane,
-    FerricastError, GpuFrame, PixelFormat, RawFrame, Result, ScreenCapture,
+    CaptureConfig, CaptureSource, CapturedFrame, DmaBufFd, DmaBufImporter, DmaBufModifiers,
+    DmaBufPlane, DrmDevice, FerricastError, FrameSync, GpuFrame, PixelFormat, RawFrame, Result,
+    ScreenCapture,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
@@ -91,12 +104,14 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 
-/// DMA-BUF allocation backend. Wraps a single gbm device tied to
-/// the first usable render node. Allocates LINEAR BGRA buffers —
-/// LINEAR is universally supported, costs a bit of bandwidth vs
-/// tiled formats but keeps the negotiation matrix small.
+/// DMA-BUF allocation backend: one gbm device on the compositor's
+/// render node. The layout of each buffer is negotiated per allocation
+/// (see [`DmabufAllocator::alloc`]).
 struct DmabufAllocator {
     device: gbm::Device<std::fs::File>,
+    /// The render node the buffers are allocated on (their producer
+    /// GPU, as `GpuFrame::producer` reports it).
+    node: DrmDevice,
     /// `(format_fourcc → allowed modifiers)` advertised by the
     /// compositor via the `linux-dmabuf-v1` feedback path. Empty
     /// when feedback wasn't available (older compositor, v3
@@ -140,6 +155,7 @@ impl DmabufAllocator {
                     );
                     return Ok(DmabufAllocator {
                         device: d,
+                        node: DrmDevice::from_dev(meta.rdev()),
                         accepted: HashMap::new(),
                     });
                 }
@@ -158,6 +174,8 @@ impl DmabufAllocator {
                 );
                 return Ok(DmabufAllocator {
                     device: d,
+                    node: DrmDevice::from_path(node)
+                        .map_err(|e| FerricastError::Capture(format!("stat {node}: {e}")))?,
                     accepted: HashMap::new(),
                 });
             }
@@ -191,163 +209,79 @@ impl DmabufAllocator {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one linear setup or event sequence over shared state; splitting it would scatter that state"
-    )]
+    /// Allocates a `width`×`height` buffer the compositor can render
+    /// into and the capture's consumers can read.
+    ///
+    /// The layout comes from three sets: what the compositor's renderer
+    /// imports (`linux-dmabuf` feedback for this fourcc), what this side
+    /// can read back to the CPU (`readable`: the Vulkan importer's
+    /// modifiers, or LINEAR alone without it, since only LINEAR can be
+    /// `mmap`ped), and, as a preference, what the GPU consumer imports
+    /// without a copy (`preferred`, e.g. NVENC's EGL modifiers). GBM picks
+    /// the best layout of the list it is given. NVIDIA's GBM refuses
+    /// LINEAR with `RENDERING`, so on NVIDIA this has to be a tiled
+    /// (block-linear) modifier.
     fn alloc(
         &self,
         width: u32,
         height: u32,
         fourcc: drm_fourcc::DrmFourcc,
         format: PixelFormat,
+        readable: &[u64],
+        preferred: &[u64],
     ) -> Result<AllocatedBuffer> {
-        // Allocation strategy now goes through the compositor's
-        // advertised modifier set first (via linux-dmabuf-v1
-        // feedback). This is the difference between "the buffer
-        // allocates fine but `copy()` returns failed" and "we
-        // never reach `failed` because the layout actually matches
-        // what the compositor's renderer can read":
-        //
-        //   1. If feedback gave us a list for this fourcc, walk
-        //      it in preference order. Within the list, LINEAR
-        //      first (universal-readable for software fallbacks
-        //      and screencopy paths that go through GLES blit),
-        //      then everything else.
-        //   2. If feedback didn't advertise this fourcc, walk a
-        //      fixed cascade: LINEAR → INVALID → legacy LINEAR
-        //      flag. INVALID stays in the cascade because old
-        //      compositors that don't expose feedback at v4+ may
-        //      still accept driver-picked layouts (single-GPU
-        //      Intel hosts mostly).
         use gbm::{BufferObjectFlags, Modifier};
 
+        let candidates =
+            LayoutChoice::new(self.accepted.get(&(fourcc as u32)), readable, preferred);
         tracing::debug!(
             ?fourcc,
             width,
             height,
-            advertised_modifiers = self
-                .accepted
-                .get(&(fourcc as u32))
-                .map_or(0, std::vec::Vec::len),
-            "gbm: attempting dmabuf alloc"
+            ?candidates,
+            "gbm: choosing a dmabuf layout"
         );
-
-        // Pick the preferred modifier list. When feedback is empty
-        // (older compositor / no v4 binding) we synthesise the
-        // legacy cascade so the rest of the function shape stays
-        // identical.
-        let mut wanted: Vec<u64> = self
-            .accepted
-            .get(&(fourcc as u32))
-            .cloned()
-            .unwrap_or_default();
-        if wanted.is_empty() {
-            wanted.push(u64::from(Modifier::Linear));
-            wanted.push(u64::from(Modifier::Invalid));
-        } else {
-            // LINEAR first if it's in the set — keeps the bytes
-            // mmap'able for the shm-encode fallback path and is the
-            // most widely-supported across compositor renderers.
-            let linear = u64::from(Modifier::Linear);
-            if let Some(pos) = wanted.iter().position(|&m| m == linear) {
-                wanted.swap(0, pos);
-            }
-        }
-
-        let mut last_err: Option<std::io::Error> = None;
-        let mut bo_opt: Option<gbm::BufferObject<()>> = None;
-        // Crucial knob: pass `RENDERING` so the compositor's GLES
-        // renderer can bind the buffer as a render *target* via
-        // EGL. The plain `create_buffer_object_with_modifiers`
-        // (v1, no flags) variant lets mesa pick defaults — which
-        // on many drivers means SCANOUT-ish flags that EGL refuses
-        // to bind for rendering. niri's screencopy backend does
-        // `renderer.bind(&mut dmabuf)` and that's where it fails
-        // without RENDERING. We use the v2 API to force the right
-        // flags; v2 needs libgbm ≥ 22.2 which is present on every
-        // distro shipping a recent Wayland stack.
+        // `RENDERING`: the compositor binds the buffer as a render
+        // target (niri's screencopy does `renderer.bind(dmabuf)`); without
+        // it GBM may pick scanout-only layouts EGL refuses to render to.
         let usage = BufferObjectFlags::RENDERING;
-        // Important: this loop ONLY tries LINEAR (modifier == 0).
-        // After-capture we hand the bytes to the encoder via
-        // `mmap` + the kernel's dma-buf sync ioctl. That mmap
-        // assumes row-major BGRA layout — which is what LINEAR
-        // gives. Vendor-tiled modifiers like NVIDIA's
-        // `BLOCK_LINEAR_2D` (0x0300_0000_0060_6011) write pixels
-        // in a tile pattern; mmap'ing those returns bytes that
-        // *look* like BGRA per row but are actually scrambled.
-        // The encoder happily compresses the scramble and the
-        // chromecast plays unrecognisable garbage — symptom the
-        // user hit on NVIDIA when LINEAR+RENDERING got rejected
-        // and the cascade fell through to the next advertised
-        // modifier.
-        //
-        // For non-LINEAR modifiers we'd need a Vulkan blit step
-        // (tiled→linear on the GPU) followed by readback. That's
-        // what `crate::vulkan::VulkanImporter` does, but the CPU
-        // fallbacks here (no importer, re-orientation) `mmap` the
-        // bo, so allocation stays LINEAR-only. Until those read back
-        // through Vulkan too: if LINEAR+RENDERING can't allocate,
-        // fail the dmabuf path so sticky-disable promotes us to shm.
-        let linear = u64::from(Modifier::Linear);
-        for modifier_u64 in &wanted {
-            if *modifier_u64 != linear {
-                tracing::trace!(
-                    modifier = format!("0x{modifier_u64:016x}"),
-                    "gbm: skipping non-LINEAR modifier (mmap-readback requires row-major layout)"
-                );
-                continue;
-            }
-            let modifier: Modifier = (*modifier_u64).into();
-            match self.device.create_buffer_object_with_modifiers2::<()>(
-                width,
-                height,
-                fourcc,
-                [modifier].into_iter(),
-                usage,
-            ) {
-                Ok(bo) => {
-                    tracing::debug!(
-                        ?fourcc,
-                        modifier = format!("0x{modifier_u64:016x}"),
-                        flags = format!("{usage:?}"),
-                        "gbm: allocated with advertised modifier + RENDERING"
-                    );
-                    bo_opt = Some(bo);
+        let mut last_err: Option<std::io::Error> = None;
+        let mut bo = None;
+        for list in candidates.attempts() {
+            let modifiers = list.iter().map(|&m| Modifier::from(m));
+            match self
+                .device
+                .create_buffer_object_with_modifiers2::<()>(width, height, fourcc, modifiers, usage)
+            {
+                Ok(allocated) => {
+                    bo = Some(allocated);
                     break;
                 }
                 Err(e) => {
-                    tracing::debug!(
-                        modifier = format!("0x{modifier_u64:016x}"),
-                        %e,
-                        "gbm: rejected this modifier; trying next"
-                    );
+                    tracing::debug!(modifiers = list.len(), %e, "gbm: refused this modifier list");
                     last_err = Some(e);
                 }
             }
         }
-        // Final legacy-flag fallback for the no-feedback case —
-        // some drivers (NVIDIA's GBM in particular) only do LINEAR
-        // via the flag API, not the modifier API. Same RENDERING
-        // requirement, just expressed as flag bits.
-        if bo_opt.is_none() {
+        // Drivers without the modifier API (and compositors without
+        // feedback): the legacy flag, when LINEAR is something this side
+        // can read.
+        if bo.is_none() && readable.contains(&u64::from(Modifier::Linear)) {
             match self.device.create_buffer_object::<()>(
                 width,
                 height,
                 fourcc,
                 BufferObjectFlags::LINEAR | BufferObjectFlags::RENDERING,
             ) {
-                Ok(bo) => {
-                    tracing::debug!(?fourcc, "gbm: allocated with legacy LINEAR+RENDERING flags");
-                    bo_opt = Some(bo);
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                }
+                Ok(allocated) => bo = Some(allocated),
+                Err(e) => last_err = Some(e),
             }
         }
-        let bo = bo_opt.ok_or_else(|| {
-            let cause = last_err.map_or_else(|| "no modifier worked".into(), |e| e.to_string());
+        let bo = bo.ok_or_else(|| {
+            let cause = last_err.map_or_else(
+                || "no layout both the compositor and this side support".into(),
+                |e| e.to_string(),
+            );
             FerricastError::Capture(format!(
                 "gbm alloc (fourcc={fourcc:?}, {width}x{height}): {cause}"
             ))
@@ -355,6 +289,13 @@ impl DmabufAllocator {
 
         let modifier = u64::from(bo.modifier());
         let stride = bo.stride();
+        tracing::debug!(
+            ?fourcc,
+            modifier = format!("0x{modifier:016x}"),
+            stride,
+            preferred = preferred.contains(&modifier),
+            "gbm: dmabuf allocated"
+        );
         let fd: OwnedFd = bo
             .fd()
             .map_err(|e| FerricastError::Capture(format!("gbm fd: {e}")))?;
@@ -370,13 +311,55 @@ impl DmabufAllocator {
     }
 }
 
+/// The modifier lists [`DmabufAllocator::alloc`] tries, best first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LayoutChoice {
+    /// Imported by the compositor, readable here and taken by the
+    /// consumer without a copy.
+    preferred: Vec<u64>,
+    /// Imported by the compositor and readable here.
+    readable: Vec<u64>,
+}
+
+impl LayoutChoice {
+    /// `accepted` is the compositor's list for the fourcc (`None`
+    /// without feedback: then any readable layout is tried). The
+    /// implicit modifier (`INVALID`) is never chosen: the importers need
+    /// the explicit layout.
+    fn new(accepted: Option<&Vec<u64>>, readable: &[u64], preferred: &[u64]) -> Self {
+        let invalid = u64::from(gbm::Modifier::Invalid);
+        let readable: Vec<u64> = readable
+            .iter()
+            .copied()
+            .filter(|m| *m != invalid && accepted.is_none_or(|list| list.contains(m)))
+            .collect();
+        let preferred = readable
+            .iter()
+            .copied()
+            .filter(|m| preferred.contains(m))
+            .collect();
+        Self {
+            preferred,
+            readable,
+        }
+    }
+
+    /// The non-empty lists to try, in order, without repeating one.
+    fn attempts(&self) -> impl Iterator<Item = &[u64]> {
+        let readable = (self.readable != self.preferred).then_some(self.readable.as_slice());
+        std::iter::once(self.preferred.as_slice())
+            .chain(readable)
+            .filter(|list| !list.is_empty())
+    }
+}
+
 /// One DMA-BUF the compositor writes into. Keeps the `gbm` BO alive
 /// (drop releases the memory) and exposes the fd for `wl_buffer`
 /// wrapping + downstream consumption.
 struct AllocatedBuffer {
     /// Never read: held so the memory stays alive while the
-    /// `wl_buffer` and the exported `fd` reference it (readback goes
-    /// through the fd, see `mmap_bo_to_raw`).
+    /// `wl_buffer` and the exported `fd` reference it (readbacks go
+    /// through the fd).
     _bo: gbm::BufferObject<()>,
     fd: OwnedFd,
     width: u32,
@@ -482,10 +465,16 @@ impl ScreenCapture for WaylandDirectCapture {
         let (size_tx, size_rx) = tokio::sync::oneshot::channel::<(u32, u32)>();
 
         let output_name_clone = output_name.clone();
+        let consumer = config.consumer_modifiers;
         let join = std::thread::Builder::new()
             .name("ferricast-wl-direct".into())
             .spawn(move || {
-                if let Err(e) = run_worker(&output_name_clone, fps, &frame_tx, &stop_rx, size_tx) {
+                let target = WorkerTarget {
+                    output_name: &output_name_clone,
+                    fps,
+                    consumer: &consumer,
+                };
+                if let Err(e) = run_worker(&target, &frame_tx, &stop_rx, size_tx) {
                     warn!(%e, "wayland-direct worker exited");
                 }
             })
@@ -580,17 +569,55 @@ const FRAME_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// after which the worker stays on SHM for the rest of the session.
 const DMABUF_FAILURE_THRESHOLD: u32 = 3;
 
+/// How long one wait for a damaged frame blocks before the worker
+/// checks for a stop request. `copy_with_damage` answers only once the
+/// output changed, which on an idle screen can be never.
+const DAMAGE_POLL: Duration = Duration::from_millis(100);
+
+/// Set to `1` to request every frame with `copy` instead of
+/// `copy_with_damage` (for compositors whose damage reporting is broken,
+/// and to measure the capture path at the full frame rate).
+const FULL_COPY_ENV: &str = "FERRICAST_WLR_FULL_COPY";
+
+/// What the worker captures and for whom.
+struct WorkerTarget<'a> {
+    output_name: &'a str,
+    fps: u32,
+    /// Modifiers the GPU consumer imports without a copy.
+    consumer: &'a DmaBufModifiers,
+}
+
+/// Logs the optional globals that would let capture synchronise more
+/// precisely than wlr-screencopy's `ready` event (see
+/// `design/NVCODEC.md`, "Capture zero-copy").
+fn log_sync_globals(globals: &wayland_client::globals::GlobalList) {
+    let advertised = |interface: &str| {
+        globals
+            .contents()
+            .with_list(|list| list.iter().any(|g| g.interface == interface))
+    };
+    info!(
+        ext_image_copy_capture = advertised("ext_image_copy_capture_manager_v1"),
+        linux_drm_syncobj = advertised("wp_linux_drm_syncobj_manager_v1"),
+        "wayland-direct: capture synchronisation relies on wlr-screencopy `ready`"
+    );
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one linear setup or event sequence over shared state; splitting it would scatter that state"
 )]
 fn run_worker(
-    output_name: &str,
-    fps: u32,
+    target: &WorkerTarget<'_>,
     frame_tx: &mpsc::Sender<CapturedFrame>,
     stop_rx: &std::sync::mpsc::Receiver<()>,
     size_tx: tokio::sync::oneshot::Sender<(u32, u32)>,
 ) -> Result<()> {
+    let WorkerTarget {
+        output_name,
+        fps,
+        consumer,
+    } = *target;
     let conn = Connection::connect_to_env()
         .map_err(|e| FerricastError::Capture(format!("wayland connect: {e}")))?;
     let (globals, mut queue) = registry_queue_init::<WorkerState>(&conn)
@@ -608,6 +635,7 @@ fn run_worker(
         warn!("wayland-direct: zwp_linux_dmabuf_v1 absent — falling back to wl_shm transport");
     }
     let xdg_om: Option<ZxdgOutputManagerV1> = globals.bind(&qh, 2..=3, ()).ok();
+    log_sync_globals(&globals);
 
     let mut state = WorkerState {
         outputs: Vec::new(),
@@ -695,8 +723,9 @@ fn run_worker(
         a
     });
     // One importer per session, like the PipeWire worker; only worth
-    // bringing up when there are dmabufs to hand downstream.
-    let mut gpu_path = allocator.as_ref().and_then(|_| GpuPath::build(main_device));
+    // bringing up when there are dmabufs to hand downstream. It runs on
+    // the GPU the buffers are allocated on.
+    let mut gpu_path = allocator.as_ref().and_then(|a| GpuPath::build(a.node));
     // Declared after the connection so its `wl_buffer`s are destroyed
     // before the connection goes away.
     let mut pool: BufferPool<PooledBuffer> = BufferPool::default();
@@ -717,6 +746,7 @@ fn run_worker(
     let mut dmabuf_disabled = false;
     let mut dmabuf_consecutive_failures: u32 = 0;
     let mut gpu_orientation_warned = false;
+    let full_copy = std::env::var_os(FULL_COPY_ENV).is_some_and(|v| v == "1");
 
     loop {
         // Cooperative stop — check between frames. A disconnected
@@ -833,7 +863,14 @@ fn run_worker(
             }
             match pool.pick() {
                 Pick::Free(idx) => transport = Some(Transport::Dmabuf(idx)),
-                Pick::Grow => match make_dmabuf_buffer(alloc, dmabuf_proxy, &qh, offer) {
+                Pick::Grow => match make_dmabuf_buffer(
+                    alloc,
+                    dmabuf_proxy,
+                    &qh,
+                    offer,
+                    gpu_path.as_ref(),
+                    consumer,
+                ) {
                     Ok(buf) => transport = Some(Transport::Dmabuf(pool.insert(buf))),
                     Err(e) => {
                         // Alloc-time failure (gbm rejected our format /
@@ -892,18 +929,40 @@ fn run_worker(
         };
         let attempted_dmabuf = matches!(transport, Transport::Dmabuf(_));
 
-        frame.copy(&buffer);
-        queue
-            .dispatch_until(&mut state, FRAME_EVENT_TIMEOUT, |s| {
-                s.status != FrameStatus::Pending
-            })
-            .map_err(|e| FerricastError::Capture(format!("frame wait: {e}")))?;
+        // `copy_with_damage`: the compositor answers once the output
+        // changed, so an idle screen costs no copy, readback or import;
+        // the stream's frame pacer repeats the last frame meanwhile. The
+        // compositor still renders the whole output into the buffer
+        // (niri renders with buffer age 0), so every buffer of the pool
+        // holds a complete picture.
+        if full_copy {
+            frame.copy(&buffer);
+        } else {
+            frame.copy_with_damage(&buffer);
+        }
+        let stopped = loop {
+            let answered = queue
+                .dispatch_until(&mut state, DAMAGE_POLL, |s| {
+                    s.status != FrameStatus::Pending
+                })
+                .map_err(|e| FerricastError::Capture(format!("frame wait: {e}")))?;
+            if answered {
+                break false;
+            }
+            match stop_rx.try_recv() {
+                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break true,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        };
         // The frame object is single-use: once `ready` / `failed`
         // arrived (or we gave up waiting) nothing else will happen on
         // it. Destroy it on every path, otherwise each capture leaks a
         // protocol object on both sides of the connection (~108k/hour
         // at 30 fps).
         frame.destroy();
+        if stopped {
+            break;
+        }
         if state.status != FrameStatus::Ready {
             // Record per-transport consecutive failures so the
             // sticky-disable above only fires when the *dmabuf*
@@ -940,7 +999,7 @@ fn run_worker(
         // The compositor hands us the framebuffer in its native
         // orientation; undo `Y_INVERT` and the output transform so the
         // receiver sees what the user sees. Only CPU frames can be
-        // re-oriented (there is no GPU rotate step), so a frame that
+        // re-oriented (there is no GPU rotate step yet), so a frame that
         // needs it never leaves as a `GpuFrame`.
         let orientation = state.frame_orientation();
         let captured = match transport {
@@ -953,17 +1012,16 @@ fn run_worker(
                 //      VPP, NVENC) import the fd directly; CPU encoders
                 //      call `into_cpu()`, which reads it back through
                 //      Vulkan.
-                //   2. `Cpu`: no importer, a layout it can't read, or
-                //      an orientation to undo. Read the LINEAR buffer
-                //      back here via `mmap` (see `mmap_bo_to_raw`) —
-                //      one memcpy the encoder would have paid anyway.
+                //   2. `Cpu`: an orientation to undo, or no importer.
+                //      Read back through Vulkan (any layout), or, without
+                //      it, through `mmap` (the allocation is then LINEAR).
                 let gpu = match gpu_path.as_mut() {
                     Some(_) if !orientation.is_identity() => {
                         if !std::mem::replace(&mut gpu_orientation_warned, true) {
                             warn!(
                                 ?orientation,
                                 "wayland-direct: output is rotated / y-inverted and GPU \
-                                 frames can't be re-oriented — emitting CPU frames"
+                                 frames can't be re-oriented yet — reading frames back"
                             );
                         }
                         None
@@ -978,7 +1036,11 @@ fn run_worker(
                         warn!("wayland-direct: pooled buffer vanished — dropping frame");
                         continue;
                     };
-                    match mmap_bo_to_raw(&pooled.alloc) {
+                    let raw = match gpu_path.as_ref() {
+                        Some(gpu) => gpu.read_back(&pooled.alloc),
+                        None => mmap_bo_to_raw(&pooled.alloc),
+                    };
+                    match raw {
                         Ok(raw) => CapturedFrame::Cpu(orient_raw_frame(raw, orientation)),
                         Err(e) => {
                             warn!(%e, "wayland-direct: dmabuf readback failed — dropping frame");
@@ -1051,23 +1113,25 @@ fn orient_raw_frame(raw: RawFrame, orientation: Orientation) -> RawFrame {
 /// capture thread instead.
 struct GpuPath {
     importer: Arc<VulkanImporter>,
+    /// The render node the buffers are allocated on.
+    node: DrmDevice,
     bgra_modifiers: Vec<u64>,
     rgba_modifiers: Vec<u64>,
     unreadable_warned: bool,
 }
 
 impl GpuPath {
-    /// Bring the importer up on the compositor's GPU
-    /// (`compositor_device` from `linux-dmabuf` feedback, when known).
+    /// Bring the importer up on `node`, the GPU the buffers are
+    /// allocated on (the compositor's, from `linux-dmabuf` feedback).
     /// `None`, logged, when Vulkan is unusable here.
-    fn build(compositor_device: Option<u64>) -> Option<Self> {
-        let importer = match VulkanImporter::new(compositor_device) {
+    fn build(node: DrmDevice) -> Option<Self> {
+        let importer = match VulkanImporter::new(Some(node.dev())) {
             Ok(importer) => importer,
             Err(e) => {
                 warn!(
                     %e,
-                    "wayland-direct: Vulkan importer unavailable — dmabuf frames are read \
-                     back to CPU on the capture thread"
+                    "wayland-direct: Vulkan importer unavailable — dmabufs are allocated \
+                     LINEAR and read back through mmap on the capture thread"
                 );
                 return None;
             }
@@ -1076,30 +1140,70 @@ impl GpuPath {
             bgra_modifiers: importer.supported_modifiers(PixelFormat::Bgra),
             rgba_modifiers: importer.supported_modifiers(PixelFormat::Rgba),
             importer: Arc::new(importer),
+            node: node.render_node(),
             unreadable_warned: false,
         };
+        debug!(bgra = ?path.bgra_modifiers, "wayland-direct: Vulkan readback modifiers");
         info!(
             bgra_modifiers = path.bgra_modifiers.len(),
             rgba_modifiers = path.rgba_modifiers.len(),
+            node = ?path.node,
             "wayland-direct: Vulkan importer ready — dmabuf frames go downstream zero-copy"
         );
         Some(path)
     }
 
+    /// The modifiers the importer reads back for `format`.
+    fn modifiers(&self, format: PixelFormat) -> &[u64] {
+        match format {
+            PixelFormat::Bgra => &self.bgra_modifiers,
+            PixelFormat::Rgba => &self.rgba_modifiers,
+            PixelFormat::Nv12 | PixelFormat::I420 | PixelFormat::P010 => &[],
+        }
+    }
+
     /// Whether the importer can read a buffer back, so a CPU encoder
     /// handed the `GpuFrame` won't fail on `into_cpu()`.
     fn can_read_back(&self, format: PixelFormat, modifier: u64) -> bool {
-        let modifiers = match format {
-            PixelFormat::Bgra => &self.bgra_modifiers,
-            PixelFormat::Rgba => &self.rgba_modifiers,
-            PixelFormat::Nv12 | PixelFormat::I420 | PixelFormat::P010 => return false,
-        };
-        modifiers.contains(&modifier)
+        self.modifiers(format).contains(&modifier)
     }
 
-    /// Lease the pooled buffer at `idx` into a `GpuFrame` owning a
-    /// `dup` of its fd. `None` (logged) when the buffer can't go
-    /// downstream; the caller then reads it back to CPU.
+    /// The buffer as a `GpuFrame` plane, owning a `dup` of its fd.
+    fn plane(alloc: &AllocatedBuffer) -> std::io::Result<DmaBufPlane> {
+        Ok(DmaBufPlane {
+            fd: DmaBufFd::dup(alloc.fd.as_fd())?,
+            offset: 0,
+            stride: alloc.stride,
+            modifier: alloc.modifier,
+            size: alloc.stride.saturating_mul(alloc.height),
+        })
+    }
+
+    /// Reads `alloc` back to a tightly packed CPU frame through Vulkan:
+    /// right for every layout, unlike an `mmap` (tiled layouts read as
+    /// scrambled tiles, and NVIDIA's LINEAR buffers do not show the GPU's
+    /// view past the first pages).
+    fn read_back(&self, alloc: &AllocatedBuffer) -> Result<RawFrame> {
+        let plane = Self::plane(alloc)
+            .map_err(|e| FerricastError::Capture(format!("dup(dmabuf fd): {e}")))?;
+        let data = self
+            .importer
+            .readback(&plane, alloc.width, alloc.height, alloc.format)?;
+        Ok(RawFrame {
+            hdr: None,
+            colour: None,
+            width: alloc.width,
+            height: alloc.height,
+            stride: alloc.format.packed_row_bytes(alloc.width),
+            format: alloc.format,
+            data,
+            timestamp_us: now_us(),
+        })
+    }
+
+    /// Lease the pooled buffer at `idx` into a `GpuFrame`. `None`
+    /// (logged) when the buffer can't go downstream; the caller then
+    /// reads it back to CPU.
     fn frame(&mut self, pool: &BufferPool<PooledBuffer>, idx: SlotIdx) -> Option<GpuFrame> {
         let alloc = &pool.get(idx)?.alloc;
         if !self.can_read_back(alloc.format, alloc.modifier) {
@@ -1113,8 +1217,8 @@ impl GpuPath {
             }
             return None;
         }
-        let fd = match DmaBufFd::dup(alloc.fd.as_fd()) {
-            Ok(fd) => fd,
+        let plane = match Self::plane(alloc) {
+            Ok(plane) => plane,
             Err(e) => {
                 warn!(%e, "wayland-direct: dup(dmabuf fd) failed — CPU readback for this frame");
                 return None;
@@ -1127,15 +1231,13 @@ impl GpuPath {
             stride: alloc.stride,
             format: alloc.format,
             timestamp_us: now_us(),
-            plane: DmaBufPlane {
-                fd,
-                offset: 0,
-                stride: alloc.stride,
-                modifier: alloc.modifier,
-                size: alloc.stride.saturating_mul(alloc.height),
-            },
+            plane,
             importer: Some(Arc::clone(&self.importer) as Arc<dyn DmaBufImporter>),
             lease: Some(lease),
+            producer: Some(self.node),
+            // wlr-screencopy reports `ready` once the copy is complete;
+            // niri sends it after its render's sync point signalled.
+            sync: FrameSync::Ready,
         })
     }
 }
@@ -1173,13 +1275,26 @@ fn make_dmabuf_buffer(
     dmabuf: &ZwpLinuxDmabufV1,
     qh: &QueueHandle<WorkerState>,
     offer: &DmabufOffer,
+    gpu: Option<&GpuPath>,
+    consumer: &DmaBufModifiers,
 ) -> Result<PooledBuffer> {
     let fourcc = drm_fourcc::DrmFourcc::try_from(offer.format).map_err(|_| {
         FerricastError::Capture(format!("unknown DRM fourcc 0x{:08x}", offer.format))
     })?;
     let format = dmabuf_pixel_format(fourcc)
         .ok_or_else(|| FerricastError::Capture(format!("unsupported dmabuf fourcc {fourcc:?}")))?;
-    let buf = alloc.alloc(offer.width, offer.height, fourcc, format)?;
+    // Without the Vulkan importer the only CPU readback is `mmap`, which
+    // only LINEAR survives.
+    let linear = [u64::from(gbm::Modifier::Linear)];
+    let readable = gpu.map_or(linear.as_slice(), |gpu| gpu.modifiers(format));
+    let buf = alloc.alloc(
+        offer.width,
+        offer.height,
+        fourcc,
+        format,
+        readable,
+        consumer.get(format),
+    )?;
     // The compositor only finds out about a bad params combo at
     // `copy()` time (it emits `failed` on the frame), so logging
     // what we negotiated here is the only way to diagnose
@@ -1287,10 +1402,12 @@ fn now_us() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
-/// Read a freshly-captured dmabuf back to host bytes. Used when the
-/// frame can't leave as a `CapturedFrame::Gpu`: no Vulkan importer
-/// to attach (the encoder's `into_cpu()` would fail), a layout it
-/// can't read, or an orientation to undo on the CPU.
+/// Read a freshly-captured LINEAR dmabuf back to host bytes. Only used
+/// without a Vulkan importer (the allocation is then LINEAR-only): an
+/// `mmap` of a tiled buffer reads scrambled tiles, and on NVIDIA even a
+/// LINEAR mapping does not show the GPU's view past the first pages
+/// (`design/NVCODEC.md`), which is why every other readback goes through
+/// [`GpuPath::read_back`].
 ///
 /// We *don't* go through `gbm_bo_map` here. That call has been
 /// observed to return `EAGAIN` ("Resource temporarily unavailable")
@@ -2041,6 +2158,39 @@ mod tests {
             data: Bytes::from(data),
             timestamp_us: 7,
         }
+    }
+
+    const TILED: u64 = 0x0300_0000_0060_6014;
+    const OTHER_TILED: u64 = 0x0300_0000_0060_6015;
+    const LINEAR: u64 = 0;
+    const INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+
+    #[test]
+    fn layout_prefers_what_every_side_takes() {
+        let compositor = vec![LINEAR, TILED, OTHER_TILED, INVALID];
+        let choice = LayoutChoice::new(Some(&compositor), &[TILED, OTHER_TILED, LINEAR], &[TILED]);
+        assert_eq!(choice.preferred, [TILED]);
+        assert_eq!(choice.readable, [TILED, OTHER_TILED, LINEAR]);
+        let attempts: Vec<&[u64]> = choice.attempts().collect();
+        assert_eq!(attempts, [&[TILED][..], &[TILED, OTHER_TILED, LINEAR][..]]);
+    }
+
+    #[test]
+    fn layout_without_importer_is_linear_only() {
+        let compositor = vec![TILED, LINEAR];
+        let choice = LayoutChoice::new(Some(&compositor), &[LINEAR], &[TILED]);
+        let attempts: Vec<&[u64]> = choice.attempts().collect();
+        assert_eq!(attempts, [&[LINEAR][..]]);
+        // A compositor that cannot import LINEAR leaves nothing to try.
+        let choice = LayoutChoice::new(Some(&vec![TILED]), &[LINEAR], &[]);
+        assert_eq!(choice.attempts().count(), 0);
+    }
+
+    #[test]
+    fn layout_without_feedback_never_picks_the_implicit_modifier() {
+        let choice = LayoutChoice::new(None, &[INVALID, TILED], &[]);
+        let attempts: Vec<&[u64]> = choice.attempts().collect();
+        assert_eq!(attempts, [&[TILED][..]]);
     }
 
     #[test]

@@ -10,11 +10,13 @@
 //! * [`stream`]    — `PipeWire` main-loop worker.
 //! * [`format`]    — SPA pod construction & format conversion.
 //! * [`lease`]     — keeps DMA-BUF buffers dequeued while consumers read them.
+//! * [`sync`]      — explicit sync (`SPA_META_SyncTimeline`) acquire / release.
 
 mod format;
 mod lease;
 mod portal;
 mod stream;
+mod sync;
 
 use std::sync::{Arc, RwLock};
 

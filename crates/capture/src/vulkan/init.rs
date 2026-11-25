@@ -91,6 +91,7 @@ pub(super) fn build(compositor_device: Option<u64>) -> Result<Inner> {
     let instance = create_instance(&entry)?;
     let preferred = PreferredNode::resolve(env_drm_node(), compositor_device);
     let (physical_device, queue_family_index) = pick_physical_device(&instance, preferred)?;
+    let render_node = device_render_node(&instance, physical_device);
     let sync_fd_import = supports_sync_fd_import(&instance, physical_device);
     let device = create_device(
         &instance,
@@ -132,6 +133,7 @@ pub(super) fn build(compositor_device: Option<u64>) -> Result<Inner> {
 
     Ok(Inner {
         entry,
+        render_node,
         instance,
         physical_device,
         device,
@@ -303,6 +305,21 @@ impl PreferredNode {
             Self::Env(node) | Self::Compositor(node) => node,
         }
     }
+}
+
+/// The render node (`dev_t`) of `dev`, when the driver reports it.
+fn device_render_node(instance: &ash::Instance, dev: vk::PhysicalDevice) -> Option<u64> {
+    // SAFETY: `dev` came from this instance.
+    let props = unsafe { instance.get_physical_device_properties(dev) };
+    // SAFETY: as above.
+    let exts = unsafe { instance.enumerate_device_extension_properties(dev) }.ok()?;
+    // The render node is listed last when the device has both.
+    let node = device_drm_nodes(instance, dev, &props, &exts).pop()?;
+    let (major, minor) = (
+        u32::try_from(node.major).ok()?,
+        u32::try_from(node.minor).ok()?,
+    );
+    Some(libc::makedev(major, minor))
 }
 
 /// Primary and render DRM nodes of `dev`, when the driver exposes

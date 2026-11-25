@@ -9,7 +9,10 @@ mod dmabuf;
 mod native;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use dmabuf::{DmaBufFd, DmaBufId, DmaBufImporter, DmaBufPlane, GpuFrame};
+pub use dmabuf::{
+    DmaBufFd, DmaBufId, DmaBufImporter, DmaBufPlane, DrmDevice, FrameSync, GpuFrame, SyncWait,
+    Syncobj, SyncobjDevice,
+};
 pub use native::{NativeFrame, NativeSurface, SurfaceKind, SurfacePixels};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
