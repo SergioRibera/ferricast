@@ -154,6 +154,10 @@ __device__ __forceinline__ Axis axis(int out, float ratio, int size, int filter)
 // The resampled value of placement pixel (u, v).
 template <class S>
 __device__ __forceinline__ typename S::Value sample(const S& s, const Geometry& g, int u, int v) {
+    if (g.ratio_x == 1.0f && g.ratio_y == 1.0f) {
+        // Same size (copy, crop, rotate, convert): one source sample.
+        return s.at(g.xx * u + g.xy * v + g.x0, g.yx * u + g.yy * v + g.y0);
+    }
     Axis ax = axis(u, g.ratio_x, g.oriented_w, g.filter);
     Axis ay = axis(v, g.ratio_y, g.oriented_h, g.filter);
     typename S::Value acc = S::zero();
