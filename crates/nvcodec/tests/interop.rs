@@ -507,6 +507,46 @@ fn implicit_wait_ignores_pending_nvidia_work_explicit_wait_does_not() {
     );
 }
 
+/// Unregistering after an event recorded behind the last read, in one
+/// batch, then clearing the rest without a context-wide wait.
+#[test]
+fn forget_all_waits_for_an_event_and_clear_with_for_nothing() {
+    use ferricast_nvcodec::cuda::Event;
+    use ferricast_nvcodec::interop::Quiesce;
+
+    let Some(gpu) = Gpu::get() else { return };
+    let mut importer = DmaBufImporter::new(&gpu.context, Some(gpu.node)).unwrap();
+    let stream = Stream::new(&gpu.context).unwrap();
+    let tiled = Gpu::tiled_modifier(&importer);
+    let bos: Vec<_> = (0..3)
+        .map(|_| gpu.allocate(64, 32, DrmFormat::Argb8888, tiled).unwrap())
+        .collect();
+    for (index, bo) in bos.iter().enumerate() {
+        gpu.write(bo, &pattern(64, 32, index as u8));
+        importer
+            .import(BufferKey(index as u128), &dma_buf(bo))
+            .unwrap();
+    }
+    let pool = FramePool::new(importer.context(), 64 * 4, 32);
+    let copied = {
+        let frame = importer.map(BufferKey(0), FENCE).unwrap();
+        frame.copy_to_pool(&pool, &stream).unwrap()
+    };
+    let event = Event::new(&gpu.context).unwrap();
+    event.record(&stream).unwrap();
+    let forgotten = importer.forget_all(
+        [BufferKey(0), BufferKey(1), BufferKey(7)],
+        Quiesce::after(&event),
+    );
+    assert_eq!(forgotten, 2);
+    assert!(!importer.contains(BufferKey(0)) && importer.contains(BufferKey(2)));
+    stream.synchronize().unwrap();
+    drop(copied);
+    // SAFETY: the only work that read a buffer (the copy) is done.
+    importer.clear_with(unsafe { Quiesce::idle() });
+    assert!(importer.is_empty());
+}
+
 /// GBM, EGL and GLES, loaded at runtime like the crate loads its drivers.
 #[path = "support/dmabuf.rs"]
 mod support;
