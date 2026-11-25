@@ -18,7 +18,7 @@
 //!   of the session's size and format: encoded in place.
 //! - [`CapturedFrame::Gpu`] (Linux): the DMA-BUF is imported into CUDA
 //!   through EGL, once per capture buffer, and encoded from the CUDA array
-//!   it aliases (tiled buffers) or from a device copy (LINEAR ones). The
+//!   or pitched memory it aliases (tiled and LINEAR buffers). The
 //!   frame, and with it the capture buffer's lease, is held until NVENC has
 //!   finished reading it. Any failure on this path sends that frame through
 //!   the CPU readback instead; the next frame tries again.
@@ -600,11 +600,9 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
 mod zero_copy {
     use std::collections::HashMap;
     use std::os::fd::AsFd as _;
-    use std::sync::Arc;
     use std::time::Duration;
 
-    use ferricast_codec::cuda::nvcodec::cuda::{DeviceBuffer, Event, Stream};
-    use ferricast_codec::cuda::nvcodec::encode::{self as nv, Encoder, FrameOptions};
+    use ferricast_codec::cuda::nvcodec::encode::{Encoder, FrameOptions};
     use ferricast_codec::cuda::nvcodec::interop::{
         BufferKey, DmaBuf, DmaBufImporter, DrmFormat, DrmNode, FenceWait, FrameView, Modifier,
     };
@@ -630,8 +628,6 @@ mod zero_copy {
         Identity(#[source] std::io::Error),
         #[error(transparent)]
         Nvcodec(#[from] nvcodec::Error),
-        #[error("the staging buffer is still being encoded")]
-        StagingBusy,
     }
 
     /// The zero-copy path's state, created on the first DMA-BUF.
@@ -699,7 +695,8 @@ mod zero_copy {
     /// One capture buffer imported into CUDA and known to NVENC.
     #[derive(Debug, Clone, Copy)]
     struct Imported {
-        /// NVENC's key for the buffer's CUDA array.
+        /// NVENC's key for the buffer's CUDA array (tiled layouts) or
+        /// pitched memory (LINEAR).
         key: u64,
         description: Description,
     }
@@ -712,15 +709,6 @@ mod zero_copy {
         /// The description of the last frame: a change means the producer
         /// reallocated its pool.
         last: Option<Description>,
-        /// LINEAR buffers come as pitched memory, which NVENC registers from
-        /// a device buffer: this one, copied into on `stream`.
-        staging: Option<Staging>,
-    }
-
-    struct Staging {
-        buffer: Arc<DeviceBuffer>,
-        stream: Stream,
-        copied: Event,
     }
 
     impl ZeroCopy {
@@ -733,7 +721,6 @@ mod zero_copy {
                 buffers: HashMap::new(),
                 next_key: 0,
                 last: None,
-                staging: None,
             })
         }
 
@@ -778,59 +765,24 @@ mod zero_copy {
                 }
             };
             let mapped = self.importer.map(key, FenceWait::Implicit(FENCE_TIMEOUT))?;
+            // SAFETY (both arms): the memory belongs to the importer's
+            // registration under `key`, which stays alive until NVENC's
+            // registration of `imported.key` is invalidated (`clear` and the
+            // re-import above invalidate NVENC's first; `NvencEncoder` drops
+            // the encoder before the importer). The encoder's caller holds
+            // the frame, and with it the producer's lease, until the packet
+            // is out, so the buffer is not written while NVENC reads it.
             match mapped.view() {
                 FrameView::Array(array) => {
-                    // SAFETY: the array belongs to the importer's
-                    // registration under `key`, which stays alive until
-                    // NVENC's registration of `imported.key` is invalidated
-                    // (`clear` and the re-import above invalidate NVENC's
-                    // first; `NvencEncoder` drops the encoder before the
-                    // importer). The encoder's caller holds the frame, and
-                    // with it the producer's lease, until the packet is out,
-                    // so the buffer is not written while NVENC reads it.
+                    // SAFETY: see above.
                     unsafe { encoder.encode_array(imported.key, array, options) }?;
                 }
-                FrameView::Pitched(_) => {
-                    let staging = match &mut self.staging {
-                        Some(staging)
-                            if staging.buffer.width_bytes() >= frame.width as usize * 4
-                                && staging.buffer.rows() >= frame.height as usize =>
-                        {
-                            staging
-                        }
-                        slot => slot.insert(Staging::new(self.importer.context(), frame)?),
-                    };
-                    let buffer = Arc::get_mut(&mut staging.buffer).ok_or(Error::StagingBusy)?;
-                    mapped.copy_into(buffer, &staging.stream)?;
-                    staging.copied.record(&staging.stream)?;
-                    encoder.encode_device(
-                        nv::DeviceFrame {
-                            buffer: &staging.buffer,
-                            chroma_row: None,
-                            ready: Some(&staging.copied),
-                        },
-                        options,
-                    )?;
+                FrameView::Pitched(pitched) => {
+                    // SAFETY: see above.
+                    unsafe { encoder.encode_pitched(imported.key, pitched, options) }?;
                 }
             }
             Ok(())
-        }
-    }
-
-    impl Staging {
-        fn new(
-            context: &Arc<nvcodec::cuda::Context>,
-            frame: &GpuFrame,
-        ) -> Result<Self, nvcodec::Error> {
-            Ok(Self {
-                buffer: Arc::new(DeviceBuffer::pitched(
-                    context,
-                    frame.width as usize * 4,
-                    frame.height as usize,
-                )?),
-                stream: Stream::new(context)?,
-                copied: Event::new(context)?,
-            })
         }
     }
 
