@@ -382,3 +382,65 @@ fn forced_versions_through_the_environment() {
         );
     }
 }
+
+/// `DeviceBuffer::upload` and `DeviceBuffer::fill` run after the work
+/// already queued on the crate's (non-blocking) streams and are complete,
+/// for every stream, when they return.
+#[test]
+fn blocking_upload_and_fill_are_ordered_with_streams() {
+    let Some(context) = context() else { return };
+    let (width, rows) = (8192, 2048);
+    let mut target = DeviceBuffer::pitched(&context, width, rows).unwrap();
+    let mut source = DeviceBuffer::pitched(&context, width, rows).unwrap();
+    source.fill(0x22).unwrap();
+    let stream = Stream::new(&context).unwrap();
+    let mut host = vec![0; width * rows];
+    let mut expect = |buffer: &DeviceBuffer, value: u8, what: &str| {
+        let region = buffer.region();
+        buffer
+            .download(
+                region,
+                HostImageMut {
+                    data: &mut host,
+                    pitch: width,
+                },
+            )
+            .unwrap();
+        assert!(host.iter().all(|&byte| byte == value), "{what}");
+    };
+    // Enough queued copies that a call racing them would finish first.
+    let queue_copies = |target: &mut DeviceBuffer, source: &DeviceBuffer| {
+        for _ in 0..32 {
+            target
+                .copy_from_async(Point { x_bytes: 0, row: 0 }, source, source.region(), &stream)
+                .unwrap();
+        }
+    };
+    let pattern = vec![0x33; width * rows];
+    for _ in 0..3 {
+        queue_copies(&mut target, &source);
+        target.fill(0x11).unwrap();
+        expect(&target, 0x11, "fill lands after the queued copies");
+
+        queue_copies(&mut target, &source);
+        target
+            .upload(
+                target.region(),
+                HostImage {
+                    data: &pattern,
+                    pitch: width,
+                },
+            )
+            .unwrap();
+        expect(&target, 0x33, "upload lands after the queued copies");
+
+        // Complete on return: a stream reading right after sees it.
+        target.fill(0x44).unwrap();
+        source
+            .copy_from_async(Point { x_bytes: 0, row: 0 }, &target, target.region(), &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        expect(&source, 0x44, "a stream sees the finished fill");
+        source.fill(0x22).unwrap();
+    }
+}

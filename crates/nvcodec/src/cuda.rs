@@ -950,15 +950,26 @@ impl DeviceBuffer {
         &self.context
     }
 
-    /// Copies `src` into `dst` of this buffer, waiting for completion.
+    /// Copies `src` into `dst` of this buffer, ordered after all work
+    /// queued on the buffer's context (on any stream), and waits for the
+    /// copy to complete: work queued afterwards, on any stream, sees it.
+    ///
+    /// Synchronises the whole context twice (the copy runs on the legacy
+    /// default stream, which the crate's non-blocking streams do not order
+    /// against): for set-up and tests. Pipelines use
+    /// [`DeviceBuffer::upload_async`] on their own stream.
     ///
     /// # Errors
     ///
     /// [`Error::CopyOutOfBounds`] / [`Error::PitchTooSmall`] when either
-    /// side is too small, [`Error::Cuda`].
+    /// side is too small, [`Error::Cuda`] (including failures of earlier
+    /// work on the context).
     pub fn upload(&mut self, dst: Region, src: HostImage<'_>) -> Result<()> {
         let copy = self.upload_params(dst, src)?;
-        self.run(copy.as_ref(), None)
+        self.context.synchronize()?;
+        self.run(copy.as_ref(), None)?;
+        // A copy from pageable memory may return once the source is staged.
+        self.context.synchronize()
     }
 
     /// Queues the copy of `src` into `dst` of this buffer on `stream`.
@@ -1043,18 +1054,26 @@ impl DeviceBuffer {
         self.run(copy.as_ref(), Some(stream))
     }
 
-    /// Sets every byte of the buffer to `value`, waiting for completion.
+    /// Sets every byte of the buffer to `value`, ordered after all work
+    /// queued on the buffer's context (on any stream), and waits for it to
+    /// complete: work queued afterwards, on any stream, sees it.
+    ///
+    /// Synchronises the whole context twice (a memset of device memory runs
+    /// on the legacy default stream and returns before it completes): for
+    /// set-up and tests. Pipelines use [`DeviceBuffer::fill_async`].
     ///
     /// # Errors
     ///
-    /// [`Error::Cuda`].
+    /// [`Error::Cuda`] (including failures of earlier work on the context).
     pub fn fill(&mut self, value: u8) -> Result<()> {
         let cuda = self.context.cuda;
         let _current = self.context.guard()?;
+        self.context.synchronize()?;
         // SAFETY: the allocation spans `rows` rows of `pitch` bytes, of which
         // `width_bytes` are set; its context is current.
         unsafe { (cuda.memset_d2d8)(self.ptr, self.pitch, value, self.width_bytes, self.rows) }
-            .check("cuMemsetD2D8_v2")
+            .check("cuMemsetD2D8_v2")?;
+        self.context.synchronize()
     }
 
     /// Queues setting every byte of the buffer to `value` on `stream`.
