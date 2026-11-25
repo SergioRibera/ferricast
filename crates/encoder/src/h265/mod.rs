@@ -54,7 +54,8 @@ fn registry() -> VideoEncoderRegistry {
             VaapiH265Encoder::probe()
                 .map(drop)
                 .map_err(CodecError::from_backend(BackendId::Vaapi, Operation::Probe))
-        }),
+        })
+        .on_gpu(ferricast_core::GpuAffinity::NotNvidia),
     );
     #[cfg(not(feature = "vaapi-hevc"))]
     let registry = registry.missing(BackendId::Vaapi, "ferricast-encoder/vaapi-hevc");

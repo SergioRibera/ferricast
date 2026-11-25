@@ -32,35 +32,79 @@ pub mod h265;
 mod nv12;
 #[cfg(all(feature = "nvenc", any(target_os = "linux", target_os = "windows")))]
 pub mod nvenc;
+// VA-API plumbing the H.264 and HEVC encoders share (render node, VPP).
 pub mod opus;
 mod platform;
+#[cfg(feature = "vaapi")]
+#[allow(
+    unsafe_code,
+    reason = "vaQueryVideoProcPipelineCaps; the block carries a SAFETY comment"
+)]
+mod vaapi;
 // The scaler is crate-private: an audio-only build leaves it unused.
 #[allow(dead_code, reason = "conditional: used by the video encoders only")]
 pub mod scale;
 
 pub use ferricast_codec::{Availability, BackendReport};
 
-/// DRM format modifiers the GPU encoders on this machine encode from
-/// without a copy, for screen capture to prefer when it allocates or
+/// DRM format modifiers the GPU encoder `config` would select encodes
+/// from without a copy, for screen capture to prefer when it allocates or
 /// negotiates DMA-BUFs (`CaptureConfig::consumer_modifiers`). Empty when
-/// no such encoder is built in or usable (today: NVENC on Linux).
+/// that encoder publishes none (VA-API, software) or none is usable
+/// (today only NVENC on Linux lists its modifiers).
 #[must_use]
-pub fn dmabuf_modifiers() -> ferricast_core::DmaBufModifiers {
-    #[cfg(all(feature = "nvenc", target_os = "linux"))]
-    return nvenc::dmabuf_modifiers();
-    #[cfg(not(all(feature = "nvenc", target_os = "linux")))]
-    ferricast_core::DmaBufModifiers::default()
+pub fn dmabuf_modifiers(config: &ferricast_core::EncoderConfig) -> ferricast_core::DmaBufModifiers {
+    match predicted_backend(config) {
+        #[cfg(all(feature = "nvenc", target_os = "linux"))]
+        Some(ferricast_core::BackendId::Nvenc) => {
+            ferricast_codec::cuda::CudaDevice::for_config(config, ferricast_core::BackendId::Nvenc)
+                .map(nvenc::dmabuf_modifiers_on)
+                .unwrap_or_default()
+        }
+        _ => ferricast_core::DmaBufModifiers::default(),
+    }
 }
 
-/// Whether a GPU encoder on this machine turns rotated or flipped GPU
-/// frames itself (`CaptureConfig::consumer_orients`): NVENC on Linux,
-/// whose GPU fit applies `GpuFrame::orientation`.
+/// Whether the encoder `config` would select turns rotated or flipped GPU
+/// frames itself (`CaptureConfig::consumer_orients`), so capture can hand
+/// them over instead of turning them on the CPU: NVENC on Linux when its
+/// DMA-BUF import works on its GPU (its GPU fit applies
+/// `GpuFrame::orientation`); VA-API when its render node's VPP rotates and
+/// mirrors every way. Every encoder stays upright either way: one that
+/// cannot turn a frame reads it back and turns it on the CPU.
 #[must_use]
-pub fn orients_gpu_frames() -> bool {
-    #[cfg(all(feature = "nvenc", target_os = "linux"))]
-    return nvenc::orients_gpu_frames();
-    #[cfg(not(all(feature = "nvenc", target_os = "linux")))]
-    false
+pub fn orients_gpu_frames(config: &ferricast_core::EncoderConfig) -> bool {
+    match predicted_backend(config) {
+        #[cfg(all(feature = "nvenc", target_os = "linux"))]
+        Some(ferricast_core::BackendId::Nvenc) => {
+            ferricast_codec::cuda::CudaDevice::for_config(config, ferricast_core::BackendId::Nvenc)
+                .is_ok_and(nvenc::orients_gpu_frames_on)
+        }
+        #[cfg(feature = "vaapi")]
+        Some(ferricast_core::BackendId::Vaapi) => vaapi::orients_gpu_frames(config),
+        _ => false,
+    }
+}
+
+/// The backend automatic selection would most likely open for `config`
+/// (its codec, backend selection and GPU preference), probing but not
+/// opening; `None` for a codec without an encoder facade or a selection
+/// that does not resolve.
+#[must_use]
+pub fn predicted_backend(
+    config: &ferricast_core::EncoderConfig,
+) -> Option<ferricast_core::BackendId> {
+    use ferricast_codec::GpuInput as _;
+    let registry = match config.codec {
+        ferricast_core::Codec::H264 => h264::H264Encoder::registry(),
+        ferricast_core::Codec::H265 => h265::H265Encoder::registry(),
+        ferricast_core::Codec::Vp8 | ferricast_core::Codec::Vp9 | ferricast_core::Codec::Av1 => {
+            return None;
+        }
+    };
+    let placement = config.gpu_placement().ok()?;
+    let plan = registry.plan_on(&config.backend, &placement).ok()?;
+    registry.first_available(&plan)
 }
 
 /// Adds every encode job of this crate to an istmo codec catalog.

@@ -77,7 +77,8 @@ fn registry() -> VideoEncoderRegistry {
                     BackendId::Vaapi,
                     ferricast_core::Operation::Probe,
                 ))
-        }),
+        })
+        .on_gpu(ferricast_core::GpuAffinity::NotNvidia),
     );
     #[cfg(not(feature = "vaapi"))]
     let registry = registry.missing(BackendId::Vaapi, "ferricast-encoder/vaapi");
