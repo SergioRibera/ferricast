@@ -420,11 +420,16 @@ fn ensure_staging(
         .map_err(|e| FerricastError::Capture(format!("vk create_buffer (staging): {e}")))?;
 
     let reqs = unsafe { inner.device.get_buffer_memory_requirements(buffer) };
+    // The CPU reads every byte of this buffer: cached memory reads at
+    // memcpy speed, uncached (write-combined) memory several times
+    // slower (a 1080p frame took most of a frame period on NVIDIA).
+    let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
     let memory_type = pick_memory_type(
         memory_props,
         reqs.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        host | vk::MemoryPropertyFlags::HOST_CACHED,
     )
+    .or_else(|| pick_memory_type(memory_props, reqs.memory_type_bits, host))
     .ok_or_else(|| FerricastError::Capture("vk: no host-visible memory type for staging".into()))?;
 
     let alloc = vk::MemoryAllocateInfo::default()
