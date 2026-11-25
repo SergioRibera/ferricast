@@ -40,6 +40,18 @@ pub mod scale;
 
 pub use ferricast_codec::{Availability, BackendReport};
 
+/// DRM format modifiers the GPU encoders on this machine encode from
+/// without a copy, for screen capture to prefer when it allocates or
+/// negotiates DMA-BUFs (`CaptureConfig::consumer_modifiers`). Empty when
+/// no such encoder is built in or usable (today: NVENC on Linux).
+#[must_use]
+pub fn dmabuf_modifiers() -> ferricast_core::DmaBufModifiers {
+    #[cfg(all(feature = "nvenc", target_os = "linux"))]
+    return nvenc::dmabuf_modifiers();
+    #[cfg(not(all(feature = "nvenc", target_os = "linux")))]
+    ferricast_core::DmaBufModifiers::default()
+}
+
 /// Adds every encode job of this crate to an istmo codec catalog.
 #[cfg(feature = "istmo")]
 #[must_use]
