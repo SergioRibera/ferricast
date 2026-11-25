@@ -1050,9 +1050,10 @@ top of that).
 - `DeviceBuffer::upload` / `fill` run on the legacy default stream: a pageable
   `cuMemcpy2D` may return before the DMA lands and `cuMemsetD2D8` is
   asynchronous, and neither is ordered with the crate's non-blocking streams.
-  Work on a non-blocking stream right after them can see stale memory (the
-  kernel tests first failed this way). Tests synchronise the context after
-  uploading; use `upload_async` / `fill_async` on the consuming stream.
+  Work on a non-blocking stream right after them could see stale memory (the
+  kernel tests first failed this way). They now synchronise the context
+  before and after (see "NVENC and context hardening"); on a hot path use
+  `upload_async` / `fill_async` on the consuming stream instead.
 
 ## NVENC and context hardening
 
@@ -1187,7 +1188,19 @@ several versions run each in a child process
   and VA-API).
 - `invalidate_array` / `clear_input_caches` flush the pictures still
   reading the invalidated memory and unregister before returning, which is
-  what the `encode_array` / `encode_pitched` contract promises.
+  what the `encode_array` / `encode_pitched` contract promises. They
+  return the flush's error: NVENC may then still read the memory, so
+  ferricast's zero-copy path keeps that buffer imported (and a session
+  change reopens the session before dropping the imports). The importer
+  is cleared with `Quiesce::idle()` when the encoder goes; `forget` takes a
+  `Quiesce` too, so no ferricast path waits on the whole shared context.
+- NVDEC decoders are created and destroyed on the session thread as well
+  (`lifecycle::run`), and the decoder passes its CUDA / NVDEC errors to
+  `Context::note_error`, so a sticky error marks the shared context lost
+  for the next decoder or encoder.
+- `DeviceFrame::download` copies into page-locked memory
+  (`PinnedBuffer::download`: every plane queued after the picture, one
+  wait) and returns that buffer.
 - A failed `nvEncLockBitstream` keeps the picture pending (input mapped,
   slot taken) instead of recycling a slot NVENC may still use.
 - Host upload failures: the stream is synchronised before returning
