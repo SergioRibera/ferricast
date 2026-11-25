@@ -68,7 +68,7 @@ pub use cache::{
     FileCache, MemoryCache, NoCache, SelectionCache, SelectionInput, SelectionKey, SizeClass,
 };
 pub use events::{EventReceiver, SessionEvent, SessionEvents};
-pub use gpu::GpuInput;
+pub use gpu::{GpuInput, GpuReport};
 pub use registry::{
     Availability, BackendReport, Candidate, Missing, OpenFn, Plan, ProbeFn, Registry,
 };

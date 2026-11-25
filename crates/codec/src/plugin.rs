@@ -39,6 +39,7 @@ use crate::audio::{
 use crate::bitstream::NalSyntax;
 use crate::cache::SelectionCache;
 use crate::events::{self, EventReceiver, SessionEvent, SessionEvents};
+use crate::gpu::GpuReport;
 use crate::registry::BackendReport;
 use crate::video_decoder::{SelectingVideoDecoder, VideoDecoderRegistry};
 use crate::video_encoder::{SelectingVideoEncoder, VideoEncoderRegistry};
@@ -118,6 +119,11 @@ pub trait Codecs {
     /// Every job this build can do and every backend for it, probed
     /// for availability on this device.
     async fn capabilities(&self) -> Result<Vec<JobReport>, CodecError>;
+
+    /// This machine's GPUs, each with the catalog's hardware video
+    /// backends that run on it, for a GPU picker; the choice goes back in
+    /// each request's `EncoderConfig::gpu` / `DecoderConfig::gpu`.
+    async fn gpus(&self) -> Result<Vec<GpuReport>, CodecError>;
 
     /// Opens the codec `request` describes, reports which backend its
     /// selection picked, and closes it again.
@@ -277,6 +283,14 @@ impl Catalog {
             .chain(audio_encode)
             .chain(audio_decode)
             .collect()
+    }
+
+    /// The GPUs with the catalog's video backends on each.
+    #[must_use]
+    pub fn gpus(&self) -> Vec<GpuReport> {
+        let encoders: Vec<_> = self.video_encoders.iter().map(|(_, r)| r()).collect();
+        let decoders: Vec<_> = self.video_decoders.iter().map(|(_, r, _)| r()).collect();
+        GpuReport::scan(&encoders, &decoders)
     }
 
     fn reports(&self) -> Vec<JobReport> {
@@ -617,6 +631,10 @@ impl CodecService {
 impl Codecs for CodecService {
     async fn capabilities(&self) -> Result<Vec<JobReport>, CodecError> {
         Ok(self.0.catalog.reports())
+    }
+
+    async fn gpus(&self) -> Result<Vec<GpuReport>, CodecError> {
+        Ok(self.0.catalog.gpus())
     }
 
     async fn resolve(&self, request: OpenRequest) -> Result<Resolution, CodecError> {
