@@ -649,8 +649,8 @@ pub(crate) mod zero_copy {
 
     use ferricast_codec::cuda::nvcodec::encode::{Encoder, FrameOptions};
     use ferricast_codec::cuda::nvcodec::interop::{
-        BufferKey, DmaBuf, DmaBufImporter, DrmFormat, DrmNode, FenceWait, FrameView, Modifier,
-        Quiesce,
+        BufferKey, DmaBuf, DmaBufImporter, DrmFormat, DrmNode, FenceWait, FrameView, MappedFrame,
+        Modifier, Quiesce,
     };
     use ferricast_codec::cuda::{self, nvcodec};
     use ferricast_core::{DmaBufId, DmaBufModifiers, DrmDevice, FrameSync, GpuFrame, PixelFormat};
@@ -700,16 +700,11 @@ pub(crate) mod zero_copy {
     }
 
     impl State {
-        /// Encodes `frame` from its DMA-BUF. Errors leave the encoder able
-        /// to take the same frame from the CPU.
-        pub(super) fn encode(
-            &mut self,
-            encoder: &mut Encoder,
-            frame: &GpuFrame,
-            options: FrameOptions,
-        ) -> Result<(), Error> {
+        /// The importer, created on the first DMA-BUF (on the GPU of its
+        /// producer, when the frame names it).
+        fn ready(&mut self, producer: Option<DrmDevice>) -> Result<&mut ZeroCopy, Error> {
             if matches!(self, Self::Untried) {
-                *self = match ZeroCopy::new(frame.producer) {
+                *self = match ZeroCopy::new(producer) {
                     Ok(zero_copy) => Self::Ready(Box::new(zero_copy)),
                     Err(error) => {
                         info!(%error, "NVENC: no DMA-BUF zero-copy, capture frames are read back");
@@ -718,24 +713,53 @@ pub(crate) mod zero_copy {
                 };
             }
             match self {
-                Self::Ready(zero_copy) => {
-                    let result = zero_copy.encode(encoder, frame, options);
-                    if let Err(error) = &result {
-                        zero_copy.failures += 1;
-                        // Loud the first time, then once per minute at 60 fps:
-                        // a path that keeps failing costs a readback per frame.
-                        if zero_copy.failures % 3600 == 1 {
-                            tracing::warn!(
-                                %error,
-                                failures = zero_copy.failures,
-                                "NVENC: DMA-BUF zero-copy failed, reading the frame back"
-                            );
-                        }
-                    }
-                    result
-                }
+                Self::Ready(zero_copy) => Ok(zero_copy),
                 Self::Untried | Self::Unavailable => Err(Error::Unavailable),
             }
+        }
+
+        /// Encodes `frame` from its DMA-BUF. Errors leave the encoder able
+        /// to take the same frame from the CPU.
+        pub(super) fn encode(
+            &mut self,
+            encoder: &mut Encoder,
+            frame: &GpuFrame,
+            options: FrameOptions,
+        ) -> Result<(), Error> {
+            let zero_copy = self.ready(frame.producer)?;
+            let result = zero_copy.encode(encoder, frame, options);
+            if let Err(error) = &result {
+                zero_copy.failures += 1;
+                // Loud the first time, then once per minute at 60 fps:
+                // a path that keeps failing costs a readback per frame.
+                if zero_copy.failures % 3600 == 1 {
+                    tracing::warn!(
+                        %error,
+                        failures = zero_copy.failures,
+                        "NVENC: DMA-BUF zero-copy failed, reading the frame back"
+                    );
+                }
+            }
+            result
+        }
+
+        /// Imports and maps `frame`'s DMA-BUF like [`State::encode`] and
+        /// lends its CUDA view to `use_view` (the GPU fit, `fit.rs`) with the
+        /// encoder, instead of handing it to NVENC.
+        ///
+        /// `use_view` must leave no CUDA work reading the view queued when
+        /// it returns (NVENC locked its picture, or the caller synchronised
+        /// on error): a later eviction unregisters without waiting.
+        pub(super) fn with_view<R, E: From<Error>>(
+            &mut self,
+            encoder: &mut Encoder,
+            frame: &GpuFrame,
+            use_view: impl FnOnce(&mut Encoder, FrameView<'_>) -> Result<R, E>,
+        ) -> Result<R, E> {
+            let zero_copy = self.ready(frame.producer)?;
+            let (key, _) = zero_copy.import(encoder, frame)?;
+            let mapped = zero_copy.map(key, frame.sync)?;
+            use_view(encoder, mapped.view())
         }
     }
 
@@ -867,12 +891,16 @@ pub(crate) mod zero_copy {
             }
         }
 
-        fn encode(
+        /// Registers `frame`'s buffer with the importer (once per capture
+        /// buffer) and returns the importer's key and the registration:
+        /// buffers of another GPU and ones refused before are turned away,
+        /// a changed pool starts over, stale and least recently used
+        /// registrations are dropped.
+        fn import(
             &mut self,
             encoder: &mut Encoder,
             frame: &GpuFrame,
-            options: FrameOptions,
-        ) -> Result<(), Error> {
+        ) -> Result<(BufferKey, Imported), Error> {
             if let (Some(node), Some(producer)) = (self.node, frame.producer)
                 && producer.render_node() != node.render_node()
             {
@@ -909,21 +937,35 @@ pub(crate) mod zero_copy {
                     imported
                 }
             };
-            self.buffers.insert(
-                id,
-                Imported {
-                    last_used: self.frames,
-                    ..imported
-                },
-            );
-            let fence = match frame.sync {
+            let imported = Imported {
+                last_used: self.frames,
+                ..imported
+            };
+            self.buffers.insert(id, imported);
+            Ok((key, imported))
+        }
+
+        /// Maps the buffer under `key`, waiting for its producer as `sync`
+        /// says.
+        fn map(&mut self, key: BufferKey, sync: FrameSync) -> Result<MappedFrame<'_>, Error> {
+            let fence = match sync {
                 // The capture waited for the producer (explicit acquire
                 // point, or a protocol that reports finished frames).
                 FrameSync::Ready => FenceWait::AlreadySignalled,
                 // Best effort: NVIDIA attaches no implicit fence.
                 FrameSync::Implicit => FenceWait::Implicit(FENCE_TIMEOUT),
             };
-            let mapped = self.importer.map(key, fence)?;
+            Ok(self.importer.map(key, fence)?)
+        }
+
+        fn encode(
+            &mut self,
+            encoder: &mut Encoder,
+            frame: &GpuFrame,
+            options: FrameOptions,
+        ) -> Result<(), Error> {
+            let (key, imported) = self.import(encoder, frame)?;
+            let mapped = self.map(key, frame.sync)?;
             // SAFETY (both arms): the memory belongs to the importer's
             // registration under `key`, which stays alive until NVENC's
             // registration of `imported.key` is invalidated (`clear`,
@@ -969,80 +1011,6 @@ pub(crate) mod zero_copy {
             offset: frame.plane.offset,
             stride: frame.plane.stride,
             modifier: Modifier(frame.plane.modifier),
-        }
-    }
-
-    /// GPU fitting (`fit.rs`): the importer lends a frame's mapped memory to
-    /// the image kernels instead of handing it to NVENC.
-    impl State {
-        /// Imports and maps `frame`'s DMA-BUF and passes its CUDA view to
-        /// `use_view`, with the encoder (whose stale registrations the
-        /// import may invalidate).
-        pub(super) fn with_view<R, E: From<Error>>(
-            &mut self,
-            encoder: &mut Encoder,
-            frame: &GpuFrame,
-            use_view: impl FnOnce(&mut Encoder, FrameView<'_>) -> Result<R, E>,
-        ) -> Result<R, E> {
-            if matches!(self, Self::Untried) {
-                *self = match ZeroCopy::new(frame.producer) {
-                    Ok(zero_copy) => Self::Ready(Box::new(zero_copy)),
-                    Err(error) => {
-                        info!(%error, "NVENC: no DMA-BUF import, capture frames are read back");
-                        Self::Unavailable
-                    }
-                };
-            }
-            let Self::Ready(zero_copy) = self else {
-                return Err(Error::Unavailable.into());
-            };
-            let key = zero_copy.import(encoder, frame)?;
-            let mapped = zero_copy
-                .importer
-                .map(key, FenceWait::Implicit(FENCE_TIMEOUT))
-                .map_err(Error::from)?;
-            use_view(encoder, mapped.view())
-        }
-    }
-
-    impl ZeroCopy {
-        /// Registers `frame`'s buffer (once per capture buffer), starting
-        /// over when the producer's pool changed; the same bookkeeping as
-        /// [`ZeroCopy::encode`].
-        fn import(&mut self, encoder: &mut Encoder, frame: &GpuFrame) -> Result<BufferKey, Error> {
-            let description = Description::from(frame);
-            let id = frame.plane.fd.buffer_id().map_err(Error::Identity)?;
-            if self.last.is_some_and(|last| last != description) {
-                self.clear(encoder);
-            }
-            self.last = Some(description);
-            self.frames += 1;
-            self.retire(encoder, id);
-            let key = buffer_key(id);
-            let imported = match self.buffers.get(&id).copied() {
-                Some(imported) if imported.description == description => imported,
-                stale => {
-                    if stale.is_some() {
-                        self.evict(encoder, &[id]);
-                    }
-                    self.importer.import(key, &dma_buf(frame))?;
-                    let imported = Imported {
-                        key: self.next_key,
-                        description,
-                        last_used: self.frames,
-                    };
-                    self.next_key += 1;
-                    imported
-                }
-            };
-            self.buffers.insert(
-                id,
-                Imported {
-                    last_used: self.frames,
-                    ..imported
-                },
-            );
-            Ok(key)
         }
     }
 

@@ -410,7 +410,13 @@ impl<C: NvencCodec> NvencEncoder<C> {
                     Mapped::Pitched(view) => KernelInput::Packed { view, order, size },
                 };
                 // The importer waited for the producer's fence on the CPU.
-                fit.encode(encoder, input, source, None, session, options)
+                let encoded = fit.encode(encoder, input, source, None, session, options);
+                if encoded.is_err() {
+                    // Kernels may still read the view; the importer
+                    // unregisters it later without waiting.
+                    fit.stream.synchronize()?;
+                }
+                encoded
             })
     }
 }
