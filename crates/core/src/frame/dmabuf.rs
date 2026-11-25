@@ -3,12 +3,102 @@
 //! module only exists on Linux and Android.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::unix::fs::MetadataExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
 
 use super::{BufferLease, FrameError, PixelFormat, RawFrame};
 use crate::error::Result;
+
+mod syncobj;
+
+pub use self::syncobj::{SyncWait, Syncobj, SyncobjDevice};
+
+/// A DRM device node, by device number (`st_rdev`, the `dev_t` that
+/// `linux-dmabuf` feedback's `main_device` and Vulkan's
+/// `VK_EXT_physical_device_drm` report): the GPU a DMA-BUF lives on.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DrmDevice(u64);
+
+impl DrmDevice {
+    /// The node with device number `dev`.
+    #[must_use]
+    pub const fn from_dev(dev: u64) -> Self {
+        Self(dev)
+    }
+
+    /// The device number.
+    #[must_use]
+    pub const fn dev(self) -> u64 {
+        self.0
+    }
+
+    /// The node at `path` (`/dev/dri/renderD128`).
+    ///
+    /// # Errors
+    /// The OS error from `stat`.
+    pub fn from_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        std::fs::metadata(path).map(|metadata| Self(metadata.rdev()))
+    }
+
+    /// `/dev/dri/renderD*` paths that exist, in numerical order.
+    #[must_use]
+    pub fn render_node_paths() -> Vec<PathBuf> {
+        (128..=192)
+            .map(|n| PathBuf::from(format!("/dev/dri/renderD{n}")))
+            .filter(|path| path.exists())
+            .collect()
+    }
+
+    /// The render node of the same GPU (a `cardN` primary node maps to
+    /// its `renderD*` sibling through sysfs); `self` when it already is
+    /// one or no sibling is found.
+    #[must_use]
+    pub fn render_node(self) -> Self {
+        let sysfs = format!(
+            "/sys/dev/char/{}:{}/device/drm",
+            libc::major(self.0),
+            libc::minor(self.0)
+        );
+        std::fs::read_dir(sysfs)
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("renderD"))
+            .find_map(|entry| Self::from_path(Path::new("/dev/dri").join(entry.file_name())).ok())
+            .unwrap_or(self)
+    }
+}
+
+impl std::fmt::Debug for DrmDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "DrmDevice({}:{})",
+            libc::major(self.0),
+            libc::minor(self.0)
+        )
+    }
+}
+
+/// What a consumer must do before reading a [`GpuFrame`]'s pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameSync {
+    /// The producer gives no stronger guarantee than the DMA-BUF's
+    /// implicit fences: wait on them (`poll` the buffer, or import its
+    /// `sync_file`). Mesa drivers attach their rendering fences; the
+    /// NVIDIA driver does not, so on NVIDIA this is best effort.
+    #[default]
+    Implicit,
+    /// Writing finished before the frame was handed over: the capture
+    /// waited on the producer's explicit acquire point (PipeWire's
+    /// `SPA_META_SyncTimeline`), or the protocol only reports the frame
+    /// once rendering completed (wlr-screencopy `ready`, which niri
+    /// sends after its render's sync point signalled). No wait needed.
+    Ready,
+}
 
 /// A frame that lives on the GPU as a DMA-BUF.
 ///
@@ -38,6 +128,13 @@ pub struct GpuFrame {
     /// clone of the frame is alive. `None` when the producer gives no
     /// such guarantee (the contents may then change under readers).
     pub lease: Option<BufferLease>,
+    /// The render node of the GPU the buffer lives on, when the
+    /// producer knows it. GPU consumers check it before importing (a
+    /// buffer of the integrated GPU cannot be imported into NVIDIA's
+    /// CUDA) and encoder selection can prefer a backend on this GPU.
+    pub producer: Option<DrmDevice>,
+    /// Whether the pixels are complete when the frame arrives.
+    pub sync: FrameSync,
 }
 
 impl std::fmt::Debug for GpuFrame {
@@ -51,6 +148,8 @@ impl std::fmt::Debug for GpuFrame {
             .field("plane", &self.plane)
             .field("has_importer", &self.importer.is_some())
             .field("lease", &self.lease)
+            .field("producer", &self.producer)
+            .field("sync", &self.sync)
             .finish()
     }
 }
@@ -269,6 +368,8 @@ mod tests {
             },
             importer: Some(Arc::new(PackedImporter)),
             lease: None,
+            producer: None,
+            sync: FrameSync::Implicit,
         });
         let raw = frame.into_cpu().expect("readback");
         assert_eq!(raw.stride, width * 4);
@@ -321,6 +422,8 @@ mod tests {
             },
             importer: Some(Arc::new(LeaseCheckingImporter(Arc::clone(returns)))),
             lease: Some(BufferLease::new(CountReturns(Arc::clone(returns)))),
+            producer: None,
+            sync: FrameSync::Ready,
         }
     }
 

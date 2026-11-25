@@ -25,8 +25,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ferricast_core::{
     AccelerationPolicy, AutoSelect, BackendId, BackendSelection, BufferLease, CapturedFrame, Codec,
-    CodecError, ColourDescription, DecoderConfig, DmaBufFd, DmaBufPlane, EncodedFrame,
-    EncoderConfig, FrameMemory, GpuFrame, PixelFormat, RawFrame, VideoDecoder, VideoEncoder,
+    CodecError, ColourDescription, DecoderConfig, DmaBufFd, DmaBufPlane, DrmDevice, EncodedFrame,
+    EncoderConfig, FrameMemory, FrameSync, GpuFrame, PixelFormat, RawFrame, VideoDecoder,
+    VideoEncoder,
 };
 use ferricast_nvcodec::interop::{DmaBufImporter, DrmFormat, Modifier};
 
@@ -221,6 +222,9 @@ fn dma_buf_round_trip<E: VideoEncoder + Default, D: VideoDecoder + Default>(
             },
             importer: None,
             lease: Some(BufferLease::new(Returned(Arc::clone(&returned)))),
+            producer: Some(DrmDevice::from_dev(gpu.node.dev())),
+            // GLES finished writing (glFinish) before the frame is built.
+            sync: FrameSync::Ready,
         };
         let packet = encoder
             .encode(CapturedFrame::Gpu(frame))
@@ -571,6 +575,8 @@ fn a_zero_copy_failure_falls_back_for_that_frame_only() {
         },
         importer: Some(Arc::new(Readback(pattern.clone(), Arc::clone(&readbacks)))),
         lease: None,
+        producer: None,
+        sync: FrameSync::Implicit,
     };
     encoder.encode(CapturedFrame::Gpu(not_importable)).unwrap();
     assert_eq!(readbacks.load(Ordering::SeqCst), 1, "{name}: read back");
@@ -600,6 +606,8 @@ fn a_zero_copy_failure_falls_back_for_that_frame_only() {
         },
         importer: Some(Arc::new(Readback(pattern, Arc::clone(&readbacks)))),
         lease: None,
+        producer: Some(DrmDevice::from_dev(gpu.node.dev())),
+        sync: FrameSync::Ready,
     };
     encoder.encode(CapturedFrame::Gpu(importable)).unwrap();
     assert_eq!(

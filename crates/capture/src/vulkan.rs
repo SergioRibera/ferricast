@@ -75,6 +75,9 @@ pub(super) struct Inner {
         reason = "owns the loaded Vulkan library for as long as any Vulkan state lives"
     )]
     pub(super) entry: ash::Entry,
+    /// The chosen device's DRM render node (`dev_t`), when the driver
+    /// reports it (`VK_EXT_physical_device_drm`).
+    pub(super) render_node: Option<u64>,
     pub(super) instance: ash::Instance,
     pub(super) physical_device: vk::PhysicalDevice,
     pub(super) device: ash::Device,
@@ -214,6 +217,12 @@ impl VulkanImporter {
             inner,
             state: Mutex::new(state),
         })
+    }
+
+    /// The render node (`dev_t`) of the GPU the importer runs on: the
+    /// producer GPU of the buffers it reads, as far as capture knows.
+    pub(crate) fn render_node(&self) -> Option<u64> {
+        self.inner.render_node
     }
 
     /// DRM modifiers the GPU can import and read back for the given

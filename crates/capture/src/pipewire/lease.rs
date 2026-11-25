@@ -11,17 +11,20 @@
 //! (renegotiation, disconnect) its entry is forgotten, so a release
 //! arriving later matches nothing and never touches freed memory.
 
+use std::collections::HashMap;
 use std::ptr::NonNull;
 
 use ferricast_core::BufferLease;
 use pipewire as pw;
 use pw::spa::buffer::Data;
 use pw::stream::StreamRef;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
+
+use super::sync::{ExplicitSync, ReleasePoint};
 
 /// Identity of one hold on a dequeued buffer. Unique for the life of
 /// the worker, so a stale release can't alias a newer hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct LeaseId(u64);
 
 /// Posted from a lease guard's `Drop` to the `PipeWire` loop.
@@ -112,6 +115,9 @@ impl<B: Copy + PartialEq> HeldBuffers<B> {
 /// Lease side of the `PipeWire` worker. Lives on the loop thread only.
 pub(super) struct BufferLeases {
     book: HeldBuffers<NonNull<pw::sys::pw_buffer>>,
+    /// Explicit-sync release points of held buffers, signalled when the
+    /// buffer is re-queued.
+    releases: HashMap<LeaseId, ReleasePoint>,
     tx: pw::channel::Sender<Release>,
 }
 
@@ -119,6 +125,7 @@ impl BufferLeases {
     pub(super) fn new(tx: pw::channel::Sender<Release>) -> Self {
         Self {
             book: HeldBuffers::default(),
+            releases: HashMap::new(),
             tx,
         }
     }
@@ -141,11 +148,14 @@ impl BufferLeases {
     /// drops. At the hold limit the buffer is handed back unchanged.
     pub(super) fn hold<'s>(
         &mut self,
-        buffer: DequeuedBuffer<'s>,
+        mut buffer: DequeuedBuffer<'s>,
     ) -> std::result::Result<BufferLease, DequeuedBuffer<'s>> {
         let Some(id) = self.book.hold(buffer.raw) else {
             return Err(buffer);
         };
+        if let Some(release) = buffer.release.take() {
+            self.releases.insert(id, release);
+        }
         // The book now owns the re-queue; the guard must not do it too.
         std::mem::forget(buffer);
         Ok(BufferLease::new(ReleaseOnDrop {
@@ -164,10 +174,15 @@ impl BufferLeases {
 
     /// Re-queue the buffer behind `release`, unless it is gone.
     pub(super) fn release(&mut self, stream: &StreamRef, release: &Release) {
+        let point = self.releases.remove(&release.0);
         let Some(buffer) = self.book.release(release.0) else {
             trace!(id = release.0.0, "late release of a removed buffer ignored");
             return;
         };
+        // Downstream is done reading: the producer may render again.
+        if let Some(point) = point {
+            point.signal();
+        }
         // SAFETY: `buffer` came from `dequeue_raw_buffer` on this stream
         // and has not been queued since (`HeldBuffers::release` returns
         // each hold once). It is still allocated: `remove_buffer` drops
@@ -184,12 +199,14 @@ impl BufferLeases {
 pub(super) struct DequeuedBuffer<'s> {
     stream: &'s StreamRef,
     raw: NonNull<pw::sys::pw_buffer>,
+    /// Signalled when the buffer is re-queued (explicit sync).
+    release: Option<ReleasePoint>,
 }
 
 impl<'s> DequeuedBuffer<'s> {
     /// Dequeue everything ready, re-queue all but the newest. Returns
     /// the newest buffer and how many were dequeued.
-    pub(super) fn newest(stream: &'s StreamRef) -> (Option<Self>, usize) {
+    pub(super) fn newest(stream: &'s StreamRef, sync: &mut ExplicitSync) -> (Option<Self>, usize) {
         let mut drained = 0;
         let mut newest = None;
         loop {
@@ -200,10 +217,29 @@ impl<'s> DequeuedBuffer<'s> {
                 break;
             };
             drained += 1;
+            // SAFETY: `raw` is a live dequeued buffer; its `spa_buffer`
+            // outlives this call.
+            let release = match unsafe { sync.release_point(raw.as_ref().buffer) } {
+                Ok(release) => release,
+                Err(error) => {
+                    warn!(%error, "PipeWire buffer's release point is unusable");
+                    None
+                }
+            };
             // Dropping the previous newest re-queues it.
-            newest = Some(Self { stream, raw });
+            newest = Some(Self {
+                stream,
+                raw,
+                release,
+            });
         }
         (newest, drained)
+    }
+
+    /// The buffer's `spa_buffer`, valid while `self` is dequeued.
+    pub(super) fn spa_buffer(&self) -> *const pw::spa::sys::spa_buffer {
+        // SAFETY: `raw` is a live dequeued `pw_buffer`.
+        unsafe { self.raw.as_ref().buffer }
     }
 
     pub(super) fn datas_mut(&mut self) -> &mut [Data] {
@@ -226,6 +262,9 @@ impl<'s> DequeuedBuffer<'s> {
 
 impl Drop for DequeuedBuffer<'_> {
     fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release.signal();
+        }
         // SAFETY: `raw` was dequeued from `stream` and not queued since.
         unsafe { self.stream.queue_raw_buffer(self.raw.as_ptr()) };
     }

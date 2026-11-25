@@ -31,6 +31,12 @@ use pw::spa::sys::{
 };
 use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle, SpaTypes};
 
+use super::sync::{MetaSyncTimeline, SPA_META_SYNC_TIMELINE};
+
+/// `SPA_PARAM_BUFFERS_metaType` (`spa/param/buffers.h`): the metas a
+/// buffer must carry, as a flags choice of `1 << SPA_META_*`.
+const SPA_PARAM_BUFFERS_METATYPE: u32 = 7;
+
 /// `DRM_FORMAT_MOD_LINEAR` — buffer pixels are laid out in row-major order
 /// and can be `mmap`'d for CPU read.
 pub(super) const DRM_FORMAT_MOD_LINEAR: u64 = 0;
@@ -299,7 +305,11 @@ fn enum_format_shm(params: &EnumFormatParams) -> Vec<u8> {
 /// at connect time and passed in here.
 pub(super) struct GpuFormat {
     pub format: VideoFormat,
+    /// Every modifier the importer reads back.
     pub modifiers: Vec<u64>,
+    /// Those of `modifiers` the GPU consumer (NVENC, VA-API) also
+    /// imports without a copy (`CaptureConfig::consumer_modifiers`).
+    pub preferred: Vec<u64>,
 }
 
 /// Build the `EnumFormat` list to send at `connect()`.
@@ -319,11 +329,18 @@ pub(super) fn initial_enum_format_list(
     params: &EnumFormatParams,
     gpu_formats: &[GpuFormat],
 ) -> Vec<Vec<u8>> {
-    let mut out: Vec<Vec<u8>> = gpu_formats
+    // Pods the consumer takes directly come first: the producer picks
+    // the first pod it can satisfy, so it only falls back to a layout
+    // the consumer would have to read back when it has no better one.
+    let preferred = gpu_formats
+        .iter()
+        .filter(|gf| !gf.preferred.is_empty() && gf.preferred != gf.modifiers)
+        .map(|gf| enum_format_with_modifier(gf.format, &gf.preferred, params));
+    let readable = gpu_formats
         .iter()
         .filter(|gf| !gf.modifiers.is_empty())
-        .map(|gf| enum_format_with_modifier(gf.format, &gf.modifiers, params))
-        .collect();
+        .map(|gf| enum_format_with_modifier(gf.format, &gf.modifiers, params));
+    let mut out: Vec<Vec<u8>> = preferred.chain(readable).collect();
     out.push(enum_format_shm(params));
     out
 }
@@ -331,6 +348,35 @@ pub(super) fn initial_enum_format_list(
 // --------------------------------------------------------------------------
 // Buffers + Meta pods (sent from `param_changed` once format is fixated)
 // --------------------------------------------------------------------------
+
+/// Preferred pool depth: the compositor's own one or two in-flight
+/// buffers, plus up to three held downstream (frame channel, encoder,
+/// segmenter's repeat frame), plus a spare.
+const PREFERRED_BUFFERS: i32 = 6;
+/// `pw_stream`'s own per-stream buffer cap.
+const MAX_BUFFERS: i32 = 64;
+
+/// `ParamBuffers` variant that requires explicit sync: DMA-BUFs plus
+/// the `SPA_META_SyncTimeline` meta (and, from the producer, its two
+/// syncobj data blocks). Offered before [`param_buffers_bytes`]; a
+/// producer without explicit sync fails to intersect it and takes the
+/// plain variant.
+pub(super) fn param_buffers_explicit_sync_bytes() -> Vec<u8> {
+    let sync_timeline = 1_i32 << SPA_META_SYNC_TIMELINE;
+    let mut obj = buffers_object(1_i32 << SpaDataType::DmaBuf.as_raw());
+    obj.properties.push(Property {
+        key: SPA_PARAM_BUFFERS_METATYPE,
+        flags: PropertyFlags::MANDATORY,
+        value: Value::Choice(ChoiceValue::Int(Choice(
+            ChoiceFlags::empty(),
+            ChoiceEnum::Flags {
+                default: sync_timeline,
+                flags: vec![sync_timeline],
+            },
+        ))),
+    });
+    serialize(obj)
+}
 
 /// `ParamBuffers` pod: tells `PipeWire` what shapes of buffers we accept.
 ///
@@ -345,19 +391,17 @@ pub(super) fn initial_enum_format_list(
 /// buffer dequeued while downstream reads them (see `lease`), so a
 /// deeper pool means fewer hold-limit readbacks. The range is wide
 /// enough to intersect anything a compositor offers.
-/// Preferred pool depth: the compositor's own one or two in-flight
-/// buffers, plus up to three held downstream (frame channel, encoder,
-/// segmenter's repeat frame), plus a spare.
-const PREFERRED_BUFFERS: i32 = 6;
-/// `pw_stream`'s own per-stream buffer cap.
-const MAX_BUFFERS: i32 = 64;
-
 pub(super) fn param_buffers_bytes() -> Vec<u8> {
     let data_types = (1_i32 << SpaDataType::MemFd.as_raw())
         | (1_i32 << SpaDataType::MemPtr.as_raw())
         | (1_i32 << SpaDataType::DmaBuf.as_raw());
+    serialize(buffers_object(data_types))
+}
 
-    let obj = Object {
+/// The `ParamBuffers` object for buffers of `data_types` (a bitmask of
+/// `SPA_DATA_*`).
+fn buffers_object(data_types: i32) -> Object {
+    Object {
         type_: SpaTypes::ObjectParamBuffers.as_raw(),
         id: ParamType::Buffers.as_raw(),
         properties: vec![
@@ -377,6 +421,31 @@ pub(super) fn param_buffers_bytes() -> Vec<u8> {
                 key: SPA_PARAM_BUFFERS_dataType,
                 flags: PropertyFlags::empty(),
                 value: Value::Int(data_types),
+            },
+        ],
+    }
+}
+
+/// `ParamMeta(SyncTimeline)` pod: asks an explicit-sync producer for
+/// acquire / release timeline points on every buffer (see
+/// [`super::sync`]).
+pub(super) fn param_meta_sync_timeline_bytes() -> Vec<u8> {
+    let obj = Object {
+        type_: SpaTypes::ObjectParamMeta.as_raw(),
+        id: ParamType::Meta.as_raw(),
+        properties: vec![
+            Property {
+                key: SPA_PARAM_META_type,
+                flags: PropertyFlags::empty(),
+                value: Value::Id(Id(SPA_META_SYNC_TIMELINE)),
+            },
+            Property {
+                key: SPA_PARAM_META_size,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(
+                    i32::try_from(size_of::<MetaSyncTimeline>())
+                        .expect("invariant: spa_meta_sync_timeline is 24 bytes"),
+                ),
             },
         ],
     };

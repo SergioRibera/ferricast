@@ -15,6 +15,7 @@ mod format;
 mod lease;
 mod portal;
 mod stream;
+mod sync;
 
 use std::sync::{Arc, RwLock};
 

@@ -27,6 +27,40 @@ pub struct CaptureConfig {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub show_cursor: bool,
+    /// DRM format modifiers the frames' consumer (a GPU encoder) imports
+    /// without a copy. Capture backends that allocate or negotiate
+    /// DMA-BUFs prefer these among the layouts they can also read back.
+    /// Empty: no preference.
+    pub consumer_modifiers: DmaBufModifiers,
+}
+
+/// DRM format modifiers per pixel format, in preference order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DmaBufModifiers(Vec<(PixelFormat, Vec<u64>)>);
+
+impl DmaBufModifiers {
+    /// Adds (or replaces) the modifiers of `format`.
+    #[must_use]
+    pub fn with(mut self, format: PixelFormat, modifiers: Vec<u64>) -> Self {
+        self.0.retain(|(known, _)| *known != format);
+        self.0.push((format, modifiers));
+        self
+    }
+
+    /// The modifiers of `format`; empty when none were given.
+    #[must_use]
+    pub fn get(&self, format: PixelFormat) -> &[u64] {
+        self.0
+            .iter()
+            .find(|(known, _)| *known == format)
+            .map_or(&[], |(_, modifiers)| modifiers.as_slice())
+    }
+
+    /// Whether no format has modifiers.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|(_, modifiers)| modifiers.is_empty())
+    }
 }
 
 impl Default for CaptureConfig {
@@ -36,6 +70,7 @@ impl Default for CaptureConfig {
             width: None,
             height: None,
             show_cursor: true,
+            consumer_modifiers: DmaBufModifiers::default(),
         }
     }
 }

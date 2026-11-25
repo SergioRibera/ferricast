@@ -30,7 +30,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use ferricast_core::{
-    CaptureConfig, CapturedFrame, DmaBufFd, DmaBufPlane, FerricastError, GpuFrame, RawFrame, Result,
+    CaptureConfig, CapturedFrame, DmaBufFd, DmaBufModifiers, DmaBufPlane, DrmDevice,
+    FerricastError, FrameSync, GpuFrame, RawFrame, Result,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -50,6 +51,7 @@ use pw::stream::{Stream, StreamFlags, StreamRef, StreamState};
 use super::format::{self, EnumFormatParams, GpuFormat, NegotiatedFormat};
 use super::lease::{BufferLeases, DequeuedBuffer, Release};
 use super::portal::PortalStream;
+use super::sync::ExplicitSync;
 use crate::vulkan::VulkanImporter;
 
 pub(super) type SharedFormat = Arc<RwLock<Option<NegotiatedFormat>>>;
@@ -101,6 +103,14 @@ struct UserData {
     /// previous frame. `None` collapses the dmabuf path to a warning
     /// + drop and we rely on the SHM fallback.
     importer: Option<Arc<VulkanImporter>>,
+    /// Modifiers `importer` reads back, per pixel format.
+    readable: DmaBufModifiers,
+    /// The GPU the importer runs on (`GpuFrame::producer`).
+    producer: Option<DrmDevice>,
+    /// Acquire / release points of explicitly synchronised buffers.
+    explicit_sync: ExplicitSync,
+    /// Set once an acquire failure was logged.
+    acquire_failure_logged: bool,
 }
 
 impl UserData {
@@ -249,16 +259,46 @@ fn run(
                 if mods.is_empty() {
                     None
                 } else {
-                    debug!(format = ?f, modifiers = mods.len(), "GPU format supported");
+                    let preferred: Vec<u64> = format::pixel_format(*f)
+                        .map(|p| config.consumer_modifiers.get(p))
+                        .unwrap_or_default()
+                        .iter()
+                        .copied()
+                        .filter(|m| mods.contains(m))
+                        .collect();
+                    debug!(
+                        format = ?f,
+                        modifiers = mods.len(),
+                        preferred = preferred.len(),
+                        "GPU format supported"
+                    );
                     Some(GpuFormat {
                         format: *f,
                         modifiers: mods,
+                        preferred,
                     })
                 }
             })
             .collect(),
         None => Vec::new(),
     };
+
+    let readable =
+        gpu_formats.iter().fold(
+            DmaBufModifiers::default(),
+            |acc, gf| match format::pixel_format(gf.format) {
+                Some(p) => {
+                    let mut mods = acc.get(p).to_vec();
+                    mods.extend(gf.modifiers.iter().filter(|m| !acc.get(p).contains(m)));
+                    acc.with(p, mods)
+                }
+                None => acc,
+            },
+        );
+    let producer = importer
+        .as_ref()
+        .and_then(|imp| imp.render_node())
+        .map(|dev| DrmDevice::from_dev(dev).render_node());
 
     // Shared between the stream listener and the throttle timer; both
     // run on this thread's PipeWire loop, never re-entrantly.
@@ -278,6 +318,10 @@ fn run(
         last_processed_at: None,
         deferred: false,
         importer,
+        readable,
+        producer,
+        explicit_sync: ExplicitSync::new(producer),
+        acquire_failure_logged: false,
     }));
     let frame_period = user_data.borrow().frame_period;
 
@@ -485,11 +529,17 @@ fn handle_param_changed(
         }
     }
 
+    // Explicit sync first: a producer that supports it intersects the
+    // first Buffers param, others fall through to the plain one.
+    let explicit_bytes = format::param_buffers_explicit_sync_bytes();
     let buffers_bytes = format::param_buffers_bytes();
     let meta_bytes = format::param_meta_header_bytes();
+    let sync_meta_bytes = format::param_meta_sync_timeline_bytes();
     let mut pods = [
+        format::pod_view(&explicit_bytes),
         format::pod_view(&buffers_bytes),
         format::pod_view(&meta_bytes),
+        format::pod_view(&sync_meta_bytes),
     ];
     if let Err(e) = stream.update_params(&mut pods) {
         warn!(error = %e, "update_params(Buffers + Meta) failed");
@@ -537,7 +587,7 @@ fn handle_process(
     // Drain stale buffers and keep only the newest. It goes back to
     // the compositor when `buffer` drops at the end of this callback,
     // unless a `GpuFrame` takes a lease on it below.
-    let (newest, drained) = DequeuedBuffer::newest(stream);
+    let (newest, drained) = DequeuedBuffer::newest(stream, &mut ud.explicit_sync);
     let Some(mut buffer) = newest else {
         trace!("process tick with no buffer available");
         return;
@@ -552,6 +602,8 @@ fn handle_process(
     // a full period.
     ud.last_processed_at = Some(now);
 
+    // Raw so it can be used while `datas` borrows the buffer.
+    let spa_buffer = buffer.spa_buffer();
     let datas = buffer.datas_mut();
     let Some(plane) = datas.first_mut() else {
         warn!("PipeWire buffer had no data planes");
@@ -592,6 +644,26 @@ fn handle_process(
     if stride == 0 {
         stride = neg.pixel_format.packed_row_bytes(neg.width);
     }
+
+    // Explicit sync: nothing reads the buffer before the producer's
+    // acquire point. Dropping `buffer` on failure signals its release
+    // point and hands it back.
+    // SAFETY: `buffer` is dequeued for the rest of this callback.
+    let sync = match unsafe { ud.explicit_sync.acquire(spa_buffer) } {
+        Ok(true) => FrameSync::Ready,
+        Ok(false) => FrameSync::Implicit,
+        Err(error) => {
+            if std::mem::replace(&mut ud.acquire_failure_logged, true) {
+                debug!(%error, "PipeWire buffer not acquired — frame dropped");
+            } else {
+                warn!(%error, "PipeWire buffer not acquired — frame dropped (logged once)");
+            }
+            return;
+        }
+    };
+    let modifier = neg.modifier.unwrap_or(format::DRM_FORMAT_MOD_LINEAR);
+    let gpu_readable =
+        ud.importer.is_some() && ud.readable.get(neg.pixel_format).contains(&modifier);
 
     // `RawFrame::stride` promises "bytes per row of `data`", so the
     // CPU paths below only emit a frame when the mapped plane really
@@ -643,7 +715,12 @@ fn handle_process(
                 timestamp_us,
             })
         }
-        DataType::DmaBuf if neg.modifier_is_cpu_readable() => {
+        // LINEAR and implicit-modifier buffers the importer cannot read
+        // (or without one): copied out through `mmap`. Everything the
+        // importer reads, LINEAR included, leaves as a `GpuFrame`: GPU
+        // encoders take it without a copy (NVENC encodes LINEAR in place),
+        // and a CPU mapping of an NVIDIA LINEAR buffer is unreliable.
+        DataType::DmaBuf if !gpu_readable && neg.modifier_is_cpu_readable() => {
             let Some(bytes) = read_dmabuf_mmap(plane, chunk_offset, layout) else {
                 return;
             };
@@ -671,7 +748,6 @@ fn handle_process(
                 );
                 return;
             };
-            let modifier = neg.modifier.unwrap_or(0);
             let raw = plane.as_raw();
             let (raw_fd, raw_maxsize) = (raw.fd, raw.maxsize);
             let Ok(raw_fd) = RawFd::try_from(raw_fd) else {
@@ -732,6 +808,8 @@ fn handle_process(
                 },
                 importer: Some(importer.clone() as Arc<dyn ferricast_core::DmaBufImporter>),
                 lease: None,
+                producer: ud.producer,
+                sync,
             };
             match leases.hold(buffer) {
                 Ok(lease) => CapturedFrame::Gpu(GpuFrame {

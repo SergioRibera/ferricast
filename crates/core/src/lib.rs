@@ -28,7 +28,7 @@ pub use adaptive::AdaptiveBitrateState;
 pub use advertiser::{AdvertiseInfo, Advertiser, MdnsAdvertiser};
 pub use capture::{
     AudioCapture, AudioCaptureConfig, AudioMuteHandle, AudioSource, CaptureConfig, CaptureSource,
-    ScreenCapture, WindowIdentifier,
+    DmaBufModifiers, ScreenCapture, WindowIdentifier,
 };
 pub use codec::{
     Acceleration, AccelerationPolicy, AutoSelect, BackendAttempt, BackendId, BackendSelection,
@@ -61,7 +61,10 @@ pub use frame::{
     SurfacePixels,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use frame::{DmaBufFd, DmaBufId, DmaBufImporter, DmaBufPlane, GpuFrame};
+pub use frame::{
+    DmaBufFd, DmaBufId, DmaBufImporter, DmaBufPlane, DrmDevice, FrameSync, GpuFrame, SyncWait,
+    Syncobj, SyncobjDevice,
+};
 #[cfg(feature = "net")]
 pub use net::{
     bind_tcp, bind_udp, connect_tcp_any, local_addr_for, local_ipv4_subnets, local_socket_addr_for,
