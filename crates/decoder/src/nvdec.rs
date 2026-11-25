@@ -23,14 +23,14 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ferricast_codec::bitstream::NalSyntax;
 use ferricast_codec::bitstream::hdr::HdrTracker;
 use ferricast_codec::bitstream::vui::ColourTracker;
+use ferricast_codec::bitstream::{NalRole, NalSyntax, PacketShape, nal_units};
 use ferricast_codec::cuda::nvcodec::decode::{
     self as nv, ChromaFormat, Decoder, DecoderCaps, Device, FrameInfo, Host, HostFrame, Packet,
     SeiMessages,
 };
-use ferricast_codec::cuda::{self, CudaSurface, map_error};
+use ferricast_codec::cuda::{self, CudaSurface, codec_error, map_error, nvcodec};
 use ferricast_codec::{Candidate, VideoDecoderRegistry, VideoDecoderSession};
 use ferricast_core::{
     Acceleration, BackendId, CapturedFrame, Codec, CodecError, CodecResult, CodecTarget,
@@ -189,6 +189,7 @@ pub struct NvdecDecoder<C: NvdecCodec> {
     ready: VecDeque<CapturedFrame>,
     format: OutputFormat,
     signalling: Signalling,
+    framing: PictureFraming,
     _codec: PhantomData<fn() -> C>,
 }
 
@@ -199,6 +200,7 @@ impl<C: NvdecCodec> Default for NvdecDecoder<C> {
             ready: VecDeque::new(),
             format: OutputFormat::default(),
             signalling: Signalling::new(C::BITSTREAM, Container::default()),
+            framing: PictureFraming::default(),
             _codec: PhantomData,
         }
     }
@@ -292,6 +294,31 @@ fn timestamp(info: &FrameInfo) -> u64 {
     u64::try_from(info.timestamp).unwrap_or(0)
 }
 
+/// `CUDA_ERROR_OUT_OF_MEMORY`.
+const CUDA_OUT_OF_MEMORY: u32 = 2;
+
+/// A decode error as ferricast's. Running out of output frames (a
+/// consumer holding every device picture) or of GPU memory mid-stream hands
+/// the stream to the next backend ([`CodecError::UnsupportedStream`], which
+/// selection treats as a mid-stream hand-over) instead of failing it.
+fn decode_error(error: nvcodec::Error) -> CodecError {
+    let exhausted = match &error {
+        nvcodec::Error::FramesInFlight { .. } => true,
+        nvcodec::Error::Cuda { status, .. } | nvcodec::Error::Cuvid { status, .. } => {
+            status.0.0 == CUDA_OUT_OF_MEMORY
+        }
+        _ => false,
+    };
+    if exhausted {
+        CodecError::UnsupportedStream {
+            backend: BackendId::Nvdec,
+            reason: error.to_string(),
+        }
+    } else {
+        codec_error(BackendId::Nvdec, Operation::Decode, error)
+    }
+}
+
 /// NVDEC decoded the stream to a layout ferricast has no pixel format for
 /// (4:2:2, 4:4:4): another backend takes it over.
 fn no_pixel_format(info: &FrameInfo) -> CodecError {
@@ -364,7 +391,8 @@ impl HostPicture {
             && luma.pitch == chroma.pitch
         {
             let stride = luma.pitch;
-            if Arc::strong_count(lent) <= LEND_LIMIT {
+            // The decoder's own clone is not a lent picture.
+            if Arc::strong_count(lent) - 1 < LEND_LIMIT {
                 let picture = Self {
                     frame,
                     _lent: Arc::clone(lent),
@@ -395,6 +423,59 @@ impl HostPicture {
     }
 }
 
+/// Packets that must start a whole access unit, each after one that held
+/// exactly one, before the parser is told that packets end pictures.
+const WHOLE_PACKETS_TO_TRUST: u8 = 2;
+/// Packets this large may be a picture cut at the 16-bit MPEG-TS
+/// `PES_packet_length` limit: never trusted to end one.
+const MAX_TRUSTED_PACKET: usize = 60 * 1024;
+
+/// Whether an H.264 / HEVC packet ends a picture (`CUVID_PKT_ENDOFPICTURE`,
+/// which saves a packet of latency), learnt from the stream's packets.
+///
+/// Containers do not promise one access unit per packet: an MPEG-TS PES
+/// (HLS, Miracast) may hold several, or part of one (large pictures split
+/// over PES packets). With the flag set the parser decodes only the first
+/// picture of several, or part of a picture as a whole, silently. Without
+/// it the parser finishes a picture when the next one starts, a packet
+/// later. A packet alone cannot show it ends where its access unit ends, so
+/// the flag is set only once the stream has shown it cuts packets at access
+/// units, and only on a packet that holds exactly one; never on a keyframe,
+/// where a split costs a whole GOP, nor on a packet large enough to be cut
+/// at the PES size limit. The first packet that continues an access unit
+/// turns the flag off for good.
+#[derive(Debug, Clone, Copy, Default)]
+struct PictureFraming {
+    /// The previous packet held exactly one access unit.
+    previous_whole: bool,
+    /// Packets that started an access unit right after a whole one.
+    confirmed: u8,
+    /// A packet continued an access unit: packets are not pictures.
+    split: bool,
+}
+
+impl PictureFraming {
+    /// Whether the packet of `shape` ends its picture.
+    fn ends_picture(&mut self, shape: PacketShape, size: usize, keyframe: bool) -> bool {
+        if shape.continues() {
+            if !self.split {
+                debug!("packets split access units: NVDEC waits for each next picture");
+            }
+            self.split = true;
+        }
+        if self.previous_whole && shape.starts_access_unit {
+            self.confirmed = self.confirmed.saturating_add(1);
+        }
+        let whole = shape.is_one_access_unit();
+        self.previous_whole = whole;
+        !self.split
+            && whole
+            && !keyframe
+            && size < MAX_TRUSTED_PACKET
+            && self.confirmed >= WHOLE_PACKETS_TO_TRUST
+    }
+}
+
 /// What a stream signals about its colour and HDR metadata: the
 /// container's description, and what ferricast reads from the bitstream
 /// where NVDEC does not report it.
@@ -422,17 +503,33 @@ impl Signalling {
         }
     }
 
-    /// Reads one packet before NVDEC decodes it.
-    fn observe(&mut self, packet: &[u8]) {
+    /// Reads one packet before NVDEC decodes it. For H.264 / HEVC this is
+    /// the one walk over its NAL units, which also counts its access units
+    /// for the framing decision.
+    fn observe(&mut self, packet: &[u8]) -> Option<PacketShape> {
         match self.bitstream {
             Bitstream::Nal(syntax) => {
-                self.vui.observe_annex_b(packet, syntax);
-                if self.nvdec.is_empty() {
-                    self.read.observe_annex_b(packet, syntax);
+                let read_sei = self.nvdec.is_empty();
+                let mut shape = PacketShape::new(packet);
+                for nal in nal_units(packet) {
+                    let Some(role) = syntax.role(nal) else {
+                        continue;
+                    };
+                    shape.add(role);
+                    if role == NalRole::Prefix {
+                        self.vui.observe_nal(nal, syntax);
+                        if read_sei {
+                            self.read.observe_nal(nal, syntax);
+                        }
+                    }
                 }
+                Some(shape)
             }
-            Bitstream::Av1 => self.read.observe_av1(packet),
-            Bitstream::Opaque => {}
+            Bitstream::Av1 => {
+                self.read.observe_av1(packet);
+                None
+            }
+            Bitstream::Opaque => None,
         }
     }
 
@@ -546,6 +643,7 @@ impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
         self.ready.clear();
         self.format = OutputFormat(config.pixel_format);
         self.signalling = Signalling::new(C::BITSTREAM, Container::of(config));
+        self.framing = PictureFraming::default();
         Ok(())
     }
 
@@ -556,16 +654,22 @@ impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
         })?;
         // Read before NVDEC sees the packet, so its parameter sets count
         // whatever happens to the decode.
-        self.signalling.observe(&frame.data);
-        let packet = Packet::new(
+        let shape = self.signalling.observe(&frame.data);
+        let mut packet = Packet::new(
             &frame.data,
             i64::try_from(frame.timestamp_us).unwrap_or(i64::MAX),
         );
+        if let Some(shape) = shape {
+            let ends_picture =
+                self.framing
+                    .ends_picture(shape, frame.data.len(), frame.is_keyframe);
+            packet = packet.with_whole_picture(ends_picture);
+        }
         match session {
             Session::Host { decoder, .. } => decoder.decode(packet),
             Session::Device(decoder) => decoder.decode(packet),
         }
-        .map_err(map_error(BackendId::Nvdec, Operation::Decode))?;
+        .map_err(decode_error)?;
         self.drain()?;
         Ok(self.ready.pop_front())
     }
