@@ -334,8 +334,8 @@ fn nv12_source(name: &str) -> Option<(Vec<RawFrame>, Vec<EncodedFrame>)> {
 #[cfg(feature = "nvdec")]
 #[test]
 fn nvdec_device_frames_encode_on_nvenc_without_readback() {
-    let _gpu = one_at_a_time();
     use ferricast_codec::cuda::CudaSurface;
+    let _gpu = one_at_a_time();
 
     let name = "NVDEC → NVENC";
     let Some((_, source)) = nv12_source(name) else {
@@ -452,8 +452,8 @@ fn hdr10() -> ferricast_core::HdrMetadata {
 #[cfg(feature = "nvenc-hevc")]
 #[test]
 fn nvenc_encodes_ten_bit_hdr10_hevc() {
-    let _gpu = one_at_a_time();
     use ferricast_core::{BitDepth, ColourPrimaries, TransferCharacteristics};
+    let _gpu = one_at_a_time();
 
     let name = "HEVC Main10 HDR10";
     let hdr = hdr10();
@@ -1009,8 +1009,8 @@ fn nvdec_p010_pictures(name: &str) -> Option<(Vec<Vec<u8>>, Vec<CapturedFrame>)>
 #[cfg(all(feature = "nvdec", feature = "nvenc-hevc"))]
 #[test]
 fn nvdec_p010_encodes_on_eight_bit_nvenc_without_readback() {
-    let _gpu = one_at_a_time();
     use ferricast_codec::cuda::CudaSurface;
+    let _gpu = one_at_a_time();
 
     let name = "NVDEC P010 -> 8-bit NVENC";
     let Some((sources, pictures)) = nvdec_p010_pictures(name) else {
