@@ -18,6 +18,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::str::FromStr;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use crate::error::{Error, NvencStatus, Result, SupportedVersions};
 use crate::loader::NvencLibrary;
@@ -215,17 +216,23 @@ impl ApiVersion {
     }
 
     /// The version `FERRICAST_NVENC_API` forces, if it is set (an empty value
-    /// counts as unset).
+    /// counts as unset). Read once per process: the variable cannot switch a
+    /// running process to another version (see [`AnyApi::load`]).
     ///
     /// # Errors
     ///
     /// [`Error::InvalidApiOverride`] when the value is not a supported
     /// `<major>.<minor>`.
     pub fn requested() -> Result<Option<Self>> {
-        std::env::var_os(API_OVERRIDE_VAR)
-            .filter(|value| !value.is_empty())
-            .map(|value| Self::parse_override(&value.to_string_lossy()))
-            .transpose()
+        static REQUESTED: OnceLock<Result<Option<ApiVersion>>> = OnceLock::new();
+        REQUESTED
+            .get_or_init(|| {
+                std::env::var_os(API_OVERRIDE_VAR)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Self::parse_override(&value.to_string_lossy()))
+                    .transpose()
+            })
+            .clone()
     }
 
     fn parse_override(value: &str) -> Result<Self> {
@@ -240,13 +247,17 @@ impl ApiVersion {
     }
 
     /// Queries the driver and picks the version to use, honouring
-    /// `FERRICAST_NVENC_API`. Not cached: one cheap driver call.
+    /// `FERRICAST_NVENC_API`. The process keeps the version once a function
+    /// list was loaded ([`AnyApi::load`]): that one is returned from then on.
     ///
     /// # Errors
     ///
     /// Loading NVENC ([`NvencLibrary::get`]), [`ApiVersion::requested`] and
     /// [`ApiVersion::select`] errors.
     pub fn negotiate() -> Result<Self> {
+        if let Some(loaded) = AnyApi::loaded() {
+            return Ok(loaded.version());
+        }
         let requested = Self::requested()?;
         let driver_max = NvencLibrary::get()?.max_supported_version()?;
         let selected = Self::select(driver_max, requested).map_err(|error| match error {
@@ -429,6 +440,9 @@ pub trait NvencApi: sealed::Sealed + Sized + 'static {
 
     /// Wraps this version's [`Api`] in [`AnyApi`].
     fn wrap(api: Api<Self>) -> AnyApi;
+
+    /// This version's [`Api`] out of an [`AnyApi`] holding it.
+    fn unwrap(api: AnyApi) -> Option<Api<Self>>;
 }
 
 /// The marker types of the supported NVENC API versions, one per generated
@@ -577,6 +591,13 @@ pub mod api {
                 fn wrap(api: super::Api<Self>) -> super::AnyApi {
                     super::AnyApi::$marker(api)
                 }
+
+                fn unwrap(api: super::AnyApi) -> Option<super::Api<Self>> {
+                    match api {
+                        super::AnyApi::$marker(api) => Some(api),
+                        _ => None,
+                    }
+                }
             }
         )*};
     }
@@ -637,13 +658,21 @@ impl<A: NvencApi> fmt::Debug for Api<A> {
 }
 
 impl<A: NvencApi> Api<A> {
-    /// Loads NVENC and fills version `A`'s function list.
+    /// Version `A`'s function list: the process's ([`AnyApi::load`]).
     ///
     /// # Errors
     ///
-    /// Loading errors, [`Error::ApiNotSupportedByDriver`] when the driver
-    /// does not accept `A`, [`Error::Nvenc`] if it still rejects it.
+    /// As [`AnyApi::load`].
     pub fn load() -> Result<Self> {
+        let loaded = AnyApi::load(A::VERSION)?;
+        A::unwrap(loaded).ok_or(Error::ApiVersionInUse {
+            in_use: loaded.version(),
+            requested: A::VERSION,
+        })
+    }
+
+    /// Fills version `A`'s function list (`NvEncodeAPICreateInstance`).
+    fn create() -> Result<Self> {
         let library = NvencLibrary::get()?;
         ApiVersion::select(library.max_supported_version()?, Some(A::VERSION))?;
         Ok(Self {
@@ -664,6 +693,9 @@ impl<A: NvencApi> Api<A> {
         A::VERSION
     }
 }
+
+/// The one NVENC function list of the process ([`AnyApi::load`]).
+static PROCESS_API: Mutex<Option<AnyApi>> = Mutex::new(None);
 
 /// [`Api`] for whichever version was negotiated at runtime.
 #[derive(Clone, Copy, Debug)]
@@ -692,20 +724,48 @@ impl AnyApi {
         Self::load(ApiVersion::negotiate()?)
     }
 
-    /// Loads `version`.
+    /// The process's function list, of `version`: filled by the driver the
+    /// first time, the same list afterwards.
+    ///
+    /// One version per process: the driver keeps the API version of the
+    /// last `NvEncodeAPICreateInstance` for the whole process, and sessions
+    /// opened through another version's list then fail with
+    /// `NV_ENC_ERR_INVALID_VERSION`. A process that needs several versions
+    /// (the tests) runs each in a child process.
     ///
     /// # Errors
     ///
-    /// See [`Api::load`].
+    /// [`Error::ApiVersionInUse`] when the process already uses another
+    /// version; loading errors, [`Error::ApiNotSupportedByDriver`] when the
+    /// driver does not accept `version`, [`Error::Nvenc`] if it still
+    /// rejects it.
     pub fn load(version: ApiVersion) -> Result<Self> {
-        struct Load;
-        impl ApiVisitor for Load {
+        struct Create;
+        impl ApiVisitor for Create {
             type Output = Result<AnyApi>;
             fn visit<A: NvencApi>(self) -> Result<AnyApi> {
-                Api::<A>::load().map(AnyApi::from)
+                Api::<A>::create().map(AnyApi::from)
             }
         }
-        version.dispatch(Load)
+        let mut loaded = PROCESS_API.lock().unwrap_or_else(PoisonError::into_inner);
+        match *loaded {
+            Some(api) if api.version() == version => Ok(api),
+            Some(api) => Err(Error::ApiVersionInUse {
+                in_use: api.version(),
+                requested: version,
+            }),
+            None => {
+                let api = version.dispatch(Create)?;
+                *loaded = Some(api);
+                Ok(api)
+            }
+        }
+    }
+
+    /// The process's function list, if one was loaded.
+    #[must_use]
+    pub fn loaded() -> Option<Self> {
+        *PROCESS_API.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The loaded version.

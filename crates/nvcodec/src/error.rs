@@ -99,6 +99,18 @@ pub enum Error {
         /// The versions this build supports, for the message.
         supported: SupportedVersions,
     },
+    /// The process already talks to NVENC through another API version: the
+    /// driver keeps one version per process, so a second one cannot be
+    /// loaded next to it.
+    #[error(
+        "NVENC API {requested} was asked for, but this process already uses {in_use} (one version per process)"
+    )]
+    ApiVersionInUse {
+        /// The version the process uses.
+        in_use: ApiVersion,
+        /// The version asked for.
+        requested: ApiVersion,
+    },
     /// The NVENC function list a driver returned lacks an entry point.
     #[error("the NVENC {api} function list has no {function}")]
     NvencFunctionMissing {
@@ -277,12 +289,62 @@ pub enum Error {
         /// What is wrong with it.
         reason: String,
     },
+    /// The encoder has no session: reopening it failed (see
+    /// [`crate::encode::Encoder::reopen`]).
+    #[error("the NVENC encoder is closed: {reason}")]
+    EncoderClosed {
+        /// Why the last reopen failed.
+        reason: String,
+    },
+    /// The GPU is gone or its context is unusable (a sticky CUDA error such
+    /// as an illegal address, an Xid, a TDR or a resume): nothing on the
+    /// context works any more. Open on a new context.
+    #[error("the CUDA context is lost ({call} reported {status})")]
+    DeviceLost {
+        /// The call that found out.
+        call: &'static str,
+        /// The sticky status.
+        status: CudaStatus,
+    },
     /// A picture that does not match the encoder it is given to.
     #[error("invalid encoder input: {reason}")]
     InvalidEncodeInput {
         /// What does not match.
         reason: String,
     },
+}
+
+impl Error {
+    /// Whether the GPU or its context is gone: a sticky CUDA error (which
+    /// every later call on the context returns too) or
+    /// [`Error::DeviceLost`]. Recovering needs a new context.
+    #[must_use]
+    pub fn is_device_lost(&self) -> bool {
+        match self {
+            Self::DeviceLost { .. } => true,
+            Self::Cuda { status, .. } | Self::Cuvid { status, .. } => status.is_sticky(),
+            _ => false,
+        }
+    }
+
+    /// Whether the failure is a property of this machine that retrying in
+    /// the same process does not change: no driver library, a driver
+    /// lacking an entry point or too old, an unusable API override. Every
+    /// other failure (`cuInit`, a full GPU, a lost device) may go away.
+    #[must_use]
+    pub fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Self::LibraryMissing { .. }
+                | Self::SymbolMissing { .. }
+                | Self::DriverTooOld { .. }
+                | Self::ApiNotSupportedByDriver { .. }
+                | Self::InvalidApiOverride { .. }
+                | Self::ApiVersionInUse { .. }
+                | Self::NvencFunctionMissing { .. }
+                | Self::DeviceOutOfRange { .. }
+        )
+    }
 }
 
 /// A DRM fourcc as its four characters, for messages.
@@ -385,6 +447,19 @@ impl CudaStatus {
     #[must_use]
     pub const fn code(self) -> u32 {
         self.0.0
+    }
+
+    /// Whether the status leaves the context unusable: every later call on
+    /// it fails the same way, and only a new context recovers.
+    /// `CUDA_ERROR_DEVICES_UNAVAILABLE` (46), `CUDA_ERROR_ECC_UNCORRECTABLE`
+    /// (214), `CUDA_ERROR_ILLEGAL_ADDRESS` (700) through
+    /// `CUDA_ERROR_LAUNCH_FAILED` (719, minus the launch-configuration and
+    /// peer-access codes 701–713 that do not corrupt the context), and
+    /// `CUDA_ERROR_UNKNOWN` (999), which the driver returns after an Xid or
+    /// a failed resume.
+    #[must_use]
+    pub const fn is_sticky(self) -> bool {
+        matches!(self.code(), 46 | 214 | 700 | 714..=719 | 999)
     }
 
     /// The `CUresult` enumerator name from NVIDIA's `cuda.h`, when known.

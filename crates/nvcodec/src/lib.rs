@@ -45,6 +45,7 @@ pub mod encode;
 pub mod error;
 #[cfg(target_os = "linux")]
 pub mod interop;
+pub mod lifecycle;
 pub mod loader;
 pub mod sys;
 pub mod version;

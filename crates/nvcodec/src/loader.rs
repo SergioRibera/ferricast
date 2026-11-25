@@ -4,14 +4,17 @@
 //! first use, once per process, and its entry points are resolved into a
 //! table of function pointers. A required entry point that is missing fails
 //! the load with [`Error::SymbolMissing`]; an optional one (newer drivers,
-//! platform-specific interop) is an `Option`. The outcome, success or error,
-//! is cached, so a machine without the driver pays for one failed `dlopen`.
+//! platform-specific interop) is an `Option`. The outcome of loading, success
+//! or error, is cached, so a machine without the driver pays for one failed
+//! `dlopen`; a failed `cuInit` is retried after a delay ([`Backoff`]).
 //!
 //! The tables live in `static`s and are never dropped, so the libraries stay
 //! mapped and every function pointer stays valid for the rest of the
 //! process.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use libloading::Library;
 
@@ -194,10 +197,14 @@ driver_library! {
             ctx_pop_current: sys::cuda::tcuCtxPopCurrent_v2 = ["cuCtxPopCurrent_v2"],
             ctx_get_current: sys::cuda::tcuCtxGetCurrent = ["cuCtxGetCurrent"],
             ctx_synchronize: sys::cuda::tcuCtxSynchronize = ["cuCtxSynchronize"],
+            ctx_create: sys::cuda::tcuCtxCreate_v2 = ["cuCtxCreate_v2"],
+            ctx_destroy: sys::cuda::tcuCtxDestroy_v2 = ["cuCtxDestroy_v2"],
             mem_get_info: sys::cuda::tcuMemGetInfo_v2 = ["cuMemGetInfo_v2"],
             mem_alloc: sys::cuda::tcuMemAlloc_v2 = ["cuMemAlloc_v2"],
             mem_alloc_pitch: sys::cuda::tcuMemAllocPitch_v2 = ["cuMemAllocPitch_v2"],
             mem_free: sys::cuda::tcuMemFree_v2 = ["cuMemFree_v2"],
+            mem_host_alloc: sys::cuda::tcuMemHostAlloc = ["cuMemHostAlloc"],
+            mem_free_host: sys::cuda::tcuMemFreeHost = ["cuMemFreeHost"],
             memcpy_2d: sys::cuda::tcuMemcpy2D_v2 = ["cuMemcpy2D_v2"],
             memcpy_2d_async: sys::cuda::tcuMemcpy2DAsync_v2 = ["cuMemcpy2DAsync_v2"],
             memcpy_htod: sys::cuda::tcuMemcpyHtoD_v2 = ["cuMemcpyHtoD_v2"],
@@ -311,6 +318,69 @@ driver_library! {
     }
 }
 
+/// Retries of a failing driver call, spaced out: after a failure the same
+/// error is returned without calling again until a delay has passed, which
+/// doubles with every consecutive failure (from [`Backoff::FIRST`] up to
+/// [`Backoff::LONGEST`]). A success starts over.
+#[derive(Debug, Default)]
+pub struct Backoff {
+    failed: Option<Failure>,
+}
+
+#[derive(Debug)]
+struct Failure {
+    error: Error,
+    retry_at: Instant,
+    delay: Duration,
+}
+
+impl Backoff {
+    /// The delay after the first failure.
+    pub const FIRST: Duration = Duration::from_millis(250);
+    /// The longest delay.
+    pub const LONGEST: Duration = Duration::from_secs(30);
+
+    /// Nothing failed yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { failed: None }
+    }
+
+    /// Runs `call`, unless the last call failed less than the current delay
+    /// ago: then its error is returned again without calling.
+    ///
+    /// # Errors
+    ///
+    /// `call`'s error, fresh or remembered.
+    pub fn retry<T>(&mut self, call: impl FnOnce() -> Result<T>) -> Result<T> {
+        let now = Instant::now();
+        if let Some(failed) = &self.failed
+            && now < failed.retry_at
+        {
+            return Err(failed.error.clone());
+        }
+        match call() {
+            Ok(value) => {
+                self.failed = None;
+                Ok(value)
+            }
+            Err(error) => {
+                let delay = self
+                    .failed
+                    .as_ref()
+                    .map_or(Self::FIRST, |failed| (failed.delay * 2).min(Self::LONGEST));
+                tracing::debug!(%error, ?delay, "driver call failed; retrying after a delay");
+                self.failed = Some(Failure {
+                    error: error.clone(),
+                    retry_at: now + delay,
+                    delay,
+                });
+                Err(error)
+            }
+        }
+    }
+}
+
 static CUDA: OnceLock<Result<CudaLibrary>> = OnceLock::new();
 static CUVID: OnceLock<Result<CuvidLibrary>> = OnceLock::new();
 static NVENC: OnceLock<Result<NvencLibrary>> = OnceLock::new();
@@ -322,18 +392,27 @@ impl CudaLibrary {
     /// # Errors
     ///
     /// [`Error::LibraryMissing`] without an NVIDIA driver,
-    /// [`Error::SymbolMissing`] with one too old, [`Error::Cuda`] when
-    /// `cuInit` fails (no device, driver / kernel module mismatch). The
-    /// first outcome is returned to every later caller.
+    /// [`Error::SymbolMissing`] with one too old: kept for the process.
+    /// [`Error::Cuda`] when `cuInit` fails (no device yet, a driver / kernel
+    /// module mismatch, a GPU still waking up): returned again until
+    /// [`Backoff`]'s delay has passed, then `cuInit` is retried.
     pub fn get() -> Result<&'static Self> {
-        CUDA.get_or_init(|| {
-            let library = Self::load()?;
-            // SAFETY: `cuInit` takes no pointers; flags must be 0.
-            unsafe { (library.init)(0) }.check("cuInit")?;
-            Ok(library)
-        })
-        .as_ref()
-        .map_err(Clone::clone)
+        static INIT: Mutex<Backoff> = Mutex::new(Backoff::new());
+        static INITIALISED: AtomicBool = AtomicBool::new(false);
+        let library = CUDA
+            .get_or_init(Self::load)
+            .as_ref()
+            .map_err(Clone::clone)?;
+        if !INITIALISED.load(Ordering::Acquire) {
+            INIT.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retry(|| {
+                    // SAFETY: `cuInit` takes no pointers; flags must be 0.
+                    unsafe { (library.init)(0) }.check("cuInit")
+                })?;
+            INITIALISED.store(true, Ordering::Release);
+        }
+        Ok(library)
     }
 
     /// The CUDA version the driver implements (`cuDriverGetVersion`), e.g.
@@ -453,5 +532,28 @@ mod tests {
             ),
             expected
         );
+    }
+
+    #[test]
+    fn backoff_spaces_out_retries_and_forgets_on_success() {
+        let failure = || Error::Cuda {
+            call: "cuInit",
+            status: crate::error::CudaStatus(sys::cuda::CUresult(999)),
+        };
+        let mut backoff = Backoff::new();
+        let mut calls = 0;
+        let mut attempt = |backoff: &mut Backoff, succeed: bool| {
+            backoff.retry(|| {
+                calls += 1;
+                if succeed { Ok(()) } else { Err(failure()) }
+            })
+        };
+        assert!(attempt(&mut backoff, false).is_err());
+        // Within the delay: the remembered error, no call.
+        assert!(attempt(&mut backoff, true).is_err());
+        std::thread::sleep(Backoff::FIRST + Duration::from_millis(50));
+        assert!(attempt(&mut backoff, true).is_ok());
+        assert!(attempt(&mut backoff, true).is_ok());
+        assert_eq!(calls, 3);
     }
 }

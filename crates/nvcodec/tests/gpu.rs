@@ -274,8 +274,11 @@ fn nvenc_negotiates_the_newest_version_the_driver_accepts() {
     }
 }
 
+/// Runs in a child process with `FERRICAST_NVENC_API` set (see
+/// `every_version_the_driver_accepts_opens_a_session`): one version per
+/// process, as the driver keeps it. Passes trivially otherwise.
 #[test]
-fn every_version_the_driver_accepts_opens_a_session() {
+fn child_opens_a_session() {
     struct OpenSession<'a>(&'a Arc<Context>);
     impl ApiVisitor for OpenSession<'_> {
         type Output = Result<(), Error>;
@@ -289,29 +292,57 @@ fn every_version_the_driver_accepts_opens_a_session() {
         }
     }
 
+    let Some(value) = std::env::var_os(API_OVERRIDE_VAR) else {
+        return;
+    };
     let Some(context) = context() else { return };
     let Some(driver_max) = nvenc_driver_max() else {
         return;
     };
+    let version = ApiVersion::requested().unwrap().unwrap();
+    assert_eq!(version.to_string(), value.to_string_lossy());
+    let opened = version.dispatch(OpenSession(&context));
+    eprintln!("NVENC API {version}: {opened:?}");
+    if version.version() <= driver_max {
+        opened.unwrap();
+        assert_eq!(AnyApi::load(version).unwrap().version(), version);
+    } else {
+        let error = opened.unwrap_err();
+        eprintln!("  {error}");
+        assert!(
+            matches!(error, Error::ApiNotSupportedByDriver { requested, .. } if requested == version),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(version.minimum_driver().for_this_os())
+        );
+    }
+    eprintln!("NVENC API {version}: checked");
+}
+
+#[test]
+fn every_version_the_driver_accepts_opens_a_session() {
+    if context().is_none() || nvenc_driver_max().is_none() {
+        return;
+    }
     for version in ApiVersion::ALL {
-        let opened = version.dispatch(OpenSession(&context));
-        eprintln!("NVENC API {version}: {opened:?}");
-        if version.version() <= driver_max {
-            opened.unwrap();
-            assert_eq!(AnyApi::load(version).unwrap().version(), version);
-        } else {
-            let error = opened.unwrap_err();
-            eprintln!("  {error}");
-            assert!(
-                matches!(error, Error::ApiNotSupportedByDriver { requested, .. } if requested == version),
-                "{error}"
-            );
-            assert!(
-                error
-                    .to_string()
-                    .contains(version.minimum_driver().for_this_os())
-            );
-        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "child_opens_a_session",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(API_OVERRIDE_VAR, version.to_string())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("{}", stderr.trim());
+        assert!(output.status.success(), "{API_OVERRIDE_VAR}={version}");
+        assert!(stderr.contains(&format!("NVENC API {version}: checked")));
     }
 }
 
@@ -412,7 +443,12 @@ fn blocking_upload_and_fill_are_ordered_with_streams() {
     let queue_copies = |target: &mut DeviceBuffer, source: &DeviceBuffer| {
         for _ in 0..32 {
             target
-                .copy_from_async(Point { x_bytes: 0, row: 0 }, source, source.region(), &stream)
+                .copy_from_async(
+                    Point { x_bytes: 0, row: 0 },
+                    source,
+                    source.region(),
+                    &stream,
+                )
                 .unwrap();
         }
     };
@@ -437,7 +473,12 @@ fn blocking_upload_and_fill_are_ordered_with_streams() {
         // Complete on return: a stream reading right after sees it.
         target.fill(0x44).unwrap();
         source
-            .copy_from_async(Point { x_bytes: 0, row: 0 }, &target, target.region(), &stream)
+            .copy_from_async(
+                Point { x_bytes: 0, row: 0 },
+                &target,
+                target.region(),
+                &stream,
+            )
             .unwrap();
         stream.synchronize().unwrap();
         expect(&source, 0x44, "a stream sees the finished fill");

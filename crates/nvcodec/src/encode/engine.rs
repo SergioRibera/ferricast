@@ -12,7 +12,10 @@ use super::caps::{CodecCapabilities, codec_caps};
 use super::config::{Config, RateControl, Tuning};
 use super::raw::{ApiFeature, EncodeApi, Mapped, Picture, Registration, Resource, Submitted};
 use super::{DeviceFrame, FrameOptions, HostFrame, Packet, PictureType, Session};
-use crate::cuda::{ArrayView, Context, DeviceBuffer, Event, PitchedView, Point, Region, Stream};
+use crate::cuda::{
+    Allocation, ArrayView, Context, DeviceBuffer, Event, HostImage, PinnedBuffer, PitchedView,
+    Stream,
+};
 use crate::error::{Error, Result};
 use crate::sys::cuda::CUstream;
 use crate::version::Api;
@@ -29,6 +32,10 @@ struct Slot {
 
 struct HostSlot {
     buffer: DeviceBuffer,
+    /// Page-locked copy of the picture, uploaded asynchronously.
+    staging: PinnedBuffer,
+    /// Recorded after the upload from `staging`.
+    staged: Event,
     registered: NonNull<c_void>,
 }
 
@@ -48,6 +55,10 @@ struct DeviceEntry {
     /// address), from being reused by another buffer while the entry
     /// exists; `strong_count() == 0` says the buffer was dropped.
     buffer: Weak<DeviceBuffer>,
+    /// The buffer's memory, kept allocated until the registration is
+    /// undone: NVIDIA wants a resource unregistered before it is freed, and
+    /// the caller may drop the buffer at any time.
+    allocation: Arc<Allocation>,
     registered: NonNull<c_void>,
     chroma_offset: Option<u32>,
 }
@@ -74,6 +85,8 @@ struct Retired {
     registered: NonNull<c_void>,
     /// The last picture submitted when it was retired.
     after: u64,
+    /// The memory registered, freed only after the unregistration.
+    _allocation: Option<Arc<Allocation>>,
 }
 
 pub(crate) struct Engine<A: EncodeApi> {
@@ -84,9 +97,11 @@ pub(crate) struct Engine<A: EncodeApi> {
     session: Session<A>,
     _io_stream: Box<CUstream>,
     stream: Stream,
-    copy_done: Event,
     slots: Vec<Slot>,
     config: Config,
+    /// The size the session was initialised with: the largest a
+    /// reconfiguration can switch to.
+    max: (u32, u32),
     caps: CodecCapabilities,
     next_slot: usize,
     pending: VecDeque<Pending>,
@@ -112,7 +127,13 @@ pub(crate) struct Engine<A: EncodeApi> {
 unsafe impl<A: EncodeApi> Send for Engine<A> {}
 
 impl<A: EncodeApi> Engine<A> {
+    /// Opens the engine on the session thread ([`crate::lifecycle`]); drop
+    /// it there too ([`super::Encoder`] does).
     pub(crate) fn open(api: Api<A>, context: &Arc<Context>, config: &Config) -> Result<Self> {
+        crate::lifecycle::run(context, || Self::open_here(api, context, config))
+    }
+
+    fn open_here(api: Api<A>, context: &Arc<Context>, config: &Config) -> Result<Self> {
         config.validate()?;
         Self::check_version(config)?;
         let session = super::open_session(api, context)?;
@@ -121,7 +142,6 @@ impl<A: EncodeApi> Engine<A> {
 
         A::initialize(&session, config)?;
         let stream = Stream::new(context)?;
-        let copy_done = Event::new(context)?;
         let io_stream = Box::new(stream.raw());
         // SAFETY: the box and the stream are fields declared after the
         // session, so they are dropped after it.
@@ -131,9 +151,9 @@ impl<A: EncodeApi> Engine<A> {
             session,
             _io_stream: io_stream,
             stream,
-            copy_done,
             slots: Vec::new(),
             config: config.clone(),
+            max: (config.width, config.height),
             caps,
             next_slot: 0,
             pending: VecDeque::new(),
@@ -276,9 +296,9 @@ impl<A: EncodeApi> Engine<A> {
         self.packets.pop_front()
     }
 
-    pub(crate) fn recycle(&mut self, packet: Packet) {
+    pub(crate) fn recycle(&mut self, buffer: Vec<u8>) {
         if self.spare.len() < SPARE_BUFFERS {
-            self.spare.push(packet.data);
+            self.spare.push(buffer);
         }
     }
 
@@ -334,6 +354,8 @@ impl<A: EncodeApi> Engine<A> {
         let slot = self.free_slot()?;
         if self.slots[slot].host.is_none() {
             let buffer = DeviceBuffer::pitched(&context, width_bytes, height + chroma_rows)?;
+            let staging = PinnedBuffer::new(&context, width_bytes * (height + chroma_rows))?;
+            let staged = Event::new(&context)?;
             let registration = Registration {
                 resource: Resource::DevicePtr(buffer.device_ptr()),
                 format,
@@ -343,37 +365,46 @@ impl<A: EncodeApi> Engine<A> {
                 chroma_offset: None,
             };
             let registered = self.register(&registration)?;
-            self.slots[slot].host = Some(HostSlot { buffer, registered });
+            self.slots[slot].host = Some(HostSlot {
+                buffer,
+                staging,
+                staged,
+                registered,
+            });
         }
         let Some(host) = self.slots[slot].host.as_mut() else {
             unreachable!("the slot's host buffer was created above");
         };
         let pitch = to_u32(host.buffer.pitch(), "a device pitch")?;
 
-        // SAFETY: the host images are borrowed for this call and the copies
-        // are waited for (`copy_done`) before it returns, whatever happens
-        // in between.
-        let copied = unsafe {
-            host.buffer
-                .upload_async(Region::new(width_bytes, height), luma, &self.stream)
-                .and_then(|()| match chroma {
-                    Some(chroma) => host.buffer.upload_async(
-                        Region::new(width_bytes, chroma_rows).at(Point {
-                            x_bytes: 0,
-                            row: height,
-                        }),
-                        chroma,
-                        &self.stream,
-                    ),
-                    None => Ok(()),
-                })
-        };
-        let waited = self
-            .copy_done
-            .record(&self.stream)
-            .and_then(|()| self.copy_done.synchronize());
-        copied?;
-        waited?;
+        // The picture goes into the slot's page-locked staging buffer on the
+        // CPU, then to the device on the encoder's stream, which NVENC waits
+        // for before reading (its IO stream): the caller's memory is free
+        // when this returns, and nothing here waits for the GPU. The staging
+        // buffer's previous upload is done long ago (a full turn of the
+        // slots); the event makes sure.
+        host.staged.synchronize()?;
+        let staging = host.staging.as_mut_slice();
+        let (luma_rows, chroma_dst) = staging.split_at_mut(width_bytes * height);
+        luma.copy_rows_into(luma_rows, width_bytes, height)?;
+        if let Some(chroma) = chroma {
+            chroma.copy_rows_into(chroma_dst, width_bytes, chroma_rows)?;
+        }
+        // SAFETY: the staging buffer is page-locked memory owned by the
+        // slot; it is written again only after `staged` (recorded right
+        // after the copy) completes, and freed only after the stream is
+        // synchronised (`Drop`).
+        unsafe {
+            host.buffer.upload_async(
+                host.buffer.region(),
+                HostImage {
+                    data: host.staging.as_slice(),
+                    pitch: width_bytes,
+                },
+                &self.stream,
+            )?;
+        }
+        host.staged.record(&self.stream)?;
 
         let registered = host.registered;
         // SAFETY: the slot's registration is not mapped: its previous
@@ -446,7 +477,7 @@ impl<A: EncodeApi> Engine<A> {
             registered
         } else {
             if let Some(stale) = self.device_inputs.remove(&key) {
-                self.retire(stale.registered);
+                self.retire(stale.registered, Some(stale.allocation));
             }
             let registration = Registration {
                 resource: Resource::DevicePtr(buffer.device_ptr()),
@@ -464,6 +495,7 @@ impl<A: EncodeApi> Engine<A> {
                 key,
                 DeviceEntry {
                     buffer: Arc::downgrade(buffer),
+                    allocation: buffer.keep_allocated(),
                     registered,
                     chroma_offset,
                 },
@@ -592,7 +624,7 @@ impl<A: EncodeApi> Engine<A> {
             registered
         } else {
             if let Some(stale) = self.keyed_inputs.remove(&key) {
-                self.retire(stale.registered);
+                self.retire(stale.registered, None);
             }
             let registration = Registration {
                 resource: input.resource,
@@ -710,12 +742,21 @@ impl<A: EncodeApi> Engine<A> {
             let output = self.slots[pending.slot].bitstream;
             // SAFETY: NVENC reported the picture encoded (`ready`), its
             // bitstream buffer is not locked.
-            let locked = unsafe { A::lock(&self.session, output, &mut data) };
-            // SAFETY: the bitstream is locked (or the lock failed), NVENC no
-            // longer reads the input.
-            let unmapped = unsafe { A::unmap(&self.session, pending.mapped) };
-            let locked = locked?;
-            unmapped?;
+            let locked = match unsafe { A::lock(&self.session, output, &mut data) } {
+                Ok(locked) => locked,
+                Err(error) => {
+                    // NVENC may still be working on the picture: its input
+                    // stays mapped and its slot taken until a later lock
+                    // (or the end-of-stream drain on drop) succeeds.
+                    self.pending.push_front(pending);
+                    self.ready += 1;
+                    self.spare.push(data);
+                    return Err(error);
+                }
+            };
+            // SAFETY: the bitstream was locked and unlocked, NVENC no longer
+            // reads the input.
+            unsafe { A::unmap(&self.session, pending.mapped) }?;
             let picture_type = PictureType::from_raw(locked.picture_type);
             self.packets.push_back(Packet {
                 data,
@@ -730,10 +771,11 @@ impl<A: EncodeApi> Engine<A> {
 
     /// Queues `registered` for unregistration once no pending picture uses
     /// it.
-    fn retire(&mut self, registered: NonNull<c_void>) {
+    fn retire(&mut self, registered: NonNull<c_void>, allocation: Option<Arc<Allocation>>) {
         self.retired.push(Retired {
             registered,
             after: self.submitted,
+            _allocation: allocation,
         });
         self.release_retired();
     }
@@ -764,20 +806,26 @@ impl<A: EncodeApi> Engine<A> {
             .collect();
         for key in dead {
             if let Some(entry) = self.device_inputs.remove(&key) {
-                self.retire(entry.registered);
+                self.retire(entry.registered, Some(entry.allocation));
             }
         }
     }
 
     pub(crate) fn forget_device_buffer(&mut self, buffer: &Arc<DeviceBuffer>) {
         if let Some(entry) = self.device_inputs.remove(&(Arc::as_ptr(buffer) as usize)) {
-            self.retire(entry.registered);
+            self.retire(entry.registered, Some(entry.allocation));
         }
     }
 
+    /// Drops the registration under `key` and, before returning, unregisters
+    /// it: a pending picture reading it is encoded first (the queue is
+    /// flushed, its packets kept), so the caller may free the memory right
+    /// after. A driver failure on the way is logged; NVENC then may still
+    /// read the memory.
     pub(crate) fn invalidate_array(&mut self, key: u64) {
         if let Some(entry) = self.keyed_inputs.remove(&key) {
-            self.retire(entry.registered);
+            self.retire(entry.registered, None);
+            self.release_keyed_now("invalidating an NVENC input");
         }
     }
 
@@ -785,15 +833,33 @@ impl<A: EncodeApi> Engine<A> {
         let device: Vec<_> = self
             .device_inputs
             .drain()
-            .map(|(_, entry)| entry.registered)
+            .map(|(_, entry)| (entry.registered, Some(entry.allocation)))
             .collect();
         let arrays: Vec<_> = self
             .keyed_inputs
             .drain()
-            .map(|(_, entry)| entry.registered)
+            .map(|(_, entry)| (entry.registered, None))
             .collect();
-        for registered in device.into_iter().chain(arrays) {
-            self.retire(registered);
+        let any_keyed = !arrays.is_empty();
+        for (registered, allocation) in device.into_iter().chain(arrays) {
+            self.retire(registered, allocation);
+        }
+        if any_keyed {
+            self.release_keyed_now("clearing the NVENC input caches");
+        }
+    }
+
+    /// Unregisters every retired registration now, flushing the pictures
+    /// that may still read one: caller-keyed memory may be freed as soon as
+    /// its key is invalidated.
+    fn release_keyed_now(&mut self, doing: &'static str) {
+        let context = Arc::clone(self.context());
+        let _current = context.guard();
+        self.release_retired();
+        if !self.retired.is_empty()
+            && let Err(error) = self.flush()
+        {
+            tracing::warn!(%error, "{doing}: flushing the pictures that read it");
         }
     }
 
@@ -835,8 +901,81 @@ impl<A: EncodeApi> Engine<A> {
         config.validate()?;
         let context = Arc::clone(self.context());
         let _current = context.guard()?;
-        A::reconfigure(&self.session, &config, false)?;
+        A::reconfigure(&self.session, &config, self.max, false)?;
         self.config = config;
+        Ok(())
+    }
+
+    /// Switches the session to `config` without a new one
+    /// (`nvEncReconfigureEncoder`): picture size up to the size it was opened
+    /// with, frame rate, GOP, rate control, colour. Pictures still pending
+    /// are flushed first (their packets stay queued); a new size restarts
+    /// the stream with an IDR and drops the input registrations made for
+    /// the old one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] for a change that needs a new session (codec,
+    /// input format, profile, preset, tuning, B frames, lookahead, frames in
+    /// flight, HDR metadata, a larger picture); validation, capability and
+    /// driver errors.
+    pub(crate) fn reconfigure(&mut self, config: &Config) -> Result<()> {
+        config.validate()?;
+        let old = &self.config;
+        let fixed = config.codec == old.codec
+            && config.input_format == old.input_format
+            && config.effective_profile() == old.effective_profile()
+            && config.preset == old.preset
+            && config.tuning == old.tuning
+            && config.b_frames == old.b_frames
+            && config.lookahead == old.lookahead
+            && config.frames_in_flight == old.frames_in_flight
+            && config.hdr10 == old.hdr10;
+        if !fixed || config.width > self.max.0 || config.height > self.max.1 {
+            return Err(Error::Unsupported {
+                what: "this change",
+                reason: "it needs a new NVENC session".into(),
+            });
+        }
+        let caps = &self.caps;
+        if config.width < caps.min_width || config.height < caps.min_height {
+            return Err(Error::Unsupported {
+                what: "this picture size",
+                reason: format!(
+                    "{}x{} is under the {}x{} minimum",
+                    config.width, config.height, caps.min_width, caps.min_height
+                ),
+            });
+        }
+        if config.rate_control.vbv().is_some() && !caps.custom_vbv {
+            return Err(Error::Unsupported {
+                what: "a custom VBV",
+                reason: format!("no custom {} VBV on this GPU", config.codec),
+            });
+        }
+        let resized = (config.width, config.height) != (old.width, old.height);
+        self.flush()?;
+        let context = Arc::clone(self.context());
+        let _current = context.guard()?;
+        A::reconfigure(&self.session, config, self.max, resized)?;
+        self.config = config.clone();
+        if resized {
+            // Every registration describes the old size.
+            self.since_idr = None;
+            let hosts: Vec<_> = self
+                .slots
+                .iter_mut()
+                .filter_map(|slot| slot.host.take())
+                .collect();
+            for host in hosts {
+                // SAFETY: nothing is pending (flushed above), so nothing
+                // maps the registration; the buffer is freed after.
+                if let Err(error) = unsafe { A::unregister(&self.session, host.registered) } {
+                    tracing::warn!(%error, "unregistering an NVENC host input");
+                }
+            }
+            self.clear_input_caches();
+        }
         Ok(())
     }
 
@@ -855,12 +994,22 @@ impl<A: EncodeApi> Drop for Engine<A> {
         if let Err(error) = &current {
             tracing::warn!(%error, "making the CUDA context current to close an NVENC encoder");
         }
+        // Uploads from the staging buffers may still be queued; they are
+        // freed with the slots.
+        if let Err(error) = self.stream.synchronize() {
+            tracing::warn!(%error, "waiting for an NVENC encoder's uploads");
+        }
         let session = &self.session;
+        // NVENC wants its pending pictures drained before teardown; an end
+        // of stream also when none is pending lets the driver finish the
+        // work it does after a picture before the session goes (see
+        // `crate::lifecycle`).
+        if self.submitted > 0
+            && let Err(error) = A::end_of_stream(session)
+        {
+            tracing::warn!(%error, "flushing an NVENC encoder");
+        }
         if !self.pending.is_empty() {
-            // NVENC wants its pending pictures drained before teardown.
-            if let Err(error) = A::end_of_stream(session) {
-                tracing::warn!(%error, "flushing an NVENC encoder");
-            }
             let mut sink = Vec::new();
             for pending in self.pending.drain(..) {
                 let output = self.slots[pending.slot].bitstream;
