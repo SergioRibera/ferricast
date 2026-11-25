@@ -1652,3 +1652,58 @@ fn invalidating_a_pending_input_drains_it() {
         drop(buffer);
     }
 }
+
+/// A smaller picture is reconfigured in place (an IDR starts the new size);
+/// a larger one reopens the session; both encode right away.
+#[test]
+fn reconfigure_in_place_or_reopen() {
+    let _gpu = gpu_lock();
+    let Some(context) = context() else { return };
+    let config = |width, height| {
+        Config::low_latency(
+            Codec::H264,
+            width,
+            height,
+            InputFormat::Nv12,
+            rate(30),
+            2_000_000,
+        )
+    };
+    let encode = |encoder: &mut Encoder, width: u32, height: u32| {
+        let picture = vec![0x60; (width * height * 3 / 2) as usize];
+        encoder
+            .encode_host(
+                HostFrame::tight(&picture, InputFormat::Nv12, width, height),
+                FrameOptions::default(),
+            )
+            .unwrap();
+        encoder.next_packet().unwrap()
+    };
+    let mut encoder = Encoder::open(&context, &config(640, 360)).unwrap();
+    encode(&mut encoder, 640, 360);
+    encode(&mut encoder, 640, 360);
+    assert_eq!(encoder.registrations(), 1);
+
+    encoder.reconfigure(&config(320, 180)).unwrap();
+    assert_eq!(
+        (encoder.config().width, encoder.config().height),
+        (320, 180)
+    );
+    let packet = encode(&mut encoder, 320, 180);
+    assert!(packet.is_keyframe(), "a new size starts with an IDR");
+    // The old host slot (sized for 640x360) was dropped: registered anew.
+    assert_eq!(encoder.registrations(), 2, "in place: same session");
+
+    encoder.reconfigure(&config(1280, 720)).unwrap();
+    assert_eq!(
+        (encoder.config().width, encoder.config().height),
+        (1280, 720)
+    );
+    assert_eq!(
+        encoder.registrations(),
+        0,
+        "a larger size needs a new session"
+    );
+    assert!(encode(&mut encoder, 1280, 720).is_keyframe());
+    assert!(encoder.is_open());
+}

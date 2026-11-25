@@ -381,7 +381,7 @@ fn returned(
     call: &'static str,
     what: &'static str,
 ) -> Result<NonNull<c_void>> {
-    NonNull::new(pointer).ok_or(Error::UnexpectedValue {
+    NonNull::new(pointer).ok_or_else(|| Error::UnexpectedValue {
         call,
         what,
         value: "null".into(),

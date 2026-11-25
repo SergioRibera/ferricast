@@ -994,20 +994,21 @@ impl<A: EncodeApi> Drop for Engine<A> {
         if let Err(error) = &current {
             tracing::warn!(%error, "making the CUDA context current to close an NVENC encoder");
         }
-        // Uploads from the staging buffers may still be queued; they are
-        // freed with the slots.
-        if let Err(error) = self.stream.synchronize() {
-            tracing::warn!(%error, "waiting for an NVENC encoder's uploads");
-        }
         let session = &self.session;
-        // NVENC wants its pending pictures drained before teardown; an end
-        // of stream also when none is pending lets the driver finish the
-        // work it does after a picture before the session goes (see
-        // `crate::lifecycle`).
+        // NVENC wants its pending pictures drained before teardown. The end
+        // of stream, sent also when none is pending, and the wait for the
+        // IO stream after it let the driver finish what it does after a
+        // picture before the session goes: destroying a session right
+        // after encoding is what crashes the driver (see
+        // `crate::lifecycle`). The wait also covers the uploads from the
+        // staging buffers, freed with the slots.
         if self.submitted > 0
             && let Err(error) = A::end_of_stream(session)
         {
             tracing::warn!(%error, "flushing an NVENC encoder");
+        }
+        if let Err(error) = self.stream.synchronize() {
+            tracing::warn!(%error, "waiting for an NVENC encoder's stream");
         }
         if !self.pending.is_empty() {
             let mut sink = Vec::new();
