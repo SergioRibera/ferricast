@@ -28,6 +28,11 @@ mediacodec = ["dep:ndk", "dep:ndk-sys", "dep:libc"]
 # decoders hand each other as native frames. Apple-only dependency;
 # inert elsewhere.
 videotoolbox = ["dep:objc2-core-foundation", "dep:objc2-core-video"]
+# CUDA device memory as native frames (`cuda`: NVDEC pictures NVENC
+# encodes without a copy) and the NVIDIA error mapping the NVDEC and NVENC
+# backends share. The binding is a Linux / Windows dependency; inert
+# elsewhere.
+cuda = ["dep:ferricast-nvcodec"]
 
 [dependencies]
 ferricast-core = { path = "../core", default-features = false }
@@ -54,6 +59,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Ole",
     "Win32_System_Variant",
 ], optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+ferricast-nvcodec = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # `dlsym` for `AHardwareBuffer_lockPlanes`, which only exists from API 29.

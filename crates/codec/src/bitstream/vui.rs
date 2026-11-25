@@ -81,6 +81,12 @@ impl ColourTracker {
         }
     }
 
+    /// The chroma sample location of the latest SPS, when its VUI says.
+    #[must_use]
+    pub fn chroma_location(self) -> Option<ChromaLocation> {
+        self.current.location
+    }
+
     /// What the stream signals over `container` (the container's
     /// colour), field group by field group: the bitstream describes the
     /// samples themselves.

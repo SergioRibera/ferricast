@@ -56,6 +56,10 @@ pub mod mf;
 )]
 pub mod apple;
 
+// NVIDIA: CUDA device frames and error mapping (Linux, Windows).
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+pub mod cuda;
+
 pub use audio::{
     AudioDecoderRegistry, AudioEncoderRegistry, SelectingAudioDecoder, SelectingAudioEncoder,
 };
