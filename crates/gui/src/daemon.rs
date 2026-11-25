@@ -14,7 +14,8 @@ use std::sync::Arc;
 use ferricast::prelude::*;
 use ferricast::{ManagerEvent, SourceChange, SourceEnumerator};
 use ferricast_dbus::{
-    ActiveStreamDto, BUS_NAME, DeviceDto, MonitorInfoDto, OBJECT_PATH, SourceDto, WindowInfoDto,
+    ActiveStreamDto, BUS_NAME, DeviceDto, GpuDto, MonitorInfoDto, OBJECT_PATH, SourceDto,
+    WindowInfoDto,
 };
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
@@ -516,6 +517,47 @@ impl ManagerService {
             (_, true) => vec!["monitor".into()],
             _ => Vec::new(),
         }
+    }
+
+    #[expect(
+        clippy::unused_async,
+        reason = "zbus methods; async keeps them on the executor like the rest of the interface"
+    )]
+    async fn list_gpus(&self) -> Vec<GpuDto> {
+        let names = |backends: &[ferricast::BackendId]| {
+            backends.iter().map(|b| b.name().to_owned()).collect()
+        };
+        ferricast::StreamManager::gpus()
+            .into_iter()
+            .map(|report| GpuDto {
+                render_node: report.gpu.render_node.clone(),
+                pci: report
+                    .gpu
+                    .pci
+                    .map(|pci| pci.to_string())
+                    .unwrap_or_default(),
+                vendor: report.gpu.vendor.to_string(),
+                label: report.gpu.label(),
+                kind: report.gpu.kind.to_string(),
+                encoders: names(&report.encoders),
+                decoders: names(&report.decoders),
+            })
+            .collect()
+    }
+
+    #[zbus(property)]
+    async fn gpu_preference(&self) -> String {
+        self.manager.read().await.gpu().to_string()
+    }
+
+    #[zbus(property)]
+    async fn set_gpu_preference(&self, value: &str) -> zbus::fdo::Result<()> {
+        let gpu: ferricast::GpuPreference = value
+            .parse()
+            .map_err(|e: ferricast::InvalidGpuText| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
+        tracing::info!(%gpu, "GPU preference set over D-Bus");
+        self.manager.write().await.set_gpu(gpu);
+        Ok(())
     }
 
     /// Capture a one-shot PNG preview of the monitor `id`. See the

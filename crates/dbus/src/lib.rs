@@ -217,6 +217,27 @@ pub struct MonitorInfoDto {
     pub extra: HashMap<String, OwnedValue>,
 }
 
+/// One GPU of the daemon's machine, for a GPU picker
+/// ([`Manager::list_gpus`]); pick one by `render_node` or `pci` in
+/// [`Manager::gpu_preference`].
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct GpuDto {
+    /// `/dev/dri/renderD128`.
+    pub render_node: String,
+    /// `0000:01:00.0`, empty for a GPU that is not a PCI device.
+    pub pci: String,
+    /// `NVIDIA`, `AMD`, `Intel` or the PCI vendor id.
+    pub vendor: String,
+    /// One line: vendor, PCI ids, driver, kind.
+    pub label: String,
+    /// `integrated`, `discrete` or `unknown`.
+    pub kind: String,
+    /// Hardware video encoders that run on it (`nvenc`, `vaapi`).
+    pub encoders: Vec<String>,
+    /// Hardware video decoders that run on it.
+    pub decoders: Vec<String>,
+}
+
 /// Window entry on the wire. Same flattening conventions as
 /// [`MonitorInfoDto`].
 ///
@@ -310,6 +331,21 @@ pub trait Manager {
     /// one would have to fall back to the portal).
     #[zbus(property)]
     fn capture_capabilities(&self) -> zbus::Result<Vec<String>>;
+
+    /// The daemon's GPUs and the hardware codecs that run on each.
+    fn list_gpus(&self) -> zbus::Result<Vec<GpuDto>>;
+
+    /// Which GPU the hardware encoders and decoders run on: `auto`,
+    /// `same-as-capture`, `integrated`, `discrete`, a render node
+    /// (`/dev/dri/renderD129`) or a PCI address (`0000:01:00.0`).
+    /// Setting it applies to streams and receivers started afterwards;
+    /// text that is not a preference fails with `InvalidArgs`.
+    #[zbus(property)]
+    fn gpu_preference(&self) -> zbus::Result<String>;
+
+    /// Sets [`Manager::gpu_preference`].
+    #[zbus(property)]
+    fn set_gpu_preference(&self, value: &str) -> zbus::Result<()>;
 
     /// Capture a one-shot preview of the monitor `id`, downscaled
     /// to fit in `max_width × max_height` (aspect-preserving), and
