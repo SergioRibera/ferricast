@@ -1,24 +1,20 @@
 //! The thread that sets up and tears down driver sessions.
 //!
-//! The NVIDIA driver (595; the same crash was seen on earlier releases)
-//! corrupts its heap when NVENC sessions are opened and destroyed on
-//! threads that pop their CUDA context right after: a thread that pushes
-//! the context, opens (or destroys) a session and pops the context off an
-//! otherwise empty stack, while sessions of other threads encode, ends in a
-//! SIGSEGV in a libnvcuvid worker thread or inside `nvEncInitializeEncoder`,
-//! or in a glibc heap-corruption abort in `cuArrayDestroy` under
-//! `nvEncDestroyEncoder`. Serialising the calls does not help; keeping the
-//! context current on the thread that makes them does. A C program
-//! (`design/NVCODEC.md`, "NVENC and context hardening") crashes in seconds
-//! on four threads, and runs clean with every open and destroy on one
-//! thread that keeps the context current.
+//! The NVIDIA driver (595) crashes the process when an NVENC session is
+//! destroyed while the driver's own libnvcuvid worker thread for it is still
+//! busy: a SIGSEGV in that worker, or a glibc heap-corruption abort in
+//! `cuArrayDestroy` under `nvEncDestroyEncoder`. A plain C program does the
+//! same with nothing but "encode a few pictures, destroy the session" in a
+//! loop, on one thread or several, with or without locks
+//! (`crates/nvcodec/scripts/nvenc_churn.c`; `design/NVCODEC.md`, "NVENC and
+//! context hardening"). Nothing here removes that race; it is the driver's.
 //!
-//! So every session set-up and tear-down runs here ([`run`]): one thread,
-//! started on first use, that leaves the context of its last job current
-//! (it pops it only to make another context current). It holds no
-//! reference to the context: a released context stays current there,
-//! unused, until a job brings another. Calls from that thread run inline.
-//! Per-picture calls stay on the caller's thread.
+//! What this module guarantees is that ferricast adds no race of its own:
+//! every session set-up and tear-down runs here ([`run`]), one at a time,
+//! on one thread started on first use, which leaves the context of its last
+//! job current (it pops it only to make another context current, and holds
+//! no reference to it). Calls from that thread run inline. Per-picture calls
+//! stay on the caller's thread.
 
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};

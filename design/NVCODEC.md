@@ -647,6 +647,19 @@ destroyed repeatedly.
 - Less churn: `Encoder::reconfigure` changes size (up to the opened one),
   rate, GOP, bitrate and colour with `nvEncReconfigureEncoder` instead of a
   new session; ferricast's `configure` uses it.
+- Measured through this crate (`cfg`-style stress: 4 threads, sessions of
+  10 pictures, ~50 sessions/s, interleaved 30 s trials): before these
+  changes 5 of 6 runs crashed; with the session thread and the drain, 4 of
+  7; with an extra "park the closed session, destroy it on the next close
+  or after 1 s" scheme on top, 3 of 3 (dropped again). So the mitigations
+  remove ferricast's own races but do not make the driver's go away; the
+  C reproducer at the same load crashed in 3 of 6 to 1 of 4 runs.
+- Rejected after measuring (no effect, or within noise): a process mutex
+  around open/initialise/destroy; a reader/writer lock (pictures vs
+  lifecycle); keeping the context current on every thread; per-session
+  `NvEncodeAPICreateInstance` vs once; no `nvEncSetIOCudaStreams`;
+  parking closed sessions. Keeping an idle session alive to the end also
+  hangs the process at exit (the driver's exit handler).
 - Residual risk: a session destroy can still crash the process on this
   driver. Opens and destroys are rare in ferricast (stream start / stop,
   a larger resolution); the stress tests open thousands per minute.
