@@ -258,6 +258,7 @@ fn dma_buf_round_trip<E: VideoEncoder + Default, D: VideoDecoder + Default>(
 
 #[test]
 fn nvenc_h264_encodes_tiled_dma_bufs_zero_copy() {
+    let _gpu = one_at_a_time();
     dma_buf_round_trip::<ferricast_encoder::h264::H264Encoder, ferricast_decoder::H264Decoder>(
         "H.264 tiled DMA-BUF",
         Codec::H264,
@@ -268,6 +269,7 @@ fn nvenc_h264_encodes_tiled_dma_bufs_zero_copy() {
 
 #[test]
 fn nvenc_h264_encodes_linear_dma_bufs_zero_copy() {
+    let _gpu = one_at_a_time();
     dma_buf_round_trip::<ferricast_encoder::h264::H264Encoder, ferricast_decoder::H264Decoder>(
         "H.264 LINEAR DMA-BUF",
         Codec::H264,
@@ -280,6 +282,7 @@ fn nvenc_h264_encodes_linear_dma_bufs_zero_copy() {
 /// names.
 #[test]
 fn nvenc_converts_rgb_with_the_configured_matrix() {
+    let _gpu = one_at_a_time();
     dma_buf_round_trip::<ferricast_encoder::h264::H264Encoder, ferricast_decoder::H264Decoder>(
         "H.264 tiled DMA-BUF, BT.601",
         Codec::H264,
@@ -291,6 +294,7 @@ fn nvenc_converts_rgb_with_the_configured_matrix() {
 #[cfg(feature = "nvenc-hevc")]
 #[test]
 fn nvenc_hevc_encodes_tiled_dma_bufs_zero_copy() {
+    let _gpu = one_at_a_time();
     dma_buf_round_trip::<ferricast_encoder::h265::H265Encoder, ferricast_decoder::H265Decoder>(
         "HEVC tiled DMA-BUF",
         Codec::H265,
@@ -330,6 +334,7 @@ fn nv12_source(name: &str) -> Option<(Vec<RawFrame>, Vec<EncodedFrame>)> {
 #[cfg(feature = "nvdec")]
 #[test]
 fn nvdec_device_frames_encode_on_nvenc_without_readback() {
+    let _gpu = one_at_a_time();
     use ferricast_codec::cuda::CudaSurface;
 
     let name = "NVDEC → NVENC";
@@ -447,6 +452,7 @@ fn hdr10() -> ferricast_core::HdrMetadata {
 #[cfg(feature = "nvenc-hevc")]
 #[test]
 fn nvenc_encodes_ten_bit_hdr10_hevc() {
+    let _gpu = one_at_a_time();
     use ferricast_core::{BitDepth, ColourPrimaries, TransferCharacteristics};
 
     let name = "HEVC Main10 HDR10";
@@ -547,6 +553,7 @@ impl ferricast_core::DmaBufImporter for Readback {
 /// the next importable frame goes zero-copy again.
 #[test]
 fn a_zero_copy_failure_falls_back_for_that_frame_only() {
+    let _gpu = one_at_a_time();
     let name = "zero-copy fallback";
     let Some(gpu) = dmabuf::Gpu::get() else {
         return;
@@ -626,6 +633,7 @@ fn a_zero_copy_failure_falls_back_for_that_frame_only() {
 /// again without another import attempt.
 #[test]
 fn odd_sized_frames_go_zero_copy_and_refused_buffers_stay_read_back() {
+    let _gpu = one_at_a_time();
     let name = "odd size";
     let Some(gpu) = dmabuf::Gpu::get() else {
         return;
@@ -714,10 +722,6 @@ fn memfd() -> std::os::fd::OwnedFd {
 // scaled / letterboxed / narrowed by ferricast-nvcodec's image kernels on
 // the GPU, never read back.
 
-/// The GPU fit tests run one at a time: each holds NVENC sessions, and the
-/// GPU allows a dozen at once across every process.
-static GPU_FIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// `bgra` (`sw` × `sh`) resampled to `dw` × `dh` with the triangle filter
 /// and adaptive support the CPU scaler (`fast_image_resize`) uses, in f64.
 fn resize_reference(
@@ -805,9 +809,6 @@ fn gpu_fit_round_trip(
     modifier: impl Fn(&DmaBufImporter) -> Modifier,
     orientation: Orientation,
 ) {
-    let _serial = GPU_FIT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(gpu) = dmabuf::Gpu::get() else {
         return;
     };
@@ -889,6 +890,7 @@ fn gpu_fit_round_trip(
 
 #[test]
 fn nvenc_scales_tiled_dma_bufs_on_the_gpu() {
+    let _gpu = one_at_a_time();
     gpu_fit_round_trip(
         "GBM 1920x1080 tiled -> 1280x720",
         (1920, 1080),
@@ -900,6 +902,7 @@ fn nvenc_scales_tiled_dma_bufs_on_the_gpu() {
 
 #[test]
 fn nvenc_letterboxes_portrait_linear_dma_bufs_on_the_gpu() {
+    let _gpu = one_at_a_time();
     gpu_fit_round_trip(
         "GBM 1080x1920 LINEAR -> 1920x1080 letterboxed",
         (1080, 1920),
@@ -913,6 +916,7 @@ fn nvenc_letterboxes_portrait_linear_dma_bufs_on_the_gpu() {
 /// portrait session.
 #[test]
 fn nvenc_turns_rotated_dma_bufs_on_the_gpu() {
+    let _gpu = one_at_a_time();
     gpu_fit_round_trip(
         "GBM 1920x1080 tiled turned 90 -> 1080x1920",
         (1920, 1080),
@@ -929,6 +933,7 @@ fn nvenc_turns_rotated_dma_bufs_on_the_gpu() {
 /// upright and letterboxed into a landscape session.
 #[test]
 fn nvenc_turns_and_letterboxes_flipped_dma_bufs_on_the_gpu() {
+    let _gpu = one_at_a_time();
     gpu_fit_round_trip(
         "GBM 1920x1080 tiled flipped 270 + y-invert -> 1920x1080 letterboxed",
         (1920, 1080),
@@ -1004,12 +1009,10 @@ fn nvdec_p010_pictures(name: &str) -> Option<(Vec<Vec<u8>>, Vec<CapturedFrame>)>
 #[cfg(all(feature = "nvdec", feature = "nvenc-hevc"))]
 #[test]
 fn nvdec_p010_encodes_on_eight_bit_nvenc_without_readback() {
+    let _gpu = one_at_a_time();
     use ferricast_codec::cuda::CudaSurface;
 
     let name = "NVDEC P010 -> 8-bit NVENC";
-    let _serial = GPU_FIT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some((sources, pictures)) = nvdec_p010_pictures(name) else {
         return;
     };
@@ -1084,9 +1087,7 @@ fn nvdec_p010_encodes_on_eight_bit_nvenc_without_readback() {
 #[test]
 #[ignore = "timing; needs an NVIDIA GPU with GBM / EGL"]
 fn gpu_fit_throughput() {
-    let _serial = GPU_FIT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _gpu = one_at_a_time();
     let Some(gpu) = dmabuf::Gpu::get() else {
         return;
     };
@@ -1177,4 +1178,14 @@ fn cpu_time() -> f64 {
     let usage = unsafe { usage.assume_init() };
     let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
     seconds(usage.ru_utime) + seconds(usage.ru_stime)
+}
+
+/// Every test here runs alone. Each opens NVDEC / NVENC sessions, the GPU
+/// allows about a dozen NVENC sessions across all processes, and driver
+/// 595 can crash the process when a session is destroyed while another
+/// thread works with NVENC or NVDEC (see `design/NVCODEC.md`).
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
