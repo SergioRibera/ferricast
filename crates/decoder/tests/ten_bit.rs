@@ -12,7 +12,8 @@
 //!
 //! Each `*.p010.fnv` lists the FNV-1a 64 hash of every picture FFmpeg
 //! decodes from its clip, as packed P010, in presentation order.
-//! Hardware backends skip when the machine has no device for them.
+//! Each clip goes through the facade, each software backend, and NVDEC;
+//! hardware backends skip when the machine has no device for them.
 #![allow(
     dead_code,
     reason = "helpers for tests that each need a decoder feature; a build without them runs none"
@@ -96,6 +97,10 @@ impl Clip {
             .filter_map(|packet| decoder.decode(packet.clone()).unwrap())
             .collect();
         frames.extend(decoder.flush().unwrap());
+        let mut presentation: Vec<u64> = self.packets.iter().map(|p| p.timestamp_us).collect();
+        presentation.sort_unstable();
+        let stamps: Vec<u64> = frames.iter().map(CapturedFrame::timestamp_us).collect();
+        assert_eq!(stamps, presentation, "pictures keep their packets' times");
         frames.into_iter().map(|f| f.into_cpu().unwrap()).collect()
     }
 
@@ -197,26 +202,143 @@ fn automatic_hevc_selection_keeps_main10() {
     check_hevc("H.265 facade", ferricast_decoder::H265Decoder::default());
 }
 
+fn check_av1<D: VideoDecoder>(name: &str, decoder: D) {
+    let clip = Clip::open("av1_10bit.mp4").without_container_signalling();
+    let Some(decoder) = configured(name, &clip, decoder) else {
+        return;
+    };
+    let frames = clip.decode(decoder);
+    clip.assert_matches_reference(name, &frames);
+    for frame in &frames {
+        assert_hdr10(name, frame);
+    }
+}
+
+fn check_vp9<D: VideoDecoder>(name: &str, decoder: D) {
+    let clip = Clip::open("vp9_profile2.webm");
+    let Some(decoder) = configured(name, &clip, decoder) else {
+        return;
+    };
+    let frames = clip.decode(decoder);
+    clip.assert_matches_reference(name, &frames);
+    for frame in &frames {
+        assert_pq(name, frame);
+    }
+}
+
 #[cfg(feature = "av1-decode")]
 #[test]
 fn av1_decodes_ten_bit_bit_exact() {
-    let clip = Clip::open("av1_10bit.mp4").without_container_signalling();
-    let decoder = configured("AV1", &clip, ferricast_decoder::Av1Decoder::default()).unwrap();
-    let frames = clip.decode(decoder);
-    clip.assert_matches_reference("AV1", &frames);
-    for frame in &frames {
-        assert_hdr10("AV1", frame);
-    }
+    check_av1("AV1 facade", ferricast_decoder::Av1Decoder::default());
+}
+
+#[cfg(feature = "av1-decode")]
+#[test]
+fn rav1d_decodes_ten_bit_bit_exact() {
+    let software = ferricast_core::AutoSelect::default()
+        .with_acceleration(ferricast_core::AccelerationPolicy::SoftwareOnly);
+    check_av1(
+        "rav1d",
+        Software(ferricast_decoder::Av1Decoder::default(), software),
+    );
+}
+
+#[cfg(feature = "nvdec-decode")]
+#[test]
+fn nvdec_av1_decodes_ten_bit_bit_exact() {
+    check_av1(
+        "NVDEC AV1",
+        ferricast_decoder::nvdec::NvdecAv1Decoder::default(),
+    );
 }
 
 #[cfg(feature = "vp9-decode")]
 #[test]
 fn vp9_decodes_profile_2_bit_exact() {
-    let clip = Clip::open("vp9_profile2.webm");
-    let decoder = configured("VP9", &clip, ferricast_decoder::Vp9Decoder::default()).unwrap();
-    let frames = clip.decode(decoder);
-    clip.assert_matches_reference("VP9", &frames);
+    check_vp9("VP9 facade", ferricast_decoder::Vp9Decoder::default());
+}
+
+#[cfg(feature = "vp9-decode")]
+#[test]
+fn rusty_vp9_decodes_profile_2_bit_exact() {
+    let software = ferricast_core::AutoSelect::default()
+        .with_acceleration(ferricast_core::AccelerationPolicy::SoftwareOnly);
+    check_vp9(
+        "rusty_vp9",
+        Software(ferricast_decoder::Vp9Decoder::default(), software),
+    );
+}
+
+#[cfg(feature = "nvdec-decode")]
+#[test]
+fn nvdec_vp9_decodes_profile_2_bit_exact() {
+    check_vp9(
+        "NVDEC VP9",
+        ferricast_decoder::nvdec::NvdecVp9Decoder::default(),
+    );
+}
+
+/// NVDEC pictures kept in CUDA memory read back to the same P010 the host
+/// path hands out.
+#[cfg(feature = "nvdec-hevc-decode")]
+#[test]
+fn nvdec_device_frames_read_back_bit_exact() {
+    let clip = Clip::open("hevc_main10.mp4").without_container_signalling();
+    let name = "NVDEC HEVC (device)";
+    let mut decoder = ferricast_decoder::h265::NvdecH265Decoder::default();
+    let config = DecoderConfig {
+        memory: FrameMemory::Native,
+        ..clip.config::<ferricast_decoder::h265::NvdecH265Decoder>()
+    };
+    match decoder.configure(&config) {
+        Ok(()) => {}
+        Err(error @ CodecError::BackendUnavailable { .. }) => {
+            eprintln!("{name}: skipped, {error}");
+            return;
+        }
+        Err(error) => panic!("{name}: {error}"),
+    }
+    let mut frames: Vec<CapturedFrame> = clip
+        .packets
+        .iter()
+        .filter_map(|packet| decoder.decode(packet.clone()).unwrap())
+        .collect();
+    frames.extend(decoder.flush().unwrap());
     for frame in &frames {
-        assert_pq("VP9", frame);
+        let CapturedFrame::Native(native) = frame else {
+            panic!("{name}: a {frame:?} picture, not a native one");
+        };
+        assert_eq!(native.kind(), ferricast_core::SurfaceKind::CudaDevice);
+        assert_eq!(native.format(), PixelFormat::P010);
+    }
+    let frames: Vec<RawFrame> = frames.into_iter().map(|f| f.into_cpu().unwrap()).collect();
+    clip.assert_matches_reference(name, &frames);
+    for frame in &frames {
+        assert_hdr10(name, frame);
+    }
+}
+
+/// A facade forced onto its software backends.
+struct Software<D>(D, ferricast_core::AutoSelect);
+
+impl<D: VideoDecoder> VideoDecoder for Software<D> {
+    const CODEC: ferricast_core::Codec = D::CODEC;
+
+    fn configure(&mut self, config: &DecoderConfig) -> ferricast_core::CodecResult<()> {
+        self.0.configure(&DecoderConfig {
+            backend: BackendSelection::Auto(self.1.clone()),
+            ..config.clone()
+        })
+    }
+
+    fn decode(
+        &mut self,
+        frame: EncodedFrame,
+    ) -> ferricast_core::CodecResult<Option<CapturedFrame>> {
+        self.0.decode(frame)
+    }
+
+    fn flush(&mut self) -> ferricast_core::CodecResult<Vec<CapturedFrame>> {
+        self.0.flush()
     }
 }

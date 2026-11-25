@@ -194,3 +194,134 @@ fn av1_pictures_keep_their_packet_times() {
         );
     }
 }
+
+/// NVDEC carries each packet's timestamp through its parser to the picture
+/// it decodes. Each test skips when the machine has no NVIDIA driver, or
+/// when the GPU refuses the clip (NVDEC has minimum sizes per codec).
+#[cfg(feature = "nvdec-decode")]
+mod nvdec {
+    use ferricast_core::CodecError;
+    use ferricast_decoder::nvdec::NvdecDecoder;
+
+    use super::*;
+
+    /// The timestamps of every picture `D` decodes from `packets`, or
+    /// `None` (printed) when this machine cannot decode them with NVDEC.
+    fn nvdec_decode_all<C: ferricast_decoder::nvdec::NvdecCodec>(
+        name: &str,
+        packets: &[EncodedFrame],
+    ) -> Option<Vec<u64>> {
+        let mut decoder = NvdecDecoder::<C>::default();
+        let config = DecoderConfig {
+            hdr: None,
+            memory: ferricast_core::FrameMemory::Cpu,
+            codec: C::FERRICAST_CODEC,
+            width: WIDTH,
+            height: HEIGHT,
+            pixel_format: PixelFormat::Nv12,
+            low_latency: false,
+            colour: None,
+            backend: ferricast_core::BackendSelection::default(),
+        };
+        let skip = |error: CodecError| {
+            eprintln!("{name}: skipped, {error}");
+            None
+        };
+        match decoder.configure(&config) {
+            Ok(()) => {}
+            Err(error @ CodecError::BackendUnavailable { .. }) => return skip(error),
+            Err(error) => panic!("{name}: {error}"),
+        }
+        let mut stamps = Vec::new();
+        for packet in packets {
+            match decoder.decode(packet.clone()) {
+                Ok(frame) => stamps.extend(frame.map(|frame| frame.timestamp_us())),
+                Err(error @ CodecError::UnsupportedStream { .. }) => return skip(error),
+                Err(error) => panic!("{name}: {error}"),
+            }
+        }
+        stamps.extend(
+            decoder
+                .flush()
+                .unwrap()
+                .iter()
+                .map(CapturedFrame::timestamp_us),
+        );
+        Some(stamps)
+    }
+
+    #[test]
+    fn h264_b_frames_come_out_in_presentation_order() {
+        let packets = packets("h264.mp4");
+        if let Some(stamps) = nvdec_decode_all::<ferricast_decoder::nvdec::H264>("H.264", &packets)
+        {
+            assert_eq!(stamps, presentation_order(&packets));
+        }
+    }
+
+    #[cfg(feature = "nvdec-hevc-decode")]
+    #[test]
+    fn hevc_b_frames_and_skipped_leading_pictures_keep_their_times() {
+        use ferricast_decoder::nvdec::Hevc;
+        /// `hevc.mp4` opens with an IDR GOP; packet 10 is a CRA whose two
+        /// RASL pictures are packets 11 and 12.
+        const CRA: usize = 10;
+        const RASL: [usize; 2] = [11, 12];
+        let packets = packets("hevc.mp4");
+        let Some(stamps) = nvdec_decode_all::<Hevc>("HEVC", &packets) else {
+            return;
+        };
+        assert_eq!(stamps, presentation_order(&packets));
+        // Starting at the CRA, the decoder skips its RASL pictures.
+        let shown: Vec<EncodedFrame> = (CRA..packets.len())
+            .filter(|index| !RASL.contains(index))
+            .map(|index| packets[index].clone())
+            .collect();
+        assert_eq!(
+            nvdec_decode_all::<Hevc>("HEVC from a CRA", &packets[CRA..]).unwrap(),
+            presentation_order(&shown)
+        );
+        // Joining mid-GOP: the pictures before the next IRAP are dropped
+        // without shifting the ones after them.
+        let irap = |header: u8| (16..=21).contains(&(header >> 1 & 0x3f));
+        let mut joined = vec![parameter_sets(&packets[0], irap)];
+        joined.extend_from_slice(&packets[4..]);
+        let stamps = nvdec_decode_all::<Hevc>("HEVC joined mid-GOP", &joined).unwrap();
+        let expected = presentation_order(&packets[4..]);
+        assert!(
+            expected.ends_with(&stamps),
+            "{stamps:?} is not a tail of {expected:?}"
+        );
+    }
+
+    #[test]
+    fn vp8_vp9_and_av1_pictures_keep_their_packet_times() {
+        let check = |name: &str, stamps: Option<Vec<u64>>, packets: &[EncodedFrame]| {
+            if let Some(stamps) = stamps {
+                assert_eq!(stamps, presentation_order(packets), "{name}");
+            }
+        };
+        let vp8 = packets("vp8.webm");
+        check(
+            "VP8",
+            nvdec_decode_all::<ferricast_decoder::nvdec::Vp8>("VP8", &vp8),
+            &vp8,
+        );
+        for name in ["vp9.webm", "vp9.mp4"] {
+            let packets = packets(name);
+            check(
+                name,
+                nvdec_decode_all::<ferricast_decoder::nvdec::Vp9>(name, &packets),
+                &packets,
+            );
+        }
+        for name in ["av1.mp4", "av1.webm"] {
+            let packets = packets(name);
+            check(
+                name,
+                nvdec_decode_all::<ferricast_decoder::nvdec::Av1>(name, &packets),
+                &packets,
+            );
+        }
+    }
+}
