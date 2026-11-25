@@ -740,7 +740,8 @@ niri 26.04, 1920×1080 outputs (one normal, two rotated 90° / 270°).
   layout. On this machine: `0x0300000000606014` (block-linear), in NVENC's
   list.
 - **CPU fallbacks read back through Vulkan**, never `mmap`: rotated /
-  y-inverted outputs (no GPU rotation yet) and layouts a CPU encoder needs.
+  y-inverted outputs for a consumer that does not turn GPU frames (see
+  "Rotated outputs") and layouts a CPU encoder needs.
   An `mmap` of a tiled buffer reads scrambled tiles; one of an NVIDIA
   LINEAR buffer stops showing the GPU's view after the first pages (see
   "Observed hazard"). The Vulkan staging buffer is now `HOST_CACHED`
@@ -782,6 +783,51 @@ screenshot of DP-3 bit for bit (PSNR ∞); NVENC's stream decoded by
 ffmpeg is 51–52 dB from the readback and from the screenshot; rotated
 outputs read back in the screen's orientation (53 dB / 35 dB against a
 later screenshot of moving content).
+
+### Rotated outputs
+
+A capture of a rotated or flipped output holds the scanout buffer, not
+what the user sees. The correction travels with the frame instead of
+being undone by capture for every consumer:
+
+- `ferricast_core::Orientation` (a mirror, then a clockwise quarter-turn
+  count: the eight `wl_output` transforms, with screencopy's `Y_INVERT`
+  composed in by `Orientation::then`) is `GpuFrame::orientation`.
+  `GpuFrame::width` / `height` stay the buffer's; `oriented_size()`,
+  `CapturedFrame::width()` / `height()` and `into_cpu()` are upright.
+- wayland-direct sets it from the output's live `wl_output` transform and
+  `Y_INVERT`; PipeWire from `SPA_META_VideoTransform` (requested as a
+  meta, values read like `wl_output`'s), turning its CPU frames itself.
+- Capture hands a rotated output over as a `GpuFrame` only when the
+  consumer turns GPU frames (`CaptureConfig::consumer_orients`, filled by
+  `ferricast_encoder::orients_gpu_frames()`: NVENC's DMA-BUF import works
+  on this machine). Otherwise it reads the buffer back and turns it on
+  the capture thread, as before. `RawFrame::oriented` is the one CPU
+  implementation, used by capture and by `into_cpu`.
+- Every consumer stays upright whichever encoder the stream picks: NVENC
+  encodes from the DMA-BUF directly only when the orientation is the
+  identity and otherwise fits it with the kernels
+  (`Geometry::with_orientation`, letterboxed by the oriented size);
+  VA-API's VPP path takes only upright frames and sends the rest through
+  `into_cpu`; CPU encoders call `into_cpu`. A consumer that reads the
+  DMA-BUF itself must check the orientation, as the field documents.
+
+Live (`mycap`, `FERRICAST_WLR_FULL_COPY=1`, 10 s, 60 fps, NVENC H.264 at
+the output's upright size; readbacks counted on the frame's importer):
+
+| Output | CPU rotation (`consumer_orients = false`) | GPU rotation |
+|---|---|---|
+| DP-3, normal | — | 601 GPU frames, 0 readbacks, 0.6 % of a core, 60.0 fps |
+| HDMI-A-1, 90° | 601 CPU frames (one Vulkan readback + CPU turn each), 18 %, 60.1 fps | 600 GPU frames, 0 readbacks, 0.6 %, 60.0 fps |
+| DP-2, 270° | 601 CPU frames, 19 %, 60.0 fps | 600 GPU frames, 0 readbacks, 0.5 %, 60.0 fps |
+| HDMI-A-1 / DP-2 scaled to 606×1080 | — | 600 GPU frames, 0 readbacks, 0.5–0.7 % |
+
+Picture check: the last decoded picture (ffmpeg) against a `grim`
+screenshot taken right after: DP-3 43.3 dB, HDMI-A-1 33.8 dB, DP-2
+40.9 dB, the same as the CPU-rotation path's stream (33.8 / 40.9 dB);
+against the screenshot turned 180° both paths give 13 dB, so the pictures
+are upright. `tests/nvidia_e2e.rs` checks a 90° turn and a flipped 270°
+with `Y_INVERT` against `RawFrame::oriented` (41 / 46 dB).
 
 ### PipeWire
 
@@ -826,13 +872,13 @@ later screenshot of moving content).
   odd sizes down to even) is encoded from its top-left corner: NVENC takes
   larger inputs (`tests/nvidia_e2e.rs`,
   `odd_sized_frames_go_zero_copy_and_refused_buffers_stay_read_back`).
-- **Hook for GPU scaling / rotation.** Other sizes and rotated outputs are
-  still fitted on the CPU (capture reads rotated outputs back; NVENC reads
-  back mismatched sizes). The expected GPU path, in
-  `NvencEncoder::submit`'s `Gpu` arm: import and map as today, then
-  `kernels::Scaler::run(&mapped.view(), session size, rotation) -> pooled
-  DeviceBuffer` and `encode_device`; rotation then has to travel on the
-  frame (a `GpuFrame` transform) instead of being undone by capture.
+- **GPU fit.** Other sizes, byte orders and rotated outputs are imported
+  through the same bookkeeping (`ZeroCopy::import`: producer check,
+  refusal cache, pool change, stale / LRU eviction) and lent to the image
+  kernels (`State::with_view`, `fit.rs`), which scale, letterbox and turn
+  them by `GpuFrame::orientation` into a pooled device buffer for
+  `encode_device`. A failed fit synchronises the fit stream before
+  returning, so an eviction's `Quiesce::idle()` stays true.
 - **Hybrid laptops.** `GpuFrame::producer` and
   `ferricast_encoder::nvenc::imports_from(producer)` give encoder
   selection what it needs to prefer a backend on the producer's GPU
@@ -843,7 +889,6 @@ later screenshot of moving content).
 
 - PipeWire explicit sync and LINEAR-as-GPU are unverified against a live
   producer here (niri's portal needs an interactive pick).
-- Rotated outputs cost half a core until the CUDA scaler / rotator lands.
 - The acquire wait blocks the PipeWire loop thread (bounded by 100 ms); a
   GPU-side wait would need a CUDA external semaphore, which CUDA cannot
   import from a sync file.

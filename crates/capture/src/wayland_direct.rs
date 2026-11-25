@@ -42,8 +42,10 @@
 //!   `CapturedFrame::Gpu` holding a lease on their bo, which keeps the
 //!   compositor out of it until every downstream clone is gone, and
 //!   naming their GPU (`GpuFrame::producer`). When the output needs
-//!   re-orienting (rotated / y-inverted — GPU frames can't be yet) the
-//!   bo is read back through Vulkan and emits as `CapturedFrame::Cpu`;
+//!   re-orienting (rotated / y-inverted), frames carry the correction
+//!   (`GpuFrame::orientation`) if the consumer turns GPU frames
+//!   (`CaptureConfig::consumer_orients`); otherwise the bo is read back
+//!   through Vulkan, turned, and emits as `CapturedFrame::Cpu`;
 //!   without the importer the bos are LINEAR and read through `mmap`.
 //!   Frames are requested with `copy_with_damage`: an idle output costs
 //!   nothing, and the stream's pacer repeats the last frame.

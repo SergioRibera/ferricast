@@ -373,8 +373,10 @@ Known gaps:
 - Encoder selection does not yet prefer a backend on the capture's GPU
   (`GpuFrame::producer`, `nvenc::imports_from`): on a hybrid laptop NVENC
   is still picked over VA-API on the iGPU and reads the frames back.
-- Frames of another size than the session and rotated outputs are fitted
-  on the CPU until the CUDA scaler / rotator lands.
+- Rotated or flipped captures reach VA-API as `GpuFrame`s with an
+  orientation (when NVENC is usable on the machine) and are read back and
+  turned on the CPU (`GpuFrame::into_cpu`): the VPP blit is not told the
+  orientation yet.
 - NVDEC native output is not narrowed on the GPU: a consumer asking for
   NV12 from a 10-bit stream gets P010 surfaces.
 - AV1 encode (Ada and newer) is not wired to a facade: there is no AV1
