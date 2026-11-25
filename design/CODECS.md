@@ -89,6 +89,9 @@ ferricast           umbrella: re-exports, `codec_service()` (feature `istmo`)
   (signal type, chroma location), like HDR metadata. Before this an HDR10
   stream over MPEG-TS / RTP (no container colour) came out with an
   unspecified transfer and was shown as SDR.
+- NVDEC now reports the stream's colour itself (see "NVIDIA" below): its
+  fields win, each unspecified one is filled from the container; only the
+  chroma sample location still comes from `ColourTracker`.
 
 ## istmo plugin `ferricast.codec`
 
@@ -224,6 +227,151 @@ ferricast           umbrella: re-exports, `codec_service()` (feature `istmo`)
   colour and HDR dropped where the bitstream carries them. Also checked
   once at 1080p (coded 1088): rust_h265 and NVDEC bit-exact, NVDEC about
   490 fps against 263.
+- Superseded for NVIDIA (see the next section): NVDEC and NVENC run on
+  `ferricast-nvcodec`, `vendor/` and the patch are gone, NVENC encodes
+  HEVC Main10 + HDR10, and `ten_bit.rs` also checks NVDEC AV1 10-bit and
+  VP9 profile 2 bit-exact, each clip through the facade, the software
+  backend and NVDEC.
+
+## NVIDIA (`ferricast-nvcodec`)
+
+NVDEC and NVENC moved from `shiguredo_nvcodec` (and its patched copy in
+`vendor/`) to ferricast's own binding, `crates/nvcodec` (design and driver
+findings: `design/NVCODEC.md`). The binding is a dependency of
+`ferricast-codec` (feature `cuda`) on Linux and Windows only; the
+encoder's `nvenc` / `nvenc-hevc` and the decoder's `nvdec-decode` /
+`nvdec-hevc-decode` features turn it on and are inert on other targets
+(the backends are recorded as "only on Linux and Windows" there).
+
+Shared pieces (`ferricast_codec::cuda`):
+
+- `context()`: the primary CUDA context of device 0, retained for the
+  process; decoders and encoders share it, so a decoded picture and the
+  encoder taking it are on the same context.
+- `CudaSurface`: an NVDEC picture in a pooled pitched CUDA buffer, handed
+  out as `CapturedFrame::Native` of the new `SurfaceKind::CudaDevice`
+  (NV12, P010 for streams deeper than 8 bits). `readback` downloads it;
+  `CudaSurface::readbacks()` counts those, process-wide.
+- `codec_error`: no driver / too old / no device / NVENC session limit,
+  and any CUDA failure while probing or opening, are
+  `BackendUnavailable` (selection moves on: NVENC → VA-API → x264);
+  what the GPU cannot do is `UnsupportedStream` while decoding (the next
+  decoder takes the stream over, e.g. H.264 High 10, sizes under NVDEC's
+  minimum, 4:2:2 / 4:4:4 output ferricast has no pixel format for) and
+  `UnsupportedConfig` otherwise; the rest (corrupt packet, failed copy) is
+  a `Backend` error.
+
+Decoder (`ferricast_decoder::nvdec`, one generic `NvdecDecoder<C>`):
+
+- H.264, HEVC, VP8, VP9, AV1, each the first candidate of its facade's
+  automatic selection, ahead of VA-API, the platform decoders and the
+  software decoders.
+- Timestamps go through NVIDIA's parser with each packet; the slice-header
+  machinery that timed pictures from the bitstream (`nvdec/h264.rs`,
+  `nvdec/timestamps.rs`) is deleted. `h265/timestamps.rs` stays for
+  `rust_h265`. `tests/timestamps.rs` checks NVDEC H.264 B-frames, VP8, and
+  HEVC (CRA + RASL, joining mid-GOP) where the GPU decodes the clip (its
+  fixtures are below NVDEC's HEVC / VP9 / AV1 minimum sizes, which hand
+  over); `ten_bit.rs` checks presentation-order timestamps for every
+  backend on 256x144 clips.
+- Colour: NVDEC's (VUI, VP9 colour space, AV1 colour config) wins per
+  field; an unspecified field takes the container's; a stream with no
+  video signal type at all takes the container's range. Chroma location
+  from `ColourTracker` (H.264 / HEVC), else the container.
+- HDR: the SEI messages NVDEC hands over per picture (merged per half for
+  the stream), else ferricast's own SEI parsing (H.264 / HEVC; it stops
+  once NVDEC delivered any), else the container. AV1 metadata OBUs are
+  always read by ferricast. Bitstream metadata replaces the container's as
+  a whole, as before.
+- `FrameMemory::Cpu`: pictures decode into pooled host buffers lent to the
+  `RawFrame`'s `Bytes` without a copy (up to 48 held; past that they are
+  copied so a consumer that keeps frames cannot exhaust NVDEC's pool of
+  64). P010 for deep streams when `pixel_format` asks for it, NV12 (top
+  eight bits) otherwise; BGRA / RGBA converted on the CPU as before.
+- `FrameMemory::Native`: `CudaSurface`s; 10-bit streams stay P010 whatever
+  `pixel_format` says (no GPU narrowing).
+
+Encoder (`ferricast_encoder::nvenc`, `NvencEncoder<C>`):
+
+- Same session as before: P3, low-latency tuning, no B-frames, CBR with
+  max == average, IDR every keyframe interval plus forced / requested
+  IDRs with parameter sets, live bitrate retarget, `get_headers` from
+  `nvEncGetSequenceParams`, BGRA → ARGB / RGBA → ABGR.
+- New inputs: NV12 and P010 (`pixel_format`); P010 into an 8-bit session
+  is narrowed on the CPU; I420 is refused.
+- 10-bit + HDR: `BitDepth::Ten` with P010 input encodes HEVC Main10 with
+  the configured VUI colour and HDR10 (NVENC writes it on API 13.0+, the
+  binding builds the SEI before); refused by the GPU's capabilities where
+  absent. NVENC is out of `eight_bit_sdr_only` (VA-API keeps it). H.264 +
+  Ten and 10-bit from 8-bit input are `UnsupportedConfig`.
+- The configured colour is written for every input. RGB input is
+  converted by NVENC with the matrix the VUI names: verified for BT.709
+  and BT.601 (41 dB both ways); other matrices or full range with RGB
+  input are refused.
+- `CapturedFrame::Native(CudaSurface)` of the session's size and format
+  is encoded in place (`encode_device`, the decoder's pooled `Arc` cached
+  by NVENC, its `ready` event waited on the encoder stream); the frame is
+  held until the packet is out. Other sizes / formats are read back.
+- `CapturedFrame::Gpu` (Linux), packed RGB of the session's size: the
+  DMA-BUF is imported through EGL (`interop::DmaBufImporter`, keyed by
+  `DmaBufId`) and encoded from the CUDA array it aliases (tiled) or its
+  pitched memory (LINEAR, through the new `Encoder::encode_pitched`; a
+  first version copied into a staging buffer, which cannot be written
+  while NVENC's cache holds it). The frame and its `BufferLease` are held
+  until NVENC is done. A change of the frames' description, or more than
+  16 distinct buffers, means the capture pool changed: NVENC's
+  registrations are invalidated first, then the importer's. Any failure
+  (no EGL device, another GPU, an unsupported modifier, a fence timeout,
+  an import error) sends that frame through the CPU readback; only the
+  importer's creation failing is remembered for the session. The first
+  fallback is logged as a warning. `FERRICAST_DRM_RENDER_NODE` (the
+  capture's variable) names the producer's GPU for the importer's check.
+- `nvenc-zero-copy` is gone: the zero-copy path needs no build-time
+  dependency (EGL is loaded at run time like the drivers), so it is part
+  of `nvenc`. A root `nvenc-hevc` feature was added.
+- The probe queries NVENC's capabilities once per process (one session)
+  instead of opening a 1080p encoder.
+
+Measured (RTX 3060, driver 595.71.05, release build, 1080p60 testsrc2
+clips, through the facades with `Fixed(Nvdec)` / `Fixed(Nvenc)`;
+`tests/nvidia_throughput.rs`):
+
+| Job | before (shiguredo) | now |
+|---|---|---|
+| H.264 decode, CPU frames | 595 fps | 638-642 fps |
+| H.264 decode, native frames | 572 fps (CPU copies) | 801-810 fps (CUDA) |
+| HEVC decode, CPU frames | 958 fps | 1053-1066 fps |
+| HEVC decode, native frames | 960 fps (CPU copies) | 1594-1613 fps (CUDA) |
+| VP9 decode, CPU / native | software only: 321 fps | 872 / 1204 fps |
+| AV1 decode, CPU / native | software only: 158 fps | 1103 / 1634 fps |
+| H.264 encode from BGRA | 270-297 fps | 361-369 fps |
+| H.264 encode from NV12 | refused | 410-418 fps |
+| HEVC encode from BGRA | 257 fps | 339-345 fps |
+
+End to end (`tests/nvidia_e2e.rs`, 640x360, 30 frames): GBM DMA-BUFs
+written by GLES (tiled) / CUDA (LINEAR) → NVENC → software decode,
+worst PSNR against the written pattern 41.4 dB (H.264 tiled and LINEAR),
+41.3 dB (HEVC), 41.7 dB (BT.601); NVDEC device frames → NVENC → decode,
+64.3 dB against the first decode with `CudaSurface::readbacks()`
+unchanged; HEVC Main10 HDR10 from P010 decodes (rust_h265 and NVDEC) to
+P010, BT.2020 PQ and the configured metadata, 62.2 dB luma.
+
+Known gaps:
+
+- Windows: compiled and linted only (`x86_64-pc-windows-msvc` with every
+  NVIDIA feature); never run. No D3D11 interop: Media Foundation textures
+  reach NVENC through a readback.
+- The zero-copy capture path takes packed RGB DMA-BUFs only (what
+  PipeWire / wlr-screencopy produce here); NV12 DMA-BUFs are read back.
+- `GpuFrame` carries no DRM node, so without `FERRICAST_DRM_RENDER_NODE`
+  the importer cannot tell a buffer of another GPU before EGL refuses it
+  (that refusal falls back per frame, so it costs an import attempt per
+  new buffer).
+- NVDEC native output is not narrowed on the GPU: a consumer asking for
+  NV12 from a 10-bit stream gets P010 surfaces.
+- AV1 encode (Ada and newer) is not wired to a facade: there is no AV1
+  encoder facade.
+- One CUDA device (0) for everything; multi-GPU selection is not exposed.
 
 ## Selection cost
 
@@ -286,6 +434,7 @@ ferricast           umbrella: re-exports, `codec_service()` (feature `istmo`)
 - `nvenc-zero-copy` does not build: it calls `register_external_dmabuf` /
   `encode_external`, which no `shiguredo_nvcodec` has (the fork its comment
   names never existed). It is left out of every feature set that is
-  checked.
+  checked. Closed: the feature is removed and zero-copy DMA-BUF input is
+  part of `nvenc` (see "NVIDIA").
 - `tests/airplay_loop.rs` ("only N of M frames shown") is timing-bound and
   fails under heavy machine load; it passes run alone.

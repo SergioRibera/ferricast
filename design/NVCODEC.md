@@ -538,3 +538,45 @@ libgbm 26 with the NVIDIA GBM backend, `/dev/dri/renderD128`.
   instead of the limit status; not reproduced with two processes looping
   over different API versions. The encode tests are serialised and the
   limit test runs in its own process.
+
+## Integration decisions (ferricast's decoders and encoders)
+
+`shiguredo_nvcodec`, its patched copy in `vendor/`, the `[patch.crates-io]`
+entry and `exclude = ["vendor"]` are gone. The consumers' side is recorded
+in `design/CODECS.md` ("NVIDIA"); what changed here for them:
+
+- The crate is a dependency of `ferricast-codec` only (feature `cuda`,
+  target-gated to Linux and Windows); the encoder and decoder reach it
+  through `ferricast_codec::cuda::nvcodec`, so Apple / Android builds never
+  compile it even with the NVIDIA features on.
+- `decode::DeviceFrame::shared_buffer()` lends the pooled buffer as
+  `Arc<DeviceBuffer>` (the slot holds an `Arc` now), which is what
+  `encode::DeviceFrame` caches by: an NVDEC → NVENC pipeline registers each
+  pool buffer once. A slot whose buffer is still held elsewhere when it is
+  reused (an encoder that kept the `Arc` past the frame) gets a new buffer
+  instead of being overwritten (`DeviceSlot::make_exclusive`); ferricast's
+  encoder holds the frame until the packet is out, so this does not happen
+  in steady state.
+- `Encoder::encode_pitched` (unsafe, same contract as `encode_array`, same
+  key space): pitched memory owned elsewhere, i.e. a LINEAR DMA-BUF the
+  importer maps as `PitchedView`, is registered as
+  `NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR` and encoded in place. The
+  alternative, a device copy into an `Arc<DeviceBuffer>` staging buffer,
+  does not work with the cache: `Arc::get_mut` fails while the encoder's
+  `Weak` exists, and forgetting the registration every frame would
+  register per frame. Verified identical to host input
+  (`tests/encode.rs::pitched_input`) and on GBM LINEAR buffers through
+  ferricast.
+- NVENC accepts the CUDA arrays EGL hands out for tiled (block-linear)
+  DMA-BUFs: verified end to end (GBM buffer written by GLES → importer →
+  `encode_array` → decode, 41 dB on a gradient pattern).
+- Invalidation order on a capture pool change: NVENC's registrations first
+  (`clear_input_caches` / `invalidate_array`), then the importer's
+  (`clear` / `forget`), so an array is never unregistered from CUDA while
+  NVENC still has it registered. ferricast's encoder also declares the
+  `Encoder` before the importer so drop order is the same.
+- NVENC converts ARGB / ABGR input with the matrix named in the VUI
+  (BT.709 and BT.601 both verified round trip), at limited range.
+- The GBM / EGL / GLES test writer moved from `tests/interop.rs` to
+  `tests/support/dmabuf.rs`; ferricast's root `tests/nvidia_e2e.rs`
+  includes the same file with `#[path]`.
