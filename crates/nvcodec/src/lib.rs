@@ -16,6 +16,9 @@
 //! - [`encode`]: NVENC sessions.
 //! - `interop` (Linux): zero-copy import of DMA-BUFs (screen capture) into
 //!   CUDA through EGL, lending CUDA arrays NVENC encodes from.
+//! - [`kernels`]: GPU image kernels (scale, crop, rotate, letterbox,
+//!   RGB → NV12, P016 → NV12) from committed PTX, for pictures that do not
+//!   match the encoder.
 //! - [`sys`]: the raw generated bindings.
 //!
 //! The bindings come from FFmpeg's nv-codec-headers (one NVENC module per API
@@ -45,6 +48,7 @@ pub mod encode;
 pub mod error;
 #[cfg(target_os = "linux")]
 pub mod interop;
+pub mod kernels;
 pub mod loader;
 pub mod sys;
 pub mod version;

@@ -847,3 +847,160 @@ later screenshot of moving content).
 - The acquire wait blocks the PipeWire loop thread (bounded by 100 ms); a
   GPU-side wait would need a CUDA external semaphore, which CUDA cannot
   import from a sync file.
+
+## GPU image kernels
+
+`kernels` (`src/kernels.rs`, `src/kernels/**`): pictures whose size, orientation
+or format differ from the NVENC session are fitted on the GPU into a pooled
+device buffer that `Encoder::encode_device` takes. Before, every such frame
+(1080p screen into a 720p receiver, a portrait monitor, NVDEC P010 into an 8-bit
+session) went readback → CPU scale / narrow → upload: 28.5 ms per frame, 35 fps,
+95% of a core at 1080p → 720p.
+
+### Toolchain: committed PTX, JIT-compiled by the driver
+
+- The device code is `src/kernels/kernels.cu`; `scripts/kernels.sh` compiles it
+  to `src/kernels/kernels.ptx`, which is committed and loaded with
+  `cuModuleLoadDataEx` (error log captured into `Error::KernelLoad`). The crate
+  keeps no build script and needs no CUDA toolkit; it cross-compiles as before.
+- Compiler: nixpkgs' CUDA 12.6 `nvcc` (from the nixpkgs the flake locks,
+  `--inputs-from`; unfree, so `NIXPKGS_ALLOW_UNFREE=1 --impure`) with GCC 13 as
+  host compiler. It is the oldest CUDA nixpkgs still builds (11.x and 12.0–12.4
+  are "removed: unmaintained"); CUDA 13 can no longer target anything below
+  sm_75.
+- Target: `-arch=compute_52` (Maxwell 2, the oldest GPU of any driver the crate
+  supports), no fast math (the kernels must match the CPU references).
+- PTX ISA: nvcc 12.6 writes `.version 8.5`, which only R560+ drivers JIT. The
+  script lowers the directive to `.version 6.0` (CUDA 9; the ISA that
+  introduced the current memory model, so the code means the same) and has
+  `ptxas` verify the claim for sm_52, sm_75 and sm_86: ptxas rejects any
+  instruction or directive newer than the declared ISA (checked:
+  `shfl.sync` under `.version 5.0` → "requires PTX ISA .version 6.0 or later").
+  R470 (NVENC API 11.1, the oldest driver the crate supports; CUDA 11.4)
+  accepts PTX ISA up to 7.4, so every supported driver can JIT it. Verified on
+  driver 595 only: an R470 machine was not available.
+- `#pragma unroll 1` on the data-dependent tap loops: 102 KB of PTX instead of
+  431 KB.
+- JIT cost: ~120 ms the first time a PTX is seen, ~0.3–0.5 ms afterwards (the
+  driver's compute cache). `Kernels::get` loads once per context and shares the
+  module (`Weak` cache: unloaded with its last user).
+- Rejected: NVRTC at run time (not part of the driver install, would be one more
+  library to find and version-match); hand-written PTX (unmaintainable for ten
+  kernels); a `build.rs` with nvcc (breaks cross-compiling and builds without
+  CUDA).
+
+### Kernels and their parameters
+
+- Ten entry points, one parameter each, a `#[repr(C)]` struct mirrored from the
+  C struct (`static_assert` sizes on the C side, `const` asserts on the Rust
+  side, and a test that parses the PTX's `.param .align 8 .b8 name_param_0[N]`
+  for every entry). One typed launch per kernel family
+  (`rgb_to_rgb`, `rgb_to_nv12`, `plane`); no `void**` in the safe API.
+  `Module::launch` (unsafe, in `cuda.rs`) is the only raw launch.
+- One pass per output plane does everything: crop, orientation (the 8 `wl_output`
+  transforms: optional horizontal mirror, then a clockwise rotation; `Y_INVERT`
+  is `Orientation::FLIP_VERTICAL`), resampling into the placement rectangle,
+  letterbox fill, and the format conversion. The geometry is lowered on the
+  host to an integer affine map (oriented → source pixel, crop folded in) and
+  two scale ratios.
+- Filter: `fast_image_resize`'s convolution with adaptive support (what
+  `FrameScaler` runs): triangle (`Filter::Bilinear`) or box (`Filter::Box`)
+  stretched by the downscale ratio, so a 4× downscale averages every covered
+  pixel (one-pixel text strokes become an even 25% grey instead of aliasing).
+  Taps and weights are computed per output pixel in f32 with no rounding
+  between the axes (the CPU scaler rounds to u8 between passes). Same-size
+  geometries (copy, crop, rotate, convert) read one sample directly.
+- RGB → NV12: one thread per 2×2 block; luma per pixel and chroma from the
+  rounded average of the block's RGB, with the `yuv` crate's prebuilt 13-bit
+  BT.709 / BT.601 limited / full tables and rounding (its scalar path).
+  P016 → NV12 rounds (`(v + 128) >> 8`); P016 → P010 keeps 10 bits.
+- Inputs: `Input::Array` (tiled DMA-BUF, read through a point-sampled texture
+  object; the array's descriptor must be 4 × u8), `Input::Packed` (LINEAR
+  DMA-BUF or any pitched RGB, read with `ld.global.nc`), `Input::Nv12` /
+  `Input::P016` (NVDEC output). Outputs: RGB in either byte order, NV12, P010.
+  NV12/P010 → RGB and NV12 → P010 are refused.
+- Host checks before every launch: geometry inside both pictures, source and
+  destination sizes and chroma rows, 4:2:0 crop / placement origins even,
+  alignment of every plane (4 bytes for RGB, 2 for 16-bit), every object on the
+  converter's context. Texture reads are clamped by the hardware anyway.
+- Texture objects: created per frame (~1.4 µs host cost per call including the
+  descriptor query), destroyed once an event recorded after the kernel has
+  completed (checked without waiting at the next call; the converter waits only
+  past 16 in flight and on drop). A texture cache keyed by array handle was
+  rejected: arrays are owned by the importer, whose invalidation the converter
+  cannot see.
+- `FramePool`: buffers of one format and size, handed out again once only the
+  pool holds the `Arc` (NVENC's pending picture holds a strong `Arc` until its
+  bitstream is locked). Nothing is allocated per frame in steady state.
+- Ordering is the caller's, with events; nothing waits on the host. Additions
+  to `cuda.rs` (own impl blocks): `Module`, `Function`, `Launch`,
+  `TextureObject`, `ArrayView::descriptor`, `DeviceBuffer::as_view`. Loader:
+  the module / launch / texture / `cuArrayGetDescriptor_v2` entry points are
+  optional (every driver has them; only the kernels fail without them).
+  `cuda_extra.h` declares `cuModuleLoadDataEx` and `cuArrayGetDescriptor_v2`.
+
+### ferricast integration (`crates/encoder/src/nvenc/fit.rs`)
+
+- `NvencEncoder::submit` tries the GPU fit before any readback: NVDEC pictures
+  (`CudaSurface`) of another size or P010 into an 8-bit session; DMA-BUF
+  captures of another size or byte order (imported and mapped through the
+  zero-copy path's importer, `zero_copy::State::with_view`); CPU pictures of
+  another size or P010 into NV12 (uploaded on the fit stream into a staging
+  buffer, the frame kept until its packet is out). The geometry is
+  `FrameSize::letterbox_in`, the CPU scaler's. Any failure is logged (first,
+  then every 3600th) and the frame takes the CPU path.
+- RGB sessions keep NVENC's own ARGB → YUV conversion: at 1280×720 scale +
+  encode ran at 1043 fps from ARGB and 1049 fps from kernel-made NV12, no
+  measurable difference, and switching would change the session format for
+  CPU frames too. The NV12 kernel serves NV12 sessions.
+- CPU pictures: upload + GPU fit beat `FrameScaler` (release): 1080p → 720p
+  0.77 ms vs 2.2 ms, 4K → 1080p 3.2 vs 6.7 ms, portrait 1080×1920 → 1080p
+  0.73 vs 6.9 ms, before the CPU path's own upload.
+- The CPU path narrows P010 by truncating (`FrameView::narrowed`); the GPU
+  rounds, so the two differ by at most one level (51 dB).
+
+### Measured (RTX 3060, driver 595.71.05, release, idle GPU)
+
+GPU time per frame (frames queued back to back), host cost per call ~1.2 µs
+(pitched) / 2.6 µs (array, texture included):
+
+| Operation | µs/frame |
+|---|---|
+| 1080p → 720p BGRA (pitched / array) | 164 / 127 |
+| 1080p → 720p NV12, scale + CSC (pitched / array) | 140 / 146 |
+| 1080p BGRA → NV12, CSC only | 45 |
+| 4K → 1080p BGRA / NV12 | 407 / 416 |
+| 1080×1920 → 1920×1080 rotated (BGRA) | 95 |
+| 1080×1920 → 1920×1080 letterboxed (BGRA) | 175 |
+| 4K P010 → NV12 | 184 |
+| 4K P010 → 1080p NV12 | 394 |
+
+`cargo run --release -p ferricast-nvcodec --example kernels_bench`.
+Resampling is ALU-bound (per-pixel tap weights); a shared-memory weight table
+per block is the next step if it ever matters.
+
+Quality: crop / rotate / flip / letterbox fill / P016 → NV12 / same-size
+RGB → NV12 bit-exact against independent CPU references (odd sizes, 1×N, N×1,
+1×1); scaling within one level of an f64 `fast_image_resize` reference
+(PSNR 71.9 dB to bit-exact); against ferricast's own CPU path (`FrameScaler`, `yuv`
+crate): 54.6–68.7 dB, max difference 1 (RGB → NV12: max 1, from the `yuv`
+crate's AVX2 path, which rounds differently from its scalar path).
+
+End to end (`tests/nvidia_e2e.rs`, frames carry no CPU importer so a readback
+would fail the encode; `CudaSurface::readbacks()` unchanged for NVDEC):
+GBM tiled 1920×1080 → 1280×720 H.264 42.0 dB against the CPU path's picture
+after a lossy round trip; GBM LINEAR 1080×1920 → 1920×1080 letterboxed
+46.2 dB; NVDEC P010 → 8-bit H.264 at the same size 57.1 dB, at half size
+57.7 dB, 0 readbacks. Throughput 1080p DMA-BUF → 720p H.264 (release):
+1093 fps, 0.92 ms/frame, 2% of a core, against 393 fps and 69% of a core for
+the CPU path with an instant readback stand-in (the real Vulkan readback is on
+top of that).
+
+### Hazards found on the way
+
+- `DeviceBuffer::upload` / `fill` run on the legacy default stream: a pageable
+  `cuMemcpy2D` may return before the DMA lands and `cuMemsetD2D8` is
+  asynchronous, and neither is ordered with the crate's non-blocking streams.
+  Work on a non-blocking stream right after them can see stale memory (the
+  kernel tests first failed this way). Tests synchronise the context after
+  uploading; use `upload_async` / `fill_async` on the consuming stream.

@@ -292,6 +292,22 @@ pub enum Error {
         /// Which picture and which reference.
         reason: String,
     },
+    /// The driver could not JIT-compile the crate's PTX (a driver older than
+    /// the PTX ISA, or a bug in the PTX).
+    #[error("cuModuleLoadDataEx failed: {status}{}", if log.is_empty() { String::new() } else { format!(" ({log})") })]
+    KernelLoad {
+        /// What it returned.
+        status: CudaStatus,
+        /// The JIT compiler's error log.
+        log: String,
+    },
+    /// An image kernel was asked for a geometry, format or buffer that does
+    /// not fit (sizes, pitches, alignment, unsupported conversion).
+    #[error("invalid image kernel input: {reason}")]
+    InvalidKernelInput {
+        /// What is wrong.
+        reason: String,
+    },
 }
 
 /// A DRM fourcc as its four characters, for messages.

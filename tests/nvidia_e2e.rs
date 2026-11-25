@@ -703,3 +703,423 @@ fn memfd() -> std::os::fd::OwnedFd {
     // SAFETY: `fd` was just created and nothing else owns it.
     unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
 }
+
+// ------------------------------------------------------------------------
+// GPU fit: pictures whose size or format differs from the session are
+// scaled / letterboxed / narrowed by ferricast-nvcodec's image kernels on
+// the GPU, never read back.
+
+/// The GPU fit tests run one at a time: each holds NVENC sessions, and the
+/// GPU allows a dozen at once across every process.
+static GPU_FIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `bgra` (`sw` × `sh`) resampled to `dw` × `dh` with the triangle filter
+/// and adaptive support the CPU scaler (`fast_image_resize`) uses, in f64.
+fn resize_reference(
+    src: &[f64],
+    channels: usize,
+    (sw, sh): (usize, usize),
+    (dw, dh): (usize, usize),
+) -> Vec<f64> {
+    let taps = |input: usize, output: usize| -> Vec<(usize, Vec<f64>)> {
+        let scale = input as f64 / output as f64;
+        let support = scale.max(1.0);
+        (0..output)
+            .map(|o| {
+                let center = (o as f64 + 0.5) * scale;
+                let lo = (center - support).floor().max(0.0) as usize;
+                let hi = ((center + support).ceil() as usize).min(input);
+                let weights: Vec<f64> = (lo..hi)
+                    .map(|i| (1.0 - ((i as f64 - (center - 0.5)) / support).abs()).max(0.0))
+                    .collect();
+                let sum: f64 = weights.iter().sum();
+                (lo, weights.into_iter().map(|w| w / sum).collect())
+            })
+            .collect()
+    };
+    let (horizontal, vertical) = (taps(sw, dw), taps(sh, dh));
+    let mut rows = vec![0.0; dw * sh * channels];
+    for y in 0..sh {
+        for (x, (lo, weights)) in horizontal.iter().enumerate() {
+            for (k, w) in weights.iter().enumerate() {
+                for c in 0..channels {
+                    rows[(y * dw + x) * channels + c] += w * src[(y * sw + lo + k) * channels + c];
+                }
+            }
+        }
+    }
+    let mut out = vec![0.0; dw * dh * channels];
+    for (y, (lo, weights)) in vertical.iter().enumerate() {
+        for (k, w) in weights.iter().enumerate() {
+            for x in 0..dw * channels {
+                out[y * dw * channels + x] += w * rows[(lo + k) * dw * channels + x];
+            }
+        }
+    }
+    out
+}
+
+/// The CPU path's picture: `bgra` letterboxed into `canvas` with
+/// ferricast's geometry (black bars).
+fn letterbox_reference(bgra: &[u8], source: (u32, u32), canvas: (u32, u32)) -> Vec<u8> {
+    use ferricast_encoder::scale::FrameSize;
+    let placement =
+        FrameSize::new(source.0, source.1).letterbox_in(FrameSize::new(canvas.0, canvas.1));
+    let (pw, ph) = (
+        placement.size.width as usize,
+        placement.size.height as usize,
+    );
+    let src: Vec<f64> = bgra.iter().map(|&b| f64::from(b)).collect();
+    let placed = resize_reference(&src, 4, (source.0 as usize, source.1 as usize), (pw, ph));
+    let (cw, ch) = (canvas.0 as usize, canvas.1 as usize);
+    let mut out: Vec<u8> = [0, 0, 0, 255]
+        .into_iter()
+        .cycle()
+        .take(cw * ch * 4)
+        .collect();
+    for y in 0..ph {
+        for x in 0..pw {
+            let at = ((y + placement.y as usize) * cw + x + placement.x as usize) * 4;
+            for c in 0..4 {
+                out[at + c] = placed[(y * pw + x) * 4 + c].round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Encodes `frames` DMA-BUF captures of `source` size (GBM, `modifier`,
+/// written by GLES / CUDA, no CPU importer: a readback would fail the
+/// encode) into a `canvas` H.264 session, decodes them in software and
+/// compares each with the picture the CPU path would have encoded.
+fn gpu_fit_round_trip(
+    name: &str,
+    source: (u32, u32),
+    canvas: (u32, u32),
+    modifier: impl Fn(&DmaBufImporter) -> Modifier,
+) {
+    let _serial = GPU_FIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(gpu) = dmabuf::Gpu::get() else {
+        return;
+    };
+    let importer = DmaBufImporter::new(&gpu.context, Some(gpu.node)).unwrap();
+    let modifier = modifier(&importer);
+    let config = EncoderConfig {
+        width: canvas.0,
+        height: canvas.1,
+        ..nvenc(Codec::H264, PixelFormat::Bgra)
+    };
+    let Some(mut encoder) = encoder::<ferricast_encoder::h264::H264Encoder>(name, &config) else {
+        return;
+    };
+    let pool: Vec<dmabuf::Bo> = (0..3)
+        .map_while(|_| gpu.allocate(source.0, source.1, DrmFormat::Argb8888, modifier))
+        .collect();
+    assert_eq!(pool.len(), 3, "{name}: GBM allocation");
+    let frames = 10;
+    let patterns: Vec<Vec<u8>> = (0..frames)
+        .map(|index| bgra_pattern(source.0, source.1, index))
+        .collect();
+    let mut packets = Vec::new();
+    for (index, pattern) in patterns.iter().enumerate() {
+        let bo = &pool[index % pool.len()];
+        gpu.write(bo, pattern);
+        let frame = GpuFrame {
+            width: source.0,
+            height: source.1,
+            stride: bo.stride,
+            format: PixelFormat::Bgra,
+            timestamp_us: index as u64 * 33_333,
+            plane: DmaBufPlane {
+                fd: DmaBufFd::dup(bo.fd.as_fd()).unwrap(),
+                offset: bo.offset,
+                stride: bo.stride,
+                modifier: bo.modifier.0,
+                size: bo.stride * source.1,
+            },
+            importer: None,
+            lease: None,
+            producer: Some(DrmDevice::from_dev(gpu.node.dev())),
+            sync: FrameSync::Ready,
+        };
+        packets.push(
+            encoder
+                .encode(CapturedFrame::Gpu(frame))
+                .unwrap_or_else(|error| panic!("{name}: frame {index}: {error}")),
+        );
+    }
+    let decoded = decode::<ferricast_decoder::H264Decoder>(&packets, PixelFormat::Nv12, software());
+    assert_eq!(decoded.len(), frames, "{name}: pictures decoded");
+    let worst = decoded
+        .iter()
+        .zip(&patterns)
+        .map(|(frame, pattern)| {
+            assert_eq!((frame.width, frame.height), canvas, "{name}: size");
+            psnr_rgb(
+                &to_bgra(frame),
+                &letterbox_reference(pattern, source, canvas),
+            )
+        })
+        .fold(f64::INFINITY, f64::min);
+    eprintln!("{name}: worst PSNR {worst:.1} dB against the CPU path's picture");
+    assert!(worst > 35.0, "{name}: PSNR {worst:.1} dB");
+}
+
+#[test]
+fn nvenc_scales_tiled_dma_bufs_on_the_gpu() {
+    gpu_fit_round_trip(
+        "GBM 1920x1080 tiled -> 1280x720",
+        (1920, 1080),
+        (1280, 720),
+        dmabuf::Gpu::tiled_modifier,
+    );
+}
+
+#[test]
+fn nvenc_letterboxes_portrait_linear_dma_bufs_on_the_gpu() {
+    gpu_fit_round_trip(
+        "GBM 1080x1920 LINEAR -> 1920x1080 letterboxed",
+        (1080, 1920),
+        (1920, 1080),
+        |_| Modifier::LINEAR,
+    );
+}
+
+/// A Main10 stream of the P010 pattern (NVENC, from host memory) decoded by
+/// NVDEC into CUDA memory: the sources and the P010 pictures.
+#[cfg(all(feature = "nvdec", feature = "nvenc-hevc"))]
+fn nvdec_p010_pictures(name: &str) -> Option<(Vec<Vec<u8>>, Vec<CapturedFrame>)> {
+    use ferricast_core::BitDepth;
+
+    let config = EncoderConfig {
+        bit_depth: BitDepth::Ten,
+        colour: ColourDescription::BT709_LIMITED,
+        ..nvenc(Codec::H265, PixelFormat::P010)
+    };
+    let mut main10 = encoder::<ferricast_encoder::h265::H265Encoder>(name, &config)?;
+    let sources: Vec<Vec<u8>> = (0..FRAMES)
+        .map(|index| p010_pattern(WIDTH, HEIGHT, index))
+        .collect();
+    let stream: Vec<EncodedFrame> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, data)| {
+            main10
+                .encode(CapturedFrame::Cpu(RawFrame {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    stride: WIDTH * 2,
+                    format: PixelFormat::P010,
+                    data: data.clone().into(),
+                    timestamp_us: index as u64 * 33_333,
+                    colour: Some(ColourDescription::BT709_LIMITED),
+                    hdr: None,
+                }))
+                .unwrap()
+        })
+        .collect();
+    drop(main10);
+    let mut decoder = ferricast_decoder::H265Decoder::default();
+    decoder
+        .configure(&DecoderConfig {
+            codec: Codec::H265,
+            width: WIDTH,
+            height: HEIGHT,
+            pixel_format: PixelFormat::P010,
+            low_latency: true,
+            colour: None,
+            hdr: None,
+            memory: FrameMemory::Native,
+            backend: BackendSelection::Fixed(BackendId::Nvdec),
+        })
+        .unwrap();
+    let mut pictures = Vec::new();
+    for packet in &stream {
+        pictures.extend(decoder.decode(packet.clone()).unwrap());
+    }
+    pictures.extend(decoder.flush().unwrap());
+    assert_eq!(pictures.len(), FRAMES, "{name}: NVDEC pictures");
+    Some((sources, pictures))
+}
+
+/// NVDEC P010 pictures (a Main10 stream) into an 8-bit H.264 session, at
+/// the same size (narrowing only) and at half size (scale + narrow): none
+/// is read back, and the result decodes to the source's top bits.
+#[cfg(all(feature = "nvdec", feature = "nvenc-hevc"))]
+#[test]
+fn nvdec_p010_encodes_on_eight_bit_nvenc_without_readback() {
+    use ferricast_codec::cuda::CudaSurface;
+
+    let name = "NVDEC P010 -> 8-bit NVENC";
+    let _serial = GPU_FIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some((sources, pictures)) = nvdec_p010_pictures(name) else {
+        return;
+    };
+    for canvas in [(WIDTH, HEIGHT), (WIDTH / 2, HEIGHT / 2)] {
+        let config = EncoderConfig {
+            width: canvas.0,
+            height: canvas.1,
+            ..nvenc(Codec::H264, PixelFormat::Nv12)
+        };
+        let mut encoder = encoder::<ferricast_encoder::h264::H264Encoder>(name, &config).unwrap();
+        let readbacks = CudaSurface::readbacks();
+        let packets: Vec<EncodedFrame> = pictures
+            .iter()
+            .map(|picture| {
+                let CapturedFrame::Native(native) = picture else {
+                    panic!("{name}: NVDEC handed out {picture:?}");
+                };
+                assert_eq!(native.format(), PixelFormat::P010, "{name}");
+                encoder.encode(picture.clone()).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            CudaSurface::readbacks(),
+            readbacks,
+            "{name}: a device picture was read back to host memory"
+        );
+        let round_trip =
+            decode::<ferricast_decoder::H264Decoder>(&packets, PixelFormat::Nv12, software());
+        assert_eq!(round_trip.len(), FRAMES, "{name}: pictures");
+        let worst = round_trip
+            .iter()
+            .zip(&sources)
+            .map(|(frame, source)| {
+                assert_eq!((frame.width, frame.height), canvas, "{name}: size");
+                // The source luma narrowed with rounding, resized like the
+                // kernels do.
+                let luma: Vec<f64> = source[..(WIDTH * HEIGHT * 2) as usize]
+                    .chunks_exact(2)
+                    .map(|w| f64::from(u16::from_le_bytes([w[0], w[1]])) / 256.0)
+                    .collect();
+                let want = resize_reference(
+                    &luma,
+                    1,
+                    (WIDTH as usize, HEIGHT as usize),
+                    (canvas.0 as usize, canvas.1 as usize),
+                );
+                let got = frame
+                    .data
+                    .chunks(frame.stride as usize)
+                    .take(canvas.1 as usize)
+                    .flat_map(|row| row[..canvas.0 as usize].iter().map(|&s| f64::from(s)));
+                psnr(got, want.into_iter(), 255.0)
+            })
+            .fold(f64::INFINITY, f64::min);
+        eprintln!(
+            "{name} {}x{}: worst luma PSNR {worst:.1} dB, {} readbacks",
+            canvas.0,
+            canvas.1,
+            CudaSurface::readbacks() - readbacks
+        );
+        assert!(worst > 38.0, "{name}: PSNR {worst:.1} dB");
+    }
+}
+
+/// Encode rate and CPU time of 1080p DMA-BUF captures into a 720p session,
+/// through the GPU fit and through the CPU path (readback stand-in +
+/// `FrameScaler` + upload). Ignored by default (timing):
+///
+/// ```text
+/// cargo test --release --test nvidia_e2e --features nvenc -- --ignored --nocapture fit_throughput
+/// ```
+#[test]
+#[ignore = "timing; needs an NVIDIA GPU with GBM / EGL"]
+fn gpu_fit_throughput() {
+    let _serial = GPU_FIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(gpu) = dmabuf::Gpu::get() else {
+        return;
+    };
+    let importer = DmaBufImporter::new(&gpu.context, Some(gpu.node)).unwrap();
+    let (source, canvas) = ((1920_u32, 1080_u32), (1280_u32, 720_u32));
+    let pattern = bgra_pattern(source.0, source.1, 0);
+    let bo = gpu
+        .allocate(
+            source.0,
+            source.1,
+            DrmFormat::Argb8888,
+            dmabuf::Gpu::tiled_modifier(&importer),
+        )
+        .unwrap();
+    gpu.write(&bo, &pattern);
+    let memfd = Arc::new(memfd());
+    let readbacks = Arc::new(AtomicUsize::new(0));
+    for gpu_path in [true, false] {
+        let config = EncoderConfig {
+            width: canvas.0,
+            height: canvas.1,
+            fps: 60,
+            ..nvenc(Codec::H264, PixelFormat::Bgra)
+        };
+        let mut encoder =
+            encoder::<ferricast_encoder::h264::H264Encoder>("throughput", &config).unwrap();
+        let frame = |index: usize| {
+            let (fd, stride, modifier) = if gpu_path {
+                (
+                    DmaBufFd::dup(bo.fd.as_fd()).unwrap(),
+                    bo.stride,
+                    bo.modifier.0,
+                )
+            } else {
+                // Not importable: the CPU path, with an instant readback.
+                (DmaBufFd::dup(memfd.as_fd()).unwrap(), source.0 * 4, 0)
+            };
+            GpuFrame {
+                width: source.0,
+                height: source.1,
+                stride,
+                format: PixelFormat::Bgra,
+                timestamp_us: index as u64 * 16_666,
+                plane: DmaBufPlane {
+                    fd,
+                    offset: 0,
+                    stride,
+                    modifier,
+                    size: stride * source.1,
+                },
+                importer: (!gpu_path)
+                    .then(|| Arc::new(Readback(pattern.clone(), Arc::clone(&readbacks))) as _),
+                lease: None,
+                producer: gpu_path.then(|| DrmDevice::from_dev(gpu.node.dev())),
+                sync: FrameSync::Ready,
+            }
+        };
+        for index in 0..10 {
+            encoder.encode(CapturedFrame::Gpu(frame(index))).unwrap();
+        }
+        let count = 300;
+        let cpu_before = cpu_time();
+        let start = std::time::Instant::now();
+        for index in 0..count {
+            encoder.encode(CapturedFrame::Gpu(frame(index))).unwrap();
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let cpu = cpu_time() - cpu_before;
+        eprintln!(
+            "{} 1920x1080 -> 1280x720: {:.0} fps, {:.2} ms/frame, CPU {:.0}% of a core ({:.2} ms/frame)",
+            if gpu_path { "GPU fit" } else { "CPU path" },
+            count as f64 / elapsed,
+            elapsed * 1e3 / count as f64,
+            cpu / elapsed * 100.0,
+            cpu * 1e3 / count as f64,
+        );
+    }
+}
+
+/// User + system CPU time of the process, in seconds.
+fn cpu_time() -> f64 {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: valid out-pointer; `getrusage` fills it on success.
+    let ok = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0;
+    assert!(ok, "getrusage");
+    // SAFETY: initialised by the successful call above.
+    let usage = unsafe { usage.assume_init() };
+    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    seconds(usage.ru_utime) + seconds(usage.ru_stime)
+}
