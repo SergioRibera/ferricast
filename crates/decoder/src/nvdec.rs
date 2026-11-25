@@ -16,7 +16,12 @@
 //!   hands them out as [`RawFrame`]s without a copy (NV12, or P010 for
 //!   deeper streams when [`DecoderConfig::pixel_format`] asks for it);
 //!   [`FrameMemory::Native`] keeps the pictures in CUDA device memory
-//!   ([`CudaSurface`]), which the NVENC encoder takes without a copy.
+//!   ([`CudaSurface`]), which the NVENC encoder takes without a copy. A
+//!   deeper stream stays P010 there even when the configuration asks for
+//!   NV12: nothing narrows it on the GPU yet.
+//! - H.264 / HEVC packets are walked once (parameter sets, SEI, access
+//!   units); NVDEC is told a packet ends a picture only once the stream
+//!   has shown it cuts packets at access units (see `PictureFraming`).
 
 use std::collections::VecDeque;
 use std::marker::PhantomData;
@@ -704,6 +709,46 @@ mod tests {
 
     fn signalling(colour: Option<ColourDescription>, hdr: Option<HdrMetadata>) -> Signalling {
         Signalling::new(Bitstream::Opaque, Container { colour, hdr })
+    }
+
+    #[test]
+    fn packets_end_pictures_only_once_the_stream_proves_it() {
+        let shape = |packet: &[u8]| PacketShape::of(packet, NalSyntax::H264);
+        let one = shape(&[0, 0, 0, 1, 0x41, 0x9a]);
+        let two = shape(&[0, 0, 0, 1, 0x41, 0x9a, 0, 0, 0, 1, 0x41, 0x9b]);
+        let tail = shape(&[0x12, 0x34]);
+        let mut framing = PictureFraming::default();
+        let decisions: Vec<bool> = [one, one, one, one]
+            .into_iter()
+            .map(|shape| framing.ends_picture(shape, 100, false))
+            .collect();
+        assert_eq!(decisions, [false, false, true, true]);
+        assert!(!framing.ends_picture(two, 100, false), "two pictures");
+        assert!(!framing.ends_picture(one, 100, true), "a keyframe");
+        assert!(
+            !framing.ends_picture(one, MAX_TRUSTED_PACKET, false),
+            "too large"
+        );
+        // A continuation turns it off for good.
+        assert!(!framing.ends_picture(tail, 100, false));
+        for _ in 0..8 {
+            assert!(!framing.ends_picture(one, 100, false));
+        }
+    }
+
+    #[test]
+    fn running_out_of_frames_or_memory_hands_the_stream_over() {
+        let held = decode_error(nvcodec::Error::FramesInFlight { capacity: 32 });
+        assert!(matches!(held, CodecError::UnsupportedStream { .. }));
+        let memory = decode_error(nvcodec::Error::Cuda {
+            call: "cuMemAlloc_v2",
+            status: nvcodec::error::CudaStatus(nvcodec::sys::cuda::CUresult(CUDA_OUT_OF_MEMORY)),
+        });
+        assert!(matches!(memory, CodecError::UnsupportedStream { .. }));
+        let corrupt = decode_error(nvcodec::Error::InvalidPacket {
+            reason: "test".into(),
+        });
+        assert!(matches!(corrupt, CodecError::Backend { .. }));
     }
 
     #[test]

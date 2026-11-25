@@ -3,9 +3,9 @@
 //! read from the parameter sets and SEI messages, over what the
 //! container says.
 
-use ferricast_codec::bitstream::NalSyntax;
 use ferricast_codec::bitstream::hdr::HdrTracker;
 use ferricast_codec::bitstream::vui::ColourTracker;
+use ferricast_codec::bitstream::{NalSyntax, nal_units};
 use ferricast_core::{ColourDescription, DecoderConfig, HdrMetadata};
 
 use crate::nv12::Container;
@@ -31,8 +31,11 @@ impl NalSignalling {
     /// Reads the parameter sets and SEI messages of an Annex B access
     /// unit, before its pictures are decoded.
     pub(crate) fn observe(&mut self, access_unit: &[u8], syntax: NalSyntax) {
-        self.colour.observe_annex_b(access_unit, syntax);
-        self.hdr.observe_annex_b(access_unit, syntax);
+        // One walk over the units feeds both.
+        for nal in nal_units(access_unit) {
+            self.colour.observe_nal(nal, syntax);
+            self.hdr.observe_nal(nal, syntax);
+        }
     }
 
     /// The colour the pictures are in.
