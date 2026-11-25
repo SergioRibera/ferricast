@@ -31,15 +31,27 @@
 //!
 //! ## Transport
 //!
-//! - **Preferred**: `linux_dmabuf` event. LINEAR gbm bos (universal)
-//!   from a small pool ([`pool`]), each wrapped once as a `wl_buffer`
-//!   via `zwp_linux_dmabuf_v1` and reused across frames. With the
-//!   shared Vulkan importer up, frames emit as `CapturedFrame::Gpu`
-//!   holding a lease on their bo, which keeps the compositor out of it
-//!   until every downstream clone is gone. Without the importer, or
-//!   when the output needs re-orienting (rotated / y-inverted — GPU
-//!   frames can't be), the bo is read back and emits as
-//!   `CapturedFrame::Cpu`.
+//! - **Preferred**: `linux_dmabuf` event. gbm bos from a small pool
+//!   ([`pool`]), each wrapped once as a `wl_buffer` via
+//!   `zwp_linux_dmabuf_v1` and reused across frames. Their layout is a
+//!   modifier the compositor imports (`linux-dmabuf` feedback), the
+//!   Vulkan importer reads back, and preferably the GPU encoder takes
+//!   without a copy (`CaptureConfig::consumer_modifiers`); on NVIDIA that
+//!   is a block-linear modifier, as its GBM refuses LINEAR render
+//!   targets. With the shared Vulkan importer up, frames emit as
+//!   `CapturedFrame::Gpu` holding a lease on their bo, which keeps the
+//!   compositor out of it until every downstream clone is gone, and
+//!   naming their GPU (`GpuFrame::producer`). When the output needs
+//!   re-orienting (rotated / y-inverted — GPU frames can't be yet) the
+//!   bo is read back through Vulkan and emits as `CapturedFrame::Cpu`;
+//!   without the importer the bos are LINEAR and read through `mmap`.
+//!   Frames are requested with `copy_with_damage`: an idle output costs
+//!   nothing, and the stream's pacer repeats the last frame.
+//! - **Synchronisation**: frames leave with `FrameSync::Ready`. The
+//!   protocol's `ready` event means the copy is complete; niri sends it
+//!   only after the render's sync point signalled. wlr-screencopy has no
+//!   explicit-sync extension, and `linux-drm-syncobj-v1` covers client
+//!   surfaces, not capture.
 //! - **Fallback**: `buffer` event (`wl_shm`). Allocates a memfd pool,
 //!   reads back. Emits `CapturedFrame::Cpu`. Used when the
 //!   compositor doesn't advertise `linux_dmabuf` for the frame
@@ -346,8 +358,8 @@ impl LayoutChoice {
 /// wrapping + downstream consumption.
 struct AllocatedBuffer {
     /// Never read: held so the memory stays alive while the
-    /// `wl_buffer` and the exported `fd` reference it (readback goes
-    /// through the fd, see `mmap_bo_to_raw`).
+    /// `wl_buffer` and the exported `fd` reference it (readbacks go
+    /// through the fd).
     _bo: gbm::BufferObject<()>,
     fd: OwnedFd,
     width: u32,
@@ -1390,10 +1402,12 @@ fn now_us() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
-/// Read a freshly-captured dmabuf back to host bytes. Used when the
-/// frame can't leave as a `CapturedFrame::Gpu`: no Vulkan importer
-/// to attach (the encoder's `into_cpu()` would fail), a layout it
-/// can't read, or an orientation to undo on the CPU.
+/// Read a freshly-captured LINEAR dmabuf back to host bytes. Only used
+/// without a Vulkan importer (the allocation is then LINEAR-only): an
+/// `mmap` of a tiled buffer reads scrambled tiles, and on NVIDIA even a
+/// LINEAR mapping does not show the GPU's view past the first pages
+/// (`design/NVCODEC.md`), which is why every other readback goes through
+/// [`GpuPath::read_back`].
 ///
 /// We *don't* go through `gbm_bo_map` here. That call has been
 /// observed to return `EAGAIN` ("Resource temporarily unavailable")

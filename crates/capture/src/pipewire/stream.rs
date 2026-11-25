@@ -15,11 +15,15 @@
 //!   without branching on `MODIFIER_FIXATION_REQUIRED`.
 //! * `process` drains stale buffers and processes only the newest.
 //!
-//! Buffer reading: CPU-mapped (`MemFd` / `MemPtr`) buffers and `DmaBuf`
-//! with a LINEAR / INVALID modifier are copied out before the buffer
-//! goes back to the compositor. Tiled / compressed `DmaBufs` are emitted
-//! as `GpuFrame`s that keep their buffer dequeued until downstream
-//! drops them (see [`super::lease`]).
+//! Buffer reading: CPU-mapped (`MemFd` / `MemPtr`) buffers are copied out
+//! before the buffer goes back to the compositor. Every `DmaBuf` the
+//! Vulkan importer can read back, LINEAR included, is emitted as a
+//! `GpuFrame` that keeps its buffer dequeued until downstream drops it
+//! (see [`super::lease`]); only LINEAR / implicit-modifier buffers the
+//! importer cannot read are copied out through `mmap`. Producers with
+//! explicit sync (`SPA_META_SyncTimeline`) are waited on before anything
+//! reads a buffer and released when downstream is done (see
+//! [`super::sync`]).
 
 use std::cell::RefCell;
 use std::os::fd::{BorrowedFd, RawFd};
@@ -679,13 +683,12 @@ fn handle_process(
     // Hot decision tree:
     //
     // * shm (MemFd/MemPtr) → CPU bytes, emit `Cpu` directly.
-    // * DmaBuf with LINEAR/INVALID modifier → mmap-read; emit `Cpu`
-    //   (no point in deferring since mmap is cheap and any consumer
-    //   needs the bytes anyway).
-    // * DmaBuf with tiled/compressed modifier + GPU importer → emit
+    // * DmaBuf the importer cannot read, LINEAR / INVALID modifier →
+    //   mmap-read; emit `Cpu`.
+    // * DmaBuf the importer reads (any layout, LINEAR too) → emit
     //   `Gpu` carrying the fd + importer. The downstream encoder
-    //   either consumes the fd directly (VA-API / NVENC after the
-    //   dmabuf-input commits land) or calls `into_cpu()`, which
+    //   either consumes the fd directly (VA-API, NVENC: tiled through a
+    //   CUDA array, LINEAR in place as pitched memory) or calls `into_cpu()`, which
     //   triggers a synchronous Vulkan readback via the importer. We
     //   no longer eagerly pipeline the readback in the producer
     //   thread — that hid ~10-15 ms of blit latency for the x264
