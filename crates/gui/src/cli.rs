@@ -63,6 +63,21 @@ pub struct Cli {
     #[arg(long)]
     pub no_airplay_video: bool,
 
+    /// Which GPU the hardware encoders and decoders run on: `auto` (the
+    /// GPU that renders the screen, else a discrete one), `same-as-capture`,
+    /// `integrated`, `discrete`, or one GPU by render node
+    /// (`/dev/dri/renderD129`) or PCI address (`0000:01:00.0`). The
+    /// `FERRICAST_GPU` environment variable sets the same when this is
+    /// omitted. See `--list-gpus`.
+    #[arg(long, value_name = "PREFERENCE")]
+    pub gpu: Option<ferricast::GpuPreference>,
+
+    /// List this machine's GPUs (render node, PCI address, vendor,
+    /// integrated or discrete, the hardware codecs that run on each) and
+    /// exit.
+    #[arg(long)]
+    pub list_gpus: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -148,4 +163,38 @@ pub enum Command {
 pub enum ThumbKind {
     Monitor,
     Window,
+}
+
+/// Prints [`ferricast::StreamManager::gpus`] for `--list-gpus`.
+pub fn print_gpus() {
+    let reports = ferricast::StreamManager::gpus();
+    if reports.is_empty() {
+        println!("no GPU with a DRM render node found");
+        return;
+    }
+    let names = |backends: &[ferricast::BackendId]| {
+        if backends.is_empty() {
+            "-".to_owned()
+        } else {
+            backends
+                .iter()
+                .map(|backend| backend.name())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    };
+    println!("NODE\tPCI\tGPU\tKIND\tENCODE\tDECODE");
+    for report in reports {
+        let gpu = &report.gpu;
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            gpu.render_node,
+            gpu.pci
+                .map_or_else(|| "-".to_owned(), |pci| pci.to_string()),
+            gpu.label(),
+            gpu.kind,
+            names(&report.encoders),
+            names(&report.decoders),
+        );
+    }
 }

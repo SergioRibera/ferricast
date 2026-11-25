@@ -72,6 +72,11 @@ struct Daemon {
 async fn start() -> anyhow::Result<Option<Daemon>> {
     let args = Cli::parse();
 
+    if args.list_gpus {
+        cli::print_gpus();
+        return Ok(None);
+    }
+
     if args.background && args.command.is_some() {
         // The two modes serve opposite roles — `--background` runs
         // the daemon side that owns the bus name; a subcommand is a
@@ -171,6 +176,10 @@ async fn start() -> anyhow::Result<Option<Daemon>> {
         }
         manager_builder = manager_builder.with_port_range(min, max);
         tracing::info!(port_min = min, port_max = max, "protocol port range set");
+    }
+    if let Some(gpu) = args.gpu.clone() {
+        tracing::info!(%gpu, "GPU preference set");
+        manager_builder = manager_builder.with_gpu(gpu);
     }
 
     let (manager, manager_events) = manager_builder
