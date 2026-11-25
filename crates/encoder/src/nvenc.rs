@@ -25,7 +25,7 @@
 
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use bytes::Bytes;
 use ferricast_codec::cuda::nvcodec::cuda::HostImage;
@@ -264,6 +264,115 @@ fn capabilities() -> CodecResult<Capabilities> {
     Ok(capabilities)
 }
 
+/// The NVENC configuration of one ferricast configuration.
+struct Session<C> {
+    input: Input,
+    nv_config: nv::Config,
+    keyframe_interval: u64,
+    _codec: PhantomData<fn() -> C>,
+}
+
+impl<C: NvencCodec> Session<C> {
+    fn of(config: &EncoderConfig) -> CodecResult<Self> {
+        let input = Input::of(config)?;
+        let profile = C::profile(config)?;
+        let fps = NonZeroU32::new(config.fps).unwrap_or(NonZeroU32::MIN);
+        let keyframe_interval = config.keyframe_interval_frames();
+        let bitrate = config.bitrate_kbps.saturating_mul(1000).max(MIN_BITRATE);
+        let mut nv_config = nv::Config::low_latency(
+            C::NV_CODEC,
+            config.width.max(16),
+            config.height.max(16),
+            input.format(),
+            FrameRate::per_second(fps),
+            bitrate,
+        );
+        // No B-frames (every segment self-contained for HLS and the cast
+        // receivers), CBR with max == average (a Chromecast behind weak
+        // Wi-Fi aborts when the peak overshoots its buffer), parameter
+        // sets with every IDR (receivers join at any IDR): all from
+        // `low_latency`.
+        nv_config.gop =
+            Gop::idr_every(NonZeroU32::new(keyframe_interval).unwrap_or(NonZeroU32::MIN));
+        nv_config.profile = Some(profile);
+        nv_config.color = Some(colour(config, input)?);
+        nv_config.hdr10 = config.hdr.filter(|hdr| !hdr.is_empty()).map(hdr10);
+        Ok(Self {
+            input,
+            nv_config,
+            keyframe_interval: u64::from(keyframe_interval),
+            _codec: PhantomData,
+        })
+    }
+
+    fn log_ready(&self, encoder: &Encoder) {
+        let config = &self.nv_config;
+        info!(
+            codec = %C::NV_CODEC,
+            width = config.width,
+            height = config.height,
+            fps = config.frame_rate.num.get(),
+            input = %self.input.format(),
+            api = %encoder.api_version(),
+            "NVENC encoder ready"
+        );
+    }
+}
+
+/// Packet buffers lent to [`EncodedFrame::data`] and given back to NVENC
+/// when the last `Bytes` clone drops: in steady state no packet allocates
+/// (a 4K IDR is about 1 MB).
+#[derive(Debug, Default)]
+struct PacketPool {
+    returned: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl PacketPool {
+    /// Buffers kept for reuse at most; more are freed.
+    const CAPACITY: usize = 16;
+
+    /// `data` as `Bytes`, back in the pool once dropped.
+    fn lend(&self, data: Vec<u8>) -> Bytes {
+        Bytes::from_owner(PooledPacket {
+            data,
+            pool: Arc::downgrade(&self.returned),
+        })
+    }
+
+    /// Hands the buffers that came back to the encoder.
+    fn refill(&self, encoder: &mut Encoder) {
+        let returned =
+            std::mem::take(&mut *self.returned.lock().unwrap_or_else(PoisonError::into_inner));
+        for buffer in returned {
+            encoder.recycle_buffer(buffer);
+        }
+    }
+}
+
+/// A packet buffer on loan to `Bytes`.
+struct PooledPacket {
+    data: Vec<u8>,
+    pool: Weak<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl AsRef<[u8]> for PooledPacket {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for PooledPacket {
+    fn drop(&mut self) {
+        let Some(pool) = self.pool.upgrade() else {
+            return;
+        };
+        let mut pool = pool.lock().unwrap_or_else(PoisonError::into_inner);
+        if pool.len() < PacketPool::CAPACITY {
+            pool.push(std::mem::take(&mut self.data));
+        }
+    }
+}
+
 /// NVENC encoder for the codec `C`.
 pub struct NvencEncoder<C: NvencCodec> {
     // Field order is drop order: the session (and the CUDA array
@@ -284,6 +393,7 @@ pub struct NvencEncoder<C: NvencCodec> {
     pending_keyframe: bool,
     /// Fits frames whose size differs from the session into it.
     scaler: FrameScaler,
+    packets: PacketPool,
     _codec: PhantomData<fn() -> C>,
 }
 
@@ -315,56 +425,61 @@ impl<C: NvencCodec> NvencEncoder<C> {
     /// [`CodecError::BackendUnavailable`] without a driver or GPU, or when
     /// the GPU's session limit is reached.
     pub fn probe_with(config: EncoderConfig) -> CodecResult<Self> {
-        let input = Input::of(&config)?;
-        let profile = C::profile(&config)?;
-        let width = config.width.max(16);
-        let height = config.height.max(16);
-        let fps = NonZeroU32::new(config.fps).unwrap_or(NonZeroU32::MIN);
-        let keyframe_interval = config.keyframe_interval_frames();
-        let bitrate = config.bitrate_kbps.saturating_mul(1000).max(MIN_BITRATE);
-        let mut nv_config = nv::Config::low_latency(
-            C::NV_CODEC,
-            width,
-            height,
-            input.format(),
-            FrameRate::per_second(fps),
-            bitrate,
-        );
-        // No B-frames (every segment self-contained for HLS and the cast
-        // receivers), CBR with max == average (a Chromecast behind weak
-        // Wi-Fi aborts when the peak overshoots its buffer), parameter
-        // sets with every IDR (receivers join at any IDR): all from
-        // `low_latency`.
-        nv_config.gop =
-            Gop::idr_every(NonZeroU32::new(keyframe_interval).unwrap_or(NonZeroU32::MIN));
-        nv_config.profile = Some(profile);
-        nv_config.color = Some(colour(&config, input)?);
-        nv_config.hdr10 = config.hdr.filter(|hdr| !hdr.is_empty()).map(hdr10);
-
+        let session = Session::<C>::of(&config)?;
         let context = cuda::context().map_err(map_error(BackendId::Nvenc, Operation::Open))?;
-        let encoder = Encoder::open(&context, &nv_config)
+        let encoder = Encoder::open(&context, &session.nv_config)
             .map_err(map_error(BackendId::Nvenc, Operation::Open))?;
-        info!(
-            codec = %C::NV_CODEC,
-            width,
-            height,
-            fps = fps.get(),
-            input = %input.format(),
-            api = %encoder.api_version(),
-            "NVENC encoder ready"
-        );
+        session.log_ready(&encoder);
         Ok(Self {
             encoder,
             #[cfg(target_os = "linux")]
             zero_copy: zero_copy::State::default(),
-            input,
+            input: session.input,
             requested: config,
             frame_count: 0,
-            keyframe_interval: u64::from(keyframe_interval),
+            keyframe_interval: session.keyframe_interval,
             pending_keyframe: false,
             scaler: FrameScaler::default(),
+            packets: PacketPool::default(),
             _codec: PhantomData,
         })
+    }
+
+    /// Moves the session to `config`: reconfigured in place when NVENC can
+    /// (size within the opened one, rate, GOP, bitrate, colour), otherwise
+    /// closed and opened again, the old session first so a GPU at its
+    /// session limit takes the new one; `rebuild` always reopens. When the
+    /// new session cannot open, the previous configuration is reopened and
+    /// the error returned (selection then moves to the next backend).
+    fn apply(&mut self, config: &EncoderConfig, rebuild: bool) -> CodecResult<()> {
+        let session = Session::<C>::of(config)?;
+        // The DMA-BUF imports and NVENC's registrations of them describe
+        // the old session: NVENC's go first (its registrations must not
+        // outlive the importer's).
+        self.encoder.clear_input_caches();
+        #[cfg(target_os = "linux")]
+        {
+            self.zero_copy = zero_copy::State::default();
+        }
+        let applied = if rebuild || self.encoder.context().is_lost() {
+            // A lost context is replaced: `cuda::context` hands out a new
+            // one once the old one is marked lost.
+            let context = cuda::context().map_err(map_error(BackendId::Nvenc, Operation::Open))?;
+            self.encoder.reopen_on(&context, &session.nv_config)
+        } else {
+            self.encoder.reconfigure(&session.nv_config)
+        };
+        // A closed encoder (both reopens failed) is reported as such by
+        // every later call.
+        applied.map_err(map_error(BackendId::Nvenc, Operation::Open))?;
+        session.log_ready(&self.encoder);
+        self.input = session.input;
+        self.requested = config.clone();
+        self.keyframe_interval = session.keyframe_interval;
+        self.frame_count = 0;
+        self.pending_keyframe = false;
+        self.scaler = FrameScaler::default();
+        Ok(())
     }
 
     fn size(&self) -> (u32, u32) {
@@ -493,6 +608,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
         // Kept until the packet is out: NVENC reads a device or DMA-BUF
         // input until then, and the frame holds the capture buffer's lease
         // and the decoder's pooled buffer.
+        self.packets.refill(&mut self.encoder);
         let input = self.submit(frame, options)?;
         let packet = self.encoder.next_packet().ok_or_else(|| {
             CodecError::backend(
@@ -507,7 +623,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
         Ok(EncodedFrame {
             codec: C::FERRICAST_CODEC,
             is_keyframe: matches!(packet.picture_type, PictureType::I | PictureType::Idr),
-            data: Bytes::from(packet.data),
+            data: self.packets.lend(packet.data),
             timestamp_us,
             duration_us: Some(1_000_000 / u64::from(self.requested.fps.max(1))),
             pts_dts: (pts, pts),
@@ -530,7 +646,7 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
     const CODEC: Codec = C::FERRICAST_CODEC;
 
     fn configure(&mut self, config: &EncoderConfig) -> CodecResult<()> {
-        if self.requested.same_session_shape(config) {
+        if self.requested.same_session_shape(config) && self.encoder.is_open() {
             // Same session; only the bitrate may differ, and NVENC
             // retargets that live.
             if config.bitrate_kbps != self.requested.bitrate_kbps {
@@ -538,10 +654,12 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
             }
             return Ok(());
         }
-        // Geometry, rate, GOP, input, profile, colour or HDR changed: those
-        // are baked into the session (and its registered inputs).
-        *self = Self::probe_with(config.clone())?;
-        Ok(())
+        // Geometry, rate, GOP, input, profile, colour or HDR changed.
+        self.apply(config, false)
+    }
+
+    fn reset(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+        self.apply(config, true)
     }
 
     fn encode(&mut self, frame: CapturedFrame) -> CodecResult<EncodedFrame> {

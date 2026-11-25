@@ -1096,8 +1096,10 @@ where
     /// bitrate currently in effect.
     fn recover_encoder(&mut self) {
         self.encoder_config.bitrate_kbps = self.applied_kbps;
-        if let Err(e) = self.encoder.configure(&self.encoder_config) {
-            tracing::warn!(%e, "encoder reconfigure failed");
+        // A new session even though the configuration did not change: the
+        // old one is in a bad state (a lost GPU, a stuck hardware encoder).
+        if let Err(e) = self.encoder.reset(&self.encoder_config) {
+            tracing::warn!(%e, "encoder reset failed");
         }
         self.encoder.request_keyframe();
     }
