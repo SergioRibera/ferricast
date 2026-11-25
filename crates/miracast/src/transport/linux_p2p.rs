@@ -164,6 +164,30 @@ impl LinuxP2pClient {
         Ok(rx)
     }
 
+    /// Wipe any persistent P2P groups left by prior sessions so the
+    /// peer re-runs full GO negotiation + WPS instead of attempting
+    /// an endless `P2P-INVITATION` retry against a group we no longer
+    /// have credentials for. Called before Listen.
+    async fn flush_persistent_groups(&self) -> Result<(), TransportError> {
+        let p2p = self.p2p_proxy().await?;
+        match p2p.call_method("RemoveAllPersistentGroups", &()).await {
+            Ok(_) => {
+                tracing::info!("sink: cleared persistent groups to force fresh GO neg");
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("UnknownMethod") {
+                    tracing::debug!("sink: supplicant lacks RemoveAllPersistentGroups (ok)");
+                    Ok(())
+                } else {
+                    tracing::warn!(error = %e, "sink: RemoveAllPersistentGroups");
+                    Ok(()) // non-fatal
+                }
+            }
+        }
+    }
+
     /// Advertise the local host as a Wi-Fi Direct *Miracast sink*:
     /// set the P2P device name + Primary Device Type to Display/TV so
     /// phones' Smart View / Cast UIs classify us correctly, enter
@@ -211,30 +235,34 @@ impl LinuxP2pClient {
         let mut cfg: HashMap<&str, Value> = HashMap::new();
         cfg.insert("DeviceName", name_val);
         cfg.insert("PrimaryDeviceType", pdt_val);
-        // Pin P2P to a channel compatible with the current STA
-        // association. mt7925e-class drivers can't do STA + P2P on
-        // different bands; if STA sits on 5 GHz "Rico 5G" and P2P
-        // listens on 2.4 GHz ch 1, group formation silently dies
-        // after GO-Nego-Success. We read `CurrentBSS.Frequency` via
-        // D-Bus and pick a matching P2P channel + reg class. No STA
-        // → fall back to social channel 1 / reg class 81.
+        // Match the P2P op channel to the peer's STA band. The
+        // STA iface is still associated at this point so we read
+        // its current freq; it gets deauthed below (after config
+        // commit) to free the radio for retune. We land on the
+        // *same* channel as the STA was on, which — importantly —
+        // is also where the remote source (phone/Windows) has
+        // its STA and can therefore host a GO without switching
+        // radios. No STA → social channel 6 as a last resort.
         let iface_ref = self.interface_path.as_ref();
         let (ch, reg) = detect_sta_channel(&self.conn, &iface_ref)
             .await
-            .unwrap_or((1, 81));
+            .unwrap_or((6, 81));
         cfg.insert("ListenRegClass", Value::from(reg));
         cfg.insert("ListenChannel", Value::from(ch));
         cfg.insert("OperRegClass", Value::from(reg));
         cfg.insert("OperChannel", Value::from(ch));
         // `GOIntent` is part of the persisted config too — supplicant
         // reuses it when it auto-responds before we get a chance to
-        // override in Connect(). 14 keeps the sink preferred-but-not-
-        // forced (phone with hard 15 wins).
-        cfg.insert("GOIntent", Value::from(14u32));
-        // Reuse STA iface for the P2P group instead of spawning a
-        // p2p-wlp7s0-N virtual. mt7925e sometimes can't bring up the
-        // virtual iface while STA is active on the same radio; the
-        // group formation then silently stalls after GON-Success.
+        // override in Connect(). 15 = force-GO: lets us pick the
+        // group channel (2.4 GHz above) instead of letting the
+        // phone's 15 win and drag us to its channel.
+        cfg.insert("GOIntent", Value::from(15u32));
+        // Reuse the STA iface: mt7925e crashes supplicant when told
+        // to spawn `p2p-wlp7s0-N` while STA is associated (nl80211
+        // deinit fires immediately, systemd restarts supplicant).
+        // We pay for it by having to drop the STA connection just
+        // before Connect() and re-associate once the group goes
+        // down — handled in the `Connect` branch below.
         cfg.insert("NoGroupIface", Value::from(true));
         if let Err(e) = p2p.set_property("P2PDeviceConfig", Value::from(cfg)).await {
             tracing::error!(error = %e, "miracast sink: P2PDeviceConfig set FAILED — peers will see us as unnamed");
@@ -245,6 +273,41 @@ impl LinuxP2pClient {
                 reg_class = reg,
                 "miracast sink: P2PDeviceConfig set (channel matched to STA band)"
             );
+        }
+
+        // `disallow_freq` can only be set via ctrl_interface
+        // (`P2P_SET disallow_freq 5180-5900`) — the D-Bus API
+        // has no equivalent. We rely on `OperChannel=6` +
+        // `GOIntent=15` above to keep the group on 2.4 GHz
+        // (we win GO → we choose the channel).
+
+        // Clear persistent groups before Listen; otherwise phones that
+        // retry an `INVITATION-REQUEST` from a prior session will loop
+        // forever (we accept but have no credentials to finish).
+        self.flush_persistent_groups().await?;
+
+        // Deauthenticate the STA on wlp7s0 *now*, before any peer
+        // sends GON. If we wait until GON arrival to deauth, the
+        // ~500 ms GON Response deadline (p2p_timeout_wait_response
+        // in p2p.c) expires while the driver is still retuning —
+        // phone never sees a response, silently gives up. Deauthing
+        // here leaves the radio idle, ready to retune to whichever
+        // channel the peer picks. NM will restore the STA once
+        // GroupFinished fires below.
+        if let Ok(if_proxy) = Proxy::new(
+            &self.conn,
+            SUPPLICANT_BUS,
+            self.interface_path.clone(),
+            INTERFACE_IFACE,
+        )
+        .await
+        {
+            match if_proxy.call_method("Disconnect", &()).await {
+                Ok(_) => tracing::info!(
+                    "sink: STA deauthed before Listen — radio idle for P2P"
+                ),
+                Err(e) => tracing::warn!(error = %e, "sink: Interface.Disconnect"),
+            }
         }
 
         // Enter continuous Listen mode. Sink stays parked on the
@@ -313,6 +376,19 @@ impl LinuxP2pClient {
                     return;
                 }
             };
+            // Windows (and some Android sources) send ProvDisc with
+            // Keypad method: peer will enter a PIN we choose, so we
+            // generate one, log it loudly for the user, and cache it
+            // so the subsequent GON Request / Invitation can arm the
+            // same PIN via `wps_method=display`.
+            let mut prov_keypad =
+                match p2p_owned.receive_signal("ProvisionDiscoveryRequestEnterPin").await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sink: subscribe ProvDisc enter-pin");
+                        return;
+                    }
+                };
             let mut prov_fail = match p2p_owned.receive_signal("ProvisionDiscoveryFailure").await {
                 Ok(s) => s,
                 Err(e) => {
@@ -408,6 +484,21 @@ impl LinuxP2pClient {
                     return;
                 }
             };
+            // Xiaomi phones aggressively retry `P2P-INVITATION-REQUEST`
+            // to rejoin a persistent group from the last session. We
+            // never stored one, so supplicant auto-ACCEPTs but the
+            // handshake can never complete — hundreds of INVITATION
+            // retries per second until the phone gives up ~30 s later.
+            // Catch the signal and `RejectPeer` so the phone falls
+            // back to a fresh GO negotiation.
+            let mut invitation_recv =
+                match p2p_owned.receive_signal("InvitationReceived").await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sink: subscribe InvitationReceived");
+                        return;
+                    }
+                };
             loop {
                 tokio::select! {
                     msg = prov_pin.next() => {
@@ -452,6 +543,25 @@ impl LinuxP2pClient {
                         if let Ok(peer) = sig.body().deserialize::<OwnedObjectPath>() {
                             tracing::info!(peer = %peer.as_str(), "sink: ProvDisc PBC request");
                         }
+                    }
+                    msg = prov_keypad.next() => {
+                        let Some(sig) = msg else { break };
+                        // Peer picked Keypad method → it will enter
+                        // whatever PIN we pick. Generate one, cache
+                        // it against the peer, and log loudly so the
+                        // user can read it off the terminal / UI.
+                        let Ok(peer) = sig.body().deserialize::<OwnedObjectPath>() else {
+                            continue;
+                        };
+                        gon_in_flight.store(true, std::sync::atomic::Ordering::Release);
+                        let pin = generate_wps_pin();
+                        tracing::warn!(
+                            peer = %peer.as_str(),
+                            pin = %pin,
+                            "miracast sink: PIN for peer (type into Windows/Android) → **{}** ←",
+                            pin,
+                        );
+                        last_prov_pin = Some((peer, pin));
                     }
                     msg = prov_fail.next() => {
                         let Some(sig) = msg else { break };
@@ -507,6 +617,20 @@ impl LinuxP2pClient {
                             continue;
                         }
                         rearm_find_from_task(&p2p_owned).await;
+                    }
+                    msg = invitation_recv.next() => {
+                        let Some(sig) = msg else { break };
+                        // Phone sends P2P-INVITATION first with its
+                        // persistent group. Our supplicant reports
+                        // `unknown-network` (we cleared persistent
+                        // groups at startup), replies status=1
+                        // UNAVAILABLE, phone immediately falls back
+                        // to a fresh GON Request. Let the GON branch
+                        // below drive the join; we only log here.
+                        let _ = sta_freq_for_task;
+                        if let Ok(dict) = sig.body().deserialize::<HashMap<String, OwnedValue>>() {
+                            tracing::debug!(?dict, "sink: InvitationReceived (ignored, waiting for GON)");
+                        }
                     }
                     msg = group_finished.next() => {
                         let Some(_sig) = msg else { break };
@@ -617,27 +741,22 @@ impl LinuxP2pClient {
                         if let Some(pin) = maybe_pin {
                             args.insert("pin", Value::from(pin));
                         }
-                        // GO intent trade-off:
-                        //   15 = spec-recommended for sink (WFD 2.1 §4.5.1)
-                        //        but phones like Xiaomi Smart View also
-                        //        send 15 → P2P status 9 "both indicated
-                        //        Intent 15" → GON aborts.
-                        //   14 = still high (beats default 7), no tie
-                        //        against phones that hard-code 15.
-                        // We lose GO role when phone wins; works anyway
-                        // because RTSP listens on 0.0.0.0:7236 and the
-                        // P2P client iface still hosts that port.
-                        args.insert("go_intent", Value::from(14i32));
-                        // If the local STA is associated, force GON to
-                        // settle on that exact freq. Single-radio
-                        // drivers can't retune, so if the peer GO
-                        // picks a different channel the group never
-                        // forms. supplicant's Connect() handler takes
-                        // `frequency` as DBUS_TYPE_INT32 (MHz).
-                        if let Some(freq) = sta_freq_for_task {
-                            args.insert("frequency", Value::from(i32::from(freq)));
-                            tracing::info!(freq_mhz = freq, "sink: pinning Connect frequency to STA band");
-                        }
+                        // GO intent 0: we BECOME CLIENT, peer wins
+                        // GO. Why cede: Xiaomi Smart View hardcodes
+                        // 15 → any 15-vs-15 tie fires GON Failure
+                        // status 9; Windows uses 14 → we'd win at
+                        // 15 but then need to DHCP-serve + beacon
+                        // which we don't implement yet. As client
+                        // we just join peer's group. Peer picks
+                        // channel; we pay for it by disconnecting
+                        // the STA below so the radio is free to
+                        // retune to peer's chosen channel.
+                        args.insert("go_intent", Value::from(0i32));
+                        // Note: do NOT call `P2PDevice.Flush` here —
+                        // Flush unregisters all Peer objects on the
+                        // bus, which invalidates the `peer` path we
+                        // just captured from the GON signal.
+                        //
                         // Record BEFORE Connect so dedupe fires even
                         // when Connect itself errored out.
                         last_connect_at = Some((peer.clone(), now));

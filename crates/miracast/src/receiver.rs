@@ -257,7 +257,11 @@ async fn start_linux_p2p_sink(
                             router = lease.router.map(|r| r.to_string()).unwrap_or_else(|| "-".into()),
                             "miracast sink: DHCP lease installed; RTSP on 7236 now reachable"
                         ),
-                        Err(e) => tracing::error!(error = %e, "miracast sink: DHCP failed — phone cannot reach RTSP"),
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            iface = %kernel_ifname,
+                            "miracast sink: DHCP failed — phone cannot reach RTSP"
+                        ),
                     }
                 }
                 Err(e) => tracing::warn!(error = %e, "miracast sink: cannot resolve group ifname"),
