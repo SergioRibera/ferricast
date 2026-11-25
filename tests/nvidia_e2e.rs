@@ -51,7 +51,7 @@ fn bgra_pattern(width: u32, height: u32, frame: usize) -> Vec<u8> {
         .flat_map(|(x, y)| {
             let r = ((x + shift) * 255 / (width + shift)) as u8;
             let g = (y * 255 / height) as u8;
-            let b = (((x + y) / 2 + shift) % 256) as u8;
+            let b = ((u32::midpoint(x, y) + shift) % 256) as u8;
             [b / 2 + 64, g, r, 0xff]
         })
         .collect()
@@ -75,9 +75,9 @@ fn psnr_rgb(a: &[u8], b: &[u8]) -> f64 {
 
 /// PSNR in dB of two equal-length runs of samples with the given peak.
 fn psnr(a: impl Iterator<Item = f64>, b: impl Iterator<Item = f64>, peak: f64) -> f64 {
-    let (sum, count) = a
-        .zip(b)
-        .fold((0.0, 0_usize), |(sum, count), (a, b)| (sum + (a - b) * (a - b), count + 1));
+    let (sum, count) = a.zip(b).fold((0.0, 0_usize), |(sum, count), (a, b)| {
+        (sum + (a - b) * (a - b), count + 1)
+    });
     let mse = sum / count as f64;
     if mse == 0.0 {
         f64::INFINITY
@@ -142,7 +142,9 @@ fn decode<D: VideoDecoder + Default>(
 }
 
 fn software() -> BackendSelection {
-    BackendSelection::Auto(AutoSelect::default().with_acceleration(AccelerationPolicy::SoftwareOnly))
+    BackendSelection::Auto(
+        AutoSelect::default().with_acceleration(AccelerationPolicy::SoftwareOnly),
+    )
 }
 
 /// A decoded NV12 picture as BGRA, with the colour it signals.
@@ -227,14 +229,21 @@ fn dma_buf_round_trip<E: VideoEncoder + Default, D: VideoDecoder + Default>(
         assert_eq!(returned.load(Ordering::SeqCst), index + 1, "{name}: lease");
         packets.push(packet);
     }
-    assert!(packets[0].is_keyframe, "{name}: the stream opens with an IDR");
+    assert!(
+        packets[0].is_keyframe,
+        "{name}: the stream opens with an IDR"
+    );
     let decoded = decode::<D>(&packets, PixelFormat::Nv12, software());
     assert_eq!(decoded.len(), FRAMES, "{name}: pictures decoded");
     let worst = decoded
         .iter()
         .zip(&patterns)
         .map(|(frame, pattern)| {
-            assert_eq!(frame.colour.map(|c| c.matrix), Some(colour.matrix), "{name}");
+            assert_eq!(
+                frame.colour.map(|c| c.matrix),
+                Some(colour.matrix),
+                "{name}"
+            );
             psnr_rgb(&to_bgra(frame), pattern)
         })
         .fold(f64::INFINITY, f64::min);
@@ -323,7 +332,8 @@ fn nvdec_device_frames_encode_on_nvenc_without_readback() {
         return;
     };
     // The reference: the same stream decoded to host memory.
-    let reference = decode::<ferricast_decoder::H264Decoder>(&source, PixelFormat::Nv12, software());
+    let reference =
+        decode::<ferricast_decoder::H264Decoder>(&source, PixelFormat::Nv12, software());
 
     let mut decoder = ferricast_decoder::H264Decoder::default();
     decoder
@@ -339,9 +349,11 @@ fn nvdec_device_frames_encode_on_nvenc_without_readback() {
             backend: BackendSelection::Fixed(BackendId::Nvdec),
         })
         .unwrap();
-    let mut encoder =
-        encoder::<ferricast_encoder::h264::H264Encoder>(name, &nvenc(Codec::H264, PixelFormat::Nv12))
-            .unwrap();
+    let mut encoder = encoder::<ferricast_encoder::h264::H264Encoder>(
+        name,
+        &nvenc(Codec::H264, PixelFormat::Nv12),
+    )
+    .unwrap();
     let readbacks = CudaSurface::readbacks();
     let mut packets = Vec::new();
     for packet in &source {
@@ -361,9 +373,10 @@ fn nvdec_device_frames_encode_on_nvenc_without_readback() {
         readbacks,
         "{name}: a device picture was read back to host memory"
     );
-    let decoded = decode::<ferricast_decoder::H264Decoder>(&packets, PixelFormat::Nv12, software());
-    assert_eq!(decoded.len(), reference.len(), "{name}: pictures");
-    let worst = decoded
+    let round_trip =
+        decode::<ferricast_decoder::H264Decoder>(&packets, PixelFormat::Nv12, software());
+    assert_eq!(round_trip.len(), reference.len(), "{name}: pictures");
+    let worst = round_trip
         .iter()
         .zip(&reference)
         .map(|(got, want)| {
@@ -384,6 +397,7 @@ fn nvdec_device_frames_encode_on_nvenc_without_readback() {
 }
 
 /// P010 pattern: 10-bit samples in the high bits.
+#[cfg(feature = "nvenc-hevc")]
 fn p010_pattern(width: u32, height: u32, frame: usize) -> Vec<u8> {
     let shift = frame as u32 * 8;
     let luma = (0..height).flat_map(|y| {
@@ -402,26 +416,17 @@ fn p010_pattern(width: u32, height: u32, frame: usize) -> Vec<u8> {
         .collect()
 }
 
-/// 10-bit HDR10 HEVC from P010: decoded back as P010 with BT.2020 PQ and
-/// the mastering display and light levels it was configured with.
+/// HDR10 metadata of a 1000 cd/m² BT.2020 mastering display.
 #[cfg(feature = "nvenc-hevc")]
-#[test]
-fn nvenc_encodes_ten_bit_hdr10_hevc() {
-    use ferricast_core::{
-        BitDepth, Chromaticity, ColourPrimaries, ContentLightLevel, HdrMetadata, MasteringDisplay,
-        TransferCharacteristics,
-    };
-
-    let name = "HEVC Main10 HDR10";
-    let hdr = HdrMetadata {
+fn hdr10() -> ferricast_core::HdrMetadata {
+    use ferricast_core::{Chromaticity, ContentLightLevel, HdrMetadata, MasteringDisplay};
+    let point = |x, y| Chromaticity { x, y };
+    HdrMetadata {
         mastering_display: Some(MasteringDisplay {
-            red: Chromaticity { x: 35_400, y: 14_600 },
-            green: Chromaticity { x: 8_500, y: 39_850 },
-            blue: Chromaticity { x: 6_550, y: 2_300 },
-            white_point: Chromaticity {
-                x: 15_635,
-                y: 16_450,
-            },
+            red: point(35_400, 14_600),
+            green: point(8_500, 39_850),
+            blue: point(6_550, 2_300),
+            white_point: point(15_635, 16_450),
             max_luminance: 10_000_000,
             min_luminance: 50,
         }),
@@ -429,7 +434,18 @@ fn nvenc_encodes_ten_bit_hdr10_hevc() {
             max_cll: 1000,
             max_fall: 400,
         }),
-    };
+    }
+}
+
+/// 10-bit HDR10 HEVC from P010: decoded back as P010 with BT.2020 PQ and
+/// the mastering display and light levels it was configured with.
+#[cfg(feature = "nvenc-hevc")]
+#[test]
+fn nvenc_encodes_ten_bit_hdr10_hevc() {
+    use ferricast_core::{BitDepth, ColourPrimaries, TransferCharacteristics};
+
+    let name = "HEVC Main10 HDR10";
+    let hdr = hdr10();
     let colour = ColourDescription::from_codes(9, 16, 9, false);
     let config = EncoderConfig {
         bit_depth: BitDepth::Ten,
@@ -465,15 +481,24 @@ fn nvenc_encodes_ten_bit_hdr10_hevc() {
         backends.push(("NVDEC", BackendSelection::Fixed(BackendId::Nvdec)));
     }
     for (decoder_name, backend) in backends {
-        let decoded = decode::<ferricast_decoder::H265Decoder>(&packets, PixelFormat::P010, backend);
+        let decoded =
+            decode::<ferricast_decoder::H265Decoder>(&packets, PixelFormat::P010, backend);
         assert_eq!(decoded.len(), FRAMES, "{name} via {decoder_name}: pictures");
         let mut worst = f64::INFINITY;
         for (frame, source) in decoded.iter().zip(&sources) {
             assert_eq!(frame.format, PixelFormat::P010, "{name} via {decoder_name}");
             let colour = frame.colour.expect("colour");
             assert_eq!(colour.primaries, ColourPrimaries::Bt2020, "{decoder_name}");
-            assert_eq!(colour.transfer, TransferCharacteristics::Pq, "{decoder_name}");
-            assert_eq!(frame.hdr, Some(hdr), "{name} via {decoder_name}: HDR metadata");
+            assert_eq!(
+                colour.transfer,
+                TransferCharacteristics::Pq,
+                "{decoder_name}"
+            );
+            assert_eq!(
+                frame.hdr,
+                Some(hdr),
+                "{name} via {decoder_name}: HDR metadata"
+            );
             let words = |data: &[u8], stride: usize| -> Vec<f64> {
                 data.chunks(stride)
                     .take(HEIGHT as usize)
@@ -489,6 +514,9 @@ fn nvenc_encodes_ten_bit_hdr10_hevc() {
             worst = worst.min(psnr(got.into_iter(), want.into_iter(), 1023.0));
         }
         eprintln!("{name} via {decoder_name}: worst luma PSNR {worst:.1} dB (10-bit)");
-        assert!(worst > 40.0, "{name} via {decoder_name}: PSNR {worst:.1} dB");
+        assert!(
+            worst > 40.0,
+            "{name} via {decoder_name}: PSNR {worst:.1} dB"
+        );
     }
 }

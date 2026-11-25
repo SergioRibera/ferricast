@@ -6,6 +6,12 @@
 //! FERRICAST_BENCH_CLIP=clip.mp4 cargo test --release --test nvidia_throughput -- --ignored --nocapture
 //! ```
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "test patterns and rates over small, positive numbers"
+)]
+
 use std::time::Instant;
 
 use ferricast_core::{
@@ -75,10 +81,12 @@ fn nvdec_decode_throughput() {
 #[test]
 #[ignore = "needs an NVIDIA GPU and FERRICAST_BENCH_CLIP"]
 fn software_decode_throughput() {
-    let software = || BackendSelection::Auto(
-        ferricast_core::AutoSelect::default()
-            .with_acceleration(ferricast_core::AccelerationPolicy::SoftwareOnly),
-    );
+    let software = || {
+        BackendSelection::Auto(
+            ferricast_core::AutoSelect::default()
+                .with_acceleration(ferricast_core::AccelerationPolicy::SoftwareOnly),
+        )
+    };
     decode_fps::<ferricast_decoder::H265Decoder>(FrameMemory::Cpu, software());
     decode_fps::<ferricast_decoder::Vp9Decoder>(FrameMemory::Cpu, software());
     decode_fps::<ferricast_decoder::Av1Decoder>(FrameMemory::Cpu, software());
@@ -126,7 +134,9 @@ fn encode_fps<E: VideoEncoder + Default>(codec: Codec, format: PixelFormat) {
     let count = 600_usize;
     let start = Instant::now();
     for index in 0..count {
-        encoder.encode(frames[index % frames.len()].clone()).unwrap();
+        encoder
+            .encode(frames[index % frames.len()].clone())
+            .unwrap();
     }
     let elapsed = start.elapsed().as_secs_f64();
     println!(
