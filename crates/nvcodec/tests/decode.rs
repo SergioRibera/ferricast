@@ -567,6 +567,112 @@ fn device_frames_equal_host_frames() {
     }
 }
 
+/// `data` without its access unit delimiters, as MP4 and Matroska carry
+/// H.264 / HEVC.
+fn without_delimiters(data: &[u8], codec: Codec) -> Vec<u8> {
+    let mut starts: Vec<usize> = (0..data.len().saturating_sub(2))
+        .filter(|&at| data[at..at + 3] == [0, 0, 1])
+        .collect();
+    starts.push(data.len());
+    let mut out = Vec::new();
+    for pair in starts.windows(2) {
+        let unit = &data[pair[0]..pair[1]];
+        let header = unit.get(3).copied().unwrap_or(0);
+        let delimiter = match codec {
+            Codec::H264 => header & 0x1f == 9,
+            _ => (header >> 1) & 0x3f == 35,
+        };
+        if !delimiter {
+            out.extend_from_slice(unit);
+        }
+    }
+    out
+}
+
+/// Hashes of the pictures decoded from `packets`, each with its
+/// [`Packet::whole_picture`].
+fn decode_framed(
+    context: &Arc<Context>,
+    codec: Codec,
+    packets: &[(Vec<u8>, Option<bool>)],
+) -> Vec<u64> {
+    let mut decoder = Decoder::<Host>::new(context, DecoderConfig::new(codec)).unwrap();
+    let mut hashes = Vec::new();
+    for (index, (data, whole)) in packets.iter().enumerate() {
+        let mut packet = Packet::new(data, i64::try_from(index).unwrap());
+        if let Some(whole) = whole {
+            packet = packet.with_whole_picture(*whole);
+        }
+        decoder.decode(packet).unwrap();
+        while let Some(frame) = decoder.next_frame() {
+            hashes.push(fnv1a64(frame.data()));
+        }
+    }
+    decoder.flush().unwrap();
+    while let Some(frame) = decoder.next_frame() {
+        hashes.push(fnv1a64(frame.data()));
+    }
+    hashes
+}
+
+/// Packets that are not one picture each, sent without
+/// `Packet::whole_picture`, and whole ones mixed with them, decode every
+/// picture as FFmpeg does, also without access unit delimiters (H.264
+/// needs one between an open picture and a whole packet: the decoder sends
+/// it).
+#[test]
+fn packets_of_several_or_part_of_a_picture_decode_bit_exact() {
+    let Some(context) = context() else {
+        return;
+    };
+    for clip in [&H264_BFRAMES, &HEVC_MAIN8] {
+        if !clip.supported(&context) {
+            continue;
+        }
+        let expected = clip.expected();
+        let data = std::fs::read(fixture(clip.file)).unwrap();
+        for delimited in [true, false] {
+            let units: Vec<Vec<u8>> = access_units(&data, clip.codec)
+                .into_iter()
+                .map(|unit| {
+                    if delimited {
+                        unit.to_vec()
+                    } else {
+                        without_delimiters(unit, clip.codec)
+                    }
+                })
+                .collect();
+            let mixed: Vec<_> = units
+                .iter()
+                .enumerate()
+                .map(|(index, unit)| (unit.clone(), Some(index % 3 != 1)))
+                .collect();
+            let pairs: Vec<_> = units
+                .chunks(2)
+                .map(|pair| (pair.concat(), Some(false)))
+                .collect();
+            let halves: Vec<_> = units
+                .iter()
+                .flat_map(|unit| {
+                    let (first, second) = unit.split_at(unit.len() / 2);
+                    [
+                        (first.to_vec(), Some(false)),
+                        (second.to_vec(), Some(false)),
+                    ]
+                })
+                .collect();
+            for (case, packets) in [("mixed", mixed), ("pairs", pairs), ("halves", halves)] {
+                assert_eq!(
+                    decode_framed(&context, clip.codec, &packets),
+                    expected,
+                    "{} {case}, delimiters {delimited}",
+                    clip.file
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn display_delay_keeps_order_and_pictures() {
     let Some(context) = context() else { return };

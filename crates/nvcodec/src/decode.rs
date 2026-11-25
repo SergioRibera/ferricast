@@ -329,6 +329,9 @@ pub struct Decoder<M: OutputMode> {
     context: Arc<Context>,
     /// The end of a non-whole HEVC packet that may continue in the next.
     held: nal::HeldBack,
+    /// The last H.264 / HEVC packet went to the parser without
+    /// `CUVID_PKT_ENDOFPICTURE`: its last picture is still open.
+    open_picture: bool,
     _mode: PhantomData<fn() -> M>,
 }
 
@@ -361,6 +364,7 @@ impl<M: OutputMode> Decoder<M> {
             _lock: lock,
             context: Arc::clone(context),
             held: nal::HeldBack::default(),
+            open_picture: false,
             _mode: PhantomData,
         })
     }
@@ -390,6 +394,7 @@ impl<M: OutputMode> Decoder<M> {
         }
         if packet.discontinuity {
             self.held.clear();
+            self.open_picture = false;
             // On its own: the parser drops the data of a packet that carries the
             // flag (an H.264 IDR with its parameter sets, losing the GOP).
             self.parse(sys::CUvideopacketflags::CUVID_PKT_DISCONTINUITY.0, &[], 0)?;
@@ -411,6 +416,7 @@ impl<M: OutputMode> Decoder<M> {
         }
         match codec {
             Codec::H264 | Codec::Hevc => {
+                self.close_picture(codec, whole)?;
                 let mut held = std::mem::take(&mut self.held);
                 let crop = &mut self.state.get_mut().crop;
                 let parsed = held
@@ -454,7 +460,31 @@ impl<M: OutputMode> Decoder<M> {
     /// As [`Decoder::decode`].
     pub fn flush(&mut self) -> Result<()> {
         self.held.clear();
+        self.open_picture = false;
         self.parse(sys::CUvideopacketflags::CUVID_PKT_ENDOFSTREAM.0, &[], 0)
+    }
+
+    /// Before a whole packet that follows a packet sent without
+    /// `CUVID_PKT_ENDOFPICTURE`: NVIDIA's parser then reads the open
+    /// picture and the whole packet as one picture (losing a picture and
+    /// corrupting the ones that reference it, seen on driver 595) unless an
+    /// access unit delimiter separates them, which streams from MP4 or
+    /// Matroska lack. So the decoder sends one on its own.
+    fn close_picture(&mut self, codec: Codec, whole: bool) -> Result<()> {
+        /// `access_unit_delimiter_rbsp()`, `primary_pic_type` 7 (any).
+        const H264_DELIMITER: [u8; 6] = [0, 0, 0, 1, 0x09, 0xf0];
+        /// `access_unit_delimiter_rbsp()`, `pic_type` 2 (any), layer 0.
+        const HEVC_DELIMITER: [u8; 7] = [0, 0, 0, 1, 0x46, 0x01, 0x50];
+        let open = std::mem::replace(&mut self.open_picture, !whole);
+        if open && whole {
+            let delimiter: &[u8] = if codec == Codec::H264 {
+                &H264_DELIMITER
+            } else {
+                &HEVC_DELIMITER
+            };
+            self.parse(0, delimiter, 0)?;
+        }
+        Ok(())
     }
 
     fn parse(&mut self, flags: u32, data: &[u8], timestamp: i64) -> Result<()> {
