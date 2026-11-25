@@ -44,17 +44,16 @@ pub mod h265;
     reason = "conditional: shared by the video decoders; each backend set uses a different subset"
 )]
 mod nv12;
-#[cfg(feature = "nvdec-decode")]
+#[cfg(all(
+    feature = "nvdec-decode",
+    any(target_os = "linux", target_os = "windows")
+))]
 pub mod nvdec;
 #[cfg(feature = "opus-decode")]
 mod opus;
 mod pcm;
 mod platform;
-#[cfg(any(
-    feature = "openh264-decode",
-    feature = "nvdec-decode",
-    feature = "hevc-decode"
-))]
+#[cfg(any(feature = "openh264-decode", feature = "hevc-decode"))]
 mod signalling;
 #[cfg(feature = "vp8-decode")]
 mod vp8;

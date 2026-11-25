@@ -9,32 +9,27 @@
 
 #[cfg(feature = "hevc-decode")]
 mod software_impl;
-#[cfg(any(feature = "hevc-decode", feature = "nvdec-hevc-decode"))]
-pub(crate) mod timestamps;
+#[cfg(feature = "hevc-decode")]
+mod timestamps;
 #[cfg(feature = "vaapi-hevc-decode")]
 mod vaapi_impl;
 
-#[cfg(any(
-    feature = "nvdec-hevc-decode",
-    feature = "vaapi-hevc-decode",
-    feature = "hevc-decode"
-))]
+#[cfg(any(feature = "vaapi-hevc-decode", feature = "hevc-decode"))]
 use ferricast_codec::Candidate;
 use ferricast_codec::VideoDecoderRegistry;
 use ferricast_codec::bitstream::NalSyntax;
-#[cfg(any(
-    feature = "nvdec-hevc-decode",
-    feature = "vaapi-hevc-decode",
-    feature = "hevc-decode"
-))]
+#[cfg(any(feature = "vaapi-hevc-decode", feature = "hevc-decode"))]
 use ferricast_core::Acceleration;
 #[cfg(feature = "vaapi-hevc-decode")]
 use ferricast_core::DecoderConfig;
 use ferricast_core::{BackendId, Codec, CodecTarget};
-#[cfg(any(feature = "nvdec-hevc-decode", feature = "vaapi-hevc-decode"))]
+#[cfg(feature = "vaapi-hevc-decode")]
 use ferricast_core::{CodecError, Operation};
 
-#[cfg(feature = "nvdec-hevc-decode")]
+#[cfg(all(
+    feature = "nvdec-hevc-decode",
+    any(target_os = "linux", target_os = "windows")
+))]
 pub use crate::nvdec::NvdecH265Decoder;
 #[cfg(feature = "hevc-decode")]
 pub use software_impl::SoftwareH265Decoder;
@@ -49,22 +44,7 @@ ferricast_codec::video_decoder_facade! {
 /// The H.265 decode backends of this build, in automatic order.
 fn registry() -> VideoDecoderRegistry {
     let registry = VideoDecoderRegistry::new(CodecTarget::decode(Codec::H265));
-    #[cfg(feature = "nvdec-hevc-decode")]
-    let registry = registry.candidate(
-        Candidate::new(BackendId::Nvdec, Acceleration::Hardware, |config| {
-            // Capability query first: cheap, and it names a missing driver
-            // or codec instead of failing later on the first packet.
-            NvdecH265Decoder::probe()
-                .map_err(CodecError::from_backend(BackendId::Nvdec, Operation::Probe))?;
-            ferricast_codec::open_video_decoder::<NvdecH265Decoder>(config)
-        })
-        .with_probe(|| {
-            NvdecH265Decoder::probe()
-                .map_err(CodecError::from_backend(BackendId::Nvdec, Operation::Probe))
-        }),
-    );
-    #[cfg(not(feature = "nvdec-hevc-decode"))]
-    let registry = registry.missing(BackendId::Nvdec, "ferricast-decoder/nvdec-hevc-decode");
+    let registry = crate::facades::nvdec(registry, Codec::H265);
     #[cfg(feature = "vaapi-hevc-decode")]
     let registry = registry.candidate(
         Candidate::new(

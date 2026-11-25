@@ -46,15 +46,13 @@ vaapi-decode = ["dep:cros-libva", "dep:h264-reader"]
 # the cros-libva dependency. Opt-in: HEVC decode is part of the
 # H.265 facade only.
 vaapi-hevc-decode = ["dep:cros-libva"]
-# NVDEC hardware decode (NVIDIA). Carries the generic `NvdecDecoder<C>`
-# whose codec marker selects H.264 today; the HEVC marker lives
-# behind `nvdec-hevc-decode` below. h264-reader (and rust_h265 for
-# HEVC) read the slice headers that time NVDEC's pictures: the binding
-# drops the CUVID timestamps.
-nvdec-decode = ["dep:shiguredo_nvcodec", "dep:h264-reader"]
-# NVDEC HEVC decode. Builds on top of `nvdec-decode`; only the codec
-# marker is gated, the dispatcher and CUDA plumbing are shared.
-nvdec-hevc-decode = ["nvdec-decode", "dep:rust_h265"]
+# NVDEC hardware decode (NVIDIA) through ferricast-nvcodec: H.264, VP8,
+# VP9 and AV1, first in automatic selection. The driver is loaded at run
+# time (no SDK at build time); without one, selection moves on. Linux and
+# Windows only: elsewhere the feature is inert.
+nvdec-decode = ["ferricast-codec/cuda"]
+# NVDEC HEVC decode, on top of `nvdec-decode`.
+nvdec-hevc-decode = ["nvdec-decode"]
 # The decoders in the istmo codec plugin (`ferricast_codec::plugin`).
 istmo = ["ferricast-codec/istmo"]
 # Platform codecs. Each compiles only on its own OS (its dependency is
@@ -118,12 +116,6 @@ cros-libva = { git = "https://github.com/SergioRibera/cros-libva", branch = "fix
 # a stream can reorder pictures from it, and the software HEVC backend
 # borrows its Exp-Golomb bit reader to read picture order counts.
 h264-reader = { version = "0.7", optional = true }
-
-# NVDEC binding (same crate the encoder uses — the workspace is
-# already pinned to it, so wiring in decode here gets us NV12 output
-# from H.264 + HEVC bitstreams without a second NVIDIA library
-# dependency).
-shiguredo_nvcodec = { version = "2026.1.0", optional = true }
 
 [dev-dependencies]
 ferricast-demuxer = { path = "../demuxer" }

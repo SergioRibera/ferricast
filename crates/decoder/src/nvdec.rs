@@ -1,340 +1,657 @@
-//! Codec-generic NVDEC decoder.
+//! NVDEC hardware decode (H.264, HEVC, VP8, VP9, AV1) through
+//! `ferricast-nvcodec`.
 //!
-//! Single generic implementation that targets H.264 today and HEVC
-//! behind `nvdec-hevc-decode`. Mirrors the encoder's
-//! [`ferricast_encoder::nvenc::NvencEncoder<C>`] shape: a sealed
-//! [`NvdecCodec`] marker fixes the codec at compile time, the rest of
-//! the pipeline (`shiguredo_nvcodec::Decoder` setup, Annex-B parsing,
-//! NV12 output assembly) is identical across codecs.
+//! One generic [`NvdecDecoder`] serves every codec; a sealed
+//! [`NvdecCodec`] marker fixes the codec at compile time.
 //!
-//! Output: `CapturedFrame::Cpu(RawFrame)` with
-//! `PixelFormat::Nv12`. NVDEC produces NV12 natively (Y plane + tightly
-//! interleaved UV plane); we forward it as-is. Downstream consumers
-//! that need BGRA pay the conversion cost on their side — sinks that
-//! upload directly to a GPU texture (eframe / wgpu) can consume NV12
-//! through a fragment-shader colour conversion at zero CPU cost.
-//!
-//! The binding drops CUVID timestamps, so each picture's is worked out
-//! from the slice headers instead (see the `timestamps` module).
-
-mod h264;
-
-mod timestamps;
+//! - Timestamps travel through NVIDIA's parser with each packet and come
+//!   back with the picture it started, in display order.
+//! - Colour is the stream's own (H.264 / HEVC VUI, VP9 colour space, AV1
+//!   colour config, as NVDEC reports it), each unspecified field filled
+//!   from the container's signalling.
+//! - HDR metadata: the SEI messages NVDEC hands over with each picture,
+//!   else ferricast's own reading of the stream's SEI (H.264 / HEVC) or
+//!   metadata OBUs (AV1), else the container's.
+//! - Output: [`FrameMemory::Cpu`] decodes into pooled host buffers and
+//!   hands them out as [`RawFrame`]s without a copy (NV12, or P010 for
+//!   deeper streams when [`DecoderConfig::pixel_format`] asks for it);
+//!   [`FrameMemory::Native`] keeps the pictures in CUDA device memory
+//!   ([`CudaSurface`]), which the NVENC encoder takes without a copy.
 
 use std::collections::VecDeque;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use bytes::Bytes;
-use ferricast_core::{BackendId, CodecError, CodecResult, Operation};
-use ferricast_core::{
-    CapturedFrame, Codec, DecoderConfig, EncodedFrame, FerricastError, Result, VideoDecoder,
+use ferricast_codec::bitstream::NalSyntax;
+use ferricast_codec::bitstream::hdr::HdrTracker;
+use ferricast_codec::bitstream::vui::ColourTracker;
+use ferricast_codec::cuda::nvcodec::decode::{
+    self as nv, ChromaFormat, Decoder, DecoderCaps, Device, FrameInfo, Host, HostFrame, Packet,
+    SeiMessages,
 };
-use shiguredo_nvcodec::{
-    Decoder as NvDecoder, DecoderCodec, DecoderConfig as NvDecCfg, SurfaceFormat,
+use ferricast_codec::cuda::{self, CudaSurface, map_error};
+use ferricast_codec::{Candidate, VideoDecoderRegistry, VideoDecoderSession};
+use ferricast_core::{
+    Acceleration, BackendId, CapturedFrame, Codec, CodecError, CodecResult, CodecTarget,
+    ColourDescription, ColourPrimaries, ContentLightLevel, DecoderConfig, EncodedFrame,
+    FrameMemory, HdrMetadata, MasteringDisplay, MatrixCoefficients, NativeFrame, Operation,
+    PixelFormat, RawFrame, TransferCharacteristics, VideoDecoder,
 };
 use tracing::{debug, info};
 
-use self::sealed::Headers as _;
-use ferricast_codec::bitstream::{NalSyntax, split_annex_b};
+use crate::nv12::{self, Container, OutputFormat};
 
-use crate::nv12::{self, OutputFormat};
-use crate::signalling::NalSignalling;
-use timestamps::{Picture, Timestamps};
+/// Host pictures NVDEC may have handed out at once (each holds a pooled
+/// buffer until its last `Bytes` drops).
+const MAX_HOST_FRAMES: usize = 64;
+/// Past this many host pictures still held, new ones are copied out so the
+/// pool never runs dry under a consumer that keeps pictures (a jitter
+/// buffer).
+const LEND_LIMIT: usize = 48;
+/// Device pictures handed out at once.
+const MAX_DEVICE_FRAMES: usize = 32;
+/// `video_format` of a stream without a video signal type (H.273 5,
+/// "unspecified").
+const VIDEO_FORMAT_UNSPECIFIED: u8 = 5;
 
-/// Sealed marker pinning a [`NvdecDecoder`] to one bitstream codec.
+/// Where a codec's bitstream carries the HDR metadata ferricast reads
+/// itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bitstream {
+    /// SEI messages in Annex B NAL units (H.264, HEVC).
+    Nal(NalSyntax),
+    /// Metadata OBUs (AV1).
+    Av1,
+    /// Nowhere (VP8, VP9: only the container has it).
+    Opaque,
+}
+
+/// Sealed marker pinning a [`NvdecDecoder`] to one codec.
 pub trait NvdecCodec: sealed::Sealed + Send + 'static {
-    /// Ferricast-side codec identity. Drives [`VideoDecoder::CODEC`]
-    /// and is what the facade matches against `DecoderConfig::codec`
-    /// before configuring the underlying NVDEC session.
+    /// The ferricast codec ([`VideoDecoder::CODEC`]).
     const FERRICAST_CODEC: Codec;
-    /// shiguredo codec selector used by `query_caps` + `Decoder::new`.
-    const NV_CODEC: DecoderCodec;
-    const NAME: &'static str;
-    /// How the codec's NAL units are typed, for reading its SEI messages.
-    const SYNTAX: NalSyntax;
+    /// The NVDEC codec.
+    const NV_CODEC: nv::Codec;
+    /// Where the bitstream carries HDR metadata (and, for H.264 / HEVC,
+    /// the chroma sample location NVDEC does not report).
+    const BITSTREAM: Bitstream;
 }
 
 mod sealed {
-    use super::Picture;
-
-    pub trait Sealed {
-        /// Reads what timing the pictures needs from the bitstream.
-        type Headers: Headers;
-    }
-
-    pub trait Headers: Default {
-        /// The pictures in one packet that NVDEC is expected to show.
-        fn shown(&mut self, packet: &[u8]) -> Vec<Picture>;
-    }
+    pub trait Sealed {}
 }
 
-/// H.264 marker.
-pub struct H264;
-impl sealed::Sealed for H264 {
-    type Headers = h264::Headers;
-}
-impl NvdecCodec for H264 {
-    const FERRICAST_CODEC: Codec = Codec::H264;
-    const NV_CODEC: DecoderCodec = DecoderCodec::H264;
-    const NAME: &'static str = "H.264";
-    const SYNTAX: NalSyntax = NalSyntax::H264;
+macro_rules! marker {
+    ($(#[$meta:meta])* $name:ident, $codec:expr, $nv:expr, $bitstream:expr) => {
+        $(#[$meta])*
+        #[derive(Debug)]
+        pub enum $name {}
+        impl sealed::Sealed for $name {}
+        impl NvdecCodec for $name {
+            const FERRICAST_CODEC: Codec = $codec;
+            const NV_CODEC: nv::Codec = $nv;
+            const BITSTREAM: Bitstream = $bitstream;
+        }
+    };
 }
 
-/// HEVC marker.
+marker!(
+    /// H.264.
+    H264,
+    Codec::H264,
+    nv::Codec::H264,
+    Bitstream::Nal(NalSyntax::H264)
+);
 #[cfg(feature = "nvdec-hevc-decode")]
-pub struct Hevc;
-#[cfg(feature = "nvdec-hevc-decode")]
-impl sealed::Sealed for Hevc {
-    type Headers = crate::h265::timestamps::Headers;
-}
-#[cfg(feature = "nvdec-hevc-decode")]
-impl NvdecCodec for Hevc {
-    const FERRICAST_CODEC: Codec = Codec::H265;
-    const NV_CODEC: DecoderCodec = DecoderCodec::Hevc;
-    const NAME: &'static str = "HEVC";
-    const SYNTAX: NalSyntax = NalSyntax::H265;
-}
+marker!(
+    /// HEVC.
+    Hevc,
+    Codec::H265,
+    nv::Codec::Hevc,
+    Bitstream::Nal(NalSyntax::H265)
+);
+marker!(
+    /// VP8.
+    Vp8,
+    Codec::Vp8,
+    nv::Codec::Vp8,
+    Bitstream::Opaque
+);
+marker!(
+    /// VP9.
+    Vp9,
+    Codec::Vp9,
+    nv::Codec::Vp9,
+    Bitstream::Opaque
+);
+marker!(
+    /// AV1.
+    Av1,
+    Codec::Av1,
+    nv::Codec::Av1,
+    Bitstream::Av1
+);
 
-impl sealed::Headers for h264::Headers {
-    fn shown(&mut self, packet: &[u8]) -> Vec<Picture> {
-        self.picture(packet).into_iter().collect()
+/// The H.264 NVDEC decoder.
+pub type NvdecH264Decoder = NvdecDecoder<H264>;
+/// The HEVC NVDEC decoder.
+#[cfg(feature = "nvdec-hevc-decode")]
+pub type NvdecH265Decoder = NvdecDecoder<Hevc>;
+/// The VP8 NVDEC decoder.
+pub type NvdecVp8Decoder = NvdecDecoder<Vp8>;
+/// The VP9 NVDEC decoder.
+pub type NvdecVp9Decoder = NvdecDecoder<Vp9>;
+/// The AV1 NVDEC decoder.
+pub type NvdecAv1Decoder = NvdecDecoder<Av1>;
+
+/// Adds NVDEC for `codec` to `registry`, as the first (hardware)
+/// candidate of automatic selection.
+pub(crate) fn register(registry: VideoDecoderRegistry, codec: Codec) -> VideoDecoderRegistry {
+    match codec {
+        Codec::H264 => registry.candidate(candidate::<H264>()),
+        #[cfg(feature = "nvdec-hevc-decode")]
+        Codec::H265 => registry.candidate(candidate::<Hevc>()),
+        #[cfg(not(feature = "nvdec-hevc-decode"))]
+        Codec::H265 => registry.missing(BackendId::Nvdec, "ferricast-decoder/nvdec-hevc-decode"),
+        Codec::Vp8 => registry.candidate(candidate::<Vp8>()),
+        Codec::Vp9 => registry.candidate(candidate::<Vp9>()),
+        Codec::Av1 => registry.candidate(candidate::<Av1>()),
     }
 }
 
-#[cfg(feature = "nvdec-hevc-decode")]
-impl sealed::Headers for crate::h265::timestamps::Headers {
-    fn shown(&mut self, packet: &[u8]) -> Vec<Picture> {
-        self.pictures(&rust_h265::parse_annex_b(packet))
-            .into_iter()
-            .filter(|picture| !picture.skipped)
-            .map(|picture| Picture {
-                sequence: picture.sequence,
-                max_waiting: picture.max_num_reorder,
-            })
-            .collect()
-    }
+fn candidate<C: NvdecCodec>() -> Candidate<DecoderConfig, dyn VideoDecoderSession> {
+    Candidate::new(BackendId::Nvdec, Acceleration::Hardware, |config| {
+        // Capability query first: cheap, and it names a missing driver or
+        // codec instead of failing on the first packet.
+        NvdecDecoder::<C>::probe()?;
+        ferricast_codec::open_video_decoder::<NvdecDecoder<C>>(config)
+    })
+    .with_probe(NvdecDecoder::<C>::probe)
 }
 
-/// Codec-generic NVDEC decoder.
+/// The decoder of one stream, in host or device mode.
+enum Session {
+    Host {
+        decoder: Decoder<Host>,
+        /// Cloned into every picture lent out without a copy: its count is
+        /// how many are still held.
+        lent: Arc<()>,
+    },
+    Device(Decoder<Device>),
+}
+
+/// NVDEC decoder for the codec `C`.
 pub struct NvdecDecoder<C: NvdecCodec> {
-    decoder: Option<NvDecoder>,
+    session: Option<Session>,
     /// One packet can release several pictures (a B-frame run ending);
-    /// they wait here so none is dropped.
+    /// they wait here.
     ready: VecDeque<CapturedFrame>,
-    headers: C::Headers,
-    timestamps: Timestamps,
     format: OutputFormat,
-    /// The binding exposes neither the VUI colour nor SEI messages.
-    signalling: NalSignalling,
-    _codec: PhantomData<C>,
+    signalling: Signalling,
+    _codec: PhantomData<fn() -> C>,
 }
 
 impl<C: NvdecCodec> Default for NvdecDecoder<C> {
     fn default() -> Self {
         Self {
-            decoder: None,
+            session: None,
             ready: VecDeque::new(),
-            headers: C::Headers::default(),
-            timestamps: Timestamps::default(),
             format: OutputFormat::default(),
-            signalling: NalSignalling::default(),
+            signalling: Signalling::new(C::BITSTREAM, Container::default()),
             _codec: PhantomData,
         }
     }
 }
 
 impl<C: NvdecCodec> NvdecDecoder<C> {
-    /// Moves every picture NVDEC has finished into `ready`.
-    fn drain(&mut self) -> Result<()> {
-        let Some(decoder) = self.decoder.as_mut() else {
-            return Ok(());
-        };
-        while let Some(nv_frame) = decoder
-            .next_frame()
-            .map_err(|e| FerricastError::Decode(format!("NVDEC ({}) next_frame: {e}", C::NAME)))?
-        {
-            // NV12 (P016 above 8 bits): Y plane (full res) + interleaved UV
-            // (half height), both at the CUDA pitch, forwarded as one
-            // contiguous buffer.
-            let y_stride = nv_frame.y_stride();
-            let (width, height) = (nv_frame.width(), nv_frame.height());
-            let mut data = Vec::with_capacity(y_stride * height * 3 / 2);
-            data.extend_from_slice(nv_frame.y_plane());
-            data.extend_from_slice(nv_frame.uv_plane());
-            let deliver = if nv_frame.bit_depth() > 8 {
-                nv12::deliver_p010
-            } else {
-                nv12::deliver
-            };
-            let mut frame = deliver(
-                Bytes::from(data),
-                y_stride,
-                (width, height),
-                self.timestamps.claim(),
-                self.format.0,
-                self.signalling.colour(),
-            )
-            .ok_or_else(|| {
-                FerricastError::Decode(format!("NVDEC ({}) returned short planes", C::NAME))
-            })?;
-            frame.hdr = self.signalling.hdr();
-            self.ready.push_back(CapturedFrame::Cpu(frame));
-        }
-        Ok(())
-    }
-}
-
-impl<C: NvdecCodec> NvdecDecoder<C> {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Capability probe — fails when libcuda / libnvcuvid aren't on
-    /// the runtime LD path, or the GPU doesn't support this codec.
-    /// Cheap: no decoder session is created.
+    /// Whether this machine's GPU decodes `C` (8-bit 4:2:0): loads the
+    /// driver and asks it, without creating a decoder.
     ///
     /// # Errors
-    /// [`FerricastError::Decode`] naming what is missing.
-    pub fn probe() -> Result<()> {
-        let caps = NvDecoder::query_caps(C::NV_CODEC, /* device_id = */ 0)
-            .map_err(|e| FerricastError::Decode(format!("NVDEC ({}): query_caps: {e}", C::NAME)))?;
-        if !caps.is_supported {
-            return Err(FerricastError::Decode(format!(
-                "NVDEC ({}): codec not supported by the active GPU",
-                C::NAME
-            )));
+    ///
+    /// [`CodecError::BackendUnavailable`] without an NVIDIA driver or GPU,
+    /// or when the GPU has no decoder for the codec.
+    pub fn probe() -> CodecResult<()> {
+        let context = cuda::context().map_err(map_error(BackendId::Nvdec, Operation::Probe))?;
+        let caps = DecoderCaps::query(&context, C::NV_CODEC, ChromaFormat::Yuv420, 8)
+            .map_err(map_error(BackendId::Nvdec, Operation::Probe))?;
+        if !caps.supported {
+            return Err(CodecError::BackendUnavailable {
+                backend: BackendId::Nvdec,
+                reason: format!("this GPU does not decode {}", C::NV_CODEC),
+            });
         }
         debug!(
-            codec = C::NAME,
+            codec = %C::NV_CODEC,
             max_width = caps.max_width,
             max_height = caps.max_height,
+            engines = caps.engines,
             "NVDEC caps probe OK"
         );
         Ok(())
     }
-}
 
-// SAFETY: `shiguredo_nvcodec::Decoder` holds a CUDA context handle
-// that's only valid on the creating thread, but every method push/pop
-// the context internally before calling NVDEC. `VideoDecoder: Send`
-// is satisfied because the trait's `&mut self` contract guarantees
-// no concurrent access.
-unsafe impl<C: NvdecCodec> Send for NvdecDecoder<C> {}
-
-impl<C: NvdecCodec> NvdecDecoder<C> {
-    fn try_configure(&mut self, config: &DecoderConfig) -> Result<()> {
-        if config.codec != C::FERRICAST_CODEC {
-            return Err(FerricastError::Decode(format!(
-                "NVDEC ({}) asked to decode {:?}",
-                C::NAME,
-                config.codec
-            )));
-        }
-
-        // Cap session at 4× decode surfaces. NVDEC keeps reference
-        // frames internally; 4 is the documented minimum that handles
-        // any IPBB pattern. HEVC and H.264 both fit under this for the
-        // single-stream low-latency use case ferricast targets.
-        let cfg = NvDecCfg {
-            codec: C::NV_CODEC,
-            device_id: 0,
-            max_num_decode_surfaces: 4,
-            // Low latency: emit as soon as the picture is reconstructed.
-            // `0` is documented as "no display delay" in CUDA's NVDEC
-            // sample headers.
-            max_display_delay: 0,
-            surface_format: SurfaceFormat::Nv12,
+    fn open(config: &DecoderConfig) -> CodecResult<Session> {
+        let context = cuda::context().map_err(map_error(BackendId::Nvdec, Operation::Open))?;
+        let nv_config = nv::DecoderConfig::new(C::NV_CODEC);
+        let session = match config.memory {
+            FrameMemory::Cpu => Session::Host {
+                decoder: Decoder::new(&context, nv_config.with_max_frames(MAX_HOST_FRAMES))
+                    .map_err(map_error(BackendId::Nvdec, Operation::Open))?,
+                lent: Arc::new(()),
+            },
+            FrameMemory::Native => Session::Device(
+                Decoder::new(&context, nv_config.with_max_frames(MAX_DEVICE_FRAMES))
+                    .map_err(map_error(BackendId::Nvdec, Operation::Open))?,
+            ),
         };
-        let decoder = NvDecoder::new(cfg)
-            .map_err(|e| FerricastError::Decode(format!("NVDEC ({}) open: {e}", C::NAME)))?;
-        info!(codec = C::NAME, "NVDEC decoder ready");
-        self.decoder = Some(decoder);
-        self.ready.clear();
-        self.format = OutputFormat(config.pixel_format);
-        self.headers = C::Headers::default();
-        self.signalling = NalSignalling::of(config);
-        self.timestamps = Timestamps::default();
+        info!(codec = %C::NV_CODEC, memory = ?config.memory, "NVDEC decoder ready");
+        Ok(session)
+    }
+
+    /// Moves every picture NVDEC has finished into `ready`.
+    fn drain(&mut self) -> CodecResult<()> {
+        let Self {
+            session,
+            ready,
+            format,
+            signalling,
+            ..
+        } = self;
+        match session {
+            None => {}
+            Some(Session::Host { decoder, lent }) => {
+                while let Some(frame) = decoder.next_frame() {
+                    let raw = host_picture(frame, lent, format.0, signalling)?;
+                    ready.push_back(CapturedFrame::Cpu(raw));
+                }
+            }
+            Some(Session::Device(decoder)) => {
+                while let Some(frame) = decoder.next_frame() {
+                    let info = *frame.info();
+                    let (colour, hdr) = signalling.picture(&info, frame.sei());
+                    let surface = CudaSurface::new(frame).ok_or_else(|| no_pixel_format(&info))?;
+                    ready.push_back(CapturedFrame::Native(NativeFrame {
+                        width: info.width,
+                        height: info.height,
+                        timestamp_us: timestamp(&info),
+                        colour: Some(colour),
+                        hdr,
+                        surface: Arc::new(surface),
+                    }));
+                }
+            }
+        }
         Ok(())
     }
+}
 
-    fn try_decode(&mut self, frame: &EncodedFrame) -> Result<Option<CapturedFrame>> {
-        let decoder = self.decoder.as_mut().ok_or_else(|| {
-            FerricastError::Decode(format!("NVDEC ({}) decode before configure()", C::NAME))
+/// The picture's timestamp: the packet's, as given to the parser.
+fn timestamp(info: &FrameInfo) -> u64 {
+    u64::try_from(info.timestamp).unwrap_or(0)
+}
+
+/// NVDEC decoded the stream to a layout ferricast has no pixel format for
+/// (4:2:2, 4:4:4): another backend takes it over.
+fn no_pixel_format(info: &FrameInfo) -> CodecError {
+    CodecError::UnsupportedStream {
+        backend: BackendId::Nvdec,
+        reason: format!(
+            "NVDEC decodes this stream to {:?}, which ferricast has no pixel format for",
+            info.format
+        ),
+    }
+}
+
+/// A host picture as a [`RawFrame`] in the requested `format`. NV12 and
+/// P010 pictures are lent without a copy while few are held.
+fn host_picture(
+    frame: HostFrame,
+    lent: &Arc<()>,
+    format: PixelFormat,
+    signalling: &mut Signalling,
+) -> CodecResult<RawFrame> {
+    let info = *frame.info();
+    let (colour, hdr) = signalling.picture(&info, frame.sei());
+    let deep = match info.format {
+        nv::PixelFormat::Nv12 => false,
+        nv::PixelFormat::P016 => true,
+        nv::PixelFormat::Nv16
+        | nv::PixelFormat::P216
+        | nv::PixelFormat::Yuv444
+        | nv::PixelFormat::Yuv444P16 => return Err(no_pixel_format(&info)),
+    };
+    let size = (info.width as usize, info.height as usize);
+    let (data, stride) = HostPicture::bytes(frame, lent);
+    let deliver = if deep {
+        nv12::deliver_p010
+    } else {
+        nv12::deliver
+    };
+    let mut raw =
+        deliver(data, stride, size, timestamp(&info), format, colour).ok_or_else(|| {
+            CodecError::backend(
+                BackendId::Nvdec,
+                Operation::Decode,
+                "NVDEC returned short planes",
+            )
         })?;
+    raw.hdr = hdr;
+    Ok(raw)
+}
 
-        // Read before NVDEC sees the packet so its parameter sets are
-        // known whatever happens to the decode.
-        let pictures = self.headers.shown(&frame.data);
-        self.signalling.observe(&frame.data, C::SYNTAX);
-        // NVDEC's parser owns picture-boundary detection; one packet may
-        // release 0, 1 or N pictures depending on the GOP structure.
-        decoder
-            .decode(&frame.data)
-            .map_err(|e| FerricastError::Decode(format!("NVDEC ({}) decode: {e}", C::NAME)))?;
-        for picture in pictures {
-            self.timestamps.push(picture, frame.timestamp_us);
+/// A host frame lent to a `Bytes`: its pooled buffer goes back to the
+/// decoder when the last clone of the bytes drops.
+struct HostPicture {
+    frame: HostFrame,
+    _lent: Arc<()>,
+}
+
+impl AsRef<[u8]> for HostPicture {
+    fn as_ref(&self) -> &[u8] {
+        self.frame.data()
+    }
+}
+
+impl HostPicture {
+    /// The planes of a two-plane picture as one buffer with one stride:
+    /// the frame itself when both planes have the same pitch (even widths)
+    /// and few frames are lent, a packed copy otherwise.
+    fn bytes(frame: HostFrame, lent: &Arc<()>) -> (Bytes, usize) {
+        let layout = frame.layout();
+        if let [luma, chroma] = layout.planes()
+            && luma.pitch == chroma.pitch
+        {
+            let stride = luma.pitch;
+            if Arc::strong_count(lent) <= LEND_LIMIT {
+                let picture = Self {
+                    frame,
+                    _lent: Arc::clone(lent),
+                };
+                return (Bytes::from_owner(picture), stride);
+            }
+            return (Bytes::copy_from_slice(frame.data()), stride);
         }
-        self.drain()?;
-        self.timestamps.settle();
-        Ok(self.ready.pop_front())
+        // Odd widths: the chroma row holds one sample more than the luma
+        // row; ferricast's NV12 / P010 frames use the chroma pitch for both.
+        let planes = layout.planes();
+        let stride = planes.iter().map(|plane| plane.pitch).max().unwrap_or(0);
+        let rows: usize = planes.iter().map(|plane| plane.rows).sum();
+        let mut out = vec![0; stride * rows];
+        let mut row = 0;
+        for (index, plane) in planes.iter().enumerate() {
+            let Some(data) = frame.plane(index) else {
+                break;
+            };
+            for line in data.chunks_exact(plane.pitch) {
+                if let Some(target) = out.get_mut(row * stride..row * stride + plane.width_bytes) {
+                    target.copy_from_slice(&line[..plane.width_bytes]);
+                }
+                row += 1;
+            }
+        }
+        (Bytes::from(out), stride)
+    }
+}
+
+/// What a stream signals about its colour and HDR metadata: the
+/// container's description, and what ferricast reads from the bitstream
+/// where NVDEC does not report it.
+#[derive(Debug, Clone)]
+struct Signalling {
+    bitstream: Bitstream,
+    container: Container,
+    /// The chroma sample location of H.264 / HEVC VUIs.
+    vui: ColourTracker,
+    /// HDR metadata ferricast read from the stream itself.
+    read: HdrTracker,
+    /// HDR metadata from the SEI messages NVDEC handed over; once it has
+    /// any, ferricast stops reading SEI itself.
+    nvdec: HdrMetadata,
+}
+
+impl Signalling {
+    fn new(bitstream: Bitstream, container: Container) -> Self {
+        Self {
+            bitstream,
+            container,
+            vui: ColourTracker::default(),
+            read: HdrTracker::default(),
+            nvdec: HdrMetadata::default(),
+        }
     }
 
-    fn try_flush(&mut self) -> Result<Vec<CapturedFrame>> {
-        if let Some(decoder) = self.decoder.as_mut() {
-            decoder
-                .finish()
-                .map_err(|e| FerricastError::Decode(format!("NVDEC ({}) finish: {e}", C::NAME)))?;
-            // Everything left comes out now, in display order, so the
-            // pending timestamps are handed out earliest first.
-            self.drain()?;
+    /// Reads one packet before NVDEC decodes it.
+    fn observe(&mut self, packet: &[u8]) {
+        match self.bitstream {
+            Bitstream::Nal(syntax) => {
+                self.vui.observe_annex_b(packet, syntax);
+                if self.nvdec.is_empty() {
+                    self.read.observe_annex_b(packet, syntax);
+                }
+            }
+            Bitstream::Av1 => self.read.observe_av1(packet),
+            Bitstream::Opaque => {}
         }
-        self.timestamps = Timestamps::default();
-        Ok(self.ready.drain(..).collect())
     }
+
+    /// The colour and HDR metadata of a decoded picture with `sei`.
+    fn picture(
+        &mut self,
+        info: &FrameInfo,
+        sei: SeiMessages<'_>,
+    ) -> (ColourDescription, Option<HdrMetadata>) {
+        if let Some(display) = sei.clone().mastering_display() {
+            self.nvdec.mastering_display = Some(mastering_display(display));
+        }
+        if let Some(light) = sei.content_light_level() {
+            self.nvdec.content_light = Some(ContentLightLevel {
+                max_cll: light.max_content,
+                max_fall: light.max_frame_average,
+            });
+        }
+        (self.colour(info.colour), self.hdr())
+    }
+
+    /// The stream's HDR metadata (NVDEC's SEI, else what ferricast read),
+    /// per half; the container's when the stream has none.
+    fn hdr(&self) -> Option<HdrMetadata> {
+        let read = self.read.current_or(None).unwrap_or_default();
+        let stream = HdrMetadata {
+            mastering_display: self.nvdec.mastering_display.or(read.mastering_display),
+            content_light: self.nvdec.content_light.or(read.content_light),
+        };
+        if stream.is_empty() {
+            self.container.hdr
+        } else {
+            Some(stream)
+        }
+    }
+
+    /// NVDEC's colour, each unspecified field taken from the container.
+    fn colour(&self, nvdec: nv::Colour) -> ColourDescription {
+        let stream = ColourDescription::from_codes(
+            nvdec.primaries,
+            nvdec.transfer,
+            nvdec.matrix,
+            nvdec.full_range,
+        );
+        let location = self.vui.chroma_location();
+        let Some(container) = self.container.colour else {
+            return match location {
+                Some(location) => stream.with_chroma_location(location),
+                None => stream,
+            };
+        };
+        // A stream without a video signal type reports all of it
+        // unspecified (and limited range): the container's range applies.
+        let signalled = nvdec.full_range
+            || nvdec.video_format != VIDEO_FORMAT_UNSPECIFIED
+            || stream.primaries != ColourPrimaries::Unspecified
+            || stream.transfer != TransferCharacteristics::Unspecified
+            || stream.matrix != MatrixCoefficients::Unspecified;
+        ColourDescription {
+            primaries: if stream.primaries == ColourPrimaries::Unspecified {
+                container.primaries
+            } else {
+                stream.primaries
+            },
+            transfer: if stream.transfer == TransferCharacteristics::Unspecified {
+                container.transfer
+            } else {
+                stream.transfer
+            },
+            matrix: if stream.matrix == MatrixCoefficients::Unspecified {
+                container.matrix
+            } else {
+                stream.matrix
+            },
+            range: if signalled {
+                stream.range
+            } else {
+                container.range
+            },
+            chroma_location: location.or(container.chroma_location),
+        }
+    }
+}
+
+/// NVDEC's decoded mastering display SEI as ferricast's, through the SEI
+/// payload (primaries in bitstream order: green, blue, red).
+fn mastering_display(display: nv::MasteringDisplay) -> MasteringDisplay {
+    let mut payload = [0_u8; MasteringDisplay::SEI_LEN];
+    let points = display.primaries.into_iter().chain([display.white_point]);
+    for (chunk, (x, y)) in payload.chunks_exact_mut(4).zip(points) {
+        chunk[..2].copy_from_slice(&x.to_be_bytes());
+        chunk[2..].copy_from_slice(&y.to_be_bytes());
+    }
+    payload[16..20].copy_from_slice(&display.max_luminance.to_be_bytes());
+    payload[20..24].copy_from_slice(&display.min_luminance.to_be_bytes());
+    MasteringDisplay::from_sei(&payload)
+        .expect("invariant: the payload is exactly MasteringDisplay::SEI_LEN bytes")
 }
 
 impl<C: NvdecCodec> VideoDecoder for NvdecDecoder<C> {
     const CODEC: Codec = C::FERRICAST_CODEC;
 
     fn configure(&mut self, config: &DecoderConfig) -> CodecResult<()> {
-        self.try_configure(config).map_err(CodecError::from_backend(
-            BackendId::Nvdec,
-            Operation::Configure,
-        ))
+        if config.codec != C::FERRICAST_CODEC {
+            return Err(CodecError::UnsupportedConfig {
+                backend: BackendId::Nvdec,
+                what: format!("{:?} with the {} decoder", config.codec, C::NV_CODEC),
+            });
+        }
+        self.session = Some(Self::open(config)?);
+        self.ready.clear();
+        self.format = OutputFormat(config.pixel_format);
+        self.signalling = Signalling::new(C::BITSTREAM, Container::of(config));
+        Ok(())
     }
 
     fn decode(&mut self, frame: EncodedFrame) -> CodecResult<Option<CapturedFrame>> {
-        // NVDEC decodes H.264 at 8 bits only (HEVC to 16-bit P016): a
-        // High 10 stream goes to a backend that keeps its samples.
-        if C::FERRICAST_CODEC == Codec::H264
-            && let Some(depth) = split_annex_b(&frame.data)
-                .into_iter()
-                .filter(|nal| nal.first().is_some_and(|header| header & 0x1f == 7))
-                .find_map(ferricast_codec::bitstream::h264::sps_bit_depth)
-            && depth > 8
-        {
-            return Err(CodecError::UnsupportedStream {
-                backend: BackendId::Nvdec,
-                reason: format!("{depth}-bit H.264: NVDEC decodes 8-bit H.264 only"),
-            });
+        let session = self.session.as_mut().ok_or(CodecError::NotConfigured {
+            target: CodecTarget::decode(C::FERRICAST_CODEC),
+            operation: Operation::Decode,
+        })?;
+        // Read before NVDEC sees the packet, so its parameter sets count
+        // whatever happens to the decode.
+        self.signalling.observe(&frame.data);
+        let packet = Packet::new(
+            &frame.data,
+            i64::try_from(frame.timestamp_us).unwrap_or(i64::MAX),
+        );
+        match session {
+            Session::Host { decoder, .. } => decoder.decode(packet),
+            Session::Device(decoder) => decoder.decode(packet),
         }
-        self.try_decode(&frame).map_err(CodecError::from_backend(
-            BackendId::Nvdec,
-            Operation::Decode,
-        ))
+        .map_err(map_error(BackendId::Nvdec, Operation::Decode))?;
+        self.drain()?;
+        Ok(self.ready.pop_front())
     }
 
     fn flush(&mut self) -> CodecResult<Vec<CapturedFrame>> {
-        self.try_flush()
-            .map_err(CodecError::from_backend(BackendId::Nvdec, Operation::Flush))
+        match self.session.as_mut() {
+            Some(Session::Host { decoder, .. }) => decoder.flush(),
+            Some(Session::Device(decoder)) => decoder.flush(),
+            None => Ok(()),
+        }
+        .map_err(map_error(BackendId::Nvdec, Operation::Flush))?;
+        self.drain()?;
+        Ok(self.ready.drain(..).collect())
     }
 }
 
-/// Public alias preserving an "this is the H.264 NVDEC backend" type
-/// name in the H.264 facade.
-pub type NvdecH264Decoder = NvdecDecoder<H264>;
+#[cfg(test)]
+mod tests {
+    use ferricast_core::ColourRange;
 
-/// HEVC alias. Only present when `nvdec-hevc-decode` is on.
-#[cfg(feature = "nvdec-hevc-decode")]
-pub type NvdecH265Decoder = NvdecDecoder<Hevc>;
+    use super::*;
+
+    fn nvdec_colour(primaries: u8, transfer: u8, matrix: u8, video_format: u8) -> nv::Colour {
+        nv::Colour {
+            primaries,
+            transfer,
+            matrix,
+            full_range: false,
+            video_format,
+        }
+    }
+
+    fn signalling(colour: Option<ColourDescription>, hdr: Option<HdrMetadata>) -> Signalling {
+        Signalling::new(Bitstream::Opaque, Container { colour, hdr })
+    }
+
+    #[test]
+    fn the_stream_colour_wins_and_the_container_fills_what_it_leaves_unspecified() {
+        let container = ColourDescription::from_codes(9, 16, 9, true);
+        // VP9 profile 2: BT.2020 colour space in the bitstream, no transfer.
+        let colour = signalling(Some(container), None).colour(nvdec_colour(9, 2, 9, 0));
+        assert_eq!(colour.primaries, ColourPrimaries::Bt2020);
+        assert_eq!(colour.transfer, TransferCharacteristics::Pq);
+        // The stream has a signal type: its (limited) range stands.
+        assert_eq!(colour.range, ColourRange::Limited);
+    }
+
+    #[test]
+    fn a_stream_without_a_signal_type_takes_the_container_range() {
+        let container = ColourDescription::from_codes(1, 1, 1, true);
+        let colour = signalling(Some(container), None).colour(nvdec_colour(2, 2, 2, 5));
+        assert_eq!(colour, container);
+        let alone = signalling(None, None).colour(nvdec_colour(2, 2, 2, 5));
+        assert_eq!(alone, ColourDescription::unspecified(ColourRange::Limited));
+    }
+
+    #[test]
+    fn nvdec_sei_arrives_as_ferricast_metadata_and_wins_over_the_container() {
+        let display = nv::MasteringDisplay {
+            primaries: [(8500, 39850), (6550, 2300), (35400, 14600)],
+            white_point: (15635, 16450),
+            max_luminance: 10_000_000,
+            min_luminance: 1,
+        };
+        let ours = mastering_display(display);
+        assert_eq!((ours.green.x, ours.blue.x, ours.red.x), (8500, 6550, 35400));
+        assert_eq!(ours.white_point.y, 16450);
+        assert_eq!((ours.max_luminance, ours.min_luminance), (10_000_000, 1));
+
+        let container = HdrMetadata {
+            mastering_display: None,
+            content_light: Some(ContentLightLevel {
+                max_cll: 1,
+                max_fall: 1,
+            }),
+        };
+        let mut signalling = signalling(None, Some(container));
+        assert_eq!(signalling.hdr(), Some(container));
+        signalling.nvdec.mastering_display = Some(ours);
+        // The stream's metadata replaces the container's as a whole.
+        assert_eq!(
+            signalling.hdr(),
+            Some(HdrMetadata {
+                mastering_display: Some(ours),
+                content_light: None,
+            })
+        );
+    }
+}

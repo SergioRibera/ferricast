@@ -1,11 +1,41 @@
 //! Decoder facades for the codecs whose backends live in single-file
 //! modules: each picks its backend from the configuration's
 //! [`ferricast_core::BackendSelection`] like [`crate::H264Decoder`].
+//! Automatic selection tries NVDEC first, then the platform decoders,
+//! then the pure-Rust software decoder.
 
 use ferricast_codec::{AudioDecoderRegistry, Candidate, VideoDecoderRegistry};
 use ferricast_core::{Acceleration, AudioCodec, BackendId, Codec, CodecTarget};
 
 use crate::platform;
+
+/// Adds NVDEC for `codec`: the first hardware candidate of every video
+/// job. Recorded as missing (naming its feature) when the build leaves it
+/// out, and as elsewhere off Linux and Windows.
+pub(crate) fn nvdec(registry: VideoDecoderRegistry, codec: Codec) -> VideoDecoderRegistry {
+    #[cfg(all(
+        feature = "nvdec-decode",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    let registry = crate::nvdec::register(registry, codec);
+    #[cfg(not(all(
+        feature = "nvdec-decode",
+        any(target_os = "linux", target_os = "windows")
+    )))]
+    let registry = {
+        let feature = if codec == Codec::H265 {
+            "ferricast-decoder/nvdec-hevc-decode"
+        } else {
+            "ferricast-decoder/nvdec-decode"
+        };
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
+            registry.missing(BackendId::Nvdec, feature)
+        } else {
+            registry.elsewhere(BackendId::Nvdec, feature, "only on Linux and Windows")
+        }
+    };
+    registry
+}
 
 ferricast_codec::video_decoder_facade! {
     /// VP8 decoder over whichever backend its configuration selects.
@@ -13,7 +43,10 @@ ferricast_codec::video_decoder_facade! {
 }
 
 fn vp8_registry() -> VideoDecoderRegistry {
-    let registry = platform::video(VideoDecoderRegistry::new(CodecTarget::decode(Codec::Vp8)));
+    let registry = platform::video(nvdec(
+        VideoDecoderRegistry::new(CodecTarget::decode(Codec::Vp8)),
+        Codec::Vp8,
+    ));
     #[cfg(feature = "vp8-decode")]
     let registry = registry.candidate(Candidate::new(
         BackendId::RustVp8,
@@ -31,7 +64,10 @@ ferricast_codec::video_decoder_facade! {
 }
 
 fn vp9_registry() -> VideoDecoderRegistry {
-    let registry = platform::video(VideoDecoderRegistry::new(CodecTarget::decode(Codec::Vp9)));
+    let registry = platform::video(nvdec(
+        VideoDecoderRegistry::new(CodecTarget::decode(Codec::Vp9)),
+        Codec::Vp9,
+    ));
     #[cfg(feature = "vp9-decode")]
     let registry = registry.candidate(Candidate::new(
         BackendId::RustVp9,
@@ -49,7 +85,10 @@ ferricast_codec::video_decoder_facade! {
 }
 
 fn av1_registry() -> VideoDecoderRegistry {
-    let registry = platform::video(VideoDecoderRegistry::new(CodecTarget::decode(Codec::Av1)));
+    let registry = platform::video(nvdec(
+        VideoDecoderRegistry::new(CodecTarget::decode(Codec::Av1)),
+        Codec::Av1,
+    ));
     #[cfg(feature = "av1-decode")]
     let registry = registry.candidate(Candidate::new(
         BackendId::Rav1d,

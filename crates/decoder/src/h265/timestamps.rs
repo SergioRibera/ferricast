@@ -20,7 +20,6 @@ use rust_h265::{NalUnit, NalUnitType};
 
 /// Pictures noted at most. A stream whose pictures never come out cannot
 /// grow the list without bound; the earliest are forgotten first.
-#[cfg(feature = "hevc-decode")]
 const MAX_PENDING: usize = 64;
 /// `sps_max_sub_layers_minus1` ceiling (H.265 7.4.3.2.1).
 const MAX_SUB_LAYERS_MINUS1: u8 = 6;
@@ -83,7 +82,6 @@ pub(crate) struct PocLsb {
 }
 
 impl PocLsb {
-    #[cfg(feature = "hevc-decode")]
     fn matches(self, poc: i32) -> bool {
         i64::from(poc).rem_euclid(1 << self.log2_max) == i64::from(self.value)
     }
@@ -207,7 +205,6 @@ impl Headers {
 }
 
 /// Timestamps for a decoder that reports each released picture's POC.
-#[cfg(feature = "hevc-decode")]
 #[derive(Default)]
 pub(super) struct Timestamps {
     headers: Headers,
@@ -215,7 +212,6 @@ pub(super) struct Timestamps {
 }
 
 /// A picture decoded from a packet and not released yet.
-#[cfg(feature = "hevc-decode")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Pending {
     sequence: u32,
@@ -224,7 +220,6 @@ struct Pending {
     timestamp_us: u64,
 }
 
-#[cfg(feature = "hevc-decode")]
 impl Timestamps {
     /// Notes the parameter sets and the pictures in one packet.
     pub(super) fn observe(&mut self, nals: &[NalUnit<'_>], timestamp_us: u64) {

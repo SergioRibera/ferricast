@@ -1,5 +1,5 @@
 //! The colour and HDR signalling of an H.264 / H.265 stream, for the
-//! decoders whose backend reports neither (openh264, NVDEC, `rust_h265`):
+//! decoders whose backend reports neither (openh264, `rust_h265`):
 //! read from the parameter sets and SEI messages, over what the
 //! container says.
 

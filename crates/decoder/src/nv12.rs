@@ -89,7 +89,11 @@ pub(crate) fn crop(src: &Nv12Planes, rect: (usize, usize, usize, usize)) -> Opti
     not(any(
         feature = "hevc-decode",
         feature = "vp9-decode",
-        feature = "openh264-decode"
+        feature = "openh264-decode",
+        all(
+            feature = "nvdec-decode",
+            any(target_os = "linux", target_os = "windows")
+        )
     )),
     allow(
         dead_code,
@@ -105,7 +109,11 @@ pub(crate) struct Container {
     not(any(
         feature = "hevc-decode",
         feature = "vp9-decode",
-        feature = "openh264-decode"
+        feature = "openh264-decode",
+        all(
+            feature = "nvdec-decode",
+            any(target_os = "linux", target_os = "windows")
+        )
     )),
     allow(
         dead_code,
@@ -159,7 +167,10 @@ pub(crate) fn downshift_p010(
 /// Hands out a P010 picture (luma rows, then interleaved chroma rows,
 /// `stride` bytes apart) in the caller's requested format: P010 as is,
 /// anything else from its top eight bits through [`deliver`].
-#[cfg(feature = "nvdec-decode")]
+#[cfg(all(
+    feature = "nvdec-decode",
+    any(target_os = "linux", target_os = "windows")
+))]
 pub(crate) fn deliver_p010(
     data: Bytes,
     stride: usize,
