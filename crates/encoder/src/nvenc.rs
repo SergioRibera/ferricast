@@ -47,6 +47,8 @@ use crate::config_ext::EncoderConfigExt;
 use crate::frame_view::{self, FrameView};
 use crate::scale::{FrameScaler, FrameSize};
 
+mod fit;
+
 /// The lowest bitrate a session is opened or retargeted with.
 const MIN_BITRATE: u32 = 500_000;
 
@@ -284,6 +286,8 @@ pub struct NvencEncoder<C: NvencCodec> {
     pending_keyframe: bool,
     /// Fits frames whose size differs from the session into it.
     scaler: FrameScaler,
+    /// Fits GPU pictures that do not match the session into it on the GPU.
+    fit: fit::GpuFit,
     _codec: PhantomData<fn() -> C>,
 }
 
@@ -363,6 +367,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
             keyframe_interval: u64::from(keyframe_interval),
             pending_keyframe: false,
             scaler: FrameScaler::default(),
+            fit: fit::GpuFit::default(),
             _codec: PhantomData,
         })
     }
@@ -381,6 +386,13 @@ impl<C: NvencCodec> NvencEncoder<C> {
     ) -> CodecResult<Option<CapturedFrame>> {
         match frame {
             CapturedFrame::Cpu(raw) => {
+                // GPU fit: upload once and scale / narrow there (the upload
+                // reads `raw` until the packet is out).
+                if self.needs_fit(raw.width, raw.height, raw.format)
+                    && self.fit_host(&raw, options).is_ok()
+                {
+                    return Ok(Some(CapturedFrame::Cpu(raw)));
+                }
                 self.encode_raw(raw, options)?;
                 Ok(None)
             }
@@ -402,6 +414,12 @@ impl<C: NvencCodec> NvencEncoder<C> {
                         .map_err(map_error(BackendId::Nvenc, Operation::Encode))?;
                     return Ok(Some(CapturedFrame::Native(native)));
                 }
+                // GPU fit: another size or bit depth, scaled / narrowed in CUDA.
+                if let Some(surface) = native.surface::<CudaSurface>()
+                    && self.fit_native(surface, options).is_ok()
+                {
+                    return Ok(Some(CapturedFrame::Native(native)));
+                }
                 let raw = CapturedFrame::Native(native).into_cpu().map_err(|error| {
                     CodecError::backend(BackendId::Nvenc, Operation::Encode, error)
                 })?;
@@ -421,6 +439,12 @@ impl<C: NvencCodec> NvencEncoder<C> {
                         .encode(&mut self.encoder, &gpu, options)
                         .is_ok()
                 {
+                    return Ok(Some(CapturedFrame::Gpu(gpu)));
+                }
+                // GPU fit: another size or byte order, scaled in CUDA from the
+                // imported DMA-BUF.
+                #[cfg(target_os = "linux")]
+                if self.fit_gpu(&gpu, options).is_ok() {
                     return Ok(Some(CapturedFrame::Gpu(gpu)));
                 }
                 let raw = CapturedFrame::Gpu(gpu).into_cpu().map_err(|error| {
@@ -824,6 +848,76 @@ mod zero_copy {
             offset: frame.plane.offset,
             stride: frame.plane.stride,
             modifier: Modifier(frame.plane.modifier),
+        }
+    }
+
+    /// GPU fitting (`fit.rs`): the importer lends a frame's mapped memory to
+    /// the image kernels instead of handing it to NVENC.
+    impl State {
+        /// Imports and maps `frame`'s DMA-BUF and passes its CUDA view to
+        /// `use_view`, with the encoder (whose stale registrations the
+        /// import may invalidate).
+        pub(super) fn with_view<R, E: From<Error>>(
+            &mut self,
+            encoder: &mut Encoder,
+            frame: &GpuFrame,
+            use_view: impl FnOnce(&mut Encoder, FrameView<'_>) -> Result<R, E>,
+        ) -> Result<R, E> {
+            if matches!(self, Self::Untried) {
+                *self = match ZeroCopy::new() {
+                    Ok(zero_copy) => Self::Ready(Box::new(zero_copy)),
+                    Err(error) => {
+                        info!(%error, "NVENC: no DMA-BUF import, capture frames are read back");
+                        Self::Unavailable
+                    }
+                };
+            }
+            let Self::Ready(zero_copy) = self else {
+                return Err(Error::Unavailable.into());
+            };
+            let key = zero_copy.import(encoder, frame)?;
+            let mapped = zero_copy
+                .importer
+                .map(key, FenceWait::Implicit(FENCE_TIMEOUT))
+                .map_err(Error::from)?;
+            // The view stays valid while the registration under `key` does:
+            // until a pool change, after which the importer waits for the
+            // context before unregistering, so kernels queued on it finish.
+            use_view(encoder, mapped.view())
+        }
+    }
+
+    impl ZeroCopy {
+        /// Registers `frame`'s buffer (once per capture buffer), starting
+        /// over when the producer's pool changed; the same bookkeeping as
+        /// [`ZeroCopy::encode`].
+        fn import(&mut self, encoder: &mut Encoder, frame: &GpuFrame) -> Result<BufferKey, Error> {
+            let description = Description::from(frame);
+            let id = frame.plane.fd.buffer_id().map_err(Error::Identity)?;
+            let pool_changed = self.last.is_some_and(|last| last != description)
+                || (self.buffers.len() >= MAX_BUFFERS && !self.buffers.contains_key(&id));
+            if pool_changed {
+                self.clear(encoder);
+            }
+            self.last = Some(description);
+            let key = BufferKey::from((id.dev, id.ino));
+            match self.buffers.get(&id).copied() {
+                Some(imported) if imported.description == description => {}
+                stale => {
+                    if let Some(stale) = stale {
+                        encoder.invalidate_array(stale.key);
+                        self.importer.forget(key);
+                    }
+                    let imported = Imported {
+                        key: self.next_key,
+                        description,
+                    };
+                    self.next_key += 1;
+                    self.importer.import(key, &dma_buf(frame))?;
+                    self.buffers.insert(id, imported);
+                }
+            }
+            Ok(key)
         }
     }
 }
