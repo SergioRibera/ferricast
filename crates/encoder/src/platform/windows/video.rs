@@ -171,6 +171,11 @@ impl VideoEncoderSession for MfVideoEncoder {
         Ok(())
     }
 
+    fn reset(&mut self, config: &EncoderConfig) -> CodecResult<()> {
+        // `configure` already starts a new session.
+        self.configure(config)
+    }
+
     fn encode(&mut self, frame: CapturedFrame) -> CodecResult<EncodedFrame> {
         self.worker
             .run(Operation::Encode, move |session| session.encode(frame))
