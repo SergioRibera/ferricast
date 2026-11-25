@@ -76,10 +76,14 @@ mod caps;
 mod crop;
 mod format;
 mod frame;
+mod hevc;
+mod nal;
 mod obu;
 mod parser;
 mod pool;
 mod sei;
+mod vp8;
+mod vp9;
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -234,6 +238,13 @@ pub struct Packet<'a> {
     /// still holds are output first, as by [`Decoder::flush`]; then the
     /// packet is parsed from a clean state, so it should start at a keyframe.
     pub discontinuity: bool,
+    /// Whether this packet holds exactly one whole picture (AV1 temporal
+    /// unit, VP9 superframe), so the parser may decode it at once
+    /// (`CUVID_PKT_ENDOFPICTURE`). `None`, the default, follows
+    /// [`DecoderConfig::whole_pictures`]. Set `Some(false)` for a packet
+    /// that holds several pictures or part of one: with the flag the parser
+    /// would decode only the first of several, or a part as a whole.
+    pub whole_picture: Option<bool>,
 }
 
 impl<'a> Packet<'a> {
@@ -244,6 +255,7 @@ impl<'a> Packet<'a> {
             data,
             timestamp: Some(timestamp),
             discontinuity: false,
+            whole_picture: None,
         }
     }
 
@@ -254,6 +266,7 @@ impl<'a> Packet<'a> {
             data,
             timestamp: None,
             discontinuity: false,
+            whole_picture: None,
         }
     }
 
@@ -262,6 +275,15 @@ impl<'a> Packet<'a> {
     pub const fn with_discontinuity(self) -> Self {
         Self {
             discontinuity: true,
+            ..self
+        }
+    }
+
+    /// With [`Packet::whole_picture`].
+    #[must_use]
+    pub const fn with_whole_picture(self, whole: bool) -> Self {
+        Self {
+            whole_picture: Some(whole),
             ..self
         }
     }
@@ -306,6 +328,11 @@ pub struct Decoder<M: OutputMode> {
     parser: Parser,
     _lock: CtxLock,
     context: Arc<Context>,
+    /// The end of a non-whole HEVC packet that may continue in the next.
+    held: nal::HeldBack,
+    /// The last H.264 / HEVC packet went to the parser without
+    /// `CUVID_PKT_ENDOFPICTURE`: its last picture is still open.
+    open_picture: bool,
     _mode: PhantomData<fn() -> M>,
 }
 
@@ -337,6 +364,8 @@ impl<M: OutputMode> Decoder<M> {
             parser,
             _lock: lock,
             context: Arc::clone(context),
+            held: nal::HeldBack::default(),
+            open_picture: false,
             _mode: PhantomData,
         })
     }
@@ -344,21 +373,29 @@ impl<M: OutputMode> Decoder<M> {
     /// Feeds one packet. Pictures it completes become available from
     /// [`Decoder::next_frame`].
     ///
+    /// Before the parser sees it, a packet is checked where NVIDIA's parser
+    /// would fault on malformed data instead of failing (see
+    /// `design/NVCODEC.md`): every HEVC VPS is parsed in full, AV1 OBU
+    /// sizes must fit, VP8 partitions must fit and inter frames need a key
+    /// frame first, and AV1 inter frames need references NVDEC decoded.
+    ///
     /// # Errors
     ///
     /// [`Error::Cuvid`] when the parser or NVDEC rejects the data,
     /// [`Error::Unsupported`] for a stream the GPU cannot decode (with the
     /// limit it exceeds), [`Error::FramesInFlight`] when every output frame
-    /// is still held, [`Error::InvalidPacket`] for an AV1 temporal unit whose
-    /// OBU sizes run past the packet (the driver faults on those instead of
-    /// failing), [`Error::Cuda`] for copy failures. The decoder stays
-    /// usable: later packets (ideally from a keyframe, after a
-    /// [`Packet::discontinuity`]) decode normally.
+    /// is still held, [`Error::InvalidPacket`] for a packet the checks
+    /// refuse, [`Error::MissingReference`] for a picture whose references
+    /// were lost (it is dropped), [`Error::Cuda`] for copy failures. The
+    /// decoder stays usable: later packets (ideally from a keyframe, after
+    /// a [`Packet::discontinuity`]) decode normally.
     pub fn decode(&mut self, packet: Packet<'_>) -> Result<()> {
         if packet.data.is_empty() && !packet.discontinuity {
             return Ok(());
         }
         if packet.discontinuity {
+            self.held.clear();
+            self.open_picture = false;
             // On its own: the parser drops the data of a packet that carries the
             // flag (an H.264 IDR with its parameter sets, losing the GOP).
             self.parse(sys::CUvideopacketflags::CUVID_PKT_DISCONTINUITY.0, &[], 0)?;
@@ -366,21 +403,57 @@ impl<M: OutputMode> Decoder<M> {
                 return Ok(());
             }
         }
+        let timestamp = packet.timestamp.unwrap_or(0);
         let mut flags = 0;
         if packet.timestamp.is_some() {
             flags |= sys::CUvideopacketflags::CUVID_PKT_TIMESTAMP.0;
         }
-        let state = self.state.get_mut();
-        if matches!(state.config.codec, Codec::H264 | Codec::Hevc) {
-            state.crop.scan(state.config.codec, packet.data);
-        }
-        if state.config.codec == Codec::Av1 {
-            obu::check_temporal_unit(packet.data)?;
-        }
-        if self.state.get().config.whole_pictures && !packet.data.is_empty() {
+        let codec = self.state.get().config.codec;
+        let whole = packet
+            .whole_picture
+            .unwrap_or(self.state.get().config.whole_pictures);
+        if whole {
             flags |= sys::CUvideopacketflags::CUVID_PKT_ENDOFPICTURE.0;
         }
-        self.parse(flags, packet.data, packet.timestamp.unwrap_or(0))
+        match codec {
+            Codec::H264 | Codec::Hevc => {
+                self.close_picture(codec, whole)?;
+                let mut held = std::mem::take(&mut self.held);
+                let crop = &mut self.state.get_mut().crop;
+                let parsed = held
+                    .split(packet.data, |data| nal::screen(codec, data, whole, crop))
+                    .and_then(|ready| {
+                        if ready.is_empty() {
+                            Ok(())
+                        } else {
+                            self.parse(flags, ready, timestamp)
+                        }
+                    });
+                self.held = held;
+                parsed
+            }
+            Codec::Av1 => {
+                obu::check_temporal_unit(packet.data)?;
+                self.parse(flags, packet.data, timestamp)
+            }
+            Codec::Vp8 => {
+                let frame = vp8::check_frame(packet.data)?;
+                if !frame.key_frame && !self.state.get().vp8_keyed {
+                    return Err(Error::MissingReference {
+                        reason: "VP8 inter frame before any key frame".into(),
+                    });
+                }
+                let parsed = self.parse(flags, packet.data, timestamp);
+                // A key frame the decoder accepted set up the references.
+                let state = self.state.get_mut();
+                state.vp8_keyed |= frame.key_frame && state.sequence.is_some();
+                parsed
+            }
+            Codec::Vp9 => {
+                vp9::check_packet(packet.data)?;
+                self.parse(flags, packet.data, timestamp)
+            }
+        }
     }
 
     /// Ends the stream: every picture the parser still holds is decoded and
@@ -390,7 +463,32 @@ impl<M: OutputMode> Decoder<M> {
     ///
     /// As [`Decoder::decode`].
     pub fn flush(&mut self) -> Result<()> {
+        self.held.clear();
+        self.open_picture = false;
         self.parse(sys::CUvideopacketflags::CUVID_PKT_ENDOFSTREAM.0, &[], 0)
+    }
+
+    /// Before a whole packet that follows a packet sent without
+    /// `CUVID_PKT_ENDOFPICTURE`: NVIDIA's parser then reads the open
+    /// picture and the whole packet as one picture (losing a picture and
+    /// corrupting the ones that reference it, seen on driver 595) unless an
+    /// access unit delimiter separates them, which streams from MP4 or
+    /// Matroska lack. So the decoder sends one on its own.
+    fn close_picture(&mut self, codec: Codec, whole: bool) -> Result<()> {
+        /// `access_unit_delimiter_rbsp()`, `primary_pic_type` 7 (any).
+        const H264_DELIMITER: [u8; 6] = [0, 0, 0, 1, 0x09, 0xf0];
+        /// `access_unit_delimiter_rbsp()`, `pic_type` 2 (any), layer 0.
+        const HEVC_DELIMITER: [u8; 7] = [0, 0, 0, 1, 0x46, 0x01, 0x50];
+        let open = std::mem::replace(&mut self.open_picture, !whole);
+        if open && whole {
+            let delimiter: &[u8] = if codec == Codec::H264 {
+                &H264_DELIMITER
+            } else {
+                &HEVC_DELIMITER
+            };
+            self.parse(0, delimiter, 0)?;
+        }
+        Ok(())
     }
 
     fn parse(&mut self, flags: u32, data: &[u8], timestamp: i64) -> Result<()> {
@@ -406,6 +504,7 @@ impl<M: OutputMode> Decoder<M> {
             },
             timestamp,
         };
+        self.state.get_mut().fed.parse(data.len());
         let parsed = {
             let _current = self.context.guard()?;
             // SAFETY: a live parser and a packet whose payload is borrowed
@@ -456,11 +555,21 @@ impl<M: OutputMode> Decoder<M> {
 
 impl Decoder<Host> {
     /// The next decoded picture in display order, if any.
+    ///
+    /// The copy out of NVDEC into a page-locked host buffer runs on while
+    /// the parser goes on; this waits for it. A picture whose copy failed
+    /// is dropped (logged) and the next one returned.
     pub fn next_frame(&mut self) -> Option<HostFrame> {
-        match &mut self.state.get_mut().output {
-            Output::Host { queue, .. } => queue.pop_front(),
-            Output::Device { .. } => None,
+        let Output::Host { queue, .. } = &mut self.state.get_mut().output else {
+            return None;
+        };
+        while let Some(mut frame) = queue.pop_front() {
+            match frame.slot.wait() {
+                Ok(()) => return Some(frame),
+                Err(error) => tracing::warn!(%error, "dropping a picture whose copy failed"),
+            }
         }
+        None
     }
 }
 

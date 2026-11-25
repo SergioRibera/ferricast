@@ -381,7 +381,9 @@ libgbm 26 with the NVIDIA GBM backend, `/dev/dri/renderD128`.
   / VP8-VP9 frame (superframes whole) / AV1 temporal unit (Section 5 OBUs,
   not Annex B). `whole_pictures` (default on) sets `CUVID_PKT_ENDOFPICTURE`
   so a picture decodes without waiting for the next packet; off for
-  arbitrary chunks.
+  arbitrary chunks; `Packet::whole_picture` overrides it per packet (see
+  [NVDEC hardening](#nvdec-hardening) for why ferricast decides it per
+  packet).
 - State reachable by the callbacks lives behind a raw `NonNull` (not a
   `Box`, whose moves assert uniqueness against the parser's copy of the
   pointer). `decode` holds no reference into it while
@@ -404,7 +406,10 @@ libgbm 26 with the NVIDIA GBM backend, `/dev/dri/renderD128`.
   `Error::Unsupported` naming the exceeded limit.
 - Every picture is mapped with `output_stream` = the decoder's stream,
   copied out plane by plane (`cuMemcpy2DAsync`), unmapped right away. Host
-  mode syncs that stream (pageable destination); device mode records the
+  mode copies into pooled page-locked buffers and records the slot's
+  `ready` event (`Decoder<Host>::next_frame` waits for it; without
+  `cuMemHostAlloc` it falls back to pageable memory and a stream sync);
+  device mode records the
   slot's `ready` event and unmaps without waiting, which is safe because
   the next map of an output surface post-processes on the same stream.
   Device consumers that read asynchronously call
@@ -432,8 +437,9 @@ libgbm 26 with the NVIDIA GBM backend, `/dev/dri/renderD128`.
   - A truncated AV1 temporal unit (last OBU size past the packet) makes
     `cuvidDecodePicture` fault (SIGBUS) inside the driver. Packets are
     checked for OBU framing (headers and sizes only) and refused with
-    `Error::InvalidPacket`. Bit flips / random data inside well-framed OBUs
-    did not crash in the tests, but the driver is the trust boundary there.
+    `Error::InvalidPacket`. The driver is not a trust boundary: its parsers
+    fault on several other malformed inputs, see
+    [NVDEC hardening](#nvdec-hardening).
 - `cuvidGetDecodeStatus` (optional) gives `DecodeStatus` per frame;
   `Unknown` without the symbol.
 - Tests: `tests/decode.rs` on clips from `scripts/decode_fixtures.sh`, each
@@ -580,3 +586,116 @@ in `design/CODECS.md` ("NVIDIA"); what changed here for them:
 - The GBM / EGL / GLES test writer moved from `tests/interop.rs` to
   `tests/support/dmabuf.rs`; ferricast's root `tests/nvidia_e2e.rs`
   includes the same file with `#[path]`.
+
+## NVDEC hardening
+
+The premise that the driver is the trust boundary (malformed input fails
+inside it, cleanly) is wrong: NVIDIA's parsers and `cuvidDecodePicture`
+fault on several malformed inputs (driver 595.71.05, RTX 3060), killing the
+process. A fuzz campaign over the eleven test clips (bit flips, byte
+overwrites, truncation, splices, inserted / deleted blocks, NAL- and
+OBU-aware mutations, dropped packets, discontinuities, host and device
+mode, random display delays and framing) found these, each cut down to the
+input that triggers it; each now has a guard in front of the driver, which
+refuses the packet or picture with a typed error and leaves the decoder
+usable.
+
+| Input | Fault | Guard |
+| --- | --- | --- |
+| HEVC VPS cut short (26-byte packet, VPS stopped inside `profile_tier_level()`) | SIGSEGV in `cuvidParseVideoData` | `decode/hevc.rs`: every VPS parsed in full (§7.3.2.1 with `hrd_parameters()`, ranges checked) to its `rbsp_trailing_bits()`, else `Error::InvalidPacket` |
+| AV1 inter frame after packet loss whose references were never decoded | SIGSEGV in `cuvidDecodePicture` | `decode/parser.rs` `References`: the surfaces NVDEC decoded since the last shown key frame; an inter / switch frame referencing any other (or `0xff`) is refused (`Error::MissingReference`) and never displayed |
+| AV1 picture with `nBitstreamDataLen` wrapped negative (~4 GiB) or tile offsets past it | `memmove` fault in `cuvidDecodePicture` | `check_bitstream`: length within what was fed (and < 2 GiB), every tile's start ≤ end ≤ length |
+| AV1 sequence header with damaged fields | SIGSEGV in `cuvidParseVideoData` | `decode/obu.rs`: every sequence header parsed in full (§5.5) to its trailing bits |
+| AV1 temporal unit whose last OBU size runs past the packet | SIGBUS in `cuvidDecodePicture` | OBU framing check (already there) |
+| VP8 inter frame before any key frame that refreshes the golden frame and copies it to the alternate reference | SIGSEGV in `cuvidParseVideoData` | `decode/vp8.rs`: inter frames refused until a key frame was accepted (`Error::MissingReference`); frame tag, start code, sizes and partition layout checked too |
+| VP9 packet ending in what reads as a superframe index with frame sizes past the packet (a random 91-byte packet) | SIGSEGV in `cuvidParseVideoData` | `decode/vp9.rs`: superframe sizes must fit before the index |
+
+Truncating every NAL unit in front of the first slice of the HEVC clips
+(343 packets) crashed 8 before the VPS check and none after; every
+truncation of an SPS or PPS was refused cleanly by the driver even before,
+so they are not parsed. AV1 with 25% packet loss crashed 20 of 40 runs
+before the reference check and 0 of 100 after (H.264, HEVC, VP8, VP9: 0 of
+30 each, before and after). The campaign itself (two five-minute runs per
+clip): 11 of 22 runs crashed before (HEVC 5 of 6, VP8 2 of 2, AV1 4 of 4),
+only the AV1 runs after (see the residual risk below).
+
+Framing, which silently lost or corrupted pictures:
+
+- `CUVID_PKT_ENDOFPICTURE` on a packet holding several access units decodes
+  only the first; on part of one, decodes the part as a whole picture.
+  MPEG-TS (HLS, Miracast) gives one packet per PES, which promises neither.
+  ferricast's integration (`crates/decoder/src/nvdec.rs`,
+  `PictureFraming`) walks each packet's NAL units once
+  (`bitstream::nal_units`, `PacketShape`) and sets the flag per packet
+  (`Packet::whole_picture`) only after the stream showed two packets in a
+  row that each held one access unit and were followed by one starting a
+  new one; never on a keyframe or on a packet of 60 KiB or more (a PES cut
+  at its 16-bit length limit); the first packet that continues an access
+  unit turns it off for the stream. Otherwise the parser finishes each
+  picture when the next starts, one packet later. A split that first shows
+  on a non-key packet under 60 KiB after the flag was trusted still decodes
+  that one picture from its first part (and the pictures referencing it
+  until the next keyframe): the residual risk of saving a packet of
+  latency.
+- A whole packet after one sent without the flag, in a stream without
+  access unit delimiters (MP4 / Matroska framing, which ferricast's
+  demuxers give), makes the parser read the open picture and the new packet
+  as one picture: one picture lost and its dependants corrupted. The
+  decoder sends a lone access unit delimiter between them
+  (`Decoder::close_picture`); HEVC needed it too.
+- Non-whole HEVC packets may cut a VPS: the VPS at the end of such a packet
+  (or a start code cut short) is held back and checked with the next
+  packet (`nal::HeldBack`, at most 64 KiB, dropped at a discontinuity or
+  flush).
+
+Other fixes: a failed `cuvidReconfigureDecoder` recreates the decoder
+instead of failing every later sequence the same way; any error after a
+copy is queued synchronises the stream before the destination can go back
+to its pool or be freed; ferricast maps `FramesInFlight` and
+`CUDA_ERROR_OUT_OF_MEMORY` during decode to `UnsupportedStream`, so
+selection hands the stream to the next backend; its host lending limit no
+longer counts the decoder's own `Arc`. Device mode still hands out 10-bit
+pictures as P010 when NV12 is asked for (no GPU narrowing yet).
+
+Host mode copies each picture into a pooled page-locked buffer
+(`cuMemHostAlloc`, freed with its context held) with an event recorded
+after the copy; `next_frame` waits for it, so the parser no longer
+synchronises the stream inside its display callback, and the DMA runs at
+pinned speed. Without `cuMemHostAlloc` (or when it fails) the slot falls
+back to pageable memory and a stream sync, as before. One host stream at display
+delay 0 (fps, 3 runs, idle GPU): 1080p H.264 622 → 686 (device 760),
+1080p HEVC 945 → 1112 (device ~1390), 2160p HEVC ~245 → 289 (device 350).
+The rest of the gap is the copy itself, serialised with the next decode
+at delay 0 (`next_frame` must wait before the next packet is parsed); at
+delay 1 the next picture decodes while the copy runs and host equals
+device (2160p HEVC 365 / 364).
+
+Packet scanning: each H.264 / HEVC packet was split into an allocated
+`Vec` of NAL units three times in ferricast (parameter sets for the
+hand-over, VUI colour, HDR SEI, the last on every packet even for SDR
+streams) and scanned byte by byte in ferricast-nvcodec for the SPS crop.
+Now `bitstream::nal_units` iterates without allocating, with a start code
+search that skips three bytes at a time (the same in `decode/nal.rs`); the
+integration walks a packet once for colour, HDR and framing, only parameter
+set and SEI units are read; `ParameterSets` copies a set only when it
+changed; ferricast-nvcodec walks once for the crop and the VPS check and,
+for H.264, stops at the first slice. Per packet (scan work only, ferricast plus
+ferricast-nvcodec): 1080p H.264 59.4 → 9.8 µs and 3.07 → 0.03
+allocations, 1080p HEVC 59.8 → 14.7 µs, 2160p HEVC 295 → 72 µs.
+
+### Residual risk
+
+- AV1: a frame / tile group OBU with damaged fields inside well-formed
+  framing still faults inside `cuvidParseVideoData` (in its tile group
+  parser, reading `tile_size_minus_1` far outside the temporal unit: the
+  tile sizes it follows run off the data). The fuzz campaign hits it within
+  minutes on both AV1 clips. A guard needs the full `uncompressed_header()`
+  (§5.9) to find where the tile group starts, which in turn needs the
+  state of every reference slot (frame sizes for `frame_size_with_refs`,
+  global motion and film grain parameters loaded from the primary
+  reference, order hints for skip mode). Realistic sources rarely produce
+  it (packet loss and truncation are caught; it takes bit errors inside an
+  OBU that keep its framing valid), but untrusted AV1 should be decoded in
+  a helper process (or by dav1d) until that parser exists.
+- Anything the campaign did not reach: the driver remains unaudited; a
+  helper process is the only complete answer.
