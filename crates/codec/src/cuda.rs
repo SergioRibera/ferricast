@@ -18,17 +18,79 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use bytes::Bytes;
 use ferricast_core::{
-    BackendId, CodecError, FrameError, NativeSurface, Operation, PixelFormat, SurfaceKind,
-    SurfacePixels,
+    BackendId, CodecError, FrameError, GpuAffinity, NativeSurface, Operation, PixelFormat,
+    SurfaceKind, SurfacePixels,
 };
 pub use ferricast_nvcodec as nvcodec;
-use ferricast_nvcodec::cuda::{Context, Device, PinnedBuffer, PinnedCopy, Point, Region, Stream};
+
+use crate::gpu::GpuInput;
+use ferricast_nvcodec::cuda::{
+    Context, Device, PciBusId, PinnedBuffer, PinnedCopy, Point, Region, Stream,
+};
 use ferricast_nvcodec::decode::{self, DeviceFrame};
 use ferricast_nvcodec::loader::Backoff;
 
-/// The CUDA context of the GPU ferricast's NVIDIA backends use (device 0),
-/// shared by every decoder and encoder open at the same time, so a decoded
-/// picture and the encoder that takes it live on the same context.
+/// The CUDA context of the default GPU (CUDA's device 0); see
+/// [`context_on`].
+///
+/// # Errors
+///
+/// As [`context_on`].
+pub fn context() -> Result<Arc<Context>, nvcodec::Error> {
+    context_on(CudaDevice::Default)
+}
+
+/// Which GPU an NVIDIA backend runs on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CudaDevice {
+    /// CUDA's device 0 (the machine's GPUs are unknown: no sysfs).
+    #[default]
+    Default,
+    /// The CUDA device at this PCI address.
+    Pci(PciBusId),
+}
+
+impl CudaDevice {
+    /// The device `config`'s GPU preference puts `backend` on: the first
+    /// NVIDIA GPU it ranks.
+    ///
+    /// # Errors
+    /// [`CodecError::BackendUnavailable`] when the preference pins a GPU
+    /// that is missing or not NVIDIA's (selection moves on).
+    pub fn for_config(config: &impl GpuInput, backend: BackendId) -> Result<Self, CodecError> {
+        Ok(config
+            .gpu_for(backend, GpuAffinity::Nvidia)?
+            .and_then(|gpu| gpu.pci)
+            .map_or(Self::Default, |pci| {
+                Self::Pci(PciBusId {
+                    domain: pci.domain,
+                    bus: pci.bus,
+                    device: pci.device,
+                    function: pci.function,
+                })
+            }))
+    }
+
+    fn open(self) -> Result<Device, nvcodec::Error> {
+        match self {
+            Self::Default => Device::get(0),
+            Self::Pci(pci) => Device::by_pci_bus_id(pci),
+        }
+    }
+}
+
+impl fmt::Display for CudaDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Default => f.write_str("CUDA device 0"),
+            Self::Pci(pci) => write!(f, "the GPU at {pci}"),
+        }
+    }
+}
+
+/// The CUDA context of `device`, shared by every decoder and encoder open
+/// on it at the same time, so a decoded picture and the encoder that takes
+/// it live on the same context.
 ///
 /// - It is the device's primary context, retained while someone holds the
 ///   returned `Arc` and released when the last holder drops it (about
@@ -45,21 +107,28 @@ use ferricast_nvcodec::loader::Backoff;
 /// # Errors
 ///
 /// What loading the driver or opening the device failed with
-/// ([`nvcodec::Error::LibraryMissing`] without an NVIDIA driver).
-pub fn context() -> Result<Arc<Context>, nvcodec::Error> {
-    SHARED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .context()
+/// ([`nvcodec::Error::LibraryMissing`] without an NVIDIA driver;
+/// `CUDA_ERROR_INVALID_DEVICE` when no CUDA device sits at the address).
+pub fn context_on(device: CudaDevice) -> Result<Arc<Context>, nvcodec::Error> {
+    let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+    let index = if let Some(index) = shared.iter().position(|entry| entry.device == device) {
+        index
+    } else {
+        shared.push(SharedContext {
+            device,
+            current: Weak::new(),
+            backoff: Backoff::new(),
+        });
+        shared.len() - 1
+    };
+    shared[index].context()
 }
 
-/// The context [`context`] hands out.
-static SHARED: Mutex<SharedContext> = Mutex::new(SharedContext {
-    current: Weak::new(),
-    backoff: Backoff::new(),
-});
+/// The contexts [`context_on`] hands out, one per device asked for.
+static SHARED: Mutex<Vec<SharedContext>> = Mutex::new(Vec::new());
 
 struct SharedContext {
+    device: CudaDevice,
     current: Weak<Context>,
     /// Spaces out attempts after a failed one.
     backoff: Backoff,
@@ -75,8 +144,9 @@ impl SharedContext {
         }
         let lost_and_held = held.is_some();
         drop(held);
+        let device = self.device;
         let context = self.backoff.retry(|| {
-            let device = Device::get(0)?;
+            let device = device.open()?;
             // The driver would hand a lost primary context that someone
             // still holds out again: take a context of its own instead.
             if lost_and_held {
@@ -95,15 +165,19 @@ impl SharedContext {
     }
 }
 
-/// Forgets the shared context if `error` says it is lost, so the next
-/// [`context`] call opens a new one. [`codec_error`] does this for every
-/// error it maps; the encoders and decoders mark their own context too.
+/// Forgets the shared contexts if `error` says the device is lost, so the
+/// next [`context_on`] call opens a new one. [`codec_error`] does this for
+/// every error it maps; the encoders and decoders mark their own context
+/// too.
 fn note_lost(error: &nvcodec::Error) {
     if !error.is_device_lost() {
         return;
     }
     let shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(context) = shared.current.upgrade() {
+    // The error does not name its device: every shared context is marked
+    // (on a multi-GPU machine a healthy one is only replaced by a fresh
+    // context, not lost).
+    for context in shared.iter().filter_map(|entry| entry.current.upgrade()) {
         // Marks it lost (the error already says so; nothing is queried).
         let _ = context.note_error(error);
     }

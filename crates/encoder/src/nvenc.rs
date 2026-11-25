@@ -36,12 +36,13 @@ use ferricast_codec::cuda::nvcodec::encode::{
     Gop, Hdr10, HostFrame, InputFormat, MatrixCoefficients, PictureType, Profile, RateControl,
     TransferCharacteristics,
 };
-use ferricast_codec::cuda::{self, CudaSurface, map_error};
+use ferricast_codec::cuda::{self, CudaDevice, CudaSurface, map_error};
 use ferricast_codec::{Candidate, VideoEncoderRegistry, VideoEncoderSession};
 use ferricast_core::{
     Acceleration, BackendId, BitDepth, CapturedFrame, Codec, CodecError, CodecResult,
-    ColourDescription, ColourRange, EncodedFrame, EncoderConfig, H264Profile, HdrMetadata,
-    MatrixCoefficients as Matrix, Operation, PixelFormat, RawFrame, VideoEncoder,
+    ColourDescription, ColourRange, EncodedFrame, EncoderConfig, GpuAffinity, GpuPreference,
+    H264Profile, HdrMetadata, MatrixCoefficients as Matrix, Operation, PixelFormat, RawFrame,
+    VideoEncoder,
 };
 use tracing::info;
 
@@ -150,6 +151,7 @@ fn candidate<C: NvencCodec>() -> Candidate<EncoderConfig, dyn VideoEncoderSessio
         },
     )
     .with_probe(NvencEncoder::<C>::probe)
+    .on_gpu(GpuAffinity::Nvidia)
 }
 
 /// How the session takes pictures, from the configured pixel format and
@@ -262,19 +264,19 @@ fn crops_to(width: u32, height: u32, size: (u32, u32)) -> bool {
     fits(width, size.0) && fits(height, size.1)
 }
 
-/// What NVENC can do on this machine's GPU, queried once (it opens a
+/// What NVENC can do on `device`, queried once per device (it opens a
 /// session); a failed query is not kept, so a later probe retries.
-fn capabilities() -> CodecResult<Capabilities> {
-    static CAPABILITIES: Mutex<Option<Capabilities>> = Mutex::new(None);
+fn capabilities(device: CudaDevice) -> CodecResult<Capabilities> {
+    static CAPABILITIES: Mutex<Vec<(CudaDevice, Capabilities)>> = Mutex::new(Vec::new());
     let mut cached = CAPABILITIES.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(capabilities) = cached.as_ref() {
+    if let Some((_, capabilities)) = cached.iter().find(|(known, _)| *known == device) {
         return Ok(capabilities.clone());
     }
     let probe = map_error(BackendId::Nvenc, Operation::Probe);
-    let context = cuda::context().map_err(probe)?;
+    let context = cuda::context_on(device).map_err(probe)?;
     let capabilities =
         Capabilities::query(&context).map_err(map_error(BackendId::Nvenc, Operation::Probe))?;
-    *cached = Some(capabilities.clone());
+    cached.push((device, capabilities.clone()));
     Ok(capabilities)
 }
 
@@ -393,6 +395,8 @@ pub struct NvencEncoder<C: NvencCodec> {
     // registrations it holds) goes before the DMA-BUF importer that owns
     // the arrays.
     encoder: Encoder,
+    /// The GPU the session runs on (the configuration's GPU preference).
+    device: CudaDevice,
     #[cfg(target_os = "linux")]
     zero_copy: zero_copy::State,
     input: Input,
@@ -414,21 +418,25 @@ pub struct NvencEncoder<C: NvencCodec> {
 }
 
 impl<C: NvencCodec> NvencEncoder<C> {
-    /// Whether this machine's GPU encodes `C` through NVENC: loads the
-    /// driver and queries the GPU once per process.
+    /// Whether this machine's preferred NVIDIA GPU (`FERRICAST_GPU`, else
+    /// the first one) encodes `C` through NVENC: loads the driver and
+    /// queries the GPU once per process.
     ///
     /// # Errors
     ///
     /// [`CodecError::BackendUnavailable`] without an NVIDIA driver or GPU,
     /// or when the GPU's NVENC has no encoder for the codec.
     pub fn probe() -> CodecResult<()> {
-        capabilities()?
-            .require(C::NV_CODEC)
-            .map(drop)
-            .map_err(|error| CodecError::BackendUnavailable {
-                backend: BackendId::Nvenc,
-                reason: error.to_string(),
-            })
+        capabilities(CudaDevice::for_config(
+            &GpuPreference::Auto,
+            BackendId::Nvenc,
+        )?)?
+        .require(C::NV_CODEC)
+        .map(drop)
+        .map_err(|error| CodecError::BackendUnavailable {
+            backend: BackendId::Nvenc,
+            reason: error.to_string(),
+        })
     }
 
     /// Opens an NVENC session for `config`.
@@ -442,12 +450,15 @@ impl<C: NvencCodec> NvencEncoder<C> {
     /// the GPU's session limit is reached.
     pub fn probe_with(config: EncoderConfig) -> CodecResult<Self> {
         let session = Session::<C>::of(&config)?;
-        let context = cuda::context().map_err(map_error(BackendId::Nvenc, Operation::Open))?;
+        let device = CudaDevice::for_config(&config, BackendId::Nvenc)?;
+        let context =
+            cuda::context_on(device).map_err(map_error(BackendId::Nvenc, Operation::Open))?;
         let encoder = Encoder::open(&context, &session.nv_config)
             .map_err(map_error(BackendId::Nvenc, Operation::Open))?;
         session.log_ready(&encoder);
         Ok(Self {
             encoder,
+            device,
             #[cfg(target_os = "linux")]
             zero_copy: zero_copy::State::default(),
             input: session.input,
@@ -483,7 +494,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
         let applied = if rebuild || released.is_err() || self.encoder.context().is_lost() {
             // A lost context is replaced: `cuda::context` hands out a new
             // one once the old one is marked lost.
-            let context = match cuda::context() {
+            let context = match cuda::context_on(self.device) {
                 Ok(context) => context,
                 Err(error) => {
                     // The old session stays: so do the imports it may read.
@@ -539,8 +550,12 @@ impl<C: NvencCodec> NvencEncoder<C> {
             }
             CapturedFrame::Native(native) => {
                 let (width, height) = self.size();
-                let surface = native.surface::<CudaSurface>().filter(|_| {
-                    (native.width, native.height) == (width, height)
+                let same_gpu = |surface: &CudaSurface| {
+                    surface.frame().buffer().context().device() == self.encoder.context().device()
+                };
+                let surface = native.surface::<CudaSurface>().filter(|surface| {
+                    same_gpu(surface)
+                        && (native.width, native.height) == (width, height)
                         && native.format() == self.input.pixel_format()
                 });
                 if let Some(surface) = surface {
@@ -557,6 +572,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
                 }
                 // GPU fit: another size or bit depth, scaled / narrowed in CUDA.
                 if let Some(surface) = native.surface::<CudaSurface>()
+                    && same_gpu(surface)
                     && self.fit_native(surface, options).is_ok()
                 {
                     return Ok(Some(CapturedFrame::Native(native)));
@@ -774,16 +790,19 @@ impl<C: NvencCodec> VideoEncoder for NvencEncoder<C> {
 pub(crate) mod zero_copy {
     use std::collections::{HashMap, HashSet};
     use std::os::fd::AsFd as _;
-    use std::sync::OnceLock;
+    use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
+    use ferricast_codec::cuda::nvcodec::cuda::Context;
     use ferricast_codec::cuda::nvcodec::encode::{Encoder, FrameOptions};
     use ferricast_codec::cuda::nvcodec::interop::{
         BufferKey, DmaBuf, DmaBufImporter, DrmFormat, DrmNode, FenceWait, FrameView, MappedFrame,
         Modifier, Quiesce,
     };
-    use ferricast_codec::cuda::{self, nvcodec};
-    use ferricast_core::{DmaBufId, DmaBufModifiers, DrmDevice, FrameSync, GpuFrame, PixelFormat};
+    use ferricast_codec::cuda::{self, CudaDevice, nvcodec};
+    use ferricast_core::{
+        BackendId, DmaBufId, DmaBufModifiers, DrmDevice, FrameSync, GpuFrame, PixelFormat,
+    };
     use tracing::info;
 
     /// How long the producer's implicit write fence is waited for (only
@@ -832,9 +851,13 @@ pub(crate) mod zero_copy {
     impl State {
         /// The importer, created on the first DMA-BUF (on the GPU of its
         /// producer, when the frame names it).
-        fn ready(&mut self, producer: Option<DrmDevice>) -> Result<&mut ZeroCopy, Error> {
+        fn ready(
+            &mut self,
+            producer: Option<DrmDevice>,
+            context: &Arc<Context>,
+        ) -> Result<&mut ZeroCopy, Error> {
             if matches!(self, Self::Untried) {
-                *self = match ZeroCopy::new(producer) {
+                *self = match ZeroCopy::new(producer, context) {
                     Ok(zero_copy) => Self::Ready(Box::new(zero_copy)),
                     Err(error) => {
                         info!(%error, "NVENC: no DMA-BUF zero-copy, capture frames are read back");
@@ -856,7 +879,7 @@ pub(crate) mod zero_copy {
             frame: &GpuFrame,
             options: FrameOptions,
         ) -> Result<(), Error> {
-            let zero_copy = self.ready(frame.producer)?;
+            let zero_copy = self.ready(frame.producer, encoder.context())?;
             let result = zero_copy.encode(encoder, frame, options);
             if let Err(error) = &result {
                 zero_copy.failures += 1;
@@ -886,7 +909,7 @@ pub(crate) mod zero_copy {
             frame: &GpuFrame,
             use_view: impl FnOnce(&mut Encoder, FrameView<'_>) -> Result<R, E>,
         ) -> Result<R, E> {
-            let zero_copy = self.ready(frame.producer)?;
+            let zero_copy = self.ready(frame.producer, encoder.context())?;
             let (key, _) = zero_copy.import(encoder, frame)?;
             let mapped = zero_copy.map(key, frame.sync)?;
             use_view(encoder, mapped.view())
@@ -949,13 +972,15 @@ pub(crate) mod zero_copy {
     }
 
     impl ZeroCopy {
-        fn new(producer: Option<DrmDevice>) -> Result<Self, nvcodec::Error> {
-            let context = cuda::context()?;
+        fn new(
+            producer: Option<DrmDevice>,
+            context: &Arc<Context>,
+        ) -> Result<Self, nvcodec::Error> {
             let node = producer.or_else(|| {
                 std::env::var_os(DRM_NODE_ENV).and_then(|path| DrmDevice::from_path(path).ok())
             });
             Ok(Self {
-                importer: DmaBufImporter::new(&context, node.map(|n| DrmNode::from_dev(n.dev())))?,
+                importer: DmaBufImporter::new(context, node.map(|n| DrmNode::from_dev(n.dev())))?,
                 node,
                 buffers: HashMap::new(),
                 refused: HashSet::new(),
@@ -1171,45 +1196,64 @@ pub(crate) mod zero_copy {
         }
     }
 
-    /// What NVENC's DMA-BUF import takes on this machine, queried once per
-    /// process (it brings up EGL on the CUDA device's GPU).
+    /// What NVENC's DMA-BUF import takes on one GPU, queried once per
+    /// process and device (it brings up EGL on the CUDA device's GPU).
     #[derive(Debug, Clone)]
     struct Importable {
         modifiers: DmaBufModifiers,
         node: Option<DrmDevice>,
     }
 
-    fn importable() -> Option<Importable> {
+    fn importable(device: CudaDevice) -> Option<Importable> {
         // A machine without NVIDIA does not grow one: the answer is kept.
-        static IMPORTABLE: OnceLock<Option<Importable>> = OnceLock::new();
-        IMPORTABLE
-            .get_or_init(|| {
-                let context = cuda::context().ok()?;
-                let importer = DmaBufImporter::new(&context, None).ok()?;
-                let list = |format: DrmFormat| -> Vec<u64> {
-                    importer.modifiers(format).iter().map(|m| m.0).collect()
-                };
-                let node = context
-                    .device()
-                    .pci_bus_id()
-                    .ok()
-                    .and_then(|pci| DrmNode::render_node_of(pci).ok())
-                    .map(|node| DrmDevice::from_dev(node.dev()));
-                Some(Importable {
-                    modifiers: DmaBufModifiers::default()
-                        .with(PixelFormat::Bgra, list(DrmFormat::Argb8888))
-                        .with(PixelFormat::Rgba, list(DrmFormat::Abgr8888)),
-                    node,
-                })
+        static IMPORTABLE: Mutex<Vec<(CudaDevice, Option<Importable>)>> = Mutex::new(Vec::new());
+        let mut known = IMPORTABLE.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, importable)) = known.iter().find(|(key, _)| *key == device) {
+            return importable.clone();
+        }
+        let importable = (|| {
+            let context = cuda::context_on(device).ok()?;
+            let importer = DmaBufImporter::new(&context, None).ok()?;
+            let list = |format: DrmFormat| -> Vec<u64> {
+                importer.modifiers(format).iter().map(|m| m.0).collect()
+            };
+            let node = context
+                .device()
+                .pci_bus_id()
+                .ok()
+                .and_then(|pci| DrmNode::render_node_of(pci).ok())
+                .map(|node| DrmDevice::from_dev(node.dev()));
+            Some(Importable {
+                modifiers: DmaBufModifiers::default()
+                    .with(PixelFormat::Bgra, list(DrmFormat::Argb8888))
+                    .with(PixelFormat::Rgba, list(DrmFormat::Abgr8888)),
+                node,
             })
-            .clone()
+        })();
+        known.push((device, importable.clone()));
+        importable
+    }
+
+    /// The GPU NVENC opens on under the default preference
+    /// (`FERRICAST_GPU`, else the first NVIDIA GPU); `None` when the
+    /// preference pins a GPU NVENC cannot use.
+    fn default_device() -> Option<CudaDevice> {
+        CudaDevice::for_config(&ferricast_core::GpuPreference::Auto, BackendId::Nvenc).ok()
     }
 
     /// The DRM modifiers NVENC encodes from without a copy (what its EGL
     /// import takes), for capture to prefer; empty without NVIDIA.
     #[must_use]
     pub fn dmabuf_modifiers() -> DmaBufModifiers {
-        importable().map(|i| i.modifiers).unwrap_or_default()
+        default_device()
+            .map(dmabuf_modifiers_on)
+            .unwrap_or_default()
+    }
+
+    /// [`dmabuf_modifiers`] on `device`.
+    #[must_use]
+    pub fn dmabuf_modifiers_on(device: CudaDevice) -> DmaBufModifiers {
+        importable(device).map(|i| i.modifiers).unwrap_or_default()
     }
 
     /// Whether DMA-BUFs of `producer` can be encoded without a copy: they
@@ -1218,7 +1262,13 @@ pub(crate) mod zero_copy {
     /// that GPU (VA-API) avoids the readback NVENC would need.
     #[must_use]
     pub fn imports_from(producer: DrmDevice) -> bool {
-        importable()
+        default_device().is_some_and(|device| imports_from_on(device, producer))
+    }
+
+    /// [`imports_from`] for NVENC on `device`.
+    #[must_use]
+    pub fn imports_from_on(device: CudaDevice, producer: DrmDevice) -> bool {
+        importable(device)
             .and_then(|i| i.node)
             .is_some_and(|node| node == producer.render_node())
     }
@@ -1227,12 +1277,21 @@ pub(crate) mod zero_copy {
     /// captures, which its GPU fit turns (`GpuFrame::orientation`).
     #[must_use]
     pub fn orients_gpu_frames() -> bool {
-        importable().is_some()
+        default_device().is_some_and(orients_gpu_frames_on)
+    }
+
+    /// [`orients_gpu_frames`] for NVENC on `device`.
+    #[must_use]
+    pub fn orients_gpu_frames_on(device: CudaDevice) -> bool {
+        importable(device).is_some()
     }
 }
 
 #[cfg(target_os = "linux")]
-pub use zero_copy::{dmabuf_modifiers, imports_from, orients_gpu_frames};
+pub use zero_copy::{
+    dmabuf_modifiers, dmabuf_modifiers_on, imports_from, imports_from_on, orients_gpu_frames,
+    orients_gpu_frames_on,
+};
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {

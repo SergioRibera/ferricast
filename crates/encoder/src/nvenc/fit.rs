@@ -8,13 +8,17 @@
 //!
 //! Any failure leaves the picture to the CPU path, like the zero-copy path.
 
-use ferricast_codec::cuda::nvcodec::cuda::{DeviceBuffer, Event, HostImage, Point, Region, Stream};
+use std::sync::Arc;
+
+use ferricast_codec::cuda::nvcodec::cuda::{
+    Context, DeviceBuffer, Event, HostImage, Point, Region, Stream,
+};
 use ferricast_codec::cuda::nvcodec::encode::{DeviceFrame, Encoder, FrameOptions};
 use ferricast_codec::cuda::nvcodec::kernels::{
     Converter, FramePool, Geometry, Input as KernelInput, Matrix, Orientation, OutputFormat, Range,
     Rect, RgbOrder, Rotation, Size, YuvColour,
 };
-use ferricast_codec::cuda::{self, CudaSurface, nvcodec};
+use ferricast_codec::cuda::{CudaSurface, nvcodec};
 use ferricast_core::{
     ColourDescription, ColourRange, MatrixCoefficients, NativeSurface as _, PixelFormat, RawFrame,
 };
@@ -58,13 +62,12 @@ struct Ready {
 }
 
 impl GpuFit {
-    fn ready(&mut self) -> Result<&mut Ready, Error> {
+    fn ready(&mut self, context: &Arc<Context>) -> Result<&mut Ready, Error> {
         if self.ready.is_none() {
-            let context = cuda::context()?;
             self.ready = Some(Box::new(Ready {
-                converter: Converter::new(&context)?,
-                stream: Stream::new(&context)?,
-                done: Event::new(&context)?,
+                converter: Converter::new(context)?,
+                stream: Stream::new(context)?,
+                done: Event::new(context)?,
                 pool: None,
                 staging: None,
             }));
@@ -304,7 +307,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
             other => return Err(Error::Unsupported(format!("an NVDEC {other:?} picture"))),
         };
         let source = Source::from(FrameSize::new(info.width, info.height));
-        self.fit.ready()?.encode(
+        self.fit.ready(self.encoder.context())?.encode(
             &mut self.encoder,
             input,
             source,
@@ -352,7 +355,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
         };
         let width_bytes = row_bytes.max(chroma_bytes);
         let rows = height + chroma_rows;
-        let fit = self.fit.ready()?;
+        let fit = self.fit.ready(self.encoder.context())?;
         // Out of `fit` while in use; put back below.
         let mut staging = match fit.staging.take() {
             Some(buffer) if buffer.width_bytes() >= width_bytes && buffer.rows() >= rows => buffer,
@@ -449,7 +452,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
             size: FrameSize::new(frame.width, frame.height),
             orientation: kernel_orientation(frame.orientation),
         };
-        let fit = self.fit.ready()?;
+        let fit = self.fit.ready(self.encoder.context())?;
         self.zero_copy
             .with_view(&mut self.encoder, frame, |encoder, view| {
                 let input = match view {
@@ -488,6 +491,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
+    use ferricast_codec::cuda;
     use ferricast_codec::cuda::nvcodec::cuda::{Context, HostImageMut};
     use ferricast_core::BackendId;
 

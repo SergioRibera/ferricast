@@ -35,13 +35,13 @@ use ferricast_codec::cuda::nvcodec::decode::{
     self as nv, ChromaFormat, Decoder, DecoderCaps, Device, FrameInfo, Host, HostFrame, Packet,
     SeiMessages,
 };
-use ferricast_codec::cuda::{self, CudaSurface, codec_error, map_error, nvcodec};
+use ferricast_codec::cuda::{self, CudaDevice, CudaSurface, codec_error, map_error, nvcodec};
 use ferricast_codec::{Candidate, VideoDecoderRegistry, VideoDecoderSession};
 use ferricast_core::{
     Acceleration, BackendId, CapturedFrame, Codec, CodecError, CodecResult, CodecTarget,
     ColourDescription, ColourPrimaries, ContentLightLevel, DecoderConfig, EncodedFrame,
-    FrameMemory, HdrMetadata, MasteringDisplay, MatrixCoefficients, NativeFrame, Operation,
-    PixelFormat, RawFrame, TransferCharacteristics, VideoDecoder,
+    FrameMemory, GpuAffinity, GpuPreference, HdrMetadata, MasteringDisplay, MatrixCoefficients,
+    NativeFrame, Operation, PixelFormat, RawFrame, TransferCharacteristics, VideoDecoder,
 };
 use tracing::{debug, info};
 
@@ -169,10 +169,11 @@ fn candidate<C: NvdecCodec>() -> Candidate<DecoderConfig, dyn VideoDecoderSessio
     Candidate::new(BackendId::Nvdec, Acceleration::Hardware, |config| {
         // Capability query first: cheap, and it names a missing driver or
         // codec instead of failing on the first packet.
-        NvdecDecoder::<C>::probe()?;
+        NvdecDecoder::<C>::probe_on(CudaDevice::for_config(config, BackendId::Nvdec)?)?;
         ferricast_codec::open_video_decoder::<NvdecDecoder<C>>(config)
     })
     .with_probe(NvdecDecoder::<C>::probe)
+    .on_gpu(GpuAffinity::Nvidia)
 }
 
 /// The decoder of one stream, in host or device mode.
@@ -212,7 +213,8 @@ impl<C: NvdecCodec> Default for NvdecDecoder<C> {
 }
 
 impl<C: NvdecCodec> NvdecDecoder<C> {
-    /// Whether this machine's GPU decodes `C` (8-bit 4:2:0): loads the
+    /// Whether this machine's preferred NVIDIA GPU (`FERRICAST_GPU`, else
+    /// the first one) decodes `C` (8-bit 4:2:0): loads the
     /// driver and asks it, without creating a decoder.
     ///
     /// # Errors
@@ -220,7 +222,20 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
     /// [`CodecError::BackendUnavailable`] without an NVIDIA driver or GPU,
     /// or when the GPU has no decoder for the codec.
     pub fn probe() -> CodecResult<()> {
-        let context = cuda::context().map_err(map_error(BackendId::Nvdec, Operation::Probe))?;
+        Self::probe_on(CudaDevice::for_config(
+            &GpuPreference::Auto,
+            BackendId::Nvdec,
+        )?)
+    }
+
+    /// [`Self::probe`] on `device`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::probe`].
+    pub fn probe_on(device: CudaDevice) -> CodecResult<()> {
+        let context =
+            cuda::context_on(device).map_err(map_error(BackendId::Nvdec, Operation::Probe))?;
         let caps = DecoderCaps::query(&context, C::NV_CODEC, ChromaFormat::Yuv420, 8)
             .map_err(map_error(BackendId::Nvdec, Operation::Probe))?;
         if !caps.supported {
@@ -240,7 +255,9 @@ impl<C: NvdecCodec> NvdecDecoder<C> {
     }
 
     fn open(config: &DecoderConfig) -> CodecResult<Session> {
-        let context = cuda::context().map_err(map_error(BackendId::Nvdec, Operation::Open))?;
+        let device = CudaDevice::for_config(config, BackendId::Nvdec)?;
+        let context =
+            cuda::context_on(device).map_err(map_error(BackendId::Nvdec, Operation::Open))?;
         let nv_config = nv::DecoderConfig::new(C::NV_CODEC);
         let session = match config.memory {
             FrameMemory::Cpu => Session::Host {
