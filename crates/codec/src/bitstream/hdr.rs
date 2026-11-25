@@ -10,7 +10,7 @@ use ferricast_core::{ContentLightLevel, HdrMetadata, MasteringDisplay};
 
 use super::av1::{self, Obus};
 use super::bits::{escape, leb128, unescape};
-use super::{NalSyntax, START_CODE, split_annex_b};
+use super::{NalSyntax, START_CODE, nal_units};
 
 /// SEI `payloadType` of `mastering_display_colour_volume`.
 const SEI_MASTERING_DISPLAY: u32 = 137;
@@ -101,7 +101,7 @@ fn sei_varint(bytes: &[u8]) -> Option<(u32, &[u8])> {
 #[must_use]
 pub fn from_annex_b(access_unit: &[u8], syntax: NalSyntax) -> HdrMetadata {
     let mut found = HdrMetadata::default();
-    for nal in split_annex_b(access_unit) {
+    for nal in nal_units(access_unit) {
         merge(&mut found, from_sei_nal(nal, syntax));
     }
     found
@@ -238,6 +238,12 @@ impl HdrTracker {
     /// Records the SEI messages of an H.264 / H.265 Annex B access unit.
     pub fn observe_annex_b(&mut self, access_unit: &[u8], syntax: NalSyntax) {
         merge(&mut self.current, from_annex_b(access_unit, syntax));
+    }
+
+    /// Records `nal` (start code stripped) when it is an SEI unit, for
+    /// callers walking the units of a packet themselves.
+    pub fn observe_nal(&mut self, nal: &[u8], syntax: NalSyntax) {
+        merge(&mut self.current, from_sei_nal(nal, syntax));
     }
 
     /// Records the metadata OBUs of an AV1 temporal unit.

@@ -6,7 +6,7 @@
 use ferricast_core::{ChromaLocation, ColourDescription, ColourRange};
 
 use super::bits::Bits;
-use super::{NalSyntax, h264, hevc, split_annex_b};
+use super::{NalSyntax, h264, hevc, nal_units};
 
 /// The colour fields of a VUI: the video signal type (range, primaries,
 /// transfer, matrix) and the chroma sample location, each when present.
@@ -72,11 +72,19 @@ pub struct ColourTracker {
 impl ColourTracker {
     /// Records the last readable SPS of an Annex B access unit.
     pub fn observe_annex_b(&mut self, access_unit: &[u8], syntax: NalSyntax) {
+        for nal in nal_units(access_unit) {
+            self.observe_nal(nal, syntax);
+        }
+    }
+
+    /// Records `nal` (start code stripped) when it is a readable SPS,
+    /// for callers walking the units of a packet themselves.
+    pub fn observe_nal(&mut self, nal: &[u8], syntax: NalSyntax) {
         let read = match syntax {
             NalSyntax::H264 => h264::sps_colour,
             NalSyntax::H265 => hevc::sps_colour,
         };
-        if let Some(colour) = split_annex_b(access_unit).into_iter().rev().find_map(read) {
+        if let Some(colour) = read(nal) {
             self.current = colour;
         }
     }
