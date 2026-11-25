@@ -728,6 +728,7 @@ async fn prepare(
     let video_dec = match video_dec {
         Some((mut d, v)) => {
             let config = DecoderConfig {
+                gpu: ctx.gpu.clone(),
                 hdr: None,
                 memory: ferricast_core::FrameMemory::Cpu,
                 codec: v.codec,

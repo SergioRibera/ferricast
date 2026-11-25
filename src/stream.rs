@@ -21,8 +21,8 @@ use ferricast_core::{
     AdaptiveBitrateState, AudioCapture, AudioCaptureConfig, AudioCodec, AudioEncoder,
     AudioEncoderConfig, AudioFrame, AudioSource, AudioStreamConfig, CaptureConfig, CaptureSource,
     CapturedFrame, CastSession, ConnectOutcome, Device, EncodedFrame, EncoderConfig,
-    FerricastError, PairingChallenge, PairingResponse, Result, ScreenCapture, StreamConfig,
-    VideoEncoder,
+    FerricastError, GpuId, GpuPreference, PairingChallenge, PairingResponse, Result, ScreenCapture,
+    StreamConfig, VideoEncoder,
 };
 use ferricast_encoder::aac::AacEncoder;
 #[cfg(feature = "fdk-aac")]
@@ -183,6 +183,8 @@ pub(crate) struct StreamRequest<C, E> {
     pub capture: C,
     pub encoder: E,
     pub config: StreamConfig,
+    /// Which GPU the encoder runs on.
+    pub gpu: GpuPreference,
     pub create_session: SessionFactory,
     pub event_tx: mpsc::Sender<ManagerEvent>,
 }
@@ -215,19 +217,28 @@ where
             mut capture,
             mut encoder,
             config,
+            gpu,
             create_session,
             event_tx,
         } = self;
         let caps = &device.capabilities;
         // Apply the fps ceiling before start so the capture worker's
         // throttle anchors to the right rate from the first buffer.
-        // Capture prefers DMA-BUF layouts the GPU encoder takes without a
-        // copy. The first query brings up the GPU (EGL + CUDA), so it runs
-        // off the async workers; the answer is cached for the process.
-        let (consumer_modifiers, consumer_orients) = tokio::task::spawn_blocking(|| {
+        // Capture prefers DMA-BUF layouts the GPU encoder that will be
+        // selected takes without a copy, and hands it rotated frames only
+        // when that encoder turns them. The capture GPU is not known yet, so
+        // the prediction uses the preference alone. The first query brings
+        // up the GPU (EGL + CUDA, a VA-API VPP), so it runs off the async
+        // workers; the answers are cached for the process.
+        let predicted = EncoderConfig {
+            codec: config.codec,
+            gpu: gpu.clone(),
+            ..EncoderConfig::default()
+        };
+        let (consumer_modifiers, consumer_orients) = tokio::task::spawn_blocking(move || {
             (
-                ferricast_encoder::dmabuf_modifiers(),
-                ferricast_encoder::orients_gpu_frames(),
+                ferricast_encoder::dmabuf_modifiers(&predicted),
+                ferricast_encoder::orients_gpu_frames(&predicted),
             )
         })
         .await
@@ -248,6 +259,7 @@ where
             &mut capture,
             &mut encoder,
             config,
+            &gpu,
             &create_session,
             &event_tx,
         )
@@ -322,11 +334,21 @@ async fn start_capture_if_reachable<C: ScreenCapture>(
     Ok(())
 }
 
+/// The GPU that rendered `frame`, for GPU frames that name it.
+fn source_gpu(frame: &CapturedFrame) -> Option<GpuId> {
+    match frame {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        CapturedFrame::Gpu(gpu) => gpu.producer.map(|producer| GpuId::Dev(producer.into())),
+        _ => None,
+    }
+}
+
 async fn negotiate<C: ScreenCapture, E: VideoEncoder>(
     device: &Device,
     capture: &mut C,
     encoder: &mut E,
     config: StreamConfig,
+    gpu: &GpuPreference,
     create_session: &SessionFactory,
     event_tx: &mpsc::Sender<ManagerEvent>,
 ) -> Result<Negotiated> {
@@ -380,6 +402,8 @@ async fn negotiate<C: ScreenCapture, E: VideoEncoder>(
         // Matches the HLS segment target so natural IDRs line up
         // with segment boundaries.
         keyframe_interval_secs: 2.0,
+        gpu: gpu.clone(),
+        source_gpu: source_gpu(&first_frame),
         ..EncoderConfig::default()
     };
     tracing::info!(
@@ -1233,6 +1257,7 @@ mod tests {
             capture: FakeCapture::new(sizes),
             encoder,
             config,
+            gpu: GpuPreference::Auto,
             create_session: factory,
             event_tx,
         };
@@ -1266,6 +1291,7 @@ mod tests {
             capture: FakeCapture::new(&[(64, 36)]),
             encoder: FakeEncoder::default(),
             config: StreamConfig::default(),
+            gpu: GpuPreference::Auto,
             create_session: factory,
             event_tx,
         }

@@ -11,8 +11,9 @@ use uuid::Uuid;
 use crate::stream::{CancelRx, ErasedSession, SessionFactory, StreamEnd, StreamRequest};
 use ferricast_core::{
     AudioDecoder, CaptureSource, Device, Discovery, DiscoveryEvent, FerricastError, FrameSink,
-    MediaInfo, PairingChallenge, PairingResponse, PlaybackState, ProtocolHandler, ReceiverProtocol,
-    RemoteSender, Result, ScreenCapture, StreamConfig, VideoDecoder, VideoEncoder,
+    GpuPreference, MediaInfo, PairingChallenge, PairingResponse, PlaybackState, ProtocolHandler,
+    ReceiverProtocol, RemoteSender, Result, ScreenCapture, StreamConfig, VideoDecoder,
+    VideoEncoder,
 };
 
 use crate::receiver::ReceiverHost;
@@ -299,6 +300,11 @@ pub struct StreamManager {
     /// `StreamManagerBuilder::with_port_range` so firewall rules can
     /// target a fixed range regardless of protocol.
     port_range: Option<(u16, u16)>,
+
+    /// Which GPU the encoders of new streams run on (the decoders'
+    /// preference lives with the receiver state). Set via
+    /// `StreamManagerBuilder::with_gpu` or [`StreamManager::set_gpu`].
+    gpu: GpuPreference,
 }
 
 impl Default for StreamManager {
@@ -313,6 +319,7 @@ impl Default for StreamManager {
             event_rx: Some(event_rx),
             receiver: ReceiverHost::default(),
             port_range: None,
+            gpu: GpuPreference::Auto,
         }
     }
 }
@@ -602,6 +609,7 @@ impl StreamManager {
             capture,
             encoder,
             config,
+            gpu: self.gpu.clone(),
             create_session: proto.create_session.clone(),
             event_tx: self.event_tx.clone(),
         };
@@ -725,6 +733,20 @@ impl StreamManager {
     #[must_use]
     pub fn builder() -> StreamManagerBuilder {
         StreamManagerBuilder::default()
+    }
+
+    /// Which GPU the hardware encoders and decoders run on.
+    #[must_use]
+    pub fn gpu(&self) -> &GpuPreference {
+        &self.gpu
+    }
+
+    /// Changes the GPU preference for streams and receiver sessions
+    /// started from now on (running ones keep their GPU; receivers pick it
+    /// up when they are started again).
+    pub fn set_gpu(&mut self, gpu: GpuPreference) {
+        self.receiver.gpu = gpu.clone();
+        self.gpu = gpu;
     }
 }
 
@@ -886,6 +908,14 @@ impl StreamManagerBuilder {
     #[must_use]
     pub fn with_port_range(mut self, start: u16, end: u16) -> Self {
         self.manager.port_range = Some((start, end));
+        self
+    }
+
+    /// Run the hardware encoders and decoders on `gpu` (see
+    /// [`GpuPreference`]; `FERRICAST_GPU` overrides `Auto` at run time).
+    #[must_use]
+    pub fn with_gpu(mut self, gpu: GpuPreference) -> Self {
+        self.manager.set_gpu(gpu);
         self
     }
 

@@ -25,8 +25,8 @@ use uuid::Uuid;
 use ferricast_core::{
     AdvertiseInfo, Advertiser, AudioCodec, AudioDecoder, AudioDecoderConfig, AudioFrame,
     CapturedFrame, Codec, CodecResult, ControlSession, DecodedAudio, DecoderConfig, EncodedFrame,
-    FrameSink, MediaCommand, MediaInfo, MediaPacket, MediaPuller, PlaybackStatus, PullSpec,
-    ReceiverProtocol, RemoteSender, Result, VideoDecoder,
+    FrameSink, GpuPreference, MediaCommand, MediaInfo, MediaPacket, MediaPuller, PlaybackStatus,
+    PullSpec, ReceiverProtocol, RemoteSender, Result, VideoDecoder,
 };
 
 use crate::manager::ManagerEvent;
@@ -188,6 +188,8 @@ pub(crate) struct ReceiverHost {
     receivers_running: bool,
     /// Sessions alive across every protocol.
     sessions: Arc<AtomicUsize>,
+    /// Which GPU the video decoders run on.
+    pub(crate) gpu: GpuPreference,
 }
 
 /// Everything a session needs to run LOADs, shared by all sessions
@@ -204,6 +206,8 @@ struct PipelineCtx {
     playback: session::PlaybackOwner,
     /// Sessions alive across every protocol.
     sessions: Arc<AtomicUsize>,
+    /// Which GPU the video decoders run on.
+    gpu: GpuPreference,
 }
 
 impl ReceiverHost {
@@ -345,6 +349,7 @@ impl ReceiverHost {
                 event_tx: event_tx.clone(),
                 playback: session::PlaybackOwner::default(),
                 sessions: self.sessions.clone(),
+                gpu: self.gpu.clone(),
             });
             let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
             let supervisor = Supervisor {
