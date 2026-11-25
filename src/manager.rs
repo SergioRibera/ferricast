@@ -735,6 +735,26 @@ impl StreamManager {
         StreamManagerBuilder::default()
     }
 
+    /// This machine's GPUs (sysfs; empty off Linux), each with the compiled
+    /// hardware video encoders and decoders that run on it: the choices
+    /// for [`StreamManagerBuilder::with_gpu`] (`--list-gpus`).
+    #[must_use]
+    pub fn gpus() -> Vec<ferricast_codec::GpuReport> {
+        use ferricast_decoder::{Av1Decoder, H264Decoder, H265Decoder, Vp8Decoder, Vp9Decoder};
+        use ferricast_encoder::h264::H264Encoder;
+        use ferricast_encoder::h265::H265Encoder;
+        ferricast_codec::GpuReport::scan(
+            &[H264Encoder::registry(), H265Encoder::registry()],
+            &[
+                H264Decoder::registry(),
+                H265Decoder::registry(),
+                Vp8Decoder::registry(),
+                Vp9Decoder::registry(),
+                Av1Decoder::registry(),
+            ],
+        )
+    }
+
     /// Which GPU the hardware encoders and decoders run on.
     #[must_use]
     pub fn gpu(&self) -> &GpuPreference {
