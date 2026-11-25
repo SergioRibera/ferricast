@@ -493,19 +493,18 @@ impl Gpu {
 }
 
 /// The device number of the node at `path`, from the file system.
+#[cfg(unix)]
 fn node_dev(path: &str) -> Option<DevNumber> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata(path)
-            .ok()
-            .map(|metadata| DevNumber::from_dev(metadata.rdev()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _unused = path;
-        None
-    }
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| DevNumber::from_dev(metadata.rdev()))
+}
+
+/// No device nodes off Unix.
+#[cfg(not(unix))]
+fn node_dev(_path: &str) -> Option<DevNumber> {
+    None
 }
 
 /// The GPUs of this machine, in render node order.
@@ -547,7 +546,7 @@ impl Gpus {
     /// 1. NVIDIA: discrete (its only integrated GPUs, Tegra, are not PCI).
     /// 2. Intel: integrated on PCI bus 0 (Intel's integrated GPUs sit at
     ///    `0000:00:02.0`), discrete elsewhere (Arc cards sit behind a
-    ///    PCIe port).
+    ///    `PCIe` port).
     /// 3. The rest (AMD, others), undecided by vendor:
     ///    - discrete when another GPU is already integrated (a machine has
     ///      one integrated GPU);

@@ -201,15 +201,17 @@ impl ExternalBufferDescriptor for DmaBufImport {
         // A plain C struct of integers and arrays of integers: zero is a
         // valid value of every field, and the slots past `num_objects` /
         // `num_layers` stay zero, which the driver ignores.
-        let mut d = VADRMPRIMESurfaceDescriptor::default();
-        d.fourcc = self.va_fourcc;
-        d.width = self.width;
-        d.height = self.height;
-        d.num_objects = 1;
+        let mut d = VADRMPRIMESurfaceDescriptor {
+            fourcc: self.va_fourcc,
+            width: self.width,
+            height: self.height,
+            num_objects: 1,
+            num_layers: 1,
+            ..Default::default()
+        };
         d.objects[0].fd = self.fd;
         d.objects[0].size = self.size;
         d.objects[0].drm_format_modifier = self.modifier;
-        d.num_layers = 1;
         d.layers[0].drm_format = self.drm_fourcc;
         d.layers[0].num_planes = 1;
         d.layers[0].object_index[0] = 0;

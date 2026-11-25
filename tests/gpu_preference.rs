@@ -63,7 +63,7 @@ fn frame() -> CapturedFrame {
 
 /// Opens H.264 encode under `gpu` with automatic selection, encodes one
 /// picture, and returns the backend that did it.
-fn encoded_by(gpu: GpuPreference) -> BackendId {
+fn encoded_by(gpu: &GpuPreference) -> BackendId {
     let mut encoder = H264Encoder::default();
     encoder
         .configure(&config(gpu.clone(), BackendSelection::default()))
@@ -90,11 +90,7 @@ fn every_preference_naming_the_nvidia_gpu_picks_nvenc() {
         GpuPreference::Device(GpuId::Pci(pci)),
     ];
     for preference in preferences {
-        assert_eq!(
-            encoded_by(preference.clone()),
-            BackendId::Nvenc,
-            "{preference}"
-        );
+        assert_eq!(encoded_by(&preference), BackendId::Nvenc, "{preference}");
     }
 }
 
@@ -106,7 +102,7 @@ fn a_missing_gpu_leaves_the_hardware_backends_out() {
     }
     let missing: GpuPreference = "/dev/dri/renderD250".parse().unwrap();
     // Automatic selection drops every GPU-bound backend: software encodes.
-    assert_eq!(encoded_by(missing.clone()), BackendId::X264);
+    assert_eq!(encoded_by(&missing), BackendId::X264);
     // A fixed backend fails, naming the preference.
     let mut encoder = H264Encoder::default();
     let error = encoder

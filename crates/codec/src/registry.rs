@@ -968,7 +968,11 @@ mod gpu_order_tests {
 
     use super::*;
 
-    #[expect(clippy::trivially_copy_pass_by_ref, reason = "an `OpenFn`")]
+    #[expect(
+        clippy::unnecessary_wraps,
+        clippy::trivially_copy_pass_by_ref,
+        reason = "an `OpenFn`"
+    )]
     fn opens(_: &u32) -> CodecResult<Box<str>> {
         Ok("session".into())
     }

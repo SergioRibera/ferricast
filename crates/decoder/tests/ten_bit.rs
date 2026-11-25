@@ -77,7 +77,7 @@ impl Clip {
 
     fn config<D: VideoDecoder>(&self) -> DecoderConfig {
         DecoderConfig {
-            gpu: Default::default(),
+            gpu: ferricast_core::GpuPreference::Auto,
             codec: D::CODEC,
             width: WIDTH,
             height: HEIGHT,
@@ -288,7 +288,7 @@ fn nvdec_device_frames_read_back_bit_exact() {
     let name = "NVDEC HEVC (device)";
     let mut decoder = ferricast_decoder::h265::NvdecH265Decoder::default();
     let config = DecoderConfig {
-        gpu: Default::default(),
+        gpu: ferricast_core::GpuPreference::Auto,
         memory: FrameMemory::Native,
         ..clip.config::<ferricast_decoder::h265::NvdecH265Decoder>()
     };
@@ -328,7 +328,7 @@ impl<D: VideoDecoder> VideoDecoder for Software<D> {
 
     fn configure(&mut self, config: &DecoderConfig) -> ferricast_core::CodecResult<()> {
         self.0.configure(&DecoderConfig {
-            gpu: Default::default(),
+            gpu: ferricast_core::GpuPreference::Auto,
             backend: BackendSelection::Auto(self.1.clone()),
             ..config.clone()
         })

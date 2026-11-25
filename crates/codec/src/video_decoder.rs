@@ -478,7 +478,7 @@ mod tests {
 
     fn config(backend: BackendSelection) -> DecoderConfig {
         DecoderConfig {
-            gpu: Default::default(),
+            gpu: ferricast_core::GpuPreference::Auto,
             hdr: None,
             memory: ferricast_core::FrameMemory::Cpu,
             codec: Codec::H264,

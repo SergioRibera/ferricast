@@ -26,7 +26,7 @@ fn configured<D: VideoDecoder + Default>(low_latency: bool) -> D {
     let mut decoder = D::default();
     decoder
         .configure(&DecoderConfig {
-            gpu: Default::default(),
+            gpu: ferricast_core::GpuPreference::Auto,
             hdr: None,
             memory: ferricast_core::FrameMemory::Cpu,
             codec: D::CODEC,
@@ -214,7 +214,7 @@ mod nvdec {
     ) -> Option<Vec<u64>> {
         let mut decoder = NvdecDecoder::<C>::default();
         let config = DecoderConfig {
-            gpu: Default::default(),
+            gpu: ferricast_core::GpuPreference::Auto,
             hdr: None,
             memory: ferricast_core::FrameMemory::Cpu,
             codec: C::FERRICAST_CODEC,
