@@ -12,7 +12,10 @@ pub mod aac;
     all(target_os = "windows", feature = "media-foundation")
 ))]
 mod audio_clock;
-#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+#[cfg(any(
+    feature = "vaapi",
+    all(feature = "nvenc", any(target_os = "linux", target_os = "windows"))
+))]
 mod config_ext;
 mod frame_view;
 #[cfg(feature = "vaapi")]
@@ -27,7 +30,7 @@ pub mod h265;
     allow(dead_code, reason = "used by the NV12-input platform encoders only")
 )]
 mod nv12;
-#[cfg(feature = "nvenc")]
+#[cfg(all(feature = "nvenc", any(target_os = "linux", target_os = "windows")))]
 pub mod nvenc;
 pub mod opus;
 mod platform;
@@ -48,4 +51,35 @@ pub fn catalog(catalog: ferricast_codec::plugin::Catalog) -> ferricast_codec::pl
         .audio_encoder(AudioCodec::Aac, aac::AacEncoder::registry)
         .audio_encoder(AudioCodec::AacEld, aac::AacEldEncoder::registry)
         .audio_encoder(AudioCodec::Opus, opus::OpusEncoder::registry)
+}
+
+/// Adds NVENC for `codec`: the first candidate of automatic selection
+/// (on a laptop with an NVIDIA dGPU and an AMD / Intel iGPU, VA-API would
+/// pick the iGPU and move every captured frame across `PCIe` twice).
+/// Recorded as missing (naming its feature) when the build leaves it
+/// out, and as elsewhere off Linux and Windows.
+fn nvenc(
+    registry: ferricast_codec::VideoEncoderRegistry,
+    codec: ferricast_core::Codec,
+) -> ferricast_codec::VideoEncoderRegistry {
+    #[cfg(all(feature = "nvenc", any(target_os = "linux", target_os = "windows")))]
+    let registry = nvenc::register(registry, codec);
+    #[cfg(not(all(feature = "nvenc", any(target_os = "linux", target_os = "windows"))))]
+    let registry = {
+        let feature = if codec == ferricast_core::Codec::H265 {
+            "ferricast-encoder/nvenc-hevc"
+        } else {
+            "ferricast-encoder/nvenc"
+        };
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
+            registry.missing(ferricast_core::BackendId::Nvenc, feature)
+        } else {
+            registry.elsewhere(
+                ferricast_core::BackendId::Nvenc,
+                feature,
+                "only on Linux and Windows",
+            )
+        }
+    };
+    registry
 }

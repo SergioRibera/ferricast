@@ -13,16 +13,19 @@ mod headers;
 #[cfg(feature = "vaapi-hevc")]
 mod vaapi_impl;
 
-#[cfg(any(feature = "nvenc-hevc", feature = "vaapi-hevc"))]
+#[cfg(feature = "vaapi-hevc")]
 use ferricast_codec::Candidate;
 use ferricast_codec::VideoEncoderRegistry;
-#[cfg(any(feature = "nvenc-hevc", feature = "vaapi-hevc"))]
+#[cfg(feature = "vaapi-hevc")]
 use ferricast_core::{Acceleration, EncoderConfig};
 use ferricast_core::{BackendId, Codec, CodecTarget};
-#[cfg(any(feature = "nvenc-hevc", feature = "vaapi-hevc"))]
+#[cfg(feature = "vaapi-hevc")]
 use ferricast_core::{CodecError, Operation};
 
-#[cfg(feature = "nvenc-hevc")]
+#[cfg(all(
+    feature = "nvenc-hevc",
+    any(target_os = "linux", target_os = "windows")
+))]
 pub use crate::nvenc::NvencH265Encoder;
 #[cfg(feature = "vaapi-hevc")]
 pub use vaapi_impl::VaapiH265Encoder;
@@ -35,25 +38,7 @@ ferricast_codec::video_encoder_facade! {
 /// The H.265 encode backends of this build, in automatic order.
 fn registry() -> VideoEncoderRegistry {
     let registry = VideoEncoderRegistry::new(CodecTarget::encode(Codec::H265));
-    #[cfg(feature = "nvenc-hevc")]
-    let registry = registry.candidate(
-        Candidate::new(
-            BackendId::Nvenc,
-            Acceleration::Hardware,
-            |config: &EncoderConfig| {
-                NvencH265Encoder::probe_with(config.clone())
-                    .map(|encoder| Box::new(encoder) as _)
-                    .map_err(CodecError::from_backend(BackendId::Nvenc, Operation::Open))
-            },
-        )
-        .with_probe(|| {
-            NvencH265Encoder::probe()
-                .map(drop)
-                .map_err(CodecError::from_backend(BackendId::Nvenc, Operation::Probe))
-        }),
-    );
-    #[cfg(not(feature = "nvenc-hevc"))]
-    let registry = registry.missing(BackendId::Nvenc, "ferricast-encoder/nvenc-hevc");
+    let registry = crate::nvenc(registry, Codec::H265);
     #[cfg(feature = "vaapi-hevc")]
     let registry = registry.candidate(
         Candidate::new(

@@ -15,10 +15,11 @@ edition = "2024"
 # - `vaapi` — Intel iGPU / AMD Mesa hardware encode via cros-libva.
 #             cros-libva pins to a specific libva ABI; bump the
 #             fork rev when libva moves and bindgen output diverges.
-# - `nvenc` — NVIDIA hardware encode via shiguredo_nvcodec.
-#             Loads libcuda + libnvidia-encode at runtime; missing
-#             libraries make `probe()` fall through to the next
-#             backend at runtime.
+# - `nvenc` — NVIDIA hardware encode via ferricast-nvcodec (Linux,
+#             Windows; inert elsewhere). Loads libcuda +
+#             libnvidia-encode at runtime; missing libraries make
+#             `probe()` fall through to the next backend. Includes the
+#             zero-copy DMA-BUF input (EGL is loaded at runtime too).
 # - `fdk-aac` — AAC-LC via libfdk-aac. Off → the AAC facade
 #             routes everything to the pure-Rust oxideav-aac
 #             fallback (always compiled in).
@@ -39,7 +40,7 @@ default = [
 ]
 x264 = ["dep:x264-sys"]
 vaapi = ["dep:cros-libva"]
-nvenc = ["dep:shiguredo_nvcodec"]
+nvenc = ["ferricast-codec/cuda"]
 # HEVC (H.265) encode through NVENC. Builds on top of `nvenc` — the
 # generic `NvencEncoder<C>` carries the HEVC codec marker behind this
 # gate so a non-HEVC build doesn't compile the HEVC `CodecConfig`
@@ -53,18 +54,6 @@ nvenc-hevc = ["nvenc"]
 # both hardware paths to compile.
 vaapi-hevc = ["vaapi"]
 fdk-aac = ["dep:fdk-aac", "dep:fdk-aac-sys"]
-
-# Zero-copy DMA-BUF input on NVENC. Requires a forked
-# `shiguredo_nvcodec` that exposes `Encoder::register_external_dmabuf`
-# + `Encoder::encode_external` (the upstream crate keeps those
-# `pub(crate)`). Without the fork, NVENC stays on the CPU path
-# (Vulkan readback + libcuda HtoD) which still works on every
-# NVIDIA GPU — just not zero-copy.
-#
-# Toggle on with `--features nvenc-zero-copy` once `Cargo.toml`
-# points `shiguredo_nvcodec` at a fork that publishes the two
-# methods.
-nvenc-zero-copy = ["nvenc"]
 opus-rs = ["dep:opus-rs"]
 # The encoders in the istmo codec plugin (`ferricast_codec::plugin`).
 istmo = ["ferricast-codec/istmo"]
@@ -100,6 +89,7 @@ mediacodec = ["dep:ndk", "dep:ndk-sys", "ferricast-codec/mediacodec"]
 ferricast-core.workspace = true
 ferricast-codec.workspace = true
 bytes.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 
 
@@ -115,13 +105,6 @@ tracing.workspace = true
 # distro moves; until then `--no-default-features --features "openh264,nvenc"`
 # is the escape hatch.
 cros-libva = { git = "https://github.com/SergioRibera/cros-libva", branch = "fix/vp9-encpicparam-fields", optional = true }
-
-# NVENC (NVIDIA hardware H.264 encode). Higher-level Rust binding
-# that wraps the Video Codec SDK headers — no SDK install needed at
-# build time, the libraries (libcuda.so, libnvidia-encode.so) are
-# dlopen'd at runtime. Missing libs cause `Encoder::new` to error
-# and the factory falls back through VA-API / openh264.
-shiguredo_nvcodec = { version = "2026.1.0", optional = true }
 
 # AAC-LC encoder via libfdk-aac. Picked over a pure-Rust path
 # because no production-grade AAC encoder exists in Rust and the

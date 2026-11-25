@@ -57,7 +57,6 @@ opus-decode = ["ferricast/opus-decode"]
 fdk-aac = ["ferricast/fdk-aac"]
 # Pure-Rust Opus encoder for Cast Streaming (RTP mirror path).
 opus-rs = ["ferricast/opus-rs"]
-nvenc-zero-copy = ["ferricast/nvenc-zero-copy", "nvenc"]
 # Wayland source enumeration. Defaults on so `ferricast-gui windows`
 # works out of the box on every modern compositor that exposes
 # foreign-toplevel (wlroots, niri, KDE Plasma 6); falls through to

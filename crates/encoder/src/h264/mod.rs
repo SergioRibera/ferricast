@@ -29,18 +29,18 @@ mod vaapi_impl;
 #[cfg(feature = "x264")]
 mod x264_impl;
 
-#[cfg(any(feature = "nvenc", feature = "vaapi", feature = "x264"))]
+#[cfg(any(feature = "vaapi", feature = "x264"))]
 use ferricast_codec::Candidate;
 use ferricast_codec::VideoEncoderRegistry;
-#[cfg(any(feature = "nvenc", feature = "vaapi", feature = "x264"))]
+#[cfg(any(feature = "vaapi", feature = "x264"))]
 use ferricast_core::Acceleration;
-#[cfg(any(feature = "nvenc", feature = "vaapi"))]
+#[cfg(feature = "vaapi")]
 use ferricast_core::CodecError;
-#[cfg(any(feature = "nvenc", feature = "vaapi"))]
+#[cfg(feature = "vaapi")]
 use ferricast_core::EncoderConfig;
 use ferricast_core::{BackendId, Codec, CodecTarget};
 
-#[cfg(feature = "nvenc")]
+#[cfg(all(feature = "nvenc", any(target_os = "linux", target_os = "windows")))]
 pub use crate::nvenc::NvencH264Encoder;
 #[cfg(feature = "vaapi")]
 pub use vaapi_impl::VaapiH264Encoder;
@@ -55,31 +55,7 @@ ferricast_codec::video_encoder_facade! {
 /// The H.264 encode backends of this build, in automatic order.
 fn registry() -> VideoEncoderRegistry {
     let registry = VideoEncoderRegistry::new(CodecTarget::encode(Codec::H264));
-    #[cfg(feature = "nvenc")]
-    let registry = registry.candidate(
-        Candidate::new(
-            BackendId::Nvenc,
-            Acceleration::Hardware,
-            |config: &EncoderConfig| {
-                NvencH264Encoder::probe_with(config.clone())
-                    .map(|encoder| Box::new(encoder) as _)
-                    .map_err(CodecError::from_backend(
-                        BackendId::Nvenc,
-                        ferricast_core::Operation::Open,
-                    ))
-            },
-        )
-        .with_probe(|| {
-            NvencH264Encoder::probe()
-                .map(drop)
-                .map_err(CodecError::from_backend(
-                    BackendId::Nvenc,
-                    ferricast_core::Operation::Probe,
-                ))
-        }),
-    );
-    #[cfg(not(feature = "nvenc"))]
-    let registry = registry.missing(BackendId::Nvenc, "ferricast-encoder/nvenc");
+    let registry = crate::nvenc(registry, Codec::H264);
     #[cfg(feature = "vaapi")]
     let registry = registry.candidate(
         Candidate::new(

@@ -13,7 +13,7 @@
 //! * **I420** — U plane starts at `stride × height`, V right after it;
 //!   both chroma planes use `stride / 2`.
 
-#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+#[cfg(feature = "vaapi")]
 use ferricast_core::{BackendId, BitDepth, CodecError, CodecResult, EncoderConfig};
 use ferricast_core::{FerricastError, PixelFormat, RawFrame, Result};
 
@@ -251,7 +251,7 @@ impl<'a> FrameView<'a> {
 /// match `width × height` or its buffer.
 #[allow(
     dead_code,
-    reason = "conditional: only the x264 and platform encoders take P010 down to 8 bits"
+    reason = "conditional: only the x264, NVENC and platform encoders take P010 down to 8 bits"
 )]
 pub(crate) fn eight_bit(raw: RawFrame, width: u32, height: u32) -> Result<RawFrame> {
     let Some((data, stride)) = FrameView::new(&raw, width, height)?.narrowed() else {
@@ -272,7 +272,7 @@ pub(crate) fn eight_bit(raw: RawFrame, width: u32, height: u32) -> Result<RawFra
 /// # Errors
 ///
 /// [`CodecError::UnsupportedConfig`] naming `backend` and what it lacks.
-#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+#[cfg(feature = "vaapi")]
 pub(crate) fn eight_bit_sdr_only(config: &EncoderConfig, backend: BackendId) -> CodecResult<()> {
     if config.bit_depth != BitDepth::Eight {
         return Err(CodecError::UnsupportedConfig {

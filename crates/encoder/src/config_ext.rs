@@ -5,8 +5,8 @@ use ferricast_core::EncoderConfig;
 
 pub(crate) trait EncoderConfigExt {
     /// `true` when `other` can be served by a session opened for
-    /// `self`: same codec, geometry, frame rate, GOP, input format and
-    /// profile ceilings. Bitrate is deliberately excluded — backends
+    /// `self`: same codec, geometry, frame rate, GOP, input format,
+    /// profile ceilings, bit depth, colour and HDR metadata. Bitrate is deliberately excluded — backends
     /// that can retarget it live do so instead of rebuilding.
     fn same_session_shape(&self, other: &Self) -> bool;
 }
@@ -21,6 +21,9 @@ impl EncoderConfigExt for EncoderConfig {
             && self.pixel_format == other.pixel_format
             && self.max_h264_profile == other.max_h264_profile
             && self.max_h265_profile == other.max_h265_profile
+            && self.bit_depth == other.bit_depth
+            && self.colour == other.colour
+            && self.hdr == other.hdr
     }
 }
 
