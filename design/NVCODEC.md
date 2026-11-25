@@ -815,6 +815,10 @@ being undone by capture for every consumer:
   VA-API's VPP path takes only upright frames and sends the rest through
   `into_cpu`; CPU encoders call `into_cpu`. A consumer that reads the
   DMA-BUF itself must check the orientation, as the field documents.
+- Later: VA-API's VPP applies the orientation where the driver supports
+  it (CODECS.md, "VA-API VPP orientation"), and `consumer_orients` follows
+  the encoder the stream would select (`orients_gpu_frames(config)`), not
+  NVENC alone.
 
 Live (`mycap`, `FERRICAST_WLR_FULL_COPY=1`, 10 s, 60 fps, NVENC H.264 at
 the output's upright size; readbacks counted on the frame's importer):
@@ -888,6 +892,11 @@ with `Y_INVERT` against `RawFrame::oriented` (41 / 46 dB).
   selection what it needs to prefer a backend on the producer's GPU
   (VA-API on the iGPU zero-copy over NVENC + readback). The selection
   itself (registry order in the facades) does not use it yet.
+  Now it does: `GpuPreference::Auto` ranks the producer's GPU first and
+  `Registry::plan_on` tries the backends on it first; NVENC opens on the
+  preferred NVIDIA GPU by PCI address (`cuda::context_on`), and the
+  importer / capabilities are kept per device (see CODECS.md, "GPU
+  preference").
 
 ### Open
 

@@ -468,3 +468,134 @@ Known gaps:
   part of `nvenc` (see "NVIDIA").
 - `tests/airplay_loop.rs` ("only N of M frames shown") is timing-bound and
   fails under heavy machine load; it passes run alone.
+
+## GPU preference
+
+`ferricast_core::GpuPreference` picks the GPU the hardware codecs run on
+(hybrid laptops, multi-GPU desktops). It lives in the codec configs
+(`EncoderConfig::gpu`, `DecoderConfig::gpu`, wincode-serialised with them,
+so it crosses the istmo wire) next to `EncoderConfig::source_gpu`, the GPU
+the captured frames come from (`GpuFrame::producer`, set by the stream
+pipeline from the first frame).
+
+| Value (text) | Hardware backends use | No match |
+|---|---|---|
+| `Auto` (`auto`, default) | the capture's GPU first (zero-copy), then discrete, unknown, integrated | any GPU |
+| `SameAsCapture` (`same-as-capture`) | only the capture's GPU (a pin) | no producer known: as `Auto` |
+| `Integrated` (`integrated`) | integrated first, then unknown, discrete | any GPU |
+| `Discrete` (`discrete`) | discrete first, then unknown, integrated | any GPU |
+| `Device(GpuId)` (`/dev/dri/renderD129`, `renderD129`, `0000:01:00.0`, `01:00.0`, `226:129`) | only that GPU (a pin) | no hardware backend; software takes over |
+
+- `Auto` decision: the frame producer's GPU wins because a backend there
+  encodes from the DMA-BUF (NVENC import, VA-API VPP) while any other GPU
+  reads every frame back (two `PCIe` crossings on a hybrid laptop); without
+  a producer (decoders, capture not started) discrete first, for encode
+  throughput, which is also what the registries did before (NVENC/NVDEC
+  ahead of VA-API).
+- Enumeration: `Gpus::scan()` reads `/sys/class/drm/renderD*` (`dev`,
+  `device/{vendor,device,uevent,boot_vga}`, `device/drm/card*/dev`); empty
+  off Linux. `Gpus::scan_at(sys, dev)` takes another root (the tests use a
+  fake sysfs tree).
+- Integrated / discrete (`Gpus::classify`; the kernel has no such
+  attribute): NVIDIA discrete; Intel integrated on PCI bus 0 (`00:02.0`),
+  discrete elsewhere (Arc); others (AMD) discrete when another GPU is
+  already integrated, integrated when it is the only undecided GPU next to
+  a discrete one (APU + NVIDIA/Arc), the `boot_vga` one integrated among
+  several undecided (APU + AMD card), and `Unknown` alone (APU and card look
+  alike in sysfs). Rejected: VRAM size (`mem_info_vram_total`, BIOS UMA
+  carve-outs reach tens of GiB), PCI topology (APUs sit behind an internal
+  bridge too), `boot_vga` alone (a desktop boots on its card). The amdgpu
+  `AMDGPU_INFO_DEV_INFO` ioctl (`AMDGPU_IDS_FLAGS_FUSION`) would be exact;
+  not used (an ioctl for a label). `Device(...)` overrides a wrong guess.
+- Selection (`Registry::plan_on`, `Auto` selections only): the placement
+  (`GpuPlacement`, the preference applied to the scanned GPUs) ranks GPUs;
+  GPU-bound hardware candidates (`Candidate::on_gpu(GpuAffinity)`: NVENC /
+  NVDEC `Nvidia`, VA-API encode `NotNvidia` (NVIDIA's VA-API driver
+  decodes only), VA-API decode `Any`) are grouped by the first ranked GPU
+  each runs on, best GPU first, registry order within a GPU, then the
+  other hardware backends; software keeps its place per policy. A pin drops
+  the GPU-bound candidates that cannot run on the pinned GPU (a missing
+  pinned GPU drops them all: software opens). Without GPUs (no sysfs) the
+  order is unchanged. `Fixed` / `Ordered` keep their order.
+- Each backend opens on its first ranked GPU (`GpuInput::gpu_for`): NVENC /
+  NVDEC on the CUDA device at that GPU's PCI address
+  (`cuda::CudaDevice::for_config`, `Device::by_pci_bus_id`; one shared
+  context per device, `cuda::context_on`), VA-API on that GPU's render
+  node; a pin they cannot use is `BackendUnavailable` naming the GPU (a
+  `Fixed` backend fails with it, `Auto` moves on). Configuration-free
+  probes use `Auto` (plus `FERRICAST_GPU`). NVENC takes an NVDEC
+  `CudaSurface` in place only when both are on the same CUDA device;
+  otherwise it reads it back.
+- Cache: `SelectionKey::gpu` (the first ranked GPU's render node) separates
+  winners per GPU; the file token gains `/gpu-226-128`, and keys without a
+  GPU keep their old token.
+- Capture: `ferricast_encoder::{dmabuf_modifiers, orients_gpu_frames}`
+  now take the `EncoderConfig` the stream will use and answer for the
+  backend selection would pick (`predicted_backend`: the plan's first
+  backend whose probe passes): NVENC's modifiers / import on its GPU,
+  VA-API's VPP orientation support on its render node, nothing for
+  software. The producer is unknown before capture starts, so the stream
+  predicts with the preference alone.
+- Where it is configured: `FERRICAST_GPU` (replaces `Auto` only, like the
+  backend variables; bad text fails `configure` with `InvalidSelection`),
+  `StreamManagerBuilder::with_gpu` / `StreamManager::set_gpu` (encoders of
+  new streams, decoders of new receiver sessions),
+  `StreamManager::gpus()` (each GPU with the compiled hardware backends
+  that run on it), `ferricast-gui --gpu <preference>` and `--list-gpus`,
+  D-Bus `ListGpus` and the read/write `GpuPreference` property, the istmo
+  plugin's `gpus` call (configs carry `gpu` in `resolve` / `open`). The GUI
+  has no settings store to persist it in yet.
+- Verified on the RTX 3060 (single GPU): `Auto`, `Discrete`, `Integrated`,
+  `SameAsCapture`, `renderD128`, `0000:01:00.0` all open NVENC (and NVDEC),
+  a missing `renderD250` opens x264 / openh264 and `Fixed(Nvenc)` fails
+  naming it (`tests/gpu_preference.rs`); live wlr-screencopy (10 s, 60 fps,
+  `FERRICAST_WLR_FULL_COPY=1`) on DP-3 (normal), HDMI-A-1 (90°) and DP-2
+  (270°): every preference above encodes ~601 GPU frames with 0 readbacks,
+  0.4-0.6 % of a core; `renderD250` predicts x264, capture turns frames on
+  the CPU (600 CPU frames, 56 %).
+- Not verified (no hardware here): any hybrid or multi-GPU machine, the
+  integrated/discrete heuristic on real AMD/Intel sysfs, VA-API on a
+  preferred node, CUDA device selection by PCI address with more than one
+  NVIDIA GPU, Windows (no sysfs: preferences other than the default have
+  no effect there, and a `Device` pin leaves NVENC out).
+
+## VA-API VPP orientation
+
+- The H.264 and HEVC VA-API encoders share `ferricast_encoder::vaapi`
+  (render node, DMA-BUF import, `Vpp`). The VPP blit now turns rotated or
+  flipped captures (`GpuFrame::orientation`) instead of sending them to
+  `into_cpu`: the output region is the letterbox of the upright size, the
+  source region the whole (unrotated) buffer, `rotation_state` /
+  `mirror_state` from the orientation.
+- Mapping (`VaOrientation::of`): `va_vpp.h` turns first and mirrors second
+  ("It is assumed that the rotation operation is always performed before
+  the mirroring operation"), `VA_ROTATION_*` clockwise (`VA_ROTATION_90`:
+  output (0,0) is the source's bottom-left), `VA_MIRROR_HORIZONTAL` left ↔
+  right, `VA_MIRROR_VERTICAL` top ↔ bottom. `Orientation` mirrors first,
+  then turns; mirror-then-R equals R-then-(R mirror R⁻¹): left↔right for
+  0°/180°, top↔bottom for 90°/270°. Each mirrored orientation has a second
+  form (the opposite rotation with the other mirror), used when the driver
+  offers only one mirror direction. FFmpeg's `transpose_vaapi` uses the
+  same reading (`clock_flip` = `VA_ROTATION_90` + `VA_MIRROR_VERTICAL`).
+- `vaQueryVideoProcPipelineCaps` (no filters, zeroed caps, as FFmpeg does;
+  cros-libva's bindings already expose it and `VAProcPipelineCaps`) gives
+  `rotation_flags` (`1 << VA_ROTATION_x`) and `mirror_flags`. A frame whose
+  orientation the driver cannot apply (or a failed query: no flags) goes
+  through `into_cpu`, frame by frame; nothing is sticky.
+- `orients_gpu_frames` reports VA-API only when its VPP can do all eight
+  orientations (every rotation and at least one mirror), so capture never
+  hands rotated frames to a VA-API encoder that would read them back.
+- Tests: `every_va_form_matches_the_cpu_orientation` simulates the VA
+  order of operations on a 4×3 grid for all eight orientations and both
+  forms against `RawFrame::oriented`; `capabilities_pick_a_supported_form_or_none`
+  covers full, one-mirror, rotation-only and no capabilities.
+- Untested on hardware: this machine's VA-API is nvidia-vaapi-driver
+  (decode only: no encode entrypoint, no VPP), so the VPP path is
+  compiled and unit-tested only. Whether iHD / Mesa follow `va_vpp.h`'s
+  order (media-driver maps the pair to its own rotate+mirror enums) has to
+  be checked on Intel / AMD: an encode of a 90° and a flipped 90° output
+  against `grim` is the test to run.
+
+Superseded known gaps of "NVIDIA" above: encoder selection now prefers a
+backend on the capture's GPU (`Auto`); rotated captures reach VA-API's VPP
+with their orientation; the CUDA device follows the GPU preference.
