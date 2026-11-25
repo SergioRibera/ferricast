@@ -7,6 +7,7 @@ use crate::colour::{ColourDescription, HdrMetadata};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod dmabuf;
 mod native;
+mod orientation;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use dmabuf::{
@@ -14,6 +15,7 @@ pub use dmabuf::{
     Syncobj, SyncobjDevice,
 };
 pub use native::{NativeFrame, NativeSurface, SurfaceKind, SurfacePixels};
+pub use orientation::{Orientation, Rotation};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "wire", derive(wincode::SchemaWrite, wincode::SchemaRead))]
@@ -137,7 +139,7 @@ impl CapturedFrame {
         match self {
             CapturedFrame::Cpu(r) => r.width,
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            CapturedFrame::Gpu(g) => g.width,
+            CapturedFrame::Gpu(g) => g.oriented_size().0,
             CapturedFrame::Native(n) => n.width,
         }
     }
@@ -147,7 +149,7 @@ impl CapturedFrame {
         match self {
             CapturedFrame::Cpu(r) => r.height,
             #[cfg(any(target_os = "linux", target_os = "android"))]
-            CapturedFrame::Gpu(g) => g.height,
+            CapturedFrame::Gpu(g) => g.oriented_size().1,
             CapturedFrame::Native(n) => n.height,
         }
     }
@@ -228,6 +230,14 @@ pub enum FrameError {
     /// The importer failed to copy the GPU buffer to CPU memory.
     #[error("reading the GPU frame back to CPU memory failed: {reason}")]
     Readback { reason: String },
+    /// The picture cannot be turned on the CPU (a format other than BGRA /
+    /// RGBA, or data shorter than the picture).
+    #[error("cannot re-orient a {width}x{height} {format:?} picture")]
+    Unorientable {
+        format: PixelFormat,
+        width: u32,
+        height: u32,
+    },
 }
 
 /// One compressed video access unit.

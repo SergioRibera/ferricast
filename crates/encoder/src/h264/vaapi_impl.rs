@@ -681,7 +681,9 @@ impl VaapiH264Encoder {
 
         let timestamp_us = frame.timestamp_us();
         match frame {
-            CapturedFrame::Gpu(g) if self.vpp_context.is_some() => {
+            // A rotated or flipped capture goes through `into_cpu`, which turns
+            // it; the VPP blit is not told the orientation.
+            CapturedFrame::Gpu(g) if self.vpp_context.is_some() && g.orientation.is_identity() => {
                 self.upload_dmabuf_via_vpp(target_recon_idx, &g)?;
             }
             other => {

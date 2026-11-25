@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use ferricast_core::{
     AccelerationPolicy, AutoSelect, BackendId, BackendSelection, BufferLease, CapturedFrame, Codec,
     CodecError, ColourDescription, DecoderConfig, DmaBufFd, DmaBufPlane, DrmDevice, EncodedFrame,
-    EncoderConfig, FrameMemory, FrameSync, GpuFrame, PixelFormat, RawFrame, VideoDecoder,
-    VideoEncoder,
+    EncoderConfig, FrameMemory, FrameSync, GpuFrame, Orientation, PixelFormat, RawFrame, Rotation,
+    VideoDecoder, VideoEncoder,
 };
 use ferricast_nvcodec::interop::{DmaBufImporter, DrmFormat, Modifier};
 
@@ -225,6 +225,7 @@ fn dma_buf_round_trip<E: VideoEncoder + Default, D: VideoDecoder + Default>(
             producer: Some(DrmDevice::from_dev(gpu.node.dev())),
             // GLES finished writing (glFinish) before the frame is built.
             sync: FrameSync::Ready,
+            orientation: Orientation::IDENTITY,
         };
         let packet = encoder
             .encode(CapturedFrame::Gpu(frame))
@@ -577,6 +578,7 @@ fn a_zero_copy_failure_falls_back_for_that_frame_only() {
         lease: None,
         producer: None,
         sync: FrameSync::Implicit,
+        orientation: Orientation::IDENTITY,
     };
     encoder.encode(CapturedFrame::Gpu(not_importable)).unwrap();
     assert_eq!(readbacks.load(Ordering::SeqCst), 1, "{name}: read back");
@@ -608,6 +610,7 @@ fn a_zero_copy_failure_falls_back_for_that_frame_only() {
         lease: None,
         producer: Some(DrmDevice::from_dev(gpu.node.dev())),
         sync: FrameSync::Ready,
+        orientation: Orientation::IDENTITY,
     };
     encoder.encode(CapturedFrame::Gpu(importable)).unwrap();
     assert_eq!(
@@ -662,6 +665,7 @@ fn odd_sized_frames_go_zero_copy_and_refused_buffers_stay_read_back() {
         lease: None,
         producer: Some(DrmDevice::from_dev(gpu.node.dev())),
         sync: FrameSync::Ready,
+        orientation: Orientation::IDENTITY,
     };
     let packet = encoder.encode(CapturedFrame::Gpu(odd)).unwrap();
     assert!(packet.is_keyframe, "{name}: encoded zero-copy");
@@ -687,6 +691,7 @@ fn odd_sized_frames_go_zero_copy_and_refused_buffers_stay_read_back() {
             lease: None,
             producer: None,
             sync: FrameSync::Implicit,
+            orientation: Orientation::IDENTITY,
         };
         encoder.encode(CapturedFrame::Gpu(refused)).unwrap();
     }
@@ -791,12 +796,14 @@ fn letterbox_reference(bgra: &[u8], source: (u32, u32), canvas: (u32, u32)) -> V
 /// Encodes `frames` DMA-BUF captures of `source` size (GBM, `modifier`,
 /// written by GLES / CUDA, no CPU importer: a readback would fail the
 /// encode) into a `canvas` H.264 session, decodes them in software and
-/// compares each with the picture the CPU path would have encoded.
+/// compares each with the picture the CPU path would have encoded
+/// (turned by `orientation` on the CPU, then letterboxed).
 fn gpu_fit_round_trip(
     name: &str,
     source: (u32, u32),
     canvas: (u32, u32),
     modifier: impl Fn(&DmaBufImporter) -> Modifier,
+    orientation: Orientation,
 ) {
     let _serial = GPU_FIT
         .lock()
@@ -843,6 +850,7 @@ fn gpu_fit_round_trip(
             lease: None,
             producer: Some(DrmDevice::from_dev(gpu.node.dev())),
             sync: FrameSync::Ready,
+            orientation,
         };
         packets.push(
             encoder
@@ -857,9 +865,21 @@ fn gpu_fit_round_trip(
         .zip(&patterns)
         .map(|(frame, pattern)| {
             assert_eq!((frame.width, frame.height), canvas, "{name}: size");
+            let upright = RawFrame {
+                width: source.0,
+                height: source.1,
+                stride: source.0 * 4,
+                format: PixelFormat::Bgra,
+                data: pattern.clone().into(),
+                timestamp_us: 0,
+                colour: None,
+                hdr: None,
+            }
+            .oriented(orientation)
+            .unwrap();
             psnr_rgb(
                 &to_bgra(frame),
-                &letterbox_reference(pattern, source, canvas),
+                &letterbox_reference(&upright.data, (upright.width, upright.height), canvas),
             )
         })
         .fold(f64::INFINITY, f64::min);
@@ -874,6 +894,7 @@ fn nvenc_scales_tiled_dma_bufs_on_the_gpu() {
         (1920, 1080),
         (1280, 720),
         dmabuf::Gpu::tiled_modifier,
+        Orientation::IDENTITY,
     );
 }
 
@@ -884,6 +905,39 @@ fn nvenc_letterboxes_portrait_linear_dma_bufs_on_the_gpu() {
         (1080, 1920),
         (1920, 1080),
         |_| Modifier::LINEAR,
+        Orientation::IDENTITY,
+    );
+}
+
+/// A capture of an output rotated a quarter turn, upright on the GPU into a
+/// portrait session.
+#[test]
+fn nvenc_turns_rotated_dma_bufs_on_the_gpu() {
+    gpu_fit_round_trip(
+        "GBM 1920x1080 tiled turned 90 -> 1080x1920",
+        (1920, 1080),
+        (1080, 1920),
+        dmabuf::Gpu::tiled_modifier,
+        Orientation {
+            mirrored: false,
+            rotation: Rotation::Clockwise90,
+        },
+    );
+}
+
+/// A flipped 270° capture (with screencopy's y-invert composed in),
+/// upright and letterboxed into a landscape session.
+#[test]
+fn nvenc_turns_and_letterboxes_flipped_dma_bufs_on_the_gpu() {
+    gpu_fit_round_trip(
+        "GBM 1920x1080 tiled flipped 270 + y-invert -> 1920x1080 letterboxed",
+        (1920, 1080),
+        (1920, 1080),
+        dmabuf::Gpu::tiled_modifier,
+        Orientation::FLIP_VERTICAL.then(Orientation {
+            mirrored: true,
+            rotation: Rotation::Clockwise270,
+        }),
     );
 }
 
@@ -1088,6 +1142,7 @@ fn gpu_fit_throughput() {
                 lease: None,
                 producer: gpu_path.then(|| DrmDevice::from_dev(gpu.node.dev())),
                 sync: FrameSync::Ready,
+                orientation: Orientation::IDENTITY,
             }
         };
         for index in 0..10 {

@@ -181,6 +181,7 @@ async fn direct_capture(enumerator: &Arc<dyn SourceEnumerator>) {
         height: None,
         show_cursor: true,
         consumer_modifiers: ferricast_core::DmaBufModifiers::default(),
+        consumer_orients: false,
     };
     for _ in 0..3 {
         let mut capture = ferricast_capture::WaylandDirectCapture::new();

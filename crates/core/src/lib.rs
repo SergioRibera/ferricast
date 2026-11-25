@@ -57,8 +57,8 @@ pub use encoder::{AudioEncoder, AudioEncoderConfig, EncoderConfig, VideoEncoder}
 pub use error::{FerricastError, Result};
 pub use frame::{
     AacChannelConfig, AudioCodec, AudioFrame, BitDepth, BufferLease, CapturedFrame, EncodedFrame,
-    FrameError, NativeFrame, NativeSurface, PixelFormat, RawFrame, SourceAudioFormat, SurfaceKind,
-    SurfacePixels,
+    FrameError, NativeFrame, NativeSurface, Orientation, PixelFormat, RawFrame, Rotation,
+    SourceAudioFormat, SurfaceKind, SurfacePixels,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use frame::{

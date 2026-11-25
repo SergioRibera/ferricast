@@ -15,7 +15,7 @@
 
 use std::io::Cursor;
 
-use ferricast_core::{FerricastError, PixelFormat, Result};
+use ferricast_core::{FerricastError, Orientation, PixelFormat, Result, Rotation};
 
 use pipewire as pw;
 use pw::spa::buffer::DataType as SpaDataType;
@@ -450,6 +450,84 @@ pub(super) fn param_meta_sync_timeline_bytes() -> Vec<u8> {
         ],
     };
     serialize(obj)
+}
+
+/// `SPA_META_VideoTransform` (`spa/buffer/meta.h`): `struct
+/// spa_meta_videotransform`, one `u32` naming the transform the producer
+/// applied to the buffer. Kept here because the generated bindings of the
+/// pinned libspa-sys may predate it.
+pub(super) const SPA_META_VIDEO_TRANSFORM: u32 = 8;
+
+/// `ParamMeta(VideoTransform)` pod: asks a producer that hands over
+/// rotated or flipped buffers (a rotated output) to say so per buffer.
+pub(super) fn param_meta_video_transform_bytes() -> Vec<u8> {
+    let obj = Object {
+        type_: SpaTypes::ObjectParamMeta.as_raw(),
+        id: ParamType::Meta.as_raw(),
+        properties: vec![
+            Property {
+                key: SPA_PARAM_META_type,
+                flags: PropertyFlags::empty(),
+                value: Value::Id(Id(SPA_META_VIDEO_TRANSFORM)),
+            },
+            Property {
+                key: SPA_PARAM_META_size,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(4),
+            },
+        ],
+    };
+    serialize(obj)
+}
+
+/// The correction for a buffer whose `spa_meta_videotransform` is
+/// `transform`. The values are `wl_output`'s (portals pass the output's
+/// transform through), so they are undone the way wayland-direct undoes
+/// `wl_output` transforms: a mirror for the flipped ones, then a
+/// clockwise turn. Unknown values leave the picture as it is.
+pub(super) fn orientation_of_transform(transform: u32) -> Orientation {
+    let (mirrored, rotation) = match transform {
+        1 => (false, Rotation::Clockwise90),
+        2 => (false, Rotation::Half),
+        3 => (false, Rotation::Clockwise270),
+        4 => (true, Rotation::None),
+        5 => (true, Rotation::Clockwise90),
+        6 => (true, Rotation::Half),
+        7 => (true, Rotation::Clockwise270),
+        _ => (false, Rotation::None),
+    };
+    Orientation { mirrored, rotation }
+}
+
+/// The orientation `buffer`'s `SPA_META_VideoTransform` asks for; the
+/// identity when it carries none.
+///
+/// # Safety
+///
+/// `buffer` is null or a live dequeued `spa_buffer`.
+pub(super) unsafe fn buffer_orientation(buffer: *const pw::spa::sys::spa_buffer) -> Orientation {
+    if buffer.is_null() {
+        return Orientation::IDENTITY;
+    }
+    // SAFETY: the caller guarantees `buffer` is live; `metas` holds
+    // `n_metas` entries.
+    let metas = unsafe {
+        let buffer = &*buffer;
+        if buffer.metas.is_null() {
+            return Orientation::IDENTITY;
+        }
+        std::slice::from_raw_parts(buffer.metas, buffer.n_metas as usize)
+    };
+    metas
+        .iter()
+        .find(|meta| {
+            meta.type_ == SPA_META_VIDEO_TRANSFORM && !meta.data.is_null() && meta.size >= 4
+        })
+        // SAFETY: the meta holds at least the `u32`; shared memory may be
+        // unaligned.
+        .map_or(Orientation::IDENTITY, |meta| {
+            orientation_of_transform(unsafe { meta.data.cast::<u32>().read_unaligned() })
+        })
 }
 
 /// `ParamMeta(Header)` pod: asks `PipeWire` to attach a `spa_meta_header`

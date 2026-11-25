@@ -52,6 +52,17 @@ pub fn dmabuf_modifiers() -> ferricast_core::DmaBufModifiers {
     ferricast_core::DmaBufModifiers::default()
 }
 
+/// Whether a GPU encoder on this machine turns rotated or flipped GPU
+/// frames itself (`CaptureConfig::consumer_orients`): NVENC on Linux,
+/// whose GPU fit applies `GpuFrame::orientation`.
+#[must_use]
+pub fn orients_gpu_frames() -> bool {
+    #[cfg(all(feature = "nvenc", target_os = "linux"))]
+    return nvenc::orients_gpu_frames();
+    #[cfg(not(all(feature = "nvenc", target_os = "linux")))]
+    false
+}
+
 /// Adds every encode job of this crate to an istmo codec catalog.
 #[cfg(feature = "istmo")]
 #[must_use]

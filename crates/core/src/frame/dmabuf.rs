@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::{BufferLease, FrameError, PixelFormat, RawFrame};
+use super::{BufferLease, FrameError, Orientation, PixelFormat, RawFrame};
 use crate::error::Result;
 
 mod syncobj;
@@ -135,6 +135,12 @@ pub struct GpuFrame {
     pub producer: Option<DrmDevice>,
     /// Whether the pixels are complete when the frame arrives.
     pub sync: FrameSync,
+    /// How the buffer must be turned to show what the user sees (a rotated
+    /// or flipped output). `width` and `height` are the buffer's; the
+    /// picture's are [`GpuFrame::oriented_size`]. A consumer that reads the
+    /// DMA-BUF itself must apply it or go through [`GpuFrame::into_cpu`],
+    /// which does.
+    pub orientation: Orientation,
 }
 
 impl std::fmt::Debug for GpuFrame {
@@ -150,20 +156,30 @@ impl std::fmt::Debug for GpuFrame {
             .field("lease", &self.lease)
             .field("producer", &self.producer)
             .field("sync", &self.sync)
+            .field("orientation", &self.orientation)
             .finish()
     }
 }
 
 impl GpuFrame {
+    /// The picture's `(width, height)` once [`GpuFrame::orientation`] is
+    /// applied: what [`GpuFrame::into_cpu`] returns.
+    #[must_use]
+    pub const fn oriented_size(&self) -> (u32, u32) {
+        self.orientation.oriented_size(self.width, self.height)
+    }
+
     /// Reads the frame back into a CPU-resident, tightly packed
-    /// `RawFrame` through its importer.
+    /// `RawFrame` through its importer, turned by its orientation.
     ///
     /// The frame, and with it its [`BufferLease`], is dropped only
     /// once `readback` has returned, i.e. after the copy completed.
     ///
     /// # Errors
     /// [`FrameError::NoImporter`] when no importer is attached;
-    /// [`FrameError::Readback`] when the copy fails.
+    /// [`FrameError::Readback`] when the copy fails;
+    /// [`FrameError::Unorientable`] when it must be turned and is not BGRA /
+    /// RGBA.
     pub fn into_cpu(self) -> std::result::Result<RawFrame, FrameError> {
         let importer = self.importer.as_ref().ok_or(FrameError::NoImporter)?;
         let bytes = importer
@@ -183,6 +199,7 @@ impl GpuFrame {
             data: bytes,
             timestamp_us: self.timestamp_us,
         })
+        .and_then(|raw| raw.oriented(self.orientation))
     }
 }
 
@@ -370,11 +387,47 @@ mod tests {
             lease: None,
             producer: None,
             sync: FrameSync::Implicit,
+            orientation: Orientation::IDENTITY,
         });
         let raw = frame.into_cpu().expect("readback");
         assert_eq!(raw.stride, width * 4);
         assert_eq!(raw.data.len(), (raw.stride * raw.height) as usize);
         assert_eq!(raw.timestamp_us, 7);
+    }
+
+    /// A rotated capture reads back upright, at the size it reports.
+    #[test]
+    fn into_cpu_turns_a_rotated_frame() {
+        let (width, height) = (6, 4);
+        let quarter_turn = Orientation {
+            mirrored: false,
+            rotation: crate::frame::Rotation::Clockwise90,
+        };
+        let frame = CapturedFrame::Gpu(GpuFrame {
+            width,
+            height,
+            stride: width * 4,
+            format: PixelFormat::Bgra,
+            timestamp_us: 0,
+            plane: DmaBufPlane {
+                fd: DmaBufFd::from(memfd(c"ferricast-into-cpu-rotated")),
+                offset: 0,
+                stride: width * 4,
+                modifier: 0,
+                size: width * 4 * height,
+            },
+            importer: Some(Arc::new(PackedImporter)),
+            lease: None,
+            producer: None,
+            sync: FrameSync::Ready,
+            orientation: quarter_turn,
+        });
+        assert_eq!((frame.width(), frame.height()), (height, width));
+        let raw = frame.into_cpu().expect("readback");
+        assert_eq!(
+            (raw.width, raw.height, raw.stride),
+            (height, width, height * 4)
+        );
     }
 
     /// Counts how often the producer got its buffer back.
@@ -424,6 +477,7 @@ mod tests {
             lease: Some(BufferLease::new(CountReturns(Arc::clone(returns)))),
             producer: None,
             sync: FrameSync::Ready,
+            orientation: Orientation::IDENTITY,
         }
     }
 

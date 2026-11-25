@@ -32,6 +32,13 @@ pub struct CaptureConfig {
     /// DMA-BUFs prefer these among the layouts they can also read back.
     /// Empty: no preference.
     pub consumer_modifiers: DmaBufModifiers,
+    /// The frames' consumer turns GPU frames by their orientation itself
+    /// (NVENC's GPU fit), so a capture of a rotated or flipped output may
+    /// hand its DMA-BUFs over with `GpuFrame::orientation` set instead of
+    /// reading them back to turn them on the CPU. Other consumers still
+    /// get upright pictures from such frames (`GpuFrame::into_cpu`), at
+    /// the cost of that readback on their own thread.
+    pub consumer_orients: bool,
 }
 
 /// DRM format modifiers per pixel format, in preference order.
@@ -71,6 +78,7 @@ impl Default for CaptureConfig {
             height: None,
             show_cursor: true,
             consumer_modifiers: DmaBufModifiers::default(),
+            consumer_orients: false,
         }
     }
 }

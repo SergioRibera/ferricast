@@ -11,8 +11,8 @@
 use ferricast_codec::cuda::nvcodec::cuda::{DeviceBuffer, Event, HostImage, Point, Region, Stream};
 use ferricast_codec::cuda::nvcodec::encode::{DeviceFrame, Encoder, FrameOptions};
 use ferricast_codec::cuda::nvcodec::kernels::{
-    Converter, FramePool, Geometry, Input as KernelInput, Matrix, OutputFormat, Range, Rect,
-    RgbOrder, Size, YuvColour,
+    Converter, FramePool, Geometry, Input as KernelInput, Matrix, Orientation, OutputFormat, Range,
+    Rect, RgbOrder, Rotation, Size, YuvColour,
 };
 use ferricast_codec::cuda::{self, CudaSurface, nvcodec};
 use ferricast_core::{
@@ -97,6 +97,33 @@ struct Session {
     canvas: FrameSize,
 }
 
+/// The picture a kernel reads: its size, and how it must be turned to
+/// stand upright.
+#[derive(Clone, Copy)]
+struct Source {
+    size: FrameSize,
+    orientation: Orientation,
+}
+
+impl From<FrameSize> for Source {
+    fn from(size: FrameSize) -> Self {
+        Self {
+            size,
+            orientation: Orientation::IDENTITY,
+        }
+    }
+}
+
+impl Source {
+    /// The size once turned: what is letterboxed into the session.
+    fn oriented(self) -> FrameSize {
+        let size = self
+            .orientation
+            .oriented_size(Size::new(self.size.width, self.size.height));
+        FrameSize::new(size.width, size.height)
+    }
+}
+
 impl Ready {
     /// Fits `input` (a `source`-sized picture whose producer completes
     /// `ready`) into a pooled `target` picture of `canvas` and encodes it.
@@ -104,7 +131,7 @@ impl Ready {
         &mut self,
         encoder: &mut Encoder,
         input: KernelInput<'_>,
-        source: FrameSize,
+        source: Source,
         ready: Option<&Event>,
         session: Session,
         options: FrameOptions,
@@ -126,9 +153,10 @@ impl Ready {
             .as_mut()
             .ok_or_else(|| Error::Unsupported("the output pool".into()))?;
         let buffer = pool.acquire()?;
-        let placement = source.letterbox_in(canvas);
-        let geometry =
-            Geometry::new(Size::new(source.width, source.height), size).with_placement(Rect::new(
+        let placement = source.oriented().letterbox_in(canvas);
+        let geometry = Geometry::new(Size::new(source.size.width, source.size.height), size)
+            .with_orientation(source.orientation)
+            .with_placement(Rect::new(
                 placement.x,
                 placement.y,
                 placement.size.width,
@@ -190,6 +218,22 @@ fn rgb_matrix(colour: ColourDescription) -> Option<Matrix> {
         | MatrixCoefficients::ChromaDerivedNcl
         | MatrixCoefficients::ChromaDerivedCl
         | MatrixCoefficients::ICtCp => None,
+    }
+}
+
+/// A capture's orientation as the kernels take it (the same mirror, then
+/// clockwise rotation).
+#[cfg(target_os = "linux")]
+fn kernel_orientation(orientation: ferricast_core::Orientation) -> Orientation {
+    use ferricast_core::Rotation as Turn;
+    Orientation {
+        mirrored: orientation.mirrored,
+        rotation: match orientation.rotation {
+            Turn::None => Rotation::None,
+            Turn::Clockwise90 => Rotation::Clockwise90,
+            Turn::Half => Rotation::Half,
+            Turn::Clockwise270 => Rotation::Clockwise270,
+        },
     }
 }
 
@@ -259,7 +303,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
             },
             other => return Err(Error::Unsupported(format!("an NVDEC {other:?} picture"))),
         };
-        let source = FrameSize::new(info.width, info.height);
+        let source = Source::from(FrameSize::new(info.width, info.height));
         self.fit.ready()?.encode(
             &mut self.encoder,
             input,
@@ -359,7 +403,7 @@ impl<C: NvencCodec> NvencEncoder<C> {
             },
             PixelFormat::I420 => return Err(Error::Unsupported("I420".into())),
         };
-        let source = FrameSize::new(raw.width, raw.height);
+        let source = Source::from(FrameSize::new(raw.width, raw.height));
         let encoded = fit.encode(&mut self.encoder, input, source, None, session, options);
         fit.staging = Some(staging);
         if encoded.is_err() {
@@ -401,7 +445,10 @@ impl<C: NvencCodec> NvencEncoder<C> {
         }
         let order = rgb_order(frame.format)?;
         let size = Size::new(frame.width, frame.height);
-        let source = FrameSize::new(frame.width, frame.height);
+        let source = Source {
+            size: FrameSize::new(frame.width, frame.height),
+            orientation: kernel_orientation(frame.orientation),
+        };
         let fit = self.fit.ready()?;
         self.zero_copy
             .with_view(&mut self.encoder, frame, |encoder, view| {

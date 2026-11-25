@@ -539,11 +539,13 @@ fn handle_param_changed(
     let buffers_bytes = format::param_buffers_bytes();
     let meta_bytes = format::param_meta_header_bytes();
     let sync_meta_bytes = format::param_meta_sync_timeline_bytes();
+    let transform_meta_bytes = format::param_meta_video_transform_bytes();
     let mut pods = [
         format::pod_view(&explicit_bytes),
         format::pod_view(&buffers_bytes),
         format::pod_view(&meta_bytes),
         format::pod_view(&sync_meta_bytes),
+        format::pod_view(&transform_meta_bytes),
     ];
     if let Err(e) = stream.update_params(&mut pods) {
         warn!(error = %e, "update_params(Buffers + Meta) failed");
@@ -665,6 +667,17 @@ fn handle_process(
             return;
         }
     };
+    // A rotated or flipped buffer (a rotated output): GPU frames carry
+    // the correction for their consumer, CPU frames are turned here.
+    // SAFETY: as above.
+    let orientation = unsafe { format::buffer_orientation(spa_buffer) };
+    let upright = |raw: RawFrame| match raw.clone().oriented(orientation) {
+        Ok(oriented) => oriented,
+        Err(error) => {
+            debug!(%error, "PipeWire frame left un-oriented");
+            raw
+        }
+    };
     let modifier = neg.modifier.unwrap_or(format::DRM_FORMAT_MOD_LINEAR);
     let gpu_readable =
         ud.importer.is_some() && ud.readable.get(neg.pixel_format).contains(&modifier);
@@ -707,7 +720,7 @@ fn handle_process(
             let Some(bytes) = read_cpu_buffer(plane, chunk_offset, layout) else {
                 return;
             };
-            CapturedFrame::Cpu(RawFrame {
+            CapturedFrame::Cpu(upright(RawFrame {
                 hdr: None,
                 colour: None,
                 width: neg.width,
@@ -716,7 +729,7 @@ fn handle_process(
                 format: neg.pixel_format,
                 data: bytes,
                 timestamp_us,
-            })
+            }))
         }
         // LINEAR and implicit-modifier buffers the importer cannot read
         // (or without one): copied out through `mmap`. Everything the
@@ -727,7 +740,7 @@ fn handle_process(
             let Some(bytes) = read_dmabuf_mmap(plane, chunk_offset, layout) else {
                 return;
             };
-            CapturedFrame::Cpu(RawFrame {
+            CapturedFrame::Cpu(upright(RawFrame {
                 hdr: None,
                 colour: None,
                 width: neg.width,
@@ -736,7 +749,7 @@ fn handle_process(
                 format: neg.pixel_format,
                 data: bytes,
                 timestamp_us,
-            })
+            }))
         }
         DataType::DmaBuf => {
             // We require the importer to have come up so that
@@ -813,6 +826,7 @@ fn handle_process(
                 lease: None,
                 producer: ud.producer,
                 sync,
+                orientation,
             };
             match leases.hold(buffer) {
                 Ok(lease) => CapturedFrame::Gpu(GpuFrame {

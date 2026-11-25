@@ -440,19 +440,17 @@ impl<C: NvencCodec> NvencEncoder<C> {
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
             CapturedFrame::Gpu(gpu) => {
-                // A frame of another size (scaling, a rotated output, odd
-                // sizes) is read back and fitted on the CPU for now. The GPU
-                // path will map it as here and run the CUDA scaler on the
-                // mapped view before encoding:
-                // `kernels::Scaler::run(&mapped.view(), session size,
-                // rotation) -> pooled DeviceBuffer`, then `encode_device`
-                // (see design/NVCODEC.md, "Capture zero-copy").
+                // The session's size and byte order, upright: NVENC reads the
+                // DMA-BUF itself. Anything else (another size, a rotated
+                // output, NV12 / P010 sessions) is fitted on the GPU below,
+                // and read back only when that fails.
                 #[cfg(target_os = "linux")]
                 if let Input::Rgb(format) = self.input
+                    && gpu.orientation.is_identity()
                     && crops_to(gpu.width, gpu.height, self.size())
                     && gpu.format == format
-                    // A failure is logged by the zero-copy path; this frame
-                    // is read back below.
+                    // A failure is logged by the zero-copy path; the frame
+                    // goes the GPU fit below.
                     && self
                         .zero_copy
                         .encode(&mut self.encoder, &gpu, options)
@@ -1065,10 +1063,17 @@ pub(crate) mod zero_copy {
             .and_then(|i| i.node)
             .is_some_and(|node| node == producer.render_node())
     }
+
+    /// Whether NVENC takes DMA-BUFs here, and with them rotated or flipped
+    /// captures, which its GPU fit turns (`GpuFrame::orientation`).
+    #[must_use]
+    pub fn orients_gpu_frames() -> bool {
+        importable().is_some()
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub use zero_copy::{dmabuf_modifiers, imports_from};
+pub use zero_copy::{dmabuf_modifiers, imports_from, orients_gpu_frames};
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {

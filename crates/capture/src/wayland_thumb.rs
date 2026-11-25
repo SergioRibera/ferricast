@@ -986,6 +986,34 @@ impl Orientation {
     }
 }
 
+/// The same correction as a frame carries it: `Y_INVERT` first, then the
+/// transform, each a mirror and a clockwise turn as [`apply_wl_transform`]
+/// does them.
+impl From<Orientation> for ferricast_core::Orientation {
+    fn from(orientation: Orientation) -> Self {
+        use ferricast_core::Rotation;
+        use wl_output::Transform;
+        let (mirrored, rotation) = match orientation.transform {
+            Transform::_90 => (false, Rotation::Clockwise90),
+            Transform::_180 => (false, Rotation::Half),
+            Transform::_270 => (false, Rotation::Clockwise270),
+            Transform::Flipped => (true, Rotation::None),
+            Transform::Flipped90 => (true, Rotation::Clockwise90),
+            Transform::Flipped180 => (true, Rotation::Half),
+            Transform::Flipped270 => (true, Rotation::Clockwise270),
+            // `Normal`, and a future transform, which `apply_wl_transform`
+            // leaves alone too.
+            _ => (false, Rotation::None),
+        };
+        let transform = Self { mirrored, rotation };
+        if orientation.y_invert {
+            Self::FLIP_VERTICAL.then(transform)
+        } else {
+            transform
+        }
+    }
+}
+
 #[expect(
     clippy::many_single_char_names,
     reason = "w, h and the r, g, b, a channel offsets read as the pixel math they are"

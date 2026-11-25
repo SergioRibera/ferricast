@@ -466,6 +466,7 @@ impl ScreenCapture for WaylandDirectCapture {
 
         let output_name_clone = output_name.clone();
         let consumer = config.consumer_modifiers;
+        let orients = config.consumer_orients;
         let join = std::thread::Builder::new()
             .name("ferricast-wl-direct".into())
             .spawn(move || {
@@ -473,6 +474,7 @@ impl ScreenCapture for WaylandDirectCapture {
                     output_name: &output_name_clone,
                     fps,
                     consumer: &consumer,
+                    orients,
                 };
                 if let Err(e) = run_worker(&target, &frame_tx, &stop_rx, size_tx) {
                     warn!(%e, "wayland-direct worker exited");
@@ -585,6 +587,8 @@ struct WorkerTarget<'a> {
     fps: u32,
     /// Modifiers the GPU consumer imports without a copy.
     consumer: &'a DmaBufModifiers,
+    /// The consumer turns GPU frames itself (`CaptureConfig::consumer_orients`).
+    orients: bool,
 }
 
 /// Logs the optional globals that would let capture synchronise more
@@ -617,6 +621,7 @@ fn run_worker(
         output_name,
         fps,
         consumer,
+        orients,
     } = *target;
     let conn = Connection::connect_to_env()
         .map_err(|e| FerricastError::Capture(format!("wayland connect: {e}")))?;
@@ -998,9 +1003,10 @@ fn run_worker(
 
         // The compositor hands us the framebuffer in its native
         // orientation; undo `Y_INVERT` and the output transform so the
-        // receiver sees what the user sees. Only CPU frames can be
-        // re-oriented (there is no GPU rotate step yet), so a frame that
-        // needs it never leaves as a `GpuFrame`.
+        // receiver sees what the user sees. A consumer that turns GPU
+        // frames itself (NVENC's GPU fit) gets the buffer with the
+        // orientation attached; for any other, the frame is read back and
+        // turned here, as `GpuFrame::into_cpu` would do on its thread.
         let orientation = state.frame_orientation();
         let captured = match transport {
             Transport::Dmabuf(idx) => {
@@ -1012,21 +1018,25 @@ fn run_worker(
                 //      VPP, NVENC) import the fd directly; CPU encoders
                 //      call `into_cpu()`, which reads it back through
                 //      Vulkan.
-                //   2. `Cpu`: an orientation to undo, or no importer.
+                //      A rotated / flipped output goes this way only when
+                //      the consumer turns it (`orients`), carrying
+                //      `GpuFrame::orientation`.
+                //   2. `Cpu`: an orientation the consumer does not undo,
+                //      or no importer.
                 //      Read back through Vulkan (any layout), or, without
                 //      it, through `mmap` (the allocation is then LINEAR).
                 let gpu = match gpu_path.as_mut() {
-                    Some(_) if !orientation.is_identity() => {
+                    Some(_) if !orients && !orientation.is_identity() => {
                         if !std::mem::replace(&mut gpu_orientation_warned, true) {
-                            warn!(
+                            info!(
                                 ?orientation,
-                                "wayland-direct: output is rotated / y-inverted and GPU \
-                                 frames can't be re-oriented yet — reading frames back"
+                                "wayland-direct: output is rotated / y-inverted and the \
+                                 encoder does not turn GPU frames — reading frames back"
                             );
                         }
                         None
                     }
-                    Some(gpu) => gpu.frame(&pool, idx),
+                    Some(gpu) => gpu.frame(&pool, idx, orientation),
                     None => None,
                 };
                 if let Some(gpu) = gpu {
@@ -1073,37 +1083,19 @@ fn run_worker(
     Ok(())
 }
 
-/// Re-orient a CPU frame (see [`Orientation`]). Identity is free;
-/// otherwise this costs a repack plus one full-frame pixel shuffle,
-/// paid only on rotated / y-inverted outputs. The result is tightly
-/// packed (`stride == width * 4`) with width/height swapped for
-/// 90°/270° transforms.
+/// Re-orient a CPU frame (see [`Orientation`]) the way
+/// `GpuFrame::into_cpu` does ([`RawFrame::oriented`]). Identity is free;
+/// otherwise this costs one full-frame pixel shuffle, paid only on
+/// rotated / y-inverted outputs. The result is tightly packed
+/// (`stride == width * 4`) with width/height swapped for 90°/270°
+/// transforms.
 fn orient_raw_frame(raw: RawFrame, orientation: Orientation) -> RawFrame {
-    if orientation.is_identity() {
-        return raw;
-    }
-    let row_bytes = raw.width as usize * 4;
-    let stride = (raw.stride as usize).max(row_bytes).max(1);
-    let mut packed = Vec::with_capacity(row_bytes * raw.height as usize);
-    for row in raw.data.chunks(stride).take(raw.height as usize) {
-        let Some(pixels) = row.get(..row_bytes) else {
-            break;
-        };
-        packed.extend_from_slice(pixels);
-    }
-    // Pixel moves only, so BGRA bytes ride through an `RgbaImage` fine.
-    let Some(img) = image::RgbaImage::from_raw(raw.width, raw.height, packed) else {
-        warn!("wayland-direct: frame shorter than declared — emitting it un-oriented");
-        return raw;
-    };
-    let img = orientation.apply(img);
-    RawFrame {
-        colour: None,
-        width: img.width(),
-        height: img.height(),
-        stride: img.width() * 4,
-        data: Bytes::from(img.into_raw()),
-        ..raw
+    match raw.clone().oriented(orientation.into()) {
+        Ok(oriented) => oriented,
+        Err(e) => {
+            warn!(%e, "wayland-direct: emitting the frame un-oriented");
+            raw
+        }
     }
 }
 
@@ -1204,7 +1196,12 @@ impl GpuPath {
     /// Lease the pooled buffer at `idx` into a `GpuFrame`. `None`
     /// (logged) when the buffer can't go downstream; the caller then
     /// reads it back to CPU.
-    fn frame(&mut self, pool: &BufferPool<PooledBuffer>, idx: SlotIdx) -> Option<GpuFrame> {
+    fn frame(
+        &mut self,
+        pool: &BufferPool<PooledBuffer>,
+        idx: SlotIdx,
+        orientation: Orientation,
+    ) -> Option<GpuFrame> {
         let alloc = &pool.get(idx)?.alloc;
         if !self.can_read_back(alloc.format, alloc.modifier) {
             if !std::mem::replace(&mut self.unreadable_warned, true) {
@@ -1238,6 +1235,7 @@ impl GpuPath {
             // wlr-screencopy reports `ready` once the copy is complete;
             // niri sends it after its render's sync point signalled.
             sync: FrameSync::Ready,
+            orientation: orientation.into(),
         })
     }
 }
@@ -2247,5 +2245,48 @@ mod tests {
             },
         );
         assert_eq!((out.width, out.height, out.data.len()), (2, 2, 8));
+    }
+
+    /// Every transform, with and without `Y_INVERT`, turns the picture as
+    /// the thumbnails' `image` path does: the orientation a GPU frame
+    /// carries means what the CPU path applies.
+    #[test]
+    fn frame_orientation_matches_the_image_path() {
+        use wl_output::Transform;
+        let (width, height) = (5_u32, 3_u32);
+        let data: Vec<u8> = (0..width * height)
+            .flat_map(|i| [u8::try_from(i).unwrap(), 0, 0, 255])
+            .collect();
+        for transform in [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            for y_invert in [false, true] {
+                let orientation = Orientation {
+                    transform,
+                    y_invert,
+                };
+                let expected = orientation
+                    .apply(image::RgbaImage::from_raw(width, height, data.clone()).unwrap());
+                let out =
+                    orient_raw_frame(raw(width, height, width * 4, data.clone()), orientation);
+                assert_eq!(
+                    (out.width, out.height),
+                    expected.dimensions(),
+                    "{transform:?} {y_invert}"
+                );
+                assert_eq!(
+                    out.data.as_ref(),
+                    expected.as_raw().as_slice(),
+                    "{transform:?} {y_invert}"
+                );
+            }
+        }
     }
 }
