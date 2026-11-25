@@ -21,7 +21,9 @@
 //!   or pitched memory it aliases (tiled and LINEAR buffers). The
 //!   frame, and with it the capture buffer's lease, is held until NVENC has
 //!   finished reading it. Any failure on this path sends that frame through
-//!   the CPU readback instead; the next frame tries again.
+//!   the CPU readback instead; a buffer whose import failed is not tried
+//!   again until the capture pool changes. Frames of another GPU
+//!   (`GpuFrame::producer`) are read back without an import attempt.
 
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
