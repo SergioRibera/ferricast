@@ -1166,8 +1166,8 @@ fn cuda_array_input() {
         "array and host input differ"
     );
 
-    encoder.invalidate_array(0);
-    encoder.clear_input_caches();
+    encoder.invalidate_array(0).unwrap();
+    encoder.clear_input_caches().unwrap();
     drop(encoder);
     for array in arrays {
         array.destroy(&context);
@@ -1643,7 +1643,7 @@ fn invalidating_a_pending_input_drains_it() {
             encoder.next_packet().is_none(),
             "round {round}: a picture should be pending"
         );
-        encoder.invalidate_array(round);
+        encoder.invalidate_array(round).unwrap();
         let drained = std::iter::from_fn(|| encoder.next_packet()).count();
         assert_eq!(
             drained, 1,

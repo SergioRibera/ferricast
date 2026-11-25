@@ -820,16 +820,19 @@ impl<A: EncodeApi> Engine<A> {
     /// Drops the registration under `key` and, before returning, unregisters
     /// it: a pending picture reading it is encoded first (the queue is
     /// flushed, its packets kept), so the caller may free the memory right
-    /// after. A driver failure on the way is logged; NVENC then may still
-    /// read the memory.
-    pub(crate) fn invalidate_array(&mut self, key: u64) {
-        if let Some(entry) = self.keyed_inputs.remove(&key) {
-            self.retire(entry.registered, None);
-            self.release_keyed_now("invalidating an NVENC input");
+    /// after. On error NVENC may still read the memory: the caller must
+    /// keep it.
+    pub(crate) fn invalidate_array(&mut self, key: u64) -> Result<()> {
+        match self.keyed_inputs.remove(&key) {
+            Some(entry) => {
+                self.retire(entry.registered, None);
+                self.release_keyed_now()
+            }
+            None => Ok(()),
         }
     }
 
-    pub(crate) fn clear_input_caches(&mut self) {
+    pub(crate) fn clear_input_caches(&mut self) -> Result<()> {
         let device: Vec<_> = self
             .device_inputs
             .drain()
@@ -845,21 +848,24 @@ impl<A: EncodeApi> Engine<A> {
             self.retire(registered, allocation);
         }
         if any_keyed {
-            self.release_keyed_now("clearing the NVENC input caches");
+            self.release_keyed_now()
+        } else {
+            Ok(())
         }
     }
 
     /// Unregisters every retired registration now, flushing the pictures
     /// that may still read one: caller-keyed memory may be freed as soon as
-    /// its key is invalidated.
-    fn release_keyed_now(&mut self, doing: &'static str) {
+    /// its key is invalidated. An error (the flush failed) leaves pictures
+    /// that may still read the memory.
+    fn release_keyed_now(&mut self) -> Result<()> {
         let context = Arc::clone(self.context());
-        let _current = context.guard();
+        let _current = context.guard()?;
         self.release_retired();
-        if !self.retired.is_empty()
-            && let Err(error) = self.flush()
-        {
-            tracing::warn!(%error, "{doing}: flushing the pictures that read it");
+        if self.retired.is_empty() {
+            Ok(())
+        } else {
+            self.flush()
         }
     }
 
@@ -974,7 +980,7 @@ impl<A: EncodeApi> Engine<A> {
                     tracing::warn!(%error, "unregistering an NVENC host input");
                 }
             }
-            self.clear_input_caches();
+            self.clear_input_caches()?;
         }
         Ok(())
     }

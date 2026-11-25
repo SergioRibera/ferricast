@@ -472,20 +472,34 @@ impl<C: NvencCodec> NvencEncoder<C> {
         let session = Session::<C>::of(config)?;
         // The DMA-BUF imports and NVENC's registrations of them describe
         // the old session: NVENC's go first (its registrations must not
-        // outlive the importer's).
-        self.encoder.clear_input_caches();
-        #[cfg(target_os = "linux")]
-        {
-            self.zero_copy = zero_copy::State::default();
+        // outlive the importer's). When NVENC cannot let go of them (a
+        // failed flush), the session is replaced before the imports go.
+        let released = self.encoder.clear_input_caches();
+        if let Err(error) = &released {
+            tracing::warn!(%error, "NVENC: dropping input registrations failed, reopening the session");
         }
-        let applied = if rebuild || self.encoder.context().is_lost() {
+        #[cfg(target_os = "linux")]
+        let imports = std::mem::take(&mut self.zero_copy);
+        let applied = if rebuild || released.is_err() || self.encoder.context().is_lost() {
             // A lost context is replaced: `cuda::context` hands out a new
             // one once the old one is marked lost.
-            let context = cuda::context().map_err(map_error(BackendId::Nvenc, Operation::Open))?;
+            let context = match cuda::context() {
+                Ok(context) => context,
+                Err(error) => {
+                    // The old session stays: so do the imports it may read.
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.zero_copy = imports;
+                    }
+                    return Err(map_error(BackendId::Nvenc, Operation::Open)(error));
+                }
+            };
             self.encoder.reopen_on(&context, &session.nv_config)
         } else {
             self.encoder.reconfigure(&session.nv_config)
         };
+        #[cfg(target_os = "linux")]
+        drop(imports);
         // A closed encoder (both reopens failed) is reported as such by
         // every later call.
         applied.map_err(map_error(BackendId::Nvenc, Operation::Open))?;
@@ -953,16 +967,26 @@ pub(crate) mod zero_copy {
         }
 
         /// Forgets `ids`, NVENC's registrations first: an array must stay
-        /// registered with CUDA while NVENC's registration of it lives.
-        fn evict(&mut self, encoder: &mut Encoder, ids: &[DmaBufId]) {
-            let keys: Vec<BufferKey> = ids
-                .iter()
-                .filter_map(|id| {
-                    let imported = self.buffers.remove(id)?;
-                    encoder.invalidate_array(imported.key);
-                    Some(buffer_key(*id))
-                })
-                .collect();
+        /// registered with CUDA while NVENC's registration of it lives. A
+        /// buffer NVENC could not let go of (the flush failed) stays
+        /// registered, and the first such error is returned.
+        fn evict(&mut self, encoder: &mut Encoder, ids: &[DmaBufId]) -> Result<(), Error> {
+            let mut failed = None;
+            let mut keys = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(imported) = self.buffers.get(id).copied() else {
+                    continue;
+                };
+                match encoder.invalidate_array(imported.key) {
+                    Ok(()) => {
+                        self.buffers.remove(id);
+                        keys.push(buffer_key(*id));
+                    }
+                    Err(error) => {
+                        failed.get_or_insert(error);
+                    }
+                }
+            }
             // SAFETY: every picture NVENC encoded from these buffers has been
             // locked: the session has no frames in flight and no B frames, so
             // each `encode_array` / `encode_pitched` returned with its packet
@@ -970,20 +994,23 @@ pub(crate) mod zero_copy {
             // other CUDA work reads them.
             let idle = unsafe { Quiesce::idle() };
             self.importer.forget_all(keys, idle);
+            failed.map_or(Ok(()), |error| Err(error.into()))
         }
 
-        /// Forgets every buffer (the capture pool changed).
-        fn clear(&mut self, encoder: &mut Encoder) {
-            encoder.clear_input_caches();
+        /// Forgets every buffer (the capture pool changed). When NVENC cannot
+        /// let go of its registrations nothing is unregistered.
+        fn clear(&mut self, encoder: &mut Encoder) -> Result<(), Error> {
+            encoder.clear_input_caches()?;
             // SAFETY: as in `evict`.
             self.importer.clear_with(unsafe { Quiesce::idle() });
             self.buffers.clear();
             self.refused.clear();
+            Ok(())
         }
 
         /// Drops registrations unused for [`STALE_AFTER_FRAMES`] and, at
         /// [`MAX_BUFFERS`], the least recently used one to make room.
-        fn retire(&mut self, encoder: &mut Encoder, incoming: DmaBufId) {
+        fn retire(&mut self, encoder: &mut Encoder, incoming: DmaBufId) -> Result<(), Error> {
             let mut stale: Vec<DmaBufId> = self
                 .buffers
                 .iter()
@@ -1002,8 +1029,10 @@ pub(crate) mod zero_copy {
             {
                 stale.push(*oldest);
             }
-            if !stale.is_empty() {
-                self.evict(encoder, &stale);
+            if stale.is_empty() {
+                Ok(())
+            } else {
+                self.evict(encoder, &stale)
             }
         }
 
@@ -1025,20 +1054,20 @@ pub(crate) mod zero_copy {
             let description = Description::from(frame);
             let id = frame.plane.fd.buffer_id().map_err(Error::Identity)?;
             if self.last.is_some_and(|last| last != description) {
-                self.clear(encoder);
+                self.clear(encoder)?;
             }
             self.last = Some(description);
             if self.refused.contains(&id) {
                 return Err(Error::Refused);
             }
             self.frames += 1;
-            self.retire(encoder, id);
+            self.retire(encoder, id)?;
             let key = buffer_key(id);
             let imported = match self.buffers.get(&id).copied() {
                 Some(imported) if imported.description == description => imported,
                 stale => {
                     if stale.is_some() {
-                        self.evict(encoder, &[id]);
+                        self.evict(encoder, &[id])?;
                     }
                     if let Err(error) = self.importer.import(key, &dma_buf(frame)) {
                         self.refused.insert(id);
@@ -1101,6 +1130,18 @@ pub(crate) mod zero_copy {
                 }
             }
             Ok(())
+        }
+    }
+
+    impl Drop for ZeroCopy {
+        fn drop(&mut self) {
+            // SAFETY: NVENC no longer reads the buffers: `NvencEncoder` drops
+            // its session first (field order), and `NvencEncoder::apply`
+            // drops this only after NVENC let go of its registrations or the
+            // session was replaced. The GPU fit leaves no kernel queued on
+            // them (`fit.rs` synchronises on failure). So the importer need
+            // not synchronise the shared context.
+            self.importer.clear_with(unsafe { Quiesce::idle() });
         }
     }
 

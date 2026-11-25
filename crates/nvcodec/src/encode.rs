@@ -741,14 +741,24 @@ impl Encoder {
     /// [`Encoder::encode_pitched`]) under `key`. When this returns NVENC no
     /// longer reads it: a pending picture that does is encoded first (its
     /// packet queued), so the memory may be freed or unmapped right after.
-    pub fn invalidate_array(&mut self, key: u64) {
-        on_engine!(&mut self.state, engine => engine.invalidate_array(key), _closed => ());
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Nvenc`] / [`Error::Cuda`] when the pending pictures could not
+    /// be encoded: NVENC may then still read the memory, which must be kept
+    /// until the session is closed.
+    pub fn invalidate_array(&mut self, key: u64) -> Result<()> {
+        on_engine!(&mut self.state, engine => engine.invalidate_array(key), _closed => Ok(()))
     }
 
     /// Drops every cached device-buffer and array registration (the host
     /// input pool keeps its own), as [`Encoder::invalidate_array`] for each.
-    pub fn clear_input_caches(&mut self) {
-        on_engine!(&mut self.state, engine => engine.clear_input_caches(), _closed => ());
+    ///
+    /// # Errors
+    ///
+    /// As [`Encoder::invalidate_array`].
+    pub fn clear_input_caches(&mut self) -> Result<()> {
+        on_engine!(&mut self.state, engine => engine.clear_input_caches(), _closed => Ok(()))
     }
 
     /// How many input resources this encoder has registered with NVENC so

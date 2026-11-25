@@ -25,7 +25,7 @@ use ferricast_nvcodec::Error;
 use ferricast_nvcodec::cuda::{ArrayView, HostImageMut, Stream};
 use ferricast_nvcodec::interop::{
     BufferKey, DmaBuf, DmaBufImporter, DrmFormat, DrmNode, FenceWait, FramePool, FrameView, Import,
-    Modifier,
+    Modifier, Quiesce,
 };
 
 use support::{Bo, Gpu};
@@ -213,8 +213,8 @@ fn forget_and_clear() {
         importer.import(BufferKey(index), &dma_buf(bo)).unwrap();
     }
     assert_eq!(importer.len(), 3);
-    assert!(importer.forget(BufferKey(1)));
-    assert!(!importer.forget(BufferKey(1)));
+    assert!(importer.forget(BufferKey(1), Quiesce::CONTEXT));
+    assert!(!importer.forget(BufferKey(1), Quiesce::CONTEXT));
     assert!(!importer.contains(BufferKey(1)));
     assert!(matches!(
         importer.map(BufferKey(1), FENCE),
@@ -512,7 +512,6 @@ fn implicit_wait_ignores_pending_nvidia_work_explicit_wait_does_not() {
 #[test]
 fn forget_all_waits_for_an_event_and_clear_with_for_nothing() {
     use ferricast_nvcodec::cuda::Event;
-    use ferricast_nvcodec::interop::Quiesce;
 
     let Some(gpu) = Gpu::get() else { return };
     let mut importer = DmaBufImporter::new(&gpu.context, Some(gpu.node)).unwrap();

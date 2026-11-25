@@ -579,16 +579,17 @@ impl DmaBufImporter {
         })
     }
 
-    /// Unregisters `key`, waiting for all queued work of the context first
-    /// (every stream, every session sharing it); `false` when it was not
-    /// registered. [`DmaBufImporter::forget_all`] waits for less.
-    pub fn forget(&mut self, key: BufferKey) -> bool {
-        self.registrations.remove(&key).is_some()
+    /// Unregisters `key` once `quiesce` says the work reading it is done;
+    /// `false` when it was not registered.
+    pub fn forget(&mut self, key: BufferKey, quiesce: Quiesce<'_>) -> bool {
+        self.forget_all([key], quiesce) == 1
     }
 
     /// Unregisters every buffer (the producer's pool changed), waiting for
     /// all queued work of the context once. [`DmaBufImporter::clear_with`]
-    /// waits for less.
+    /// waits for less. Dropping the importer does this when buffers are
+    /// still registered: a user that knows the work is done clears with
+    /// [`Quiesce::idle`] first, as ferricast's NVENC path does.
     pub fn clear(&mut self) {
         self.clear_with(Quiesce::CONTEXT);
     }
