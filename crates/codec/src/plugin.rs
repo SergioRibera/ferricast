@@ -885,6 +885,7 @@ mod tests {
 
     fn decoder_config() -> DecoderConfig {
         DecoderConfig {
+            gpu: Default::default(),
             codec: Codec::H264,
             width: 1280,
             height: 720,

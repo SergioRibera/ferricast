@@ -40,7 +40,7 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 
 use ferricast_core::{
     AccelerationPolicy, AudioDecoderConfig, AudioEncoderConfig, BackendId, BitDepth, CodecError,
-    CodecTarget, DecoderConfig, EncoderConfig, FrameMemory,
+    CodecTarget, DecoderConfig, DevNumber, EncoderConfig, FrameMemory,
 };
 use tracing::{debug, warn};
 
@@ -160,6 +160,9 @@ pub struct SelectionKey {
     pub policy: AccelerationPolicy,
     /// The configuration's traits.
     pub traits: ConfigTraits,
+    /// The most preferred GPU (`GpuPlacement::key`): a winner on one GPU
+    /// says nothing about another. `None` without GPUs.
+    pub gpu: Option<DevNumber>,
 }
 
 impl SelectionKey {
@@ -188,8 +191,13 @@ impl SelectionKey {
             FrameMemory::Cpu => "cpu",
             FrameMemory::Native => "native",
         };
+        // No GPU segment without a GPU: such keys read as before.
+        let gpu = self
+            .gpu
+            .map(|dev| format!("/gpu-{}-{}", dev.major, dev.minor))
+            .unwrap_or_default();
         format!(
-            "{job}/{policy}/{}/{depth}/{memory}",
+            "{job}/{policy}/{}/{depth}/{memory}{gpu}",
             self.traits.size.token()
         )
     }
@@ -468,7 +476,26 @@ mod tests {
                 bit_depth: BitDepth::Eight,
                 memory: FrameMemory::Cpu,
             },
+            gpu: None,
         }
+    }
+
+    #[test]
+    fn each_gpu_remembers_its_own_winner() {
+        let cache = MemoryCache::default();
+        let on = |minor| SelectionKey {
+            gpu: Some(DevNumber { major: 226, minor }),
+            ..key(SizeClass::FullHd)
+        };
+        cache.record(&on(128), BackendId::Vaapi);
+        cache.record(&on(129), BackendId::Nvdec);
+        assert_eq!(cache.winner(&on(128)), Some(BackendId::Vaapi));
+        assert_eq!(cache.winner(&on(129)), Some(BackendId::Nvdec));
+        assert_eq!(cache.winner(&key(SizeClass::FullHd)), None);
+        assert_eq!(
+            on(129).token(),
+            "h264_decode/prefer-hardware/1080p/8bit/cpu/gpu-226-129"
+        );
     }
 
     #[test]

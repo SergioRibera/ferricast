@@ -20,6 +20,7 @@ pub mod bitstream;
 pub mod cache;
 pub mod events;
 pub mod facade;
+pub mod gpu;
 pub mod registry;
 pub mod session;
 pub mod video_decoder;
@@ -67,6 +68,7 @@ pub use cache::{
     FileCache, MemoryCache, NoCache, SelectionCache, SelectionInput, SelectionKey, SizeClass,
 };
 pub use events::{EventReceiver, SessionEvent, SessionEvents};
+pub use gpu::GpuInput;
 pub use registry::{
     Availability, BackendReport, Candidate, Missing, OpenFn, Plan, ProbeFn, Registry,
 };

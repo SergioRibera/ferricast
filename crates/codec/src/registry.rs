@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use ferricast_core::{
     Acceleration, AccelerationPolicy, BackendAttempt, BackendId, BackendSelection, CodecError,
-    CodecResult, CodecTarget, RuntimeFallback,
+    CodecResult, CodecTarget, DevNumber, GpuAffinity, GpuPlacement, RuntimeFallback,
 };
 use tracing::{debug, info};
 
@@ -26,6 +26,7 @@ pub struct Candidate<C, S: ?Sized> {
     open: OpenFn<C, S>,
     probe: Option<ProbeFn>,
     automatic: bool,
+    gpu: Option<GpuAffinity>,
 }
 
 impl<C, S: ?Sized> Candidate<C, S> {
@@ -38,7 +39,24 @@ impl<C, S: ?Sized> Candidate<C, S> {
             open,
             probe: None,
             automatic: true,
+            gpu: None,
         }
+    }
+
+    /// Marks a backend that runs on a DRM GPU: automatic selection orders
+    /// it by the configuration's [`ferricast_core::GpuPreference`], and
+    /// drops it when the preference pins a GPU it cannot run on.
+    #[must_use]
+    pub fn on_gpu(mut self, affinity: GpuAffinity) -> Self {
+        self.gpu = Some(affinity);
+        self
+    }
+
+    /// The GPUs it runs on; `None` for a backend not tied to a DRM GPU
+    /// (software, platform frameworks).
+    #[must_use]
+    pub fn gpu_affinity(&self) -> Option<GpuAffinity> {
+        self.gpu
     }
 
     /// Adds a cheap availability check, used by capability reports.
@@ -224,6 +242,20 @@ impl<C, S: ?Sized> Registry<C, S> {
     /// - [`CodecError::NoBackendMatchesPolicy`]: automatic selection's
     ///   policy filtered everything out.
     pub fn plan(&self, selection: &BackendSelection) -> CodecResult<Plan> {
+        self.plan_on(selection, &GpuPlacement::default())
+    }
+
+    /// [`Self::plan`] for the GPUs `gpus` ranks: automatic selection tries
+    /// the GPU-bound hardware backends ([`Candidate::on_gpu`]) that run on
+    /// the first ranked GPU first, then those of the next GPU, then the
+    /// other hardware backends; a placement pinned to one GPU drops the
+    /// GPU-bound backends that cannot run on it. `Fixed` and `Ordered`
+    /// selections keep their order (their backends still open on the
+    /// preferred GPU). Without GPUs (no sysfs) the order is unchanged.
+    ///
+    /// # Errors
+    /// As [`Self::plan`].
+    pub fn plan_on(&self, selection: &BackendSelection, gpus: &GpuPlacement) -> CodecResult<Plan> {
         let selection = selection.resolve_env(self.target)?;
         if self.candidates.is_empty() {
             return Err(CodecError::NoBackendCompiled {
@@ -256,6 +288,7 @@ impl<C, S: ?Sized> Registry<C, S> {
                 .into_iter()
                 .filter(|&index| allowed(&&self.candidates[index]))
                 .collect();
+                let filtered = self.by_gpu(filtered, gpus);
                 if filtered.is_empty() {
                     return Err(CodecError::NoBackendMatchesPolicy {
                         target: self.target,
@@ -285,7 +318,61 @@ impl<C, S: ?Sized> Registry<C, S> {
                 BackendSelection::Auto(auto) => Some(auto.acceleration),
                 BackendSelection::Fixed(_) | BackendSelection::Ordered { .. } => None,
             },
+            gpu: gpus.key(),
         })
+    }
+
+    /// `order` (an automatic plan) with its GPU-bound hardware backends
+    /// grouped by the first ranked GPU each runs on, best GPU first, ahead
+    /// of the other hardware backends; software keeps its place relative
+    /// to hardware (the acceleration policy decided it).
+    fn by_gpu(&self, order: Vec<usize>, gpus: &GpuPlacement) -> Vec<usize> {
+        if gpus.gpus().is_empty() && !gpus.is_pinned() {
+            return order;
+        }
+        let rank = |index: usize| -> Option<Option<usize>> {
+            let candidate = &self.candidates[index];
+            let affinity = candidate.gpu?;
+            Some(gpus.gpus().iter().position(|gpu| affinity.accepts(gpu)))
+        };
+        let hardware =
+            |index: &usize| self.candidates[*index].acceleration == Acceleration::Hardware;
+        let mut gpu_bound: Vec<(usize, usize)> = Vec::new();
+        let mut unplaced = Vec::new();
+        let mut others = Vec::new();
+        for &index in order.iter().filter(|index| hardware(index)) {
+            match rank(index) {
+                Some(Some(position)) => gpu_bound.push((position, index)),
+                // On no ranked GPU: kept last, unless one GPU is pinned.
+                Some(None) if gpus.is_pinned() => {
+                    debug!(
+                        target_job = %self.target,
+                        backend = %self.candidates[index].backend,
+                        "backend cannot run on the pinned GPU; left out"
+                    );
+                }
+                Some(None) => unplaced.push(index),
+                None => others.push(index),
+            }
+        }
+        // Stable: within one GPU the registry's order stays.
+        gpu_bound.sort_by_key(|(position, _)| *position);
+        let hardware_order = gpu_bound
+            .into_iter()
+            .map(|(_, index)| index)
+            .chain(unplaced)
+            .chain(others);
+        // The policy keeps each kind together: the hardware block goes
+        // where the first hardware backend was.
+        let first_hardware = order.iter().position(hardware).unwrap_or(order.len());
+        let software = order.iter().copied().filter(|index| !hardware(index));
+        let (before, after): (Vec<usize>, Vec<usize>) = software
+            .partition(|&index| order.iter().position(|&i| i == index) < Some(first_hardware));
+        before
+            .into_iter()
+            .chain(hardware_order)
+            .chain(after)
+            .collect()
     }
 
     /// Opens the first candidate of `plan`, starting at `from`, that
@@ -375,6 +462,23 @@ impl<C, S: ?Sized> Registry<C, S> {
         })
     }
 
+    /// The backend `plan` would most likely open, without opening any: the
+    /// first whose (once per process) probe passes, or that has none. For
+    /// decisions made before a session exists (what capture should hand
+    /// the encoder); a configuration the backend refuses still moves on.
+    #[must_use]
+    pub fn first_available(&self, plan: &Plan) -> Option<BackendId> {
+        plan.order
+            .iter()
+            .map(|&index| &self.candidates[index])
+            .find(|candidate| {
+                candidate.probe.is_none_or(|probe| {
+                    cache::probe_once(candidate.backend, self.target, probe).is_ok()
+                })
+            })
+            .map(Candidate::backend)
+    }
+
     /// `backend`, which `plan` opened for `config`, failed on the
     /// stream: automatic selection stops trying it first.
     pub fn demote(&self, plan: &Plan, config: &C, backend: BackendId)
@@ -396,6 +500,7 @@ impl<C, S: ?Sized> Registry<C, S> {
             target: self.target,
             policy,
             traits: config.selection_traits(),
+            gpu: plan.gpu,
         };
         Some((self.cache(), key))
     }
@@ -509,6 +614,8 @@ pub struct Plan {
     /// The acceleration policy of an automatic selection, the one kind
     /// of plan that remembers its winner.
     auto: Option<AccelerationPolicy>,
+    /// The most preferred GPU, part of the remembered winner's key.
+    gpu: Option<DevNumber>,
 }
 
 impl Plan {
@@ -850,5 +957,141 @@ mod tests {
         assert_eq!(registry.report().len(), 2);
         assert_eq!(PROBED.load(std::sync::atomic::Ordering::SeqCst), 1);
         cache::forget_probe(BackendId::Nvenc, CodecTarget::encode(Codec::Vp8));
+    }
+}
+
+#[cfg(test)]
+mod gpu_order_tests {
+    use ferricast_core::{
+        AutoSelect, Codec, DevNumber, Gpu, GpuKind, GpuPreference, GpuVendor, Gpus,
+    };
+
+    use super::*;
+
+    #[expect(clippy::trivially_copy_pass_by_ref, reason = "an `OpenFn`")]
+    fn opens(_: &u32) -> CodecResult<Box<str>> {
+        Ok("session".into())
+    }
+
+    /// NVENC, VA-API, a platform encoder, x264: the facades' order.
+    fn registry() -> Registry<u32, str> {
+        Registry::new(CodecTarget::encode(Codec::H264))
+            .with_cache(Arc::new(cache::NoCache))
+            .candidate(
+                Candidate::new(BackendId::Nvenc, Acceleration::Hardware, opens)
+                    .on_gpu(GpuAffinity::Nvidia),
+            )
+            .candidate(
+                Candidate::new(BackendId::Vaapi, Acceleration::Hardware, opens)
+                    .on_gpu(GpuAffinity::NotNvidia),
+            )
+            .candidate(Candidate::new(
+                BackendId::MediaFoundation,
+                Acceleration::Hardware,
+                opens,
+            ))
+            .candidate(Candidate::new(
+                BackendId::X264,
+                Acceleration::Software,
+                opens,
+            ))
+    }
+
+    fn gpu(minor: u32, vendor: GpuVendor, pci: &str) -> Gpu {
+        Gpu {
+            render_node: format!("/dev/dri/renderD{minor}"),
+            render_dev: DevNumber { major: 226, minor },
+            primary_dev: Some(DevNumber {
+                major: 226,
+                minor: minor - 128,
+            }),
+            pci: pci.parse().ok(),
+            vendor,
+            device_id: 0,
+            driver: None,
+            boot_vga: false,
+            kind: GpuKind::Unknown,
+        }
+    }
+
+    fn hybrid() -> Gpus {
+        Gpus::classify(vec![
+            gpu(128, GpuVendor::INTEL, "0000:00:02.0"),
+            gpu(129, GpuVendor::NVIDIA, "0000:01:00.0"),
+        ])
+    }
+
+    fn order(
+        preference: &str,
+        source: Option<u32>,
+        selection: &BackendSelection,
+    ) -> Vec<BackendId> {
+        let registry = registry();
+        let source =
+            source.map(|minor| ferricast_core::GpuId::Dev(DevNumber { major: 226, minor }));
+        let placement = GpuPlacement::resolve_in(
+            &preference.parse::<GpuPreference>().unwrap(),
+            source.as_ref(),
+            &hybrid(),
+        );
+        let plan = registry.plan_on(selection, &placement).unwrap();
+        plan.order
+            .iter()
+            .map(|&index| registry.candidates[index].backend)
+            .collect()
+    }
+
+    #[test]
+    fn hardware_backends_follow_the_preferred_gpu() {
+        use BackendId::{MediaFoundation as Mf, Nvenc, Vaapi, X264};
+        let auto = BackendSelection::default();
+        // Frames rendered on the iGPU: VA-API there first (no copy).
+        assert_eq!(order("auto", Some(128), &auto), [Vaapi, Nvenc, Mf, X264]);
+        assert_eq!(order("auto", Some(129), &auto), [Nvenc, Vaapi, Mf, X264]);
+        // No producer: discrete first.
+        assert_eq!(order("auto", None, &auto), [Nvenc, Vaapi, Mf, X264]);
+        assert_eq!(
+            order("integrated", Some(129), &auto),
+            [Vaapi, Nvenc, Mf, X264]
+        );
+        assert_eq!(
+            order("discrete", Some(128), &auto),
+            [Nvenc, Vaapi, Mf, X264]
+        );
+        // Pins drop GPU-bound backends that cannot run there.
+        assert_eq!(order("renderD128", None, &auto), [Vaapi, Mf, X264]);
+        assert_eq!(order("0000:01:00.0", None, &auto), [Nvenc, Mf, X264]);
+        assert_eq!(
+            order("same-as-capture", Some(128), &auto),
+            [Vaapi, Mf, X264]
+        );
+        assert_eq!(order("renderD200", None, &auto), [Mf, X264]);
+        // Software first keeps software first.
+        let software_first = BackendSelection::from(
+            AutoSelect::default().with_acceleration(AccelerationPolicy::PreferSoftware),
+        );
+        assert_eq!(
+            order("integrated", None, &software_first),
+            [X264, Vaapi, Nvenc, Mf]
+        );
+        // Fixed and ordered selections are not reordered.
+        assert_eq!(order("renderD128", None, &BackendId::Nvenc.into()), [Nvenc]);
+        let ordered = BackendSelection::Ordered {
+            backends: vec![Nvenc, Vaapi],
+            runtime_fallback: RuntimeFallback::Disabled,
+        };
+        assert_eq!(order("integrated", None, &ordered), [Nvenc, Vaapi]);
+    }
+
+    #[test]
+    fn without_gpus_the_order_is_unchanged() {
+        let registry = registry();
+        let placement =
+            GpuPlacement::resolve_in(&GpuPreference::Integrated, None, &Gpus::default());
+        let plan = registry
+            .plan_on(&BackendSelection::default(), &placement)
+            .unwrap();
+        assert_eq!(plan.order, [0, 1, 2, 3]);
+        assert_eq!(plan.gpu, None);
     }
 }

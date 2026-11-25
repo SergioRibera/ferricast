@@ -27,6 +27,7 @@ use tracing::warn;
 use crate::bitstream::{NalSyntax, ParameterSets};
 use crate::cache::SelectionCache;
 use crate::events::{EventReceiver, SessionEvent, SessionEvents};
+use crate::gpu::GpuInput as _;
 use crate::registry::{Plan, Registry};
 use crate::session::VideoDecoderSession;
 
@@ -193,12 +194,15 @@ impl SelectingVideoDecoder {
     fn select(&mut self, config: &DecoderConfig) -> CodecResult<()> {
         if let Some(active) = &mut self.active
             && active.config.backend == config.backend
+            && active.config.gpu == config.gpu
         {
             active.session.configure(config)?;
             active.config = config.clone();
             return Ok(());
         }
-        let plan = self.registry.plan(&config.backend)?;
+        let plan = self
+            .registry
+            .plan_on(&config.backend, &config.gpu_placement()?)?;
         let opened = self.registry.open(&plan, 0, config)?;
         self.events.emit(&SessionEvent::Opened {
             backend: opened.backend,
@@ -474,6 +478,7 @@ mod tests {
 
     fn config(backend: BackendSelection) -> DecoderConfig {
         DecoderConfig {
+            gpu: Default::default(),
             hdr: None,
             memory: ferricast_core::FrameMemory::Cpu,
             codec: Codec::H264,

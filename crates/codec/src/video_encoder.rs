@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 
 use crate::cache::SelectionCache;
 use crate::events::{EventReceiver, SessionEvent, SessionEvents};
+use crate::gpu::GpuInput as _;
 use crate::registry::{Plan, Registry};
 use crate::session::VideoEncoderSession;
 
@@ -133,7 +134,10 @@ impl SelectingVideoEncoder {
         let Some(active) = &mut self.active else {
             return self.select(config);
         };
-        if active.config.backend != config.backend {
+        if active.config.backend != config.backend
+            || active.config.gpu != config.gpu
+            || active.config.source_gpu != config.source_gpu
+        {
             return self.select(config);
         }
         let applied = match rebuild {
@@ -184,7 +188,9 @@ impl SelectingVideoEncoder {
     }
 
     fn select(&mut self, config: &EncoderConfig) -> CodecResult<()> {
-        let plan = self.registry.plan(&config.backend)?;
+        let plan = self
+            .registry
+            .plan_on(&config.backend, &config.gpu_placement()?)?;
         let opened = self.registry.open(&plan, 0, config)?;
         self.events.emit(&SessionEvent::Opened {
             backend: opened.backend,
