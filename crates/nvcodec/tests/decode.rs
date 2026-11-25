@@ -525,12 +525,11 @@ fn device_frames_equal_host_frames() {
         let mut decoder =
             Decoder::<OnDevice>::new(&context, DecoderConfig::new(clip.codec)).unwrap();
         let mut hashes = Vec::new();
-        let mut host = Vec::new();
         let mut drain = |decoder: &mut Decoder<OnDevice>| {
             while let Some(frame) = decoder.next_frame() {
-                let layout = frame.download(&mut host).unwrap();
-                assert_eq!(layout.total_bytes(), host.len());
-                hashes.push(fnv1a64(&host));
+                let (host, layout) = frame.download().unwrap();
+                assert_eq!(layout.total_bytes(), host.as_slice().len());
+                hashes.push(fnv1a64(host.as_slice()));
                 // The plane layout NVENC takes: chroma right after luma, at
                 // the buffer's pitch.
                 let planes = frame.layout().planes();

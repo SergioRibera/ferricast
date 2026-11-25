@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::format::{FrameInfo, Layout};
 use super::pool::Pooled;
 use super::sei::{SeiMessages, SeiStore};
-use crate::cuda::{DeviceBuffer, Event, HostImageMut, PinnedBuffer, Point, Region, Stream};
+use crate::cuda::{DeviceBuffer, Event, PinnedBuffer, PinnedCopy, Point, Region, Stream};
 use crate::error::Result;
 
 /// A host buffer, the event its copy completes, and the SEI of the
@@ -255,32 +255,38 @@ impl DeviceFrame {
         Ok(())
     }
 
-    /// Copies the picture to host memory, packed as in [`HostFrame`], and
-    /// returns that layout. Waits for the picture first. For tests and
-    /// diagnostics; a host consumer should decode in host mode instead.
+    /// Copies the picture to page-locked host memory, packed as in
+    /// [`HostFrame`], and returns it with that layout: every plane queued
+    /// after the picture is ready, one wait. For tests and diagnostics; a
+    /// host consumer should decode in host mode instead.
     ///
     /// # Errors
     ///
     /// [`Error::Cuda`](crate::Error::Cuda).
-    pub fn download(&self, out: &mut Vec<u8>) -> Result<Layout> {
-        self.synchronize()?;
+    pub fn download(&self) -> Result<(PinnedBuffer, Layout)> {
+        let context = self.slot.buffer.context();
         let packed = Layout::packed(self.info.format, self.info.width, self.info.height);
-        out.clear();
-        out.resize(packed.total_bytes(), 0);
+        let mut host = PinnedBuffer::new(context, packed.total_bytes())?;
+        let stream = Stream::new(context)?;
         let mut row = 0;
-        for (source, target) in self.layout.planes().iter().zip(packed.planes()) {
-            let region = Region::new(source.width_bytes, source.rows).at(Point { x_bytes: 0, row });
-            let data = out.get_mut(target.offset..).unwrap_or_default();
-            self.slot.buffer.download(
-                region,
-                HostImageMut {
-                    data,
+        let copies: Vec<PinnedCopy> = self
+            .layout
+            .planes()
+            .iter()
+            .zip(packed.planes())
+            .map(|(source, target)| {
+                let src =
+                    Region::new(source.width_bytes, source.rows).at(Point { x_bytes: 0, row });
+                row += source.rows;
+                PinnedCopy {
+                    src,
+                    offset: target.offset,
                     pitch: target.pitch,
-                },
-            )?;
-            row += source.rows;
-        }
-        Ok(packed)
+                }
+            })
+            .collect();
+        host.download(&self.slot.buffer, &copies, &stream, Some(&self.slot.ready))?;
+        Ok((host, packed))
     }
 
     /// The picture's SEI messages: empty when it has none or the driver
