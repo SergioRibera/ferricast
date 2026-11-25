@@ -16,7 +16,7 @@ use ferricast_codec::cuda::nvcodec::cuda::{
 use ferricast_codec::cuda::nvcodec::encode::{DeviceFrame, Encoder, FrameOptions};
 use ferricast_codec::cuda::nvcodec::kernels::{
     Converter, FramePool, Geometry, Input as KernelInput, Matrix, Orientation, OutputFormat, Range,
-    Rect, RgbOrder, Rotation, Size, YuvColour,
+    Rect, RgbOrder, Size, YuvColour,
 };
 use ferricast_codec::cuda::{CudaSurface, nvcodec};
 use ferricast_core::{
@@ -228,6 +228,7 @@ fn rgb_matrix(colour: ColourDescription) -> Option<Matrix> {
 /// clockwise rotation).
 #[cfg(target_os = "linux")]
 fn kernel_orientation(orientation: ferricast_core::Orientation) -> Orientation {
+    use ferricast_codec::cuda::nvcodec::kernels::Rotation;
     use ferricast_core::Rotation as Turn;
     Orientation {
         mirrored: orientation.mirrored,
