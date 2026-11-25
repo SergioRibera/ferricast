@@ -42,6 +42,7 @@ pipewire = ["ferricast/pipewire"]
 openh264 = ["ferricast/openh264"]
 vaapi = ["ferricast/vaapi"]
 nvenc = ["ferricast/nvenc"]
+nvenc-hevc = ["ferricast/nvenc-hevc"]
 nvdec = ["ferricast/nvdec"]
 aac = ["ferricast/aac"]
 # Software decoders for progressive media in receiver windows.

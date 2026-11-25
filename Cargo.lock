@@ -2033,6 +2033,8 @@ dependencies = [
  "ferricast-fairplay",
  "ferricast-hls",
  "ferricast-miracast",
+ "ferricast-nvcodec",
+ "libloading 0.9.1",
  "plist",
  "rustls",
  "serde_json",

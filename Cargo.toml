@@ -124,6 +124,8 @@ pipewire = ["ferricast-capture/pipewire"]
 openh264 = ["ferricast-encoder/x264", "ferricast-decoder/openh264-decode"]
 vaapi = ["ferricast-encoder/vaapi", "ferricast-decoder/vaapi-decode"]
 nvenc = ["ferricast-encoder/nvenc"]
+# HEVC (and HEVC Main10 / HDR10) encode through NVENC.
+nvenc-hevc = ["nvenc", "ferricast-encoder/nvenc-hevc"]
 # NVIDIA hardware decode for receivers. CUDA is loaded at runtime, so the
 # build needs no NVIDIA SDK; without a GPU the decoders fall back to VA-API
 # or software.
@@ -216,6 +218,12 @@ plist = "1.10"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Paused clock for the pipeline tests (reconnect backoff, pacing).
 tokio = { workspace = true, features = ["test-util"] }
+
+# The NVIDIA end-to-end tests allocate DMA-BUFs with GBM and write them
+# with GLES through the support module of ferricast-nvcodec's own tests.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+ferricast-nvcodec.workspace = true
+libloading = "0.9"
 
 # Optimise hot-path crates in dev: x264/yuv/fdk-aac at opt=0 are
 # 5-10× slower and starve the audio pipeline.
