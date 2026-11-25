@@ -1,5 +1,6 @@
 //! Pictures that stay in a platform's own media surface (a
-//! `CVPixelBuffer`, an `AHardwareBuffer`, a D3D11 texture) between a
+//! `CVPixelBuffer`, an `AHardwareBuffer`, a D3D11 texture, CUDA device
+//! memory) between a
 //! decoder or capture source and an encoder or renderer that takes it
 //! directly, with no CPU copy.
 //!
@@ -28,6 +29,9 @@ pub enum SurfaceKind {
     HardwareBuffer,
     /// `ID3D11Texture2D` (one array slice of it), Windows.
     D3d11Texture,
+    /// A pitched CUDA device buffer (NVDEC output), Linux and Windows:
+    /// planes stacked at one pitch, chroma on the row after the luma.
+    CudaDevice,
 }
 
 impl fmt::Display for SurfaceKind {
@@ -36,6 +40,7 @@ impl fmt::Display for SurfaceKind {
             Self::CvPixelBuffer => "CVPixelBuffer",
             Self::HardwareBuffer => "AHardwareBuffer",
             Self::D3d11Texture => "D3D11 texture",
+            Self::CudaDevice => "CUDA device memory",
         })
     }
 }
