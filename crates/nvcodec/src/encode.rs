@@ -63,7 +63,7 @@ pub use self::config::{
 use self::engine::Engine;
 pub use self::raw::ApiFeature;
 use self::raw::EncodeApi;
-use crate::cuda::{ArrayView, Context, DeviceBuffer, Event, HostImage};
+use crate::cuda::{ArrayView, Context, DeviceBuffer, Event, HostImage, PitchedView};
 use crate::error::{Error, Result};
 use crate::version::{AnyApi, Api, ApiVersion, DeviceType, NvencApi, api};
 
@@ -465,6 +465,32 @@ impl Encoder {
         with_engine!(&mut self.versioned, engine => unsafe { engine.encode_array(key, array, options) })
     }
 
+    /// Encodes a picture from pitched device memory someone else owns
+    /// (packed RGB formats only), such as a LINEAR DMA-BUF imported through
+    /// EGL ([`crate::cuda::PitchedView`]), without copying it. Cached under
+    /// `key` like [`Encoder::encode_array`], sharing its keys: the same key
+    /// with other memory or another pitch is registered again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidEncodeInput`] for a semi-planar configuration, memory
+    /// of another context, too small, or with a pitch NVENC cannot take;
+    /// driver errors.
+    ///
+    /// # Safety
+    ///
+    /// As [`Encoder::encode_array`], for the memory behind `view`.
+    pub unsafe fn encode_pitched(
+        &mut self,
+        key: u64,
+        view: PitchedView<'_>,
+        options: FrameOptions,
+    ) -> Result<()> {
+        // SAFETY: the caller upholds the contract above, which is the
+        // engine's.
+        with_engine!(&mut self.versioned, engine => unsafe { engine.encode_pitched(key, view, options) })
+    }
+
     /// The next packet, in submission order (decode order with B frames).
     pub fn next_packet(&mut self) -> Option<Packet> {
         with_engine!(&mut self.versioned, engine => engine.next_packet())
@@ -519,7 +545,8 @@ impl Encoder {
         with_engine!(&mut self.versioned, engine => engine.forget_device_buffer(buffer));
     }
 
-    /// Drops the cached registration of the array under `key`.
+    /// Drops the cached registration of the array (or pitched memory, see
+    /// [`Encoder::encode_pitched`]) under `key`.
     pub fn invalidate_array(&mut self, key: u64) {
         with_engine!(&mut self.versioned, engine => engine.invalidate_array(key));
     }

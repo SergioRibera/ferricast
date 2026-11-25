@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ferricast_nvcodec::Error;
-use ferricast_nvcodec::cuda::{ArrayView, Context, Device, DeviceBuffer, HostImage, Point, Region};
+use ferricast_nvcodec::cuda::{
+    ArrayView, Context, Device, DeviceBuffer, HostImage, PitchedView, Point, Region,
+};
 use ferricast_nvcodec::encode::{
     ApiFeature, Capabilities, Codec, CodecSupport, ColorDescription, Config, ContentLightLevel,
     DeviceFrame, Encoder, FrameOptions, FrameRate, Gop, Hdr10, HostFrame, InputFormat,
@@ -1172,6 +1174,85 @@ fn cuda_array_input() {
     }
 }
 
+/// Pitched memory owned elsewhere (what a LINEAR DMA-BUF maps to) encodes
+/// in place, registered once per key, to the same stream as host input.
+#[test]
+fn pitched_input() {
+    let _gpu = gpu_lock();
+    let Some(context) = context() else { return };
+    let format = InputFormat::Abgr;
+    let config = Config {
+        gop: Gop::idr_every(NonZeroU32::new(30).unwrap()),
+        ..Config::low_latency(Codec::H264, WIDTH, HEIGHT, format, rate(30), 6_000_000)
+    };
+    let source = video(WIDTH, HEIGHT, 4, 8);
+    let pictures: Vec<Vec<u8>> = source
+        .iter()
+        .map(|planes| pack(planes, format, WIDTH, HEIGHT))
+        .collect();
+    let row = WIDTH as usize * 4;
+    let buffers: Vec<DeviceBuffer> = pictures
+        .iter()
+        .map(|picture| {
+            let mut buffer = DeviceBuffer::pitched(&context, row, HEIGHT as usize).unwrap();
+            buffer
+                .upload(
+                    buffer.region(),
+                    HostImage {
+                        data: picture,
+                        pitch: row,
+                    },
+                )
+                .unwrap();
+            buffer
+        })
+        .collect();
+
+    let mut encoder = Encoder::open(&context, &config).unwrap();
+    let mut packets = Vec::new();
+    for round in 0..2 {
+        for (index, buffer) in buffers.iter().enumerate() {
+            // SAFETY: the buffers outlive the encoder's use of them: the
+            // encoder is dropped before them, and no picture is in flight
+            // after each call (frames_in_flight 0).
+            let view = unsafe {
+                PitchedView::from_raw(
+                    buffer.device_ptr(),
+                    buffer.pitch(),
+                    row,
+                    HEIGHT as usize,
+                    &context,
+                )
+            };
+            // SAFETY: as above.
+            unsafe {
+                encoder
+                    .encode_pitched(
+                        index as u64,
+                        view,
+                        FrameOptions {
+                            timestamp: index as u64,
+                            force_idr: false,
+                        },
+                    )
+                    .unwrap();
+            }
+            let packet = encoder.next_packet().unwrap();
+            if round == 0 {
+                packets.push(packet);
+            }
+        }
+        assert_eq!(encoder.registrations(), buffers.len() as u64);
+    }
+    let mut reference = Encoder::open(&context, &config).unwrap();
+    let expected = encode_host(&mut reference, &pictures, &[]);
+    assert_eq!(
+        stream(&packets),
+        stream(&expected),
+        "pitched and host input differ"
+    );
+    drop(encoder);
+}
 #[test]
 fn steady_state_registers_nothing() {
     let _gpu = gpu_lock();

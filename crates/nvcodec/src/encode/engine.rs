@@ -12,9 +12,9 @@ use super::caps::{CodecCapabilities, codec_caps};
 use super::config::{Config, RateControl, Tuning};
 use super::raw::{ApiFeature, EncodeApi, Mapped, Picture, Registration, Resource, Submitted};
 use super::{DeviceFrame, FrameOptions, HostFrame, Packet, PictureType, Session};
-use crate::cuda::{ArrayView, Context, DeviceBuffer, Event, Point, Region, Stream};
+use crate::cuda::{ArrayView, Context, DeviceBuffer, Event, PitchedView, Point, Region, Stream};
 use crate::error::{Error, Result};
-use crate::sys::cuda::{CUarray, CUstream};
+use crate::sys::cuda::CUstream;
 use crate::version::Api;
 
 /// Spare packet buffers kept for reuse.
@@ -52,11 +52,19 @@ struct DeviceEntry {
     chroma_offset: Option<u32>,
 }
 
-/// A registered CUDA array.
-struct ArrayEntry {
-    array: CUarray,
+/// Caller-owned memory registered under a caller key: a CUDA array, or
+/// pitched interop memory (a LINEAR DMA-BUF).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyedInput {
+    resource: Resource,
     width: u32,
     height: u32,
+    pitch: u32,
+}
+
+/// A registered [`KeyedInput`].
+struct KeyedEntry {
+    input: KeyedInput,
     registered: NonNull<c_void>,
 }
 
@@ -85,7 +93,7 @@ pub(crate) struct Engine<A: EncodeApi> {
     /// How many of the front pending pictures NVENC reported encoded.
     ready: usize,
     device_inputs: HashMap<usize, DeviceEntry>,
-    array_inputs: HashMap<u64, ArrayEntry>,
+    keyed_inputs: HashMap<u64, KeyedEntry>,
     retired: Vec<Retired>,
     packets: VecDeque<Packet>,
     spare: Vec<Vec<u8>>,
@@ -131,7 +139,7 @@ impl<A: EncodeApi> Engine<A> {
             pending: VecDeque::new(),
             ready: 0,
             device_inputs: HashMap::new(),
-            array_inputs: HashMap::new(),
+            keyed_inputs: HashMap::new(),
             retired: Vec::new(),
             packets: VecDeque::new(),
             spare: Vec::new(),
@@ -487,16 +495,6 @@ impl<A: EncodeApi> Engine<A> {
     ) -> Result<()> {
         let config = &self.config;
         let format = config.input_format;
-        if format.is_semi_planar() {
-            return Err(Error::InvalidEncodeInput {
-                reason: format!("CUDA array input takes packed RGB, not {format}"),
-            });
-        }
-        if array.context().raw() != self.context().raw() {
-            return Err(Error::InvalidEncodeInput {
-                reason: "the CUDA array belongs to another CUDA context".into(),
-            });
-        }
         if array.width() < config.width || array.height() < config.height {
             return Err(Error::InvalidEncodeInput {
                 reason: format!(
@@ -508,52 +506,113 @@ impl<A: EncodeApi> Engine<A> {
                 ),
             });
         }
-        let pitch = to_u32(format.row_bytes(array.width()), "an array pitch")?;
+        let input = KeyedInput {
+            resource: Resource::Array(array.raw()),
+            width: array.width(),
+            height: array.height(),
+            pitch: to_u32(format.row_bytes(array.width()), "an array pitch")?,
+        };
+        // SAFETY: the caller upholds `encode_array`'s contract.
+        unsafe { self.encode_keyed(key, input, array.context(), options) }
+    }
+
+    /// # Safety
+    ///
+    /// See [`super::Encoder::encode_pitched`].
+    pub(crate) unsafe fn encode_pitched(
+        &mut self,
+        key: u64,
+        view: PitchedView<'_>,
+        options: FrameOptions,
+    ) -> Result<()> {
+        let config = &self.config;
+        let width_bytes = config.input_format.row_bytes(config.width);
+        if view.width_bytes() < width_bytes || view.rows() < config.height as usize {
+            return Err(Error::InvalidEncodeInput {
+                reason: format!(
+                    "{} bytes x {} rows of pitched memory cannot hold a {}x{} picture",
+                    view.width_bytes(),
+                    view.rows(),
+                    config.width,
+                    config.height
+                ),
+            });
+        }
+        let pitch = to_u32(view.pitch(), "a device pitch")?;
+        if pitch % 4 != 0 {
+            return Err(Error::InvalidEncodeInput {
+                reason: format!("NVENC needs a pitch multiple of 4, the memory's is {pitch}"),
+            });
+        }
+        let input = KeyedInput {
+            resource: Resource::DevicePtr(view.device_ptr()),
+            width: config.width,
+            height: config.height,
+            pitch,
+        };
+        // SAFETY: the caller upholds `encode_pitched`'s contract.
+        unsafe { self.encode_keyed(key, input, view.context(), options) }
+    }
+
+    /// Encodes packed RGB from memory the caller owns and identifies by
+    /// `key`, registered once per key.
+    ///
+    /// # Safety
+    ///
+    /// The memory behind `input` stays allocated while it is cached under
+    /// `key` (see [`super::Encoder::encode_array`]).
+    unsafe fn encode_keyed(
+        &mut self,
+        key: u64,
+        input: KeyedInput,
+        context: &Arc<Context>,
+        options: FrameOptions,
+    ) -> Result<()> {
+        let format = self.config.input_format;
+        if format.is_semi_planar() {
+            return Err(Error::InvalidEncodeInput {
+                reason: format!("CUDA array and interop input take packed RGB, not {format}"),
+            });
+        }
+        if context.raw() != self.context().raw() {
+            return Err(Error::InvalidEncodeInput {
+                reason: "the input belongs to another CUDA context".into(),
+            });
+        }
 
         let context = Arc::clone(self.context());
         let _current = context.guard()?;
         let slot = self.free_slot()?;
         let cached = self
-            .array_inputs
+            .keyed_inputs
             .get(&key)
-            .filter(|entry| {
-                entry.array == array.raw()
-                    && entry.width == array.width()
-                    && entry.height == array.height()
-            })
+            .filter(|entry| entry.input == input)
             .map(|entry| entry.registered);
         let registered = if let Some(registered) = cached {
             registered
         } else {
-            if let Some(stale) = self.array_inputs.remove(&key) {
+            if let Some(stale) = self.keyed_inputs.remove(&key) {
                 self.retire(stale.registered);
             }
             let registration = Registration {
-                resource: Resource::Array(array.raw()),
+                resource: input.resource,
                 format,
                 width: self.config.width,
                 height: self.config.height,
-                pitch,
+                pitch: input.pitch,
                 chroma_offset: None,
             };
-            // The caller keeps the array allocated while it is cached
+            // The caller keeps the memory allocated while it is cached
             // under `key` (this function's contract).
             let registered = self.register(&registration)?;
-            self.array_inputs.insert(
-                key,
-                ArrayEntry {
-                    array: array.raw(),
-                    width: array.width(),
-                    height: array.height(),
-                    registered,
-                },
-            );
+            self.keyed_inputs
+                .insert(key, KeyedEntry { input, registered });
             registered
         };
         self.check_unmapped(registered)?;
         // SAFETY: as in `encode_device`.
         let mapped = unsafe { A::map(&self.session, registered)? };
-        self.submit(slot, registered, mapped, pitch, None, options)
+        self.submit(slot, registered, mapped, input.pitch, None, options)
     }
 
     /// Refuses an input that a pending picture still has mapped (the same
@@ -717,7 +776,7 @@ impl<A: EncodeApi> Engine<A> {
     }
 
     pub(crate) fn invalidate_array(&mut self, key: u64) {
-        if let Some(entry) = self.array_inputs.remove(&key) {
+        if let Some(entry) = self.keyed_inputs.remove(&key) {
             self.retire(entry.registered);
         }
     }
@@ -729,7 +788,7 @@ impl<A: EncodeApi> Engine<A> {
             .map(|(_, entry)| entry.registered)
             .collect();
         let arrays: Vec<_> = self
-            .array_inputs
+            .keyed_inputs
             .drain()
             .map(|(_, entry)| entry.registered)
             .collect();
@@ -820,7 +879,7 @@ impl<A: EncodeApi> Drop for Engine<A> {
             .iter()
             .filter_map(|slot| slot.host.as_ref().map(|host| host.registered))
             .chain(self.device_inputs.values().map(|entry| entry.registered))
-            .chain(self.array_inputs.values().map(|entry| entry.registered))
+            .chain(self.keyed_inputs.values().map(|entry| entry.registered))
             .chain(self.retired.iter().map(|retired| retired.registered));
         for registered in registered {
             // SAFETY: nothing is mapped any more and the handles are not
