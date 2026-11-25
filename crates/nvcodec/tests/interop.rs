@@ -420,6 +420,93 @@ fn per_frame_cost() {
     }
 }
 
+/// Whether `fd` (a `sync_file`) has signalled.
+fn signalled(fd: &OwnedFd) -> bool {
+    let mut poll_fd = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(fd),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd.
+    unsafe { libc::poll(&raw mut poll_fd, 1, 0) == 1 }
+}
+
+/// Pending GPU work on an NVIDIA-rendered buffer: the implicit wait
+/// (`FenceWait::Implicit`) returns at once although the work is still
+/// queued (the driver attaches no fence to the DMA-BUF), while waiting on
+/// the work's explicit fence through a DRM timeline syncobj — what the
+/// PipeWire capture does with `SPA_META_SyncTimeline` — blocks until it
+/// completed.
+#[test]
+fn implicit_wait_ignores_pending_nvidia_work_explicit_wait_does_not() {
+    use ferricast_core::{SyncWait, SyncobjDevice};
+
+    let Some(gpu) = Gpu::get() else { return };
+    let mut importer = DmaBufImporter::new(&gpu.context, Some(gpu.node)).unwrap();
+    let tiled = Gpu::tiled_modifier(&importer);
+    let bo = gpu
+        .allocate(3840, 2160, DrmFormat::Argb8888, tiled)
+        .unwrap();
+    let key = BufferKey(1);
+    importer.import(key, &dma_buf(&bo)).unwrap();
+    let clears = 3000;
+
+    // Implicit: returns while the clears are still running.
+    let work = match gpu.render_pending(&bo, clears) {
+        Ok(work) => work,
+        Err(reason) => {
+            eprintln!("skipping: {reason}");
+            return;
+        }
+    };
+    let start = Instant::now();
+    let _mapped = importer
+        .map(key, FenceWait::Implicit(Duration::from_secs(2)))
+        .unwrap();
+    let implicit = start.elapsed();
+    let pending_after_implicit = !signalled(&work);
+    let device = SyncobjDevice::open_render_node(None).unwrap();
+    let timeline = device.create().unwrap();
+    timeline
+        .import_sync_file(1, std::os::fd::AsFd::as_fd(&work))
+        .unwrap();
+    assert_eq!(
+        timeline.wait(1, Duration::from_secs(5)).unwrap(),
+        SyncWait::Signalled
+    );
+    eprintln!(
+        "implicit wait returned after {implicit:?}, work still pending: {pending_after_implicit}"
+    );
+    assert!(
+        pending_after_implicit,
+        "the work finished within the implicit wait ({implicit:?}): too little work to tell"
+    );
+
+    // Explicit: the timeline wait lasts until the work is done.
+    let work = gpu.render_pending(&bo, clears).unwrap();
+    let timeline = device.create().unwrap();
+    timeline
+        .import_sync_file(1, std::os::fd::AsFd::as_fd(&work))
+        .unwrap();
+    let start = Instant::now();
+    assert_eq!(
+        timeline.wait(1, Duration::from_secs(5)).unwrap(),
+        SyncWait::Signalled
+    );
+    let explicit = start.elapsed();
+    assert!(
+        signalled(&work),
+        "the timeline signalled before the work's fence"
+    );
+    // Then the frame is lent without another wait.
+    let _mapped = importer.map(key, FenceWait::AlreadySignalled).unwrap();
+    eprintln!("explicit timeline wait lasted {explicit:?} ({clears} clears of 3840x2160)");
+    assert!(
+        explicit > implicit * 10 && explicit > Duration::from_millis(5),
+        "explicit wait {explicit:?} vs implicit {implicit:?}"
+    );
+}
+
 /// GBM, EGL and GLES, loaded at runtime like the crate loads its drivers.
 #[path = "support/dmabuf.rs"]
 mod support;

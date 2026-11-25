@@ -15,3 +15,8 @@ workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.191"
+
+# The fence test waits on a DRM timeline syncobj with ferricast's own
+# wrapper (`ferricast_core::Syncobj`), the one PipeWire capture uses.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+ferricast-core.workspace = true

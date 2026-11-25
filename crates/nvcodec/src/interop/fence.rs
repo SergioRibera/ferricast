@@ -1,11 +1,19 @@
 //! Waiting for the producer of a DMA-BUF.
 //!
-//! Compositors and PipeWire producers attach their rendering fence to the
-//! DMA-BUF (implicit synchronisation). CUDA does not take part in implicit
-//! sync and cannot import a `sync_file`, so the wait happens on the CPU:
-//! `poll(POLLIN)` on the DMA-BUF waits for its write fences, which is what
-//! `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` + waiting on the sync file would do,
-//! without the extra file descriptor.
+//! Mesa drivers attach their rendering fence to the DMA-BUF (implicit
+//! synchronisation); `poll(POLLIN)` on the buffer waits for those write
+//! fences, which is what `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` + waiting on the
+//! sync file would do, without the extra descriptor. CUDA takes no part in
+//! implicit sync and cannot import a `sync_file`, so the wait is on the CPU.
+//!
+//! The NVIDIA driver attaches **no** fence to the buffers it renders: on
+//! driver 595 the poll returned in about 2 µs with 300 ms of GL work still
+//! queued on the buffer (`tests/interop.rs`, `implicit_wait_ignores_pending_nvidia_work`).
+//! [`FenceWait::Implicit`] is therefore best effort; correctness on NVIDIA
+//! comes from the producer: an explicit acquire point waited before
+//! [`FenceWait::AlreadySignalled`] (PipeWire's `SyncTimeline`, see
+//! `ferricast_core::Syncobj`), or a protocol that reports the frame only
+//! once rendering completed (wlr-screencopy `ready` on niri).
 
 use std::os::fd::{AsRawFd as _, BorrowedFd};
 use std::time::{Duration, Instant};
@@ -17,8 +25,8 @@ use crate::error::{Error, Result};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FenceWait {
     /// Wait up to this long for the DMA-BUF's implicit write fences.
-    /// Returns at once when they have signalled (the usual case: the
-    /// compositor reports a frame ready after its rendering finished).
+    /// Returns at once when they have signalled, and also when the
+    /// producer attached none (NVIDIA): best effort, see the module docs.
     Implicit(Duration),
     /// The caller already waited (explicit sync: a `wp_linux_drm_syncobj`
     /// acquire point, a PipeWire sync object); do not wait again.
