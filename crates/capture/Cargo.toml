@@ -20,6 +20,9 @@ istmo-screen-capture = "=0.1.1-alpha.7"
 # Drives the plugin's futures from synchronous constructors (the
 # source enumerator's first listing); they complete on any executor.
 pollster = "0.4"
+# The channel istmo's runtime hands its outbound envelopes on (the
+# version istmo-core uses), drained by `plugin`.
+flume = { version = "0.11", default-features = false }
 
 # Image encoding for thumbnails. `default-features = false` strips
 # every codec except PNG, which is the only one the daemon hands

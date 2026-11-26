@@ -2046,6 +2046,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "ferricast-core",
+ "flume 0.11.1",
  "image",
  "istmo-core",
  "istmo-screen-capture",
