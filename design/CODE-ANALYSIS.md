@@ -54,12 +54,15 @@ MP3, FLAC, Ogg, Vorbis, Opus (container), WAV via symphonia; MKV/MP4 via `matros
 
 ## Capture backends (sender, Linux)
 
+All capture goes through the istmo screen-capture plugin (`ferricast-capture`, no features); it picks the backend at run time.
+
 | Backend | Feature | Notes |
 | --- | --- | --- |
-| PipeWire (xdg-desktop-portal) | `pipewire` | portal dialog picks the source |
-| wlroots foreign-toplevel | `wlroots` | in-process picker on wlr / Niri / Plasma 6 |
-| Wayland direct (wlr-screencopy + DMA-BUF) | `wayland-direct` | GPU end-to-end; needs `libgbm` |
-| Capture backend override | — | env `FERRICAST_CAPTURE=pipewire|wayland-direct` |
+| wlr-screencopy / ext-image-copy (DMA-BUF) | — | GPU end-to-end, no dialog; needs `libgbm` |
+| X11 (XShm) | — | shared memory |
+| PipeWire (xdg-desktop-portal) | — | dialog picks the source; used when nothing else can capture it |
+| Toplevel lists (ext / wlr foreign-toplevel) | — | in-process picker on wlr / Niri / Plasma 6 |
+| Capture backend override | — | env `FERRICAST_CAPTURE=wlr-screencopy\|ext-image-copy\|x11\|portal` |
 | DRM render node | — | env `FERRICAST_DRM_RENDER_NODE=/dev/dri/renderD128` |
 
 ## Device name (new in UI)
@@ -84,7 +87,7 @@ The dependency on `istmo` is a new workspace entry (path dep since both repos li
 
 Everything below should become a Setting so power users don't need to keep env vars around:
 
-- `FERRICAST_CAPTURE=pipewire|wayland-direct` → Settings · Capture → Preferred backend
+- `FERRICAST_CAPTURE=wlr-screencopy|ext-image-copy|x11|portal` → Settings · Capture → Preferred backend
 - `FERRICAST_AIRPLAY_INTERFACE` → Settings · Protocols · AirPlay → Interface override
 - `FERRICAST_CAST_INTERFACE` (referenced in airplay advertiser doc) → same pattern
 - `FERRICAST_AAC_DECODER=symphonia` → Settings · Codecs → AAC decode = symphonia

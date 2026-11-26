@@ -194,7 +194,7 @@ impl AudioMuteHandle {
 
 /// Trait for any source of PCM audio frames. Symmetric with
 /// [`ScreenCapture`]: the runtime selects a concrete backend
-/// ([`PipeWireAudioCapture`] today), the manager pulls frames in a
+/// (`ferricast_capture::NativeAudioCapture` today), the manager pulls frames in a
 /// dedicated tokio task, and pushes them through an
 /// [`crate::AudioEncoder`].
 ///

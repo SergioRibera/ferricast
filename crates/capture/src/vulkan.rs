@@ -6,8 +6,9 @@
 //! can't `mmap` those for CPU read — every byte we'd see would be
 //! garbage. The fix is to import the dmabuf into a `VkImage`, blit it
 //! to a linearly-laid-out staging buffer, and `mmap` *that*. The
-//! wayland-direct backend attaches the same importer to its
-//! `GpuFrame`s so CPU encoders can read them back.
+//! capture attaches the importer to the `GpuFrame`s it makes of the
+//! screen-capture plugin's DMA-BUFs (the plugin has no readback of its
+//! own), so CPU encoders can read them back.
 //!
 //! Public surface:
 //!

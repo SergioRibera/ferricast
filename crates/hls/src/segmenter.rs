@@ -425,7 +425,7 @@ pub async fn run_from_frames(
     let mut stream_format = StreamFormat::default();
 
     // Both audio and video timestamps come from `SystemTime::UNIX_EPOCH`
-    // (see `pipewire_audio::now_us` and `wayland_direct::now_us`), so
+    // (the screen-capture plugin's per-chunk and per-frame `wall_us`), so
     // they share a clock origin. Audio PTS is therefore
     // `audio.ts.saturating_sub(video_wall_anchor)`, identical to the
     // video formula. Any audio captured BEFORE the first video frame
@@ -766,7 +766,7 @@ async fn recv_audio(chan: &mut Option<mpsc::Receiver<AudioFrame>>) -> Option<Aud
 /// receiver-side PTS timeline and forward to the MPEG-TS muxer.
 ///
 /// Both audio and video timestamps come from `SystemTime::UNIX_EPOCH`
-/// (see `now_us()` in `pipewire_audio.rs` and `wayland_direct.rs`),
+/// (the screen-capture plugin's per-chunk and per-frame `wall_us`),
 /// so audio PTS uses the same formula as video:
 ///   `pts_us = wall_ts.saturating_sub(video_wall_anchor)`
 ///

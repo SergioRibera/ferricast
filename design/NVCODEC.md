@@ -862,6 +862,44 @@ with `Y_INVERT` against `RawFrame::oriented` (41 / 46 dB).
   readable modifier, then SHM.
 - **Producer.** The importer's render node (`VK_EXT_physical_device_drm`).
 
+### Through the istmo screen-capture plugin
+
+The wlr-screencopy and PipeWire workers above were ported into istmo's
+`istmo-screen-capture` plugin, and ferricast's own backends are gone:
+`ferricast-capture` is an adapter over the plugin plus the Vulkan
+importer (the plugin hands DMA-BUFs over and reads none back).
+
+- **Tiers.** The adapter asks for DMA-BUFs in the layouts the consumer
+  imports *and* the importer reads, then every readable layout, then CPU
+  frames in shared memory; without an importer, CPU frames only. The
+  plugin intersects them with the compositor's feedback, as before.
+- **Frames.** A DMA-BUF frame becomes a `GpuFrame` over a `dup` of the
+  slot's plane fd, its lease the plugin buffer (the slot goes back when
+  the last clone drops), `producer` / `sync` / `orientation` from the
+  frame metadata, `timestamp_us` = the plugin's `wall_us`. A new
+  `pool_generation` clears the importer's cache. CPU frames are the
+  plugin's shared memory itself (`Bytes::from_owner`), not a copy.
+- **Rotation.** Unchanged: the orientation travels with GPU frames for a
+  consumer that turns them; any other consumer gets them read back and
+  turned, off the async workers.
+- **Hold limit.** `Exhaustion::CopyToCpu`: a consumer holding every
+  buffer gets CPU frames (the compositor's copy) instead of a stall.
+- **Full copies.** `ISTMO_SCREEN_CAPTURE_FULL_COPY=1` replaces
+  `FERRICAST_WLR_FULL_COPY=1`. Damage-driven capture of an idle output
+  delivers nothing until something changes, as before.
+
+Live (`tests/capture_live.rs`, niri 26.04, RTX 3060, driver 595,
+`ISTMO_SCREEN_CAPTURE_FULL_COPY=1`, release build):
+
+| Check | Result |
+|---|---|
+| NVENC H.264, 180 frames per output, `consumer_orients` (DP-3, DP-1 normal; HDMI-A-1 90°; DP-2 270°) | 180/180 GPU frames, 0 readbacks, 57 fps (start included), every output |
+| CPU consumer, rotated outputs | 30/30 frames read back and turned, upright size |
+| Vulkan readback of DP-3 against the compositor's own `wl_shm` screenshot | 100 % identical pixels |
+| Holding every frame | 4 GPU frames, then CPU frames (`ExhaustionReadback`) |
+| Timestamps | every frame within 200 ms of `SystemTime::now()` |
+| Audio, 3 s | 3.01 s of 48 kHz S16 samples, wall-clock timestamps, muted chunks silent |
+
 ### NVENC's zero-copy path
 
 - `FrameSync::Ready` maps with `FenceWait::AlreadySignalled`,
