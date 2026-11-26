@@ -126,6 +126,26 @@ impl FrameMapper {
         }
     }
 
+    /// Drops the importer's cached imports when `meta` starts a new pool
+    /// generation (same slot of a new generation = a new buffer). The
+    /// reset waits for the GPU to go idle, so it runs off the async
+    /// workers.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn forget_old_buffers(&mut self, meta: &FrameMeta) {
+        let generation = meta.buffer.pool_generation;
+        if meta.memory != BufferMemory::DmaBuf
+            || self.generation.replace(generation) == Some(generation)
+        {
+            return;
+        }
+        let Some(importer) = self.importer.clone() else {
+            return;
+        };
+        if let Err(e) = tokio::task::spawn_blocking(move || importer.reset_cache()).await {
+            warn!(%e, "capture: resetting the Vulkan import cache panicked");
+        }
+    }
+
     /// Makes the importer run on the GPU `meta`'s DMA-BUF lives on. The
     /// importer starts on the GPU the backends report producing on; a
     /// session whose buffers come from another one (a hybrid laptop, the
@@ -239,13 +259,6 @@ impl FrameMapper {
                 ))
             })?,
         };
-        // Same slot of a new generation = a new buffer: cached imports
-        // keyed on the old ones go.
-        if self.generation.replace(meta.buffer.pool_generation) != Some(meta.buffer.pool_generation)
-            && let Some(importer) = &self.importer
-        {
-            importer.reset_cache();
-        }
         Ok(GpuFrame {
             width: meta.size.width,
             height: meta.size.height,
