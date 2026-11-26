@@ -241,7 +241,8 @@ async fn start() -> anyhow::Result<Option<Daemon>> {
         .build_with_events();
     let manager: SharedManager = Arc::new(tokio::sync::RwLock::new(manager));
 
-    // Source enumerator: picks wlroots → x11 → stub at runtime. The
+    // Source enumerator: the screen-capture plugin's listing, or the stub
+    // where nothing lists sources without a dialog (GNOME). The
     // daemon doesn't need to know which backend it is — the trait
     // hides everything. Capability discovery happens over D-Bus.
     let enumerator = ferricast::capture::auto_enumerator();

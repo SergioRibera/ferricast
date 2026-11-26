@@ -549,10 +549,11 @@ pipeline from the first frame).
   `SameAsCapture`, `renderD128`, `0000:01:00.0` all open NVENC (and NVDEC),
   a missing `renderD250` opens x264 / openh264 and `Fixed(Nvenc)` fails
   naming it (`tests/gpu_preference.rs`); live wlr-screencopy (10 s, 60 fps,
-  `FERRICAST_WLR_FULL_COPY=1`) on DP-3 (normal), HDMI-A-1 (90°) and DP-2
-  (270°): every preference above encodes ~601 GPU frames with 0 readbacks,
-  0.4-0.6 % of a core; `renderD250` predicts x264, capture turns frames on
-  the CPU (600 CPU frames, 56 %).
+  `FERRICAST_WLR_FULL_COPY=1`, now `ISTMO_SCREEN_CAPTURE_FULL_COPY=1`) on
+  DP-3 (normal), HDMI-A-1 (90°) and DP-2 (270°): every preference above
+  encodes ~601 GPU frames with 0 readbacks, 0.4-0.6 % of a core;
+  `renderD250` predicts x264, capture turns frames on the CPU (600 CPU
+  frames, 56 %).
 - Not verified (no hardware here): any hybrid or multi-GPU machine, the
   integrated/discrete heuristic on real AMD/Intel sysfs, VA-API on a
   preferred node, CUDA device selection by PCI address with more than one
