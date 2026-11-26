@@ -227,20 +227,21 @@ impl ScreenCapture for NativeCapture {
                 },
                 |list| list.sources,
             );
-        let target = Target::resolve(&source, &listed, pinned_backend(), Session::current());
-        let opened = match &target {
-            Ok(target) => self::open(plugin, &config, formats, target).await,
-            Err(e) => Err(FerricastError::Capture(e.to_string())),
-        };
-        let session = match (opened, &target) {
-            (Ok(session), _) => session,
+        let pinned = pinned_backend();
+        let pinned_any = pinned.is_some();
+        // An unknown monitor or window is the caller's error, not a
+        // reason to ask the user.
+        let target = Target::resolve(&source, &listed, pinned, Session::current())?;
+        let session = match self::open(plugin, &config, formats, &target).await {
+            Ok(session) => session,
             // Nothing captures this source directly here: the portal is
-            // the path that is left, at the cost of its dialog.
-            (Err(e), target) if !target.as_ref().is_ok_and(Target::is_picker) => {
+            // the path that is left, at the cost of its dialog. Not with
+            // a pinned backend, whose failure is the answer.
+            Err(e) if target.falls_back_to_portal(pinned_any) => {
                 warn!(%e, "capture: direct capture failed, asking through the portal");
                 self::open(plugin, &config, formats, &Target::portal(kind)).await?
             }
-            (Err(e), _) => return Err(e),
+            Err(e) => return Err(e),
         };
         let negotiated = session.negotiated();
         info!(

@@ -157,6 +157,13 @@ impl Target {
     pub(crate) const fn is_picker(&self) -> bool {
         matches!(self, Self::Picker { .. })
     }
+
+    /// Whether a failure to open this target goes on to the portal
+    /// dialog: only for a direct capture the user did not pin to a
+    /// backend (a pinned backend's failure is the answer).
+    pub(crate) const fn falls_back_to_portal(&self, pinned: bool) -> bool {
+        !pinned && !self.is_picker()
+    }
 }
 
 /// Whether `identifier` names the window `source`. A source id names it
@@ -379,6 +386,17 @@ mod tests {
         let listed = [window("toplevel:1", "Terminal", SourceCapture::ById)];
         assert!(by_identifier(WindowIdentifier::Source("toplevel:9".into()), &listed).is_err());
         assert!(by_identifier(WindowIdentifier::Title("Gone".into()), &listed).is_err());
+    }
+
+    #[test]
+    fn only_an_unpinned_direct_capture_falls_back_to_the_portal() {
+        let direct = Target::Direct {
+            source: SourceSelector::PrimaryMonitor,
+            backend: auto(),
+        };
+        assert!(direct.falls_back_to_portal(false));
+        assert!(!direct.falls_back_to_portal(true));
+        assert!(!Target::portal(SourceKind::Window).falls_back_to_portal(false));
     }
 
     #[test]
