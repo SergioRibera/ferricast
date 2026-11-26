@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use ferricast_capture::PipeWireAudioCapture;
+use ferricast_capture::NativeAudioCapture;
 use ferricast_core::{
     AdaptiveBitrateState, AudioCapture, AudioCaptureConfig, AudioCodec, AudioEncoder,
     AudioEncoderConfig, AudioFrame, AudioSource, AudioStreamConfig, CaptureConfig, CaptureSource,
@@ -1164,7 +1164,7 @@ async fn run_audio_pipeline(config: AudioStreamConfig, tx: mpsc::Sender<AudioFra
     }
 }
 
-/// PipeWire monitor capture → encoder, until the receiving side goes
+/// System audio capture → encoder, until the receiving side goes
 /// away. The encoder is configured on the first PCM chunk with the
 /// format PipeWire actually negotiated.
 async fn run_audio_pipeline_with<A: AudioEncoder>(
@@ -1172,7 +1172,7 @@ async fn run_audio_pipeline_with<A: AudioEncoder>(
     config: AudioStreamConfig,
     tx: mpsc::Sender<AudioFrame>,
 ) -> Result<()> {
-    let mut capture = PipeWireAudioCapture::new();
+    let mut capture = NativeAudioCapture::new();
     let cap_cfg = AudioCaptureConfig {
         sample_rate: config.sample_rate,
         channels: config.channels,
@@ -1187,7 +1187,7 @@ async fn run_audio_pipeline_with<A: AudioEncoder>(
 
 async fn pump_audio<A: AudioEncoder>(
     encoder: &mut A,
-    capture: &mut PipeWireAudioCapture,
+    capture: &mut NativeAudioCapture,
     config: &AudioStreamConfig,
     tx: &mpsc::Sender<AudioFrame>,
 ) -> Result<()> {

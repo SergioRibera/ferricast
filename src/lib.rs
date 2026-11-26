@@ -32,7 +32,7 @@
 //!
 //! ## Modules
 //!
-//! - [`capture`] — screen-capture backends (PipeWire, X11, native picker).
+//! - [`capture`] — screen and audio capture (the istmo screen-capture plugin) and source listing.
 //! - [`encoder`] — video encoders (openh264, VA-API, NVENC) behind a unified trait.
 //! - [`protocols`] — receiver protocols (Chromecast today; DIAL/AirPlay/Miracast pending).
 //! - [`prelude`] — the everyday types most callers want in scope.
@@ -51,10 +51,11 @@ pub use manager::{ManagerEvent, StreamManager, StreamManagerBuilder};
 // users never have to depend on `ferricast-core` directly.
 pub use ferricast_core::*;
 
-/// Screen-capture backends.
+/// Screen and audio capture.
 ///
-/// Most callers want [`capture::NativeCapture`], which auto-selects
-/// PipeWire on Wayland and X11 elsewhere.
+/// [`capture::NativeCapture`] captures through the istmo screen-capture
+/// plugin, which picks wlr-screencopy / ext-image-copy on Wayland, X11
+/// elsewhere, and the portal when nothing else can.
 pub mod capture {
     pub use ferricast_capture::*;
 }

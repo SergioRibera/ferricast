@@ -34,7 +34,7 @@ ferricast = { path = ".", default-features = false }
 ferricast-core = { path = "crates/core" }
 ferricast-codec = { path = "crates/codec" }
 ferricast-nvcodec = { path = "crates/nvcodec" }
-ferricast-capture = { path = "crates/capture", default-features = false }
+ferricast-capture = { path = "crates/capture" }
 ferricast-chromecast = { path = "crates/chromecast", default-features = false }
 ferricast-encoder = { path = "crates/encoder", default-features = false }
 ferricast-decoder = { path = "crates/decoder", default-features = false }
@@ -77,9 +77,6 @@ path = "src/lib.rs"
 [features]
 default = [
     "chromecast",
-    "pipewire",
-    "wlroots",
-    "wayland-direct",
     "openh264",
     "vaapi",
     "nvenc",
@@ -109,18 +106,12 @@ airplay = [
 ]
 
 
-# Capture backends — re-exported from `ferricast-capture`. At least
-# one MUST be enabled; the capture crate emits a `compile_error!` if
-# both are turned off.
-pipewire = ["ferricast-capture/pipewire"]
-
 # Encoder backends — re-exported from `ferricast-encoder`. At least
 # one MUST be enabled (the encoder crate emits a `compile_error!`
 # when all three are off). Typical escape hatch when cros-libva's
 # pinned libva ABI doesn't match the host:
 #     ferricast = { default-features = false,
-#                   features = ["chromecast", "x11", "pipewire",
-#                               "openh264", "nvenc"] }
+#                   features = ["chromecast", "openh264", "nvenc"] }
 openh264 = ["ferricast-encoder/x264", "ferricast-decoder/openh264-decode"]
 vaapi = ["ferricast-encoder/vaapi", "ferricast-decoder/vaapi-decode"]
 nvenc = ["ferricast-encoder/nvenc"]
@@ -155,17 +146,6 @@ fdk-aac = ["ferricast-encoder/fdk-aac", "ferricast-decoder/fdk-aac-decode"]
 # Pure-Rust Opus encoder for Cast Streaming (RTP mirror path).
 # No system-library dependency — opus-rs is 100% Rust.
 opus-rs = ["ferricast-encoder/opus-rs", "ferricast-chromecast?/opus"]
-# Wayland source enumeration (foreign-toplevel + xdg-output).
-# Orthogonal to `pipewire`: that's for *capture* on Wayland; this is
-# for *picking the source to capture* via an in-process picker
-# instead of the portal dialog. Covers wlroots + niri + KDE Plasma 6
-# under one feature flag (historical name retained for compat).
-wlroots = ["ferricast-capture/wlroots"]
-# Wayland direct capture (no xdg-desktop-portal). Streams a
-# resolved monitor via `wlr-screencopy`, allocates DMA-BUFs through
-# gbm for GPU end-to-end. Falls back to PipeWire/portal at runtime
-# if the protocols aren't available.
-wayland-direct = ["ferricast-capture/wayland-direct", "wlroots"]
 # Platform codecs (see crates/encoder/Cargo.toml). Target-gated, so they
 # are inert off their own OS and stay in the defaults.
 media-foundation = ["ferricast-encoder/media-foundation", "ferricast-decoder/media-foundation"]
@@ -182,11 +162,6 @@ istmo = [
 
 [dependencies]
 ferricast-core.workspace = true
-# Capture's default features are turned off at the workspace level
-# so the root's `pipewire`/`x11` features fully control which backends
-# get compiled in. Otherwise turning off the root features wouldn't
-# actually disable them — capture's own defaults would still pull
-# them through.
 ferricast-capture.workspace = true
 ferricast-encoder.workspace = true
 ferricast-decoder.workspace = true
@@ -215,6 +190,8 @@ serde_json = "1"
 tempfile = "3"
 # Binary plists the AirPlay video test sends and reads.
 plist = "1.10"
+# Decodes the compositor screenshot the live capture test compares with.
+image = { version = "0.25", default-features = false, features = ["png"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Paused clock for the pipeline tests (reconnect backoff, pacing).
 tokio = { workspace = true, features = ["test-util"] }
@@ -260,3 +237,6 @@ opt-level = 3
 [patch.crates-io]
 istmo-core = { path = "../istmo/istmo/crates/core" }
 istmo-macros = { path = "../istmo/istmo/crates/macros" }
+istmo-media = { path = "../istmo/istmo/crates/media" }
+istmo-build = { path = "../istmo/istmo/crates/build" }
+istmo-screen-capture = { path = "../istmo/istmo/plugins/screen-capture" }

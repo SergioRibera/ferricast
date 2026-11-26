@@ -2,89 +2,40 @@
 name = "ferricast-capture"
 version = "0.1.0"
 edition = "2024"
-description = "PipeWire and X11 screen capture for ferricast"
-
-[features]
-# Both backends on by default — match the historical behavior of the
-# crate. Downstream callers that ship to a single environment (e.g.
-# a Wayland-only desktop appliance) can opt out via
-# `default-features = false` + the backend they want.
-default = ["pipewire", "wlroots", "wayland-direct"]
-pipewire = ["vulkan", "dep:ashpd", "dep:pipewire", "dep:libspa", "dep:futures-util"]
-# Vulkan DMA-BUF importer shared by the capture backends: reads
-# tiled / compressed DMA-BUFs back to CPU memory. Pulled in by the
-# backends that emit `GpuFrame`s; does nothing on its own.
-vulkan = ["dep:ash"]
-
-# wayland (window/monitor enumeration). "wlroots" is the historical
-# name and stays for backward compat, but the backend now also
-# supports the standard `ext-foreign-toplevel-list-v1` protocol —
-# which means it works on niri, KDE Plasma 6, and any other modern
-# compositor, not just wlr-protocols implementers.
-wlroots = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr"]
-# Wayland direct capture (no xdg-desktop-portal). Negotiates
-# `zwp_linux_dmabuf_v1` with the compositor for GPU end-to-end
-# capture via `ext-image-copy-capture-v1` or `wlr-screencopy v3`.
-# Falls back to wl_shm only when the compositor refuses dmabuf.
-# `libgbm` is needed at runtime for DMA-BUF allocation — ubiquitous
-# (mesa ships it on every desktop Linux distribution).
-wayland-direct = [
-    "vulkan",
-    "wlroots",
-    "dep:gbm",
-    "dep:drm-fourcc",
-]
+description = "Screen and audio capture for ferricast over the istmo screen-capture plugin"
 
 [dependencies]
 ferricast-core.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-thiserror.workspace = true
 bytes.workspace = true
 async-trait = { workspace = true }
 
-libc = "0.2.183"
+# Pre-release: an exact pin, since `0.1` would not match `0.1.1-alpha.7`.
+# Every capture backend (wlr-screencopy, ext-image-copy, X11, portal +
+# PipeWire, PipeWire audio) lives in the plugin; on platforms it has no
+# backend for, it answers `NoBackendCompiled`.
+istmo-core = "=0.1.1-alpha.7"
+istmo-screen-capture = "=0.1.1-alpha.7"
+# Drives the plugin's futures from synchronous constructors (the
+# source enumerator's first listing); they complete on any executor.
+pollster = "0.4"
 
 # Image encoding for thumbnails. `default-features = false` strips
 # every codec except PNG, which is the only one the daemon hands
-# back over D-Bus. Keeps capture's compile time + binary size in
-# check on builds that don't want jpeg/webp/avif support.
+# back over D-Bus.
 image = { version = "0.25", default-features = false, features = ["png"] }
 
-# wlroots enumerator backend
-wayland-client = { version = "0.31", optional = true }
-wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"], optional = true }
-wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
-
-# wayland-direct: DMA-BUF allocation via gbm + DRM fourcc constants.
-gbm = { version = "0.18", default-features = false, features = ["drm-support"], optional = true }
-drm-fourcc = { version = "2.2", optional = true }
-
-# pipewire backend.
-# `async-std` (NOT `tokio`) on purpose: the `tokio` feature pulls
-# `zbus/tokio`, which propagates via Cargo feature unification to
-# every other zbus user in the tree. That in turn breaks `mundy`
-# (theme detection in `freya-core`): mundy's subscription thread is
-# a plain `std::thread` with no Tokio reactor, so zbus panics with
-# "no Tokio 1.x runtime running" on GUI startup. `async-std` makes
-# zbus use `async-io`, which mundy already drives correctly.
-ashpd = { version = "0.10", features = ["async-std"], default-features = false, optional = true }
-pipewire = { version = "0.8", features = ["v0_3_77"], optional = true }
-# `MODIFIER_FIXATION_REQUIRED` is gated behind libspa's own `v0_3_75`
-# feature, which the `pipewire` crate doesn't pass through directly.
-libspa = { version = "0.8", features = ["v0_3_75"], optional = true }
-
-# Vulkan loader — used to import dmabuf frames from the capture backends and read
-# them back to CPU memory. Optional at runtime: if `ash::Entry::load()`
-# fails (no Vulkan loader / driver) the capture path falls back to
-# SHM-only EnumFormat advertising.
-ash = { version = "0.38", optional = true }
-# Polls the xdg-portal session's `Closed` signal stream (pipewire backend).
-futures-util = { workspace = true, optional = true }
+# The Vulkan importer that reads tiled / compressed DMA-BUF frames back
+# to CPU memory: the plugin hands DMA-BUFs over and has no readback of
+# its own. If `ash::Entry::load()` fails (no loader / driver), capture
+# asks the plugin for CPU frames instead.
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = "0.38"
+libc = "0.2.183"
 
 [dev-dependencies]
-# Log output for the `enum_thumbs` diagnostic example.
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

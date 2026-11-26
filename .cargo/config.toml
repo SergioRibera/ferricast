@@ -1,8 +1,8 @@
 # Cargo aliases for build configurations the workspace defaults
 # don't cover.
 #
-# `cargo build` still uses the workspace defaults — every encoder /
-# capture backend on. The aliases below stop short of any backend
+# `cargo build` still uses the workspace defaults — every encoder backend
+# on (capture has no features). The aliases below stop short of any backend
 # whose system dependency commonly breaks the build on a moving
 # target distro (NixOS unstable, Arch when libva ticks).
 #
@@ -20,27 +20,27 @@
 # always works.
 
 [alias]
-# "Minimal but useful" build: every protocol + capture backend
-# the workspace ships, openh264 and NVENC encoders, no VA-API. This is
+# "Minimal but useful" build: Chromecast, openh264 and NVENC
+# encoders, no VA-API. This is
 # the right command on NixOS + recent libva, or any host where
 # cros-libva refuses to compile against the system headers.
 b-min = [
     "build",
     "--no-default-features",
     "--features",
-    "chromecast,pipewire,x11,wlroots,wayland-direct,openh264,nvenc",
+    "chromecast,openh264,nvenc",
 ]
 r-min = [
     "run",
     "--no-default-features",
     "--features",
-    "chromecast,pipewire,x11,wlroots,wayland-direct,openh264,nvenc",
+    "chromecast,openh264,nvenc",
 ]
 c-min = [
     "check",
     "--no-default-features",
     "--features",
-    "chromecast,pipewire,x11,wlroots,wayland-direct,openh264,nvenc",
+    "chromecast,openh264,nvenc",
 ]
 
 # openh264-only fallback. Useful on hosts without any GPU encode
@@ -49,5 +49,5 @@ b-soft = [
     "build",
     "--no-default-features",
     "--features",
-    "chromecast,pipewire,x11,wlroots,wayland-direct,openh264",
+    "chromecast,openh264",
 ]
