@@ -60,6 +60,53 @@ struct Running {
     size: (usize, usize),
     format: Option<PixelFormat>,
     failures: Failures,
+    timestamps: Timestamps,
+}
+
+/// How far a frame's capture time may be from its delivery time before
+/// it is not believed (a presentation clock that is not the one the
+/// plugin maps to the wall clock).
+const MAX_CLOCK_SKEW_US: u64 = 1_000_000;
+
+/// Keeps video timestamps on the wall clock the HLS segmenter and the
+/// audio share (UNIX-epoch µs): a frame stamped too far from now, or
+/// before the previous frame, is stamped with its delivery time instead.
+#[derive(Debug, Default)]
+struct Timestamps {
+    last: Option<u64>,
+    warned: bool,
+}
+
+impl Timestamps {
+    /// The timestamp to give a frame `stamped` with, delivered at `now`.
+    fn checked(&mut self, stamped: u64, now: u64) -> u64 {
+        let plausible = stamped.abs_diff(now) <= MAX_CLOCK_SKEW_US
+            && self.last.is_none_or(|last| stamped >= last);
+        let timestamp = if plausible {
+            stamped
+        } else {
+            if !std::mem::replace(&mut self.warned, true) {
+                warn!(
+                    stamped,
+                    now,
+                    previous = ?self.last,
+                    "capture: frame times are off the wall clock, using delivery times"
+                );
+            }
+            now.max(self.last.unwrap_or(0))
+        };
+        self.last = Some(timestamp);
+        timestamp
+    }
+}
+
+/// Now, in UNIX-epoch microseconds.
+fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Consecutive frames that failed to convert.
@@ -302,6 +349,7 @@ impl ScreenCapture for NativeCapture {
             fps: config.fps.max(1),
             format: None,
             failures: Failures::default(),
+            timestamps: Timestamps::default(),
         });
         Ok(())
     }
@@ -337,8 +385,13 @@ impl ScreenCapture for NativeCapture {
                 converted.finish()
             };
             match frame {
-                Ok(frame) => {
+                Ok(mut frame) => {
                     running.failures.clear();
+                    let stamped = frame.timestamp_us();
+                    let checked = running.timestamps.checked(stamped, now_us());
+                    if checked != stamped {
+                        frame.set_timestamp_us(checked);
+                    }
                     running.format = Some(frame.pixel_format());
                     running.size = (frame.width() as usize, frame.height() as usize);
                     return Ok(frame);
@@ -410,6 +463,31 @@ mod tests {
         }
         let ended = failures.record(&error).unwrap_err();
         assert!(ended.to_string().contains("short buffer"), "{ended}");
+    }
+
+    #[test]
+    fn wall_clock_frame_times_are_kept() {
+        let mut timestamps = Timestamps::default();
+        let now = 1_700_000_000_000_000;
+        assert_eq!(timestamps.checked(now - 16_000, now), now - 16_000);
+        assert_eq!(timestamps.checked(now, now + 1_000), now);
+        // Equal times (a repeated frame) are not going backwards.
+        assert_eq!(timestamps.checked(now, now + 2_000), now);
+    }
+
+    #[test]
+    fn implausible_frame_times_fall_back_to_delivery() {
+        let mut timestamps = Timestamps::default();
+        let now = 1_700_000_000_000_000;
+        // A monotonic-clock value, not UNIX-epoch µs.
+        assert_eq!(timestamps.checked(5_000_000, now), now);
+        // Backwards from the previous frame.
+        assert_eq!(
+            timestamps.checked(now - 500_000, now + 10_000),
+            now + 10_000
+        );
+        // Never before the previous frame either.
+        assert_eq!(timestamps.checked(0, now), now + 10_000);
     }
 
     #[test]
