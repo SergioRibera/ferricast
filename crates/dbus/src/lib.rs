@@ -69,11 +69,12 @@ pub struct DeviceDto {
 ///
 /// | kind        | args                          | meaning                                       |
 /// |-------------|-------------------------------|-----------------------------------------------|
-/// | `""`        | (empty)                       | Let the daemon pick: PipeWire portal on       |
-/// |             |                               | Wayland; on X11 a picker dialog (TODO).       |
+/// | `""`        | (empty)                       | Let the daemon pick: on Wayland the portal    |
+/// |             |                               | dialog asks for a monitor; elsewhere (or with |
+/// |             |                               | `FERRICAST_CAPTURE` set) the primary monitor. |
 /// | `"screen"`  | `monitor: s?`                 | Full-screen capture. `monitor` is a string id |
-/// |             |                               | matching `MonitorInfoDto.id`. Legacy alias    |
-/// |             |                               | for `"monitor"` — prefer the latter.          |
+/// |             |                               | matching `MonitorInfoDto.id`; without it, as  |
+/// |             |                               | `""`. Legacy alias for `"monitor"`.           |
 /// | `"monitor"` | `id: s`                       | Capture the monitor whose id matches.         |
 /// | `"window"`  | `id: s` *or* `title: s`       | Capture a specific window. `id` is the id     |
 /// |             |                               | the daemon previously returned in             |

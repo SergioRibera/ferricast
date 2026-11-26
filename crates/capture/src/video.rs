@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 use self::formats::{Formats, Readable};
 use self::frames::FrameMapper;
 pub use self::target::BACKEND_ENV_VAR;
-use self::target::{Target, pinned_backend};
+use self::target::{Session, Target, pinned_backend};
 use crate::plugin::{Plugin, capture_error};
 #[cfg(target_os = "linux")]
 use crate::vulkan::VulkanImporter;
@@ -35,10 +35,10 @@ const SINK_DEPTH: usize = 2;
 ///
 /// The plugin picks the backend (`FERRICAST_CAPTURE` pins one, see
 /// [`BACKEND_ENV_VAR`]): on Wayland wlr-screencopy or ext-image-copy
-/// into GBM DMA-BUFs with no portal dialog, on X11 shared memory. When
-/// that cannot open the source (GNOME / Mutter, a window no backend
-/// captures by id), the xdg-desktop-portal dialog asks the user, as the
-/// portal is the one path left.
+/// into GBM DMA-BUFs with no portal dialog, on X11 shared memory. The
+/// xdg-desktop-portal dialog asks the user for a source when none is
+/// named on Wayland, for a window no backend captures by id, and when
+/// direct capture cannot open the source (GNOME / Mutter).
 ///
 /// DMA-BUF frames go out as [`CapturedFrame::Gpu`] with the Vulkan
 /// importer attached, so CPU encoders can still read them back; CPU
@@ -227,7 +227,7 @@ impl ScreenCapture for NativeCapture {
                 },
                 |list| list.sources,
             );
-        let target = Target::resolve(&source, &listed, pinned_backend());
+        let target = Target::resolve(&source, &listed, pinned_backend(), Session::current());
         let opened = match &target {
             Ok(target) => self::open(plugin, &config, formats, target).await,
             Err(e) => Err(FerricastError::Capture(e.to_string())),

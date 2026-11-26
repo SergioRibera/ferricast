@@ -12,6 +12,24 @@ use tracing::warn;
 /// and `pipewire` are the older names of the Wayland and portal paths).
 pub const BACKEND_ENV_VAR: &str = "FERRICAST_CAPTURE";
 
+/// The kind of desktop session capture runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Session {
+    Wayland,
+    /// X11, or no desktop session ferricast can tell.
+    Other,
+}
+
+impl Session {
+    /// The session of this process: Wayland when `WAYLAND_DISPLAY` is set
+    /// or `XDG_SESSION_TYPE` says so.
+    pub(crate) fn current() -> Self {
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"));
+        if wayland { Self::Wayland } else { Self::Other }
+    }
+}
+
 /// What to open: a source on a backend, or a picker of one backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Target {
@@ -32,13 +50,20 @@ impl Target {
     /// its kind the plugin lists here), with the backend `pinned` by
     /// [`BACKEND_ENV_VAR`] when set.
     ///
+    /// No monitor named means the user picks one in the portal dialog on
+    /// Wayland (where the compositor, not ferricast, knows which screen
+    /// the user means), and the primary monitor elsewhere or with a
+    /// pinned backend.
+    ///
     /// # Errors
     /// A monitor id that names no listed monitor.
     pub(crate) fn resolve(
         source: &CaptureSource,
         listed: &[Source],
         pinned: Option<BackendSelection>,
+        session: Session,
     ) -> Result<Self> {
+        let ask = pinned.is_none() && session == Session::Wayland;
         let backend = pinned.unwrap_or_else(|| {
             BackendSelection::Auto(AutoSelect {
                 prefer: AutoPreference::ZeroCopy,
@@ -53,6 +78,9 @@ impl Target {
             return Ok(Self::portal(kind));
         }
         match source {
+            CaptureSource::FullScreen { monitor: None } if ask => {
+                Ok(Self::portal(SourceKind::Monitor))
+            }
             CaptureSource::FullScreen { monitor: None } => Ok(Self::Direct {
                 source: SourceSelector::PrimaryMonitor,
                 backend,
@@ -217,6 +245,7 @@ mod tests {
                 },
                 &listed,
                 None,
+                Session::Other,
             )
             .unwrap();
             assert_eq!(
@@ -237,16 +266,28 @@ mod tests {
             },
             &[monitor("17", "DP-3")],
             None,
+            Session::Other,
         )
         .unwrap_err();
         assert!(error.to_string().contains("DP-3"), "{error}");
     }
 
     #[test]
-    fn no_monitor_is_the_primary_one_without_a_dialog() {
-        let target =
-            Target::resolve(&CaptureSource::FullScreen { monitor: None }, &[], None).unwrap();
+    fn no_monitor_is_the_primary_one_off_wayland() {
+        let screen = CaptureSource::FullScreen { monitor: None };
+        let target = Target::resolve(&screen, &[], None, Session::Other).unwrap();
         assert!(!target.is_picker());
+        assert_eq!(target.selection().0, SourceSelector::PrimaryMonitor);
+    }
+
+    #[test]
+    fn no_monitor_on_wayland_asks_through_the_portal() {
+        let screen = CaptureSource::FullScreen { monitor: None };
+        let target = Target::resolve(&screen, &[], None, Session::Wayland).unwrap();
+        assert_eq!(target, Target::portal(SourceKind::Monitor));
+        // A pinned backend never opens a dialog it was not asked for.
+        let pinned = Some(BackendSelection::Fixed(BackendId::LinuxWlrScreencopy));
+        let target = Target::resolve(&screen, &[], pinned, Session::Wayland).unwrap();
         assert_eq!(target.selection().0, SourceSelector::PrimaryMonitor);
     }
 
@@ -266,6 +307,7 @@ mod tests {
             },
             &listed,
             None,
+            Session::Other,
         )
         .unwrap();
         assert_eq!(by_title, Target::portal(SourceKind::Window));
@@ -275,14 +317,20 @@ mod tests {
             },
             &listed,
             None,
+            Session::Other,
         )
         .unwrap();
         assert_eq!(
             by_id.selection().0,
             SourceSelector::Id(listed[1].id.clone())
         );
-        let unnamed =
-            Target::resolve(&CaptureSource::Window { identifier: None }, &listed, None).unwrap();
+        let unnamed = Target::resolve(
+            &CaptureSource::Window { identifier: None },
+            &listed,
+            None,
+            Session::Other,
+        )
+        .unwrap();
         assert_eq!(unnamed, Target::portal(SourceKind::Window));
     }
 
@@ -293,6 +341,7 @@ mod tests {
             },
             listed,
             None,
+            Session::Other,
         )
     }
 
@@ -340,6 +389,7 @@ mod tests {
             },
             &[monitor("17", "DP-3")],
             Some(BackendSelection::Fixed(BackendId::LinuxPortal)),
+            Session::Other,
         )
         .unwrap();
         assert_eq!(target, Target::portal(SourceKind::Monitor));
