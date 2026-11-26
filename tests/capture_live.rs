@@ -231,6 +231,9 @@ fn rotated_outputs_reach_cpu_consumers_upright() {
     });
 }
 
+/// Needs an output whose picture holds still for a moment (pick one with
+/// `FERRICAST_TEST_MONITORS`): a playing video differs between the two
+/// copies by itself.
 #[test]
 fn vulkan_readback_matches_a_compositor_screenshot() {
     if !enabled() {
