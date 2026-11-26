@@ -32,6 +32,18 @@ pub struct NativeSourceEnumerator {
     changes: Arc<broadcast::Sender<SourceChange>>,
 }
 
+/// Waits for `future` from synchronous code. On a multi-threaded tokio
+/// worker the worker's other tasks move on to another thread while it
+/// waits (the plugin answers from its own threads either way).
+fn wait<F: std::future::Future>(future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| pollster::block_on(future))
+        }
+        _ => pollster::block_on(future),
+    }
+}
+
 fn backend_error(error: impl std::fmt::Display) -> SourceError {
     SourceError::Backend(error.to_string())
 }
@@ -54,9 +66,9 @@ impl NativeSourceEnumerator {
     pub fn try_new() -> Result<Self, SourceError> {
         let plugin = Plugin::get().map_err(backend_error)?;
         let client = plugin.client();
-        let report = pollster::block_on(client.capabilities(CapabilityQuery::default()))
-            .map_err(backend_error)?;
-        let listed = pollster::block_on(client.sources(SourceFilter::default()))
+        let report =
+            wait(client.capabilities(CapabilityQuery::default())).map_err(backend_error)?;
+        let listed = wait(client.sources(SourceFilter::default()))
             .map(|list| list.sources)
             .unwrap_or_default();
         let mut capabilities: Vec<EnumerationCapability> = report
