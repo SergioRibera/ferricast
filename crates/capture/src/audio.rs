@@ -11,7 +11,7 @@ use istmo_screen_capture::{
     AudioConfig, AudioMeta, AudioSessionHandle, AudioSource as PluginSource, SampleFormat,
     ScreenCaptureClientExt as _,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::plugin::{Plugin, capture_error};
 
@@ -122,6 +122,20 @@ impl AudioCapture for NativeAudioCapture {
             format = ?negotiated.format,
             "audio capture started"
         );
+        // The rate and channels are asked for; a different answer would
+        // reach the encoder as a different pitch or speed on the
+        // receiver unless it follows the chunks' own shape.
+        if negotiated.rate != config.sample_rate
+            || u16::from(negotiated.channels) != config.channels
+        {
+            warn!(
+                requested_rate = config.sample_rate,
+                negotiated_rate = negotiated.rate,
+                requested_channels = config.channels,
+                negotiated_channels = negotiated.channels,
+                "audio capture: PipeWire negotiated another shape than requested"
+            );
+        }
         self.running = Some(Running {
             rate: negotiated.rate,
             channels: u16::from(negotiated.channels),
