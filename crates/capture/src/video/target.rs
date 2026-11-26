@@ -77,27 +77,28 @@ impl Target {
                     backend,
                 })
             }
-            CaptureSource::Window { identifier } => {
-                let window = identifier.as_ref().and_then(|identifier| {
-                    listed.iter().filter(|s| s.kind == SourceKind::Window).find(
-                        |s| match identifier {
-                            WindowIdentifier::Id(id) => s.id.value == id.to_string(),
-                            WindowIdentifier::Title(title) => s.name == *title,
-                        },
-                    )
-                });
-                Ok(match window.map(|w| (&w.capture, w)) {
-                    Some((SourceCapture::ById, window)) => Self::Direct {
+            CaptureSource::Window { identifier: None } => Ok(Self::portal(SourceKind::Window)),
+            CaptureSource::Window {
+                identifier: Some(identifier),
+            } => {
+                let window = listed
+                    .iter()
+                    .filter(|s| s.kind == SourceKind::Window)
+                    .find(|s| identifies(identifier, s))
+                    .ok_or_else(|| {
+                        FerricastError::Capture(format!("capture: no window {identifier:?} here"))
+                    })?;
+                Ok(match &window.capture {
+                    SourceCapture::ById => Self::Direct {
                         source: SourceSelector::Id(window.id.clone()),
                         backend,
                     },
                     // Listed from the compositor's window list only: the
                     // picker of a backend that can capture it.
-                    Some((SourceCapture::PickerOnly(backends), _)) => Self::Picker {
+                    SourceCapture::PickerOnly(backends) => Self::Picker {
                         kind: SourceKind::Window,
                         backend: backends.first().copied().unwrap_or(BackendId::LinuxPortal),
                     },
-                    None => Self::portal(SourceKind::Window),
                 })
             }
         }
@@ -127,6 +128,19 @@ impl Target {
 
     pub(crate) const fn is_picker(&self) -> bool {
         matches!(self, Self::Picker { .. })
+    }
+}
+
+/// Whether `identifier` names the window `source`. A source id names it
+/// exactly; a title names the first window with that title.
+fn identifies(identifier: &WindowIdentifier, source: &Source) -> bool {
+    match identifier {
+        WindowIdentifier::Source(id) => source.id.value == *id,
+        // X11 lists windows as `window:0x…`.
+        WindowIdentifier::Id(xid) => {
+            source.id.value == xid.to_string() || source.id.value == format!("window:{xid:#x}")
+        }
+        WindowIdentifier::Title(title) => source.name == *title,
     }
 }
 
@@ -267,9 +281,55 @@ mod tests {
             by_id.selection().0,
             SourceSelector::Id(listed[1].id.clone())
         );
-        let unknown =
+        let unnamed =
             Target::resolve(&CaptureSource::Window { identifier: None }, &listed, None).unwrap();
-        assert_eq!(unknown, Target::portal(SourceKind::Window));
+        assert_eq!(unnamed, Target::portal(SourceKind::Window));
+    }
+
+    fn by_identifier(identifier: WindowIdentifier, listed: &[Source]) -> Result<Target> {
+        Target::resolve(
+            &CaptureSource::Window {
+                identifier: Some(identifier),
+            },
+            listed,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_window_is_found_by_its_listed_id_among_same_title_windows() {
+        let listed = [
+            window("toplevel:1", "Terminal", SourceCapture::ById),
+            window("toplevel:2", "Terminal", SourceCapture::ById),
+        ];
+        let target = by_identifier(WindowIdentifier::Source("toplevel:2".into()), &listed).unwrap();
+        assert_eq!(
+            target.selection().0,
+            SourceSelector::Id(listed[1].id.clone())
+        );
+        // A title alone is the explicit fallback: the first match.
+        let target = by_identifier(WindowIdentifier::Title("Terminal".into()), &listed).unwrap();
+        assert_eq!(
+            target.selection().0,
+            SourceSelector::Id(listed[0].id.clone())
+        );
+    }
+
+    #[test]
+    fn an_xid_names_an_x11_window() {
+        let listed = [window("window:0x2a00007", "xterm", SourceCapture::ById)];
+        let target = by_identifier(WindowIdentifier::Id(0x2a0_0007), &listed).unwrap();
+        assert_eq!(
+            target.selection().0,
+            SourceSelector::Id(listed[0].id.clone())
+        );
+    }
+
+    #[test]
+    fn an_unknown_window_is_an_error_not_a_dialog() {
+        let listed = [window("toplevel:1", "Terminal", SourceCapture::ById)];
+        assert!(by_identifier(WindowIdentifier::Source("toplevel:9".into()), &listed).is_err());
+        assert!(by_identifier(WindowIdentifier::Title("Gone".into()), &listed).is_err());
     }
 
     #[test]

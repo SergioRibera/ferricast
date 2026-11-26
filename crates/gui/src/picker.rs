@@ -206,11 +206,10 @@ fn dto_to_capture_source(s: &SourceDto) -> CaptureSource {
         "window" => {
             let id = str_arg(s, "id");
             if let Some(id) = id {
-                let identifier = id
-                    .parse::<u64>()
-                    .map_or_else(|_| WindowIdentifier::Title(id), WindowIdentifier::Id);
+                // The picker lists the enumerator's ids: carried as is, so
+                // windows sharing a title stay apart.
                 return CaptureSource::Window {
-                    identifier: Some(identifier),
+                    identifier: Some(crate::daemon::window_identifier(id)),
                 };
             }
             CaptureSource::Window {
@@ -1066,6 +1065,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("ListMonitors"), "{err}");
+    }
+
+    #[test]
+    fn a_picked_window_keeps_its_listed_id() {
+        for (id, expected) in [
+            ("toplevel:2", "Source(\"toplevel:2\")"),
+            ("window:0x2a00007", "Source(\"window:0x2a00007\")"),
+            ("44040199", "Id(44040199)"),
+        ] {
+            let CaptureSource::Window {
+                identifier: Some(identifier),
+            } = dto_to_capture_source(&SourceDto::window_by_id(id))
+            else {
+                panic!("a window source for {id}");
+            };
+            assert_eq!(format!("{identifier:?}"), expected);
+        }
     }
 
     #[tokio::test(start_paused = true)]

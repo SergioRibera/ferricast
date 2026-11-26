@@ -17,8 +17,15 @@ pub enum CaptureSource {
 
 #[derive(Debug, Clone)]
 pub enum WindowIdentifier {
+    /// The window whose title is exactly this; the first one when
+    /// several share it.
     Title(String),
+    /// A numeric window id (an X11 XID).
     Id(u64),
+    /// The window with this source id, exactly as a
+    /// `SourceEnumerator` listed it in
+    /// `WindowInfo::id`.
+    Source(String),
 }
 
 #[derive(Debug, Clone)]

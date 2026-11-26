@@ -66,6 +66,16 @@ fn str_arg(s: &SourceDto, key: &str) -> Option<String> {
         .map(std::borrow::ToOwned::to_owned)
 }
 
+/// A window id a caller passed (`args.id`) as a capture identifier: a
+/// number is an X11 XID, anything else a source id as the enumerator
+/// lists it (`toplevel:…`, `window:0x…`).
+pub(crate) fn window_identifier(id: String) -> ferricast::WindowIdentifier {
+    id.parse::<u64>().map_or_else(
+        |_| ferricast::WindowIdentifier::Source(id),
+        ferricast::WindowIdentifier::Id,
+    )
+}
+
 /// Translate a wire [`SourceDto`] into a [`CaptureSource`], resolving
 /// any picker-issued ids against the live enumerator first. The
 /// kinds we accept:
@@ -78,13 +88,12 @@ fn str_arg(s: &SourceDto, key: &str) -> Option<String> {
 ///   exists *and* the enumerator can actually enumerate (stub
 ///   backends fall through to "let the capture backend try its
 ///   own picker").
-/// - `"window"` with `id: s` → look the window up in the enumerator,
-///   prefer `WindowIdentifier::Id` when the id parses as a u64
-///   (X11 case), fall back to its current title (wlroots case
-///   where ids are wayland `protocol_ids` and don't survive a fresh
-///   `wl_display` connection — title is the only handle the capture
-///   backend can re-resolve).
-/// - `"window"` with `title: s` → exact title; no enumerator lookup.
+/// - `"window"` with `id: s` → look the window up in the enumerator
+///   and capture it by that id (`WindowIdentifier::Source`), so two
+///   windows with one title stay apart. Without an enumerator see
+///   [`window_identifier`].
+/// - `"window"` with `title: s` → the first window with that exact
+///   title; no enumerator lookup.
 ///
 /// Returning `zbus::fdo::Error` so unknown ids surface as proper bus
 /// errors, not a generic capture failure later.
@@ -137,27 +146,14 @@ async fn resolve_source(
                             "no window with id {id:?} (try ListWindows to see current ids)"
                         )));
                     };
-                    // X11 ids are decimal XIDs — pass them through as
-                    // numeric so the capture backend doesn't have to
-                    // re-parse. Anything that doesn't parse (wlroots
-                    // wayland protocol_id) falls back to the current
-                    // title; the capture backend will re-resolve.
-                    let identifier = if let Ok(num) = w.id.parse::<u64>() {
-                        ferricast::WindowIdentifier::Id(num)
-                    } else {
-                        ferricast::WindowIdentifier::Title(w.title)
-                    };
+                    // The listed id, as is: it names this window even
+                    // when others share its title.
                     return Ok(CaptureSource::Window {
-                        identifier: Some(identifier),
+                        identifier: Some(ferricast::WindowIdentifier::Source(w.id)),
                     });
                 }
-                // No enumerator → trust the caller, treat the id as
-                // a literal numeric XID or pass it as a title if it
-                // doesn't parse.
-                let identifier = id
-                    .parse::<u64>()
-                    .map(ferricast::WindowIdentifier::Id)
-                    .unwrap_or(ferricast::WindowIdentifier::Title(id));
+                // No enumerator → trust the caller.
+                let identifier = window_identifier(id);
                 return Ok(CaptureSource::Window {
                     identifier: Some(identifier),
                 });
