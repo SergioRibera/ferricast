@@ -285,6 +285,8 @@ impl ScreenCapture for NativeCapture {
                 )));
             };
             let (meta, buffer) = frame.into_parts();
+            #[cfg(target_os = "linux")]
+            running.mapper.follow_producer(&meta).await;
             let converted = match running.mapper.convert(&meta, buffer) {
                 Ok(converted) => converted,
                 Err(e) => {

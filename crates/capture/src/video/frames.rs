@@ -17,6 +17,8 @@ use istmo_screen_capture::{
 };
 #[cfg(target_os = "linux")]
 use istmo_screen_capture::{GpuIdentity, SyncKind};
+#[cfg(target_os = "linux")]
+use tracing::debug;
 use tracing::warn;
 
 use super::formats::byte_order;
@@ -108,6 +110,9 @@ pub(crate) struct FrameMapper {
     /// The pool generation the importer's cache belongs to.
     #[cfg(target_os = "linux")]
     generation: Option<u64>,
+    /// The producer GPU an importer was last built for (or tried on).
+    #[cfg(target_os = "linux")]
+    producer: Option<u64>,
 }
 
 impl FrameMapper {
@@ -117,6 +122,46 @@ impl FrameMapper {
             importer,
             orients,
             generation: None,
+            producer: None,
+        }
+    }
+
+    /// Makes the importer run on the GPU `meta`'s DMA-BUF lives on. The
+    /// importer starts on the GPU the backends report producing on; a
+    /// session whose buffers come from another one (a hybrid laptop, the
+    /// portal) gets an importer there, built off the async workers, once
+    /// per producer. Without one there, the old importer stays.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn follow_producer(&mut self, meta: &FrameMeta) {
+        let Some(GpuIdentity::Drm(dev)) = meta.producer else {
+            return;
+        };
+        let Some(importer) = &self.importer else {
+            return;
+        };
+        if meta.memory != BufferMemory::DmaBuf
+            || importer.render_node() == Some(dev)
+            || self.producer.replace(dev) == Some(dev)
+        {
+            return;
+        }
+        match tokio::task::spawn_blocking(move || VulkanImporter::new(Some(dev))).await {
+            Ok(Ok(rebuilt)) if rebuilt.render_node() == Some(dev) => {
+                debug!(
+                    producer = dev,
+                    "capture: Vulkan importer moved to the producer GPU"
+                );
+                self.importer = Some(Arc::new(rebuilt));
+                self.generation = None;
+            }
+            Ok(Ok(_)) => warn!(
+                producer = dev,
+                "capture: no Vulkan device on the producer GPU"
+            ),
+            Ok(Err(e)) => {
+                warn!(%e, producer = dev, "capture: no Vulkan importer on the producer GPU");
+            }
+            Err(e) => warn!(%e, "capture: Vulkan importer start panicked"),
         }
     }
 
