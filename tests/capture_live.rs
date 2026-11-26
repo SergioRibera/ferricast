@@ -14,7 +14,9 @@
 //!
 //! `ISTMO_SCREEN_CAPTURE_FULL_COPY=1` asks for every frame instead of damaged
 //! ones, which makes the frame counts independent of what the screen
-//! shows.
+//! shows. `FERRICAST_TEST_MONITORS=DP-3,HDMI-A-1` limits the checks to
+//! those outputs; the readback check runs only on the still output named
+//! by `FERRICAST_TEST_STILL_MONITOR`.
 
 #![cfg(target_os = "linux")]
 #![allow(
@@ -231,21 +233,29 @@ fn rotated_outputs_reach_cpu_consumers_upright() {
     });
 }
 
-/// Needs an output whose picture holds still for a moment (pick one with
-/// `FERRICAST_TEST_MONITORS`): a playing video differs between the two
-/// copies by itself.
+/// Needs an upright output whose picture holds still for a moment, named
+/// in `FERRICAST_TEST_STILL_MONITOR` (a playing video differs between the
+/// two copies by itself); skipped without it.
 #[test]
 fn vulkan_readback_matches_a_compositor_screenshot() {
     if !enabled() {
         return;
     }
+    let Ok(still) = std::env::var("FERRICAST_TEST_STILL_MONITOR") else {
+        eprintln!("skipped: set FERRICAST_TEST_STILL_MONITOR to an output whose picture is still");
+        return;
+    };
     let _screen = one_at_a_time();
     runtime().block_on(async {
         let monitors = monitors().await;
         let monitor = monitors
             .iter()
-            .find(|m| m.geometry.width >= m.geometry.height)
-            .expect("an upright monitor");
+            .find(|m| m.id == still)
+            .expect("FERRICAST_TEST_STILL_MONITOR names a listed monitor");
+        assert!(
+            monitor.geometry.width >= monitor.geometry.height,
+            "{still} is rotated: the readback is compared unturned"
+        );
         let config = CaptureConfig {
             show_cursor: false,
             ..CaptureConfig::default()
