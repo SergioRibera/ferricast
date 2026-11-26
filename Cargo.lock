@@ -3606,13 +3606,13 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "istmo-core"
-version = "0.1.1-alpha.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330695de5b9aa91a424f00386ff56b6198efa99b75960ed3ebf9ae9fc1dbeb04"
+version = "0.1.1-alpha.7"
 dependencies = [
  "flume 0.11.1",
+ "futures-core",
  "oneshot",
  "pollster",
+ "rustix 1.1.4",
  "tracing",
  "wasm-bindgen-futures",
  "wincode",
@@ -3620,9 +3620,7 @@ dependencies = [
 
 [[package]]
 name = "istmo-macros"
-version = "0.1.1-alpha.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0889dc3b436af5ca69f5d78503de2803f21c35d95cec80825253debfe1186b21"
+version = "0.1.1-alpha.7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8592,7 +8590,7 @@ dependencies = [
  "as-raw-xcb-connection",
  "gethostname",
  "libc",
- "libloading 0.8.9",
+ "libloading 0.9.1",
  "once_cell",
  "rustix 1.1.4",
  "x11rb-protocol 0.14.0",

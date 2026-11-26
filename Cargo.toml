@@ -253,3 +253,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.ferricast-airplay]
 opt-level = 3
+
+# The istmo crates come from a local checkout of istmo next to this one
+# (`../istmo/istmo`) while the releases they need are unpublished. Goes
+# once those releases are on crates.io.
+[patch.crates-io]
+istmo-core = { path = "../istmo/istmo/crates/core" }
+istmo-macros = { path = "../istmo/istmo/crates/macros" }

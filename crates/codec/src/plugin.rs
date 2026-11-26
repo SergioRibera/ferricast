@@ -114,32 +114,43 @@ pub struct CodecSession {
 }
 
 /// The codec control plane.
+///
+/// Every method but `events` probes, opens or locks codecs (driver calls
+/// that can take seconds, or wait for a frame being encoded), so they run
+/// on istmo's blocking workers.
 #[plugin(name = "ferricast.codec", crate = "::istmo_core")]
 pub trait Codecs {
     /// Every job this build can do and every backend for it, probed
     /// for availability on this device.
+    #[istmo_macros::blocking]
     async fn capabilities(&self) -> Result<Vec<JobReport>, CodecError>;
 
     /// This machine's GPUs, each with the catalog's hardware video
     /// backends that run on it, for a GPU picker; the choice goes back in
     /// each request's `EncoderConfig::gpu` / `DecoderConfig::gpu`.
+    #[istmo_macros::blocking]
     async fn gpus(&self) -> Result<Vec<GpuReport>, CodecError>;
 
     /// Opens the codec `request` describes, reports which backend its
     /// selection picked, and closes it again.
+    #[istmo_macros::blocking]
     async fn resolve(&self, request: OpenRequest) -> Result<Resolution, CodecError>;
 
     /// Opens a codec session.
     #[owned]
+    #[istmo_macros::blocking]
     async fn open(&self, request: OpenRequest) -> Result<CodecSession, CodecError>;
 
     /// Ends a session (dropping its owned handle does the same).
+    #[istmo_macros::blocking]
     async fn close(&self, session: NativeHandleId) -> Result<(), CodecError>;
 
     /// Asks a video encoder session for a keyframe next.
+    #[istmo_macros::blocking]
     async fn request_keyframe(&self, session: NativeHandleId) -> Result<(), CodecError>;
 
     /// Retargets a video encoder session's bitrate.
+    #[istmo_macros::blocking]
     async fn set_bitrate(&self, session: NativeHandleId, kbps: u32) -> Result<(), CodecError>;
 
     /// What happens to `session`: first [`SessionEvent::Opened`] for the
