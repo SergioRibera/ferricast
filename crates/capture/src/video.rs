@@ -263,7 +263,7 @@ impl ScreenCapture for NativeCapture {
                 config.consumer_orients,
             ),
             #[cfg(not(target_os = "linux"))]
-            mapper: FrameMapper::new(config.consumer_orients),
+            mapper: FrameMapper::new(),
             session,
             fps: config.fps.max(1),
             format: None,

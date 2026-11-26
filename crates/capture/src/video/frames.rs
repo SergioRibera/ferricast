@@ -50,6 +50,13 @@ pub(crate) struct Converted {
 impl Converted {
     /// The frame as the consumer gets it: read back and turned when it
     /// still has to be. Blocking (a GPU readback, a full-frame shuffle).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "only the GPU readback (Linux) fails"
+        )
+    )]
     pub(crate) fn finish(self) -> Result<CapturedFrame> {
         let Some(orientation) = self.pending else {
             return Ok(self.frame);
@@ -96,6 +103,7 @@ pub(crate) struct FrameMapper {
     #[cfg(target_os = "linux")]
     pub(crate) importer: Option<Arc<VulkanImporter>>,
     /// The consumer turns GPU frames itself (`CaptureConfig::consumer_orients`).
+    #[cfg(target_os = "linux")]
     pub(crate) orients: bool,
     /// The pool generation the importer's cache belongs to.
     #[cfg(target_os = "linux")]
@@ -113,8 +121,8 @@ impl FrameMapper {
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(crate) const fn new(orients: bool) -> Self {
-        Self { orients }
+    pub(crate) const fn new() -> Self {
+        Self {}
     }
 
     /// The plugin frame `(meta, buffer)` as a ferricast frame.
@@ -122,6 +130,13 @@ impl FrameMapper {
     /// # Errors
     /// A frame in memory or a format this crate never asks for, or a
     /// buffer that does not hold what its metadata says.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(
+            clippy::unused_self,
+            reason = "only DMA-BUF frames (Linux) need the mapper's state"
+        )
+    )]
     pub(crate) fn convert(&mut self, meta: &FrameMeta, buffer: NativeBuffer) -> Result<Converted> {
         let turn = orientation(meta.orientation);
         match meta.memory {
@@ -268,6 +283,8 @@ fn cpu_frame(meta: &FrameMeta, buffer: NativeBuffer) -> Result<RawFrame> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use istmo_core::{BufferIdentity, NativeBuffer};
     use istmo_screen_capture::pixels::CpuView;
     use istmo_screen_capture::{PixelFormat as Format, PlaneLayout, Size};
@@ -512,8 +529,8 @@ mod tests {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn mapper(orients: bool) -> FrameMapper {
-        FrameMapper::new(orients)
+    fn mapper(_orients: bool) -> FrameMapper {
+        FrameMapper::new()
     }
 
     fn frame(meta: FrameMeta, buffer: NativeBuffer) -> (FrameMeta, NativeBuffer) {
