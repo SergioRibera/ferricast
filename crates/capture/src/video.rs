@@ -1,4 +1,4 @@
-//! [`NatieCapture`]: ferricast's screen capture over the plugin.
+//! [`NativeCapture`]: ferricast's screen capture over the plugin.
 
 mod formats;
 mod frames;
@@ -31,6 +31,11 @@ use crate::vulkan::VulkanImporter;
 /// evicted, which also hands their buffers back to the producer.
 const SINK_DEPTH: usize = 2;
 
+/// Frames in a row that may fail to convert before capture gives up: a
+/// stream that keeps sending what this crate cannot read is broken, and
+/// saying so beats dropping its frames forever.
+const FAILED_FRAMES_LIMIT: u32 = 30;
+
 /// Screen capture through the istmo screen-capture plugin.
 ///
 /// The plugin picks the backend (`FERRICAST_CAPTURE` pins one, see
@@ -54,6 +59,34 @@ struct Running {
     fps: u32,
     size: (usize, usize),
     format: Option<PixelFormat>,
+    failures: Failures,
+}
+
+/// Consecutive frames that failed to convert.
+#[derive(Debug, Default)]
+struct Failures {
+    in_a_row: u32,
+}
+
+impl Failures {
+    /// Counts `error`; the first of a run is logged, the
+    /// [`FAILED_FRAMES_LIMIT`]th ends the capture with it.
+    fn record(&mut self, error: &FerricastError) -> Result<()> {
+        self.in_a_row += 1;
+        if self.in_a_row == 1 {
+            warn!(%error, "capture: dropping a frame");
+        }
+        if self.in_a_row >= FAILED_FRAMES_LIMIT {
+            return Err(FerricastError::Capture(format!(
+                "capture: {FAILED_FRAMES_LIMIT} frames in a row failed, the last with: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.in_a_row = 0;
+    }
 }
 
 impl NativeCapture {
@@ -268,6 +301,7 @@ impl ScreenCapture for NativeCapture {
             session,
             fps: config.fps.max(1),
             format: None,
+            failures: Failures::default(),
         });
         Ok(())
     }
@@ -290,7 +324,7 @@ impl ScreenCapture for NativeCapture {
             let converted = match running.mapper.convert(&meta, buffer) {
                 Ok(converted) => converted,
                 Err(e) => {
-                    warn!(%e, "capture: dropping a frame");
+                    running.failures.record(&e)?;
                     continue;
                 }
             };
@@ -304,11 +338,12 @@ impl ScreenCapture for NativeCapture {
             };
             match frame {
                 Ok(frame) => {
+                    running.failures.clear();
                     running.format = Some(frame.pixel_format());
                     running.size = (frame.width() as usize, frame.height() as usize);
                     return Ok(frame);
                 }
-                Err(e) => warn!(%e, "capture: dropping a frame"),
+                Err(e) => running.failures.record(&e)?,
             }
         }
     }
@@ -360,4 +395,30 @@ async fn open(
         )
         .await
         .map_err(capture_error("opening the capture session"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_run_of_failed_frames_ends_the_capture() {
+        let error = FerricastError::Capture("short buffer".into());
+        let mut failures = Failures::default();
+        for _ in 1..FAILED_FRAMES_LIMIT {
+            failures.record(&error).unwrap();
+        }
+        let ended = failures.record(&error).unwrap_err();
+        assert!(ended.to_string().contains("short buffer"), "{ended}");
+    }
+
+    #[test]
+    fn a_good_frame_ends_the_run() {
+        let error = FerricastError::Capture("short buffer".into());
+        let mut failures = Failures::default();
+        for _ in 0..FAILED_FRAMES_LIMIT * 3 {
+            failures.record(&error).unwrap();
+            failures.clear();
+        }
+    }
 }
