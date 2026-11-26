@@ -233,7 +233,11 @@ impl FrameMapper {
             offset: plane.offset,
             stride: plane.stride,
             modifier: dmabuf.modifier,
-            size: u32::try_from(size).unwrap_or(u32::MAX),
+            size: u32::try_from(size).map_err(|_| {
+                FerricastError::Capture(format!(
+                    "capture: a {size}-byte DMA-BUF is larger than 4 GiB"
+                ))
+            })?,
         };
         // Same slot of a new generation = a new buffer: cached imports
         // keyed on the old ones go.
